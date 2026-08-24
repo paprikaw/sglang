@@ -4,6 +4,11 @@ from sglang.srt.elastic_pp.capacity import (
     ElasticPPCapacityEstimate,
     estimate_kv_capacity,
 )
+from sglang.srt.elastic_pp.coordinator import (
+    ElasticPPMigrationCoordinator,
+    ElasticPPMigrationPhase,
+    ElasticPPMigrationSnapshot,
+)
 from sglang.srt.elastic_pp.kv_residency import (
     ElasticKVResidency,
     KVLayerPreparation,
@@ -41,6 +46,9 @@ __all__ = [
     "DynamicPPTransition",
     "DynamicPPTransitionState",
     "ElasticLayerResidency",
+    "ElasticPPMigrationCoordinator",
+    "ElasticPPMigrationPhase",
+    "ElasticPPMigrationSnapshot",
     "ElasticKVResidency",
     "ElasticKVSlotTracker",
     "ElasticPPKVTransport",

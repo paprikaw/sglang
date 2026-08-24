@@ -481,6 +481,7 @@ v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
+from sglang.srt.entrypoints.elastic_pp import router as elastic_pp_router
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -492,6 +493,8 @@ from sglang.srt.runtime_context import (
 
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
+elastic_pp_router.route_class = ORJSONRoute
+app.include_router(elastic_pp_router)
 
 
 def _anthropic_validation_message(raw_errors) -> str:

@@ -102,6 +102,7 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
 from sglang.srt.elastic_pp.topology import PPTopology
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -156,6 +157,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     ProfileReq,
+    ReconfigureElasticPPReqInput,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -564,6 +566,7 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.init_elastic_pp_migration_coordinator()
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -908,6 +911,43 @@ class Scheduler(
             topology.generation,
             topology.active_ranks,
             topology.layer_ranges,
+        )
+
+    def init_elastic_pp_migration_coordinator(self) -> None:
+        """Bind prepared model/KV transports to the resident PP scheduler."""
+
+        self.elastic_pp_migration_coordinator = None
+        self._elastic_pp_pending_req = None
+        self._elastic_pp_draining = False
+        if not get_parallel().enable_elastic_pp:
+            return
+
+        topology = self._pp_topology()
+        if topology is None:
+            raise RuntimeError("elastic PP has no startup topology")
+        model_runner = self.tp_worker.model_runner
+        group = model_runner.elastic_pp_migration_group
+        layer_transport = model_runner.elastic_pp_layer_transport
+        kv_transport = model_runner.elastic_pp_kv_transport
+        if group is None or layer_transport is None or kv_transport is None:
+            raise RuntimeError(
+                "elastic PP migration transports were not initialized by the model runner"
+            )
+
+        pp_loop_size = self.ps.pp_size + get_parallel().pp_async_batch_depth
+        self.elastic_pp_migration_coordinator = ElasticPPMigrationCoordinator(
+            rank=self.ps.pp_rank,
+            current_topology=topology,
+            group=group,
+            model_runner=model_runner,
+            layer_transport=layer_transport,
+            kv_transport=kv_transport,
+            fence_step_provider=lambda: getattr(self, "_pp_microstep", 0),
+            # The prepare thread may finish immediately after one scheduler
+            # rank has sampled its counter.  Two complete ring revolutions
+            # leave enough deterministic runway for every rank to receive the
+            # agreed fence before it becomes due.
+            fence_lead_steps=2 * pp_loop_size,
         )
 
     def init_mamba_backend(self) -> None:
@@ -1674,6 +1714,10 @@ class Scheduler(
                 (PauseGenerationReqInput, self.pause_generation),
                 (ContinueGenerationReqInput, self.continue_generation),
                 (ConfigureLoggingReq, self.configure_logging),
+                (
+                    ReconfigureElasticPPReqInput,
+                    self.handle_reconfigure_elastic_pp,
+                ),
                 (ScaleElasticEPReqInput, self.handle_scale_elastic_ep),
                 (DumperControlReqInput, self.handle_dumper_control),
                 (AddExternalCorpusReqInput, self.add_external_corpus),

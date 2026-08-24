@@ -16,7 +16,8 @@ from tqdm import tqdm
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
-from sglang.srt.elastic_pp.topology import PPTopology
+from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationPhase
+from sglang.srt.elastic_pp.topology import DynamicPPTransition, PPTopology
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -25,6 +26,10 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.io_struct import (
+    ReconfigureElasticPPReqInput,
+    ReconfigureElasticPPReqOutput,
+)
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -151,6 +156,290 @@ class SchedulerPPMixin:
             return None
         return topology.next_rank(self.ps.pp_rank)
 
+    @staticmethod
+    def _elastic_pp_layer_counts(topology: PPTopology) -> List[int]:
+        return [layer_range.size for layer_range in topology.layer_ranges]
+
+    def _elastic_pp_build_output(
+        self: Scheduler,
+        *,
+        success: bool,
+        message: str,
+    ) -> ReconfigureElasticPPReqOutput:
+        coordinator = self.elastic_pp_migration_coordinator
+        snapshot = coordinator.snapshot()
+        transition = coordinator.transition
+        if transition is None:
+            topology = self._pp_topology()
+            assert topology is not None
+            source = target = topology
+        else:
+            source = transition.source
+            target = transition.target
+        return ReconfigureElasticPPReqOutput(
+            success=success,
+            message=message,
+            old_generation=source.generation,
+            new_generation=target.generation,
+            old_layer_counts=self._elastic_pp_layer_counts(source),
+            new_layer_counts=self._elastic_pp_layer_counts(target),
+            migration_phase=snapshot.phase.value,
+            source_usable=snapshot.source_usable,
+            fence_microstep=snapshot.fence_microstep,
+            prepare_seconds=snapshot.prepare_seconds,
+            fence_seconds=snapshot.fence_seconds,
+            total_seconds=snapshot.total_seconds,
+        )
+
+    def _elastic_pp_send_deferred_output(
+        self: Scheduler,
+        output: ReconfigureElasticPPReqOutput,
+    ) -> None:
+        recv_req = self._elastic_pp_pending_req
+        if recv_req is None:
+            return
+        if self.rust_server is not None:
+            self.rust_server.push_control_output(recv_req, output)
+        else:
+            self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
+        self._elastic_pp_pending_req = None
+
+    def _elastic_pp_emit_terminal_response(self: Scheduler) -> None:
+        if self._elastic_pp_pending_req is None:
+            return
+        coordinator = self.elastic_pp_migration_coordinator
+        snapshot = coordinator.snapshot()
+        if snapshot.phase == ElasticPPMigrationPhase.FAILED:
+            self._elastic_pp_send_deferred_output(
+                self._elastic_pp_build_output(
+                    success=False,
+                    message=snapshot.error or "elastic PP migration failed",
+                )
+            )
+        elif snapshot.phase in {
+            ElasticPPMigrationPhase.COMMITTED,
+            ElasticPPMigrationPhase.CLEANING,
+            ElasticPPMigrationPhase.DONE,
+        }:
+            self._elastic_pp_send_deferred_output(
+                self._elastic_pp_build_output(
+                    success=True,
+                    message=(
+                        "Elastic PP topology committed at a drained scheduler fence"
+                    ),
+                )
+            )
+
+    def _elastic_pp_drain_due(self: Scheduler) -> bool:
+        coordinator = self.elastic_pp_migration_coordinator
+        if coordinator is None:
+            return False
+        snapshot = coordinator.snapshot()
+        if snapshot.phase == ElasticPPMigrationPhase.FAILED:
+            self._elastic_pp_draining = False
+            self._elastic_pp_emit_terminal_response()
+            return False
+        if snapshot.phase == ElasticPPMigrationPhase.BULK_READY:
+            if snapshot.fence_microstep is None:
+                raise RuntimeError("elastic PP bulk-ready state has no fence microstep")
+            if self._pp_microstep >= snapshot.fence_microstep:
+                self._elastic_pp_draining = True
+        return self._elastic_pp_draining
+
+    def _elastic_pp_fence_is_drained(self: Scheduler) -> bool:
+        if any(batch is not None for batch in self.mbs):
+            return False
+        if self.last_rank_comm_queue:
+            return False
+        if self.pp_outputs is not None:
+            return False
+        return not any(self._pp_tensor_dict_inbox.values())
+
+    def _elastic_pp_finalize_if_drained(self: Scheduler) -> None:
+        coordinator = self.elastic_pp_migration_coordinator
+        if (
+            coordinator is None
+            or not self._elastic_pp_draining
+            or not self._elastic_pp_fence_is_drained()
+        ):
+            self._elastic_pp_emit_terminal_response()
+            return
+
+        # No tensor or request send may outlive route publication.  These waits
+        # happen only once per migration, after matching receives have already
+        # been posted while the common microbatch ring was draining.
+        self._pp_commit_comm_work(self.send_req_work)
+        self._pp_commit_comm_work(self.send_proxy_work)
+        self._pp_commit_comm_work(self.send_output_work)
+        try:
+            coordinator.finalize_at_fence(self._pp_install_topology)
+        except BaseException:
+            snapshot = coordinator.snapshot()
+            self._elastic_pp_draining = False
+            self._elastic_pp_emit_terminal_response()
+            if not snapshot.source_usable:
+                raise RuntimeError(
+                    "elastic PP suffered a partial commit; serving cannot safely resume: "
+                    f"{snapshot.error}"
+                )
+            return
+
+        self._elastic_pp_draining = False
+        self._elastic_pp_emit_terminal_response()
+
+        # The old generation has no scheduler or communication references now.
+        # Record one final stream event and release retired tensors off the
+        # serving thread so allocator/GC work does not extend the fence pause.
+        completion_event = self.device_module.Event()
+        completion_event.record(self.device_module.current_stream())
+        coordinator.start_cleanup(completion_event)
+
+    def handle_reconfigure_elastic_pp(
+        self: Scheduler, recv_req: ReconfigureElasticPPReqInput
+    ) -> Optional[ReconfigureElasticPPReqOutput]:
+        """Start a non-blocking PP prepare; completion is returned after commit."""
+
+        current = self._pp_topology()
+        coordinator = self.elastic_pp_migration_coordinator
+
+        def make_output(
+            *,
+            success: bool,
+            message: str,
+            target_generation: int,
+            new_counts: List[int],
+            phase: str,
+        ) -> ReconfigureElasticPPReqOutput:
+            old_generation = -1 if current is None else current.generation
+            old_counts = (
+                [] if current is None else self._elastic_pp_layer_counts(current)
+            )
+            return ReconfigureElasticPPReqOutput(
+                success=success,
+                message=message,
+                old_generation=old_generation,
+                new_generation=target_generation,
+                old_layer_counts=old_counts,
+                new_layer_counts=new_counts,
+                migration_phase=phase,
+                source_usable=True,
+            )
+
+        requested_counts = [int(count) for count in recv_req.layer_counts]
+        requested_generation = (
+            -1 if recv_req.generation is None else int(recv_req.generation)
+        )
+        if coordinator is None or current is None:
+            return make_output(
+                success=False,
+                message="Elastic PP is not enabled on this server",
+                target_generation=requested_generation,
+                new_counts=requested_counts,
+                phase="disabled",
+            )
+        if len(requested_counts) != self.ps.pp_size:
+            return make_output(
+                success=False,
+                message=(
+                    "Elastic PP requires one layer count per resident rank: "
+                    f"got={len(requested_counts)}, expected={self.ps.pp_size}"
+                ),
+                target_generation=requested_generation,
+                new_counts=requested_counts,
+                phase=coordinator.phase.value,
+            )
+        if any(count < 0 for count in requested_counts):
+            return make_output(
+                success=False,
+                message=f"Elastic PP layer counts must be non-negative: {requested_counts}",
+                target_generation=requested_generation,
+                new_counts=requested_counts,
+                phase=coordinator.phase.value,
+            )
+        if sum(requested_counts) != current.num_layers:
+            return make_output(
+                success=False,
+                message=(
+                    "Elastic PP target must cover every model layer: "
+                    f"got={sum(requested_counts)}, expected={current.num_layers}"
+                ),
+                target_generation=requested_generation,
+                new_counts=requested_counts,
+                phase=coordinator.phase.value,
+            )
+        if self.ps.pp_size > 1 and (
+            requested_counts[0] == 0 or requested_counts[-1] == 0
+        ):
+            return make_output(
+                success=False,
+                message=(
+                    "Elastic PP currently requires the physical first and last "
+                    "ranks to remain active"
+                ),
+                target_generation=requested_generation,
+                new_counts=requested_counts,
+                phase=coordinator.phase.value,
+            )
+
+        current_counts = self._elastic_pp_layer_counts(current)
+        if requested_counts == current_counts and (
+            recv_req.generation is None or recv_req.generation == current.generation
+        ):
+            return make_output(
+                success=True,
+                message="Elastic PP topology is already active",
+                target_generation=current.generation,
+                new_counts=requested_counts,
+                phase="done",
+            )
+
+        target_generation = (
+            current.generation + 1
+            if recv_req.generation is None
+            else int(recv_req.generation)
+        )
+        if target_generation != current.generation + 1:
+            return make_output(
+                success=False,
+                message=(
+                    "Elastic PP generation must advance exactly once: "
+                    f"got={target_generation}, expected={current.generation + 1}"
+                ),
+                target_generation=target_generation,
+                new_counts=requested_counts,
+                phase=coordinator.phase.value,
+            )
+
+        target = PPTopology.from_layer_counts(
+            requested_counts,
+            generation=target_generation,
+        )
+        transition = DynamicPPTransition.build(current, target)
+        self._elastic_pp_pending_req = recv_req
+        try:
+            coordinator.begin(transition)
+        except BaseException as exc:
+            self._elastic_pp_pending_req = None
+            return make_output(
+                success=False,
+                message=f"{type(exc).__name__}: {exc}",
+                target_generation=target_generation,
+                new_counts=requested_counts,
+                phase=coordinator.phase.value,
+            )
+
+        logger.info(
+            "Elastic PP migration generation=%d started: %s -> %s",
+            target_generation,
+            current_counts,
+            requested_counts,
+        )
+        # The request must continue through every resident PP scheduler before
+        # the migration collectives can complete.  Returning None keeps the
+        # scheduler loop non-blocking; rank 0 emits the deferred response after
+        # the common fence commits or preparation fails.
+        return None
+
     def _pp_launch_or_skip_batch(
         self: Scheduler,
         mb_id: int,
@@ -220,11 +509,20 @@ class SchedulerPPMixin:
                             async_send=True,
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
-                    plan = self.get_next_batch_to_run(
-                        running_batch=self.running_batch, last_batch=self.last_batch
-                    )
-                    self.running_batch = plan.running_batch
-                    self.mbs[mb_id] = plan.batch_to_run
+                    if self._elastic_pp_drain_due():
+                        # Preserve scheduler/request state in running_mbs while
+                        # retiring every already-launched ring slot.  Requests
+                        # received during the fence remain queued and resume on
+                        # the target topology after commit.
+                        self.mbs[mb_id] = None
+                        server_is_idle = False
+                    else:
+                        plan = self.get_next_batch_to_run(
+                            running_batch=self.running_batch,
+                            last_batch=self.last_batch,
+                        )
+                        self.running_batch = plan.running_batch
+                        self.mbs[mb_id] = plan.batch_to_run
                 self.running_mbs[mb_id] = self.running_batch
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
@@ -280,6 +578,8 @@ class SchedulerPPMixin:
                             )
 
                 self.pp_outputs = next_pp_outputs
+                self._pp_microstep += 1
+                self._elastic_pp_finalize_if_drained()
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -701,6 +1001,8 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+        self._pp_microstep = 0
+        self._elastic_pp_draining = False
 
     def profile_and_init_predictor(self: Scheduler):
         """

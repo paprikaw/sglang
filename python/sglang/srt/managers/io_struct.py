@@ -2037,6 +2037,28 @@ class ScaleElasticEPReqOutput(BaseReq, kw_only=True):
     scale_phase: str = "idle"
 
 
+class ReconfigureElasticPPReqInput(BaseReq, kw_only=True):
+    """Move layer/KV ownership within a fixed resident PP group."""
+
+    layer_counts: List[int]
+    generation: Optional[int] = None
+
+
+class ReconfigureElasticPPReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    old_generation: int
+    new_generation: int
+    old_layer_counts: List[int]
+    new_layer_counts: List[int]
+    migration_phase: str
+    source_usable: bool = True
+    fence_microstep: Optional[int] = None
+    prepare_seconds: Optional[float] = None
+    fence_seconds: Optional[float] = None
+    total_seconds: Optional[float] = None
+
+
 class GetInternalStateReq(BaseReq, kw_only=True):
     pass
 

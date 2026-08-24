@@ -155,3 +155,52 @@ def test_sparse_transport_populates_unpublished_zero_rank_backing():
     assert torch.equal(
         target_pool.get_value_buffer(1)[slots], source_pool.v_buffer[1][slots]
     )
+
+
+def test_global_exchange_order_moves_a_boundary_with_bounded_chunks():
+    transition = DynamicPPTransition.build(
+        PPTopology.from_layer_counts([2, 2], generation=0),
+        PPTopology.from_layer_counts([1, 3], generation=1),
+    )
+    slots = torch.tensor([1, 3, 5], dtype=torch.long)
+    source_pool = _make_pool(start_layer=0, layer_num=2)
+    target_pool = _make_pool(start_layer=2, layer_num=2)
+    source_pool.k_buffer[1][slots] = torch.tensor(
+        [[[11.0, 12.0]], [[31.0, 32.0]], [[51.0, 52.0]]]
+    )
+    source_pool.v_buffer[1][slots] = torch.tensor(
+        [[[13.0, 14.0]], [[33.0, 34.0]], [[53.0, 54.0]]]
+    )
+
+    mailbox = _Mailbox()
+    source = ElasticPPKVTransport(
+        group=_Group(mailbox, 0),
+        model_runner=_Runner(source_pool),
+        allocator=_Allocator(slots),
+        rank=0,
+        slot_chunk_size=2,
+    )
+    target = ElasticPPKVTransport(
+        group=_Group(mailbox, 1),
+        model_runner=_Runner(target_pool),
+        allocator=_Allocator(slots),
+        rank=1,
+        slot_chunk_size=2,
+    )
+
+    source_slots = source.prepare_transition(transition)
+    target_slots = target.prepare_transition(transition)
+    assert (
+        source.exchange_phase(transition, phase="bulk", slot_ids=source_slots)
+        == frozenset()
+    )
+    assert target.exchange_phase(
+        transition, phase="bulk", slot_ids=target_slots
+    ) == frozenset({1})
+    target_pool.commit_elastic_pp_kv_layers(generation=1)
+    assert torch.equal(
+        target_pool.get_key_buffer(1)[slots], source_pool.k_buffer[1][slots]
+    )
+    assert torch.equal(
+        target_pool.get_value_buffer(1)[slots], source_pool.v_buffer[1][slots]
+    )

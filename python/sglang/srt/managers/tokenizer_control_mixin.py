@@ -51,6 +51,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ReconfigureElasticPPReqInput,
+    ReconfigureElasticPPReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
@@ -124,6 +126,7 @@ _COMMUNICATOR_SPECS = [
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
+    ("reconfigure_elastic_pp", ReconfigureElasticPPReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
 
@@ -373,6 +376,78 @@ class TokenizerControlMixin:
                 hicache_storage_backend_extra_config=None,
             )
         return out
+
+    async def reconfigure_elastic_pp(
+        self: TokenizerManager,
+        obj: ReconfigureElasticPPReqInput,
+    ) -> ReconfigureElasticPPReqOutput:
+        """Reconfigure every DP replica to the same logical PP topology."""
+
+        self.auto_create_handle_loop()
+        results: List[ReconfigureElasticPPReqOutput] = (
+            await self.reconfigure_elastic_pp_communicator(obj)
+        )
+        if not results:
+            return ReconfigureElasticPPReqOutput(
+                success=False,
+                message="Elastic PP returned no scheduler responses",
+                old_generation=-1,
+                new_generation=-1,
+                old_layer_counts=[],
+                new_layer_counts=list(obj.layer_counts),
+                migration_phase="failed",
+                source_usable=False,
+            )
+
+        first = results[0]
+        failures = [result for result in results if not result.success]
+        signatures = {
+            (result.new_generation, tuple(result.new_layer_counts))
+            for result in results
+        }
+        if failures or len(signatures) != 1:
+            messages = list(
+                dict.fromkeys(
+                    result.message for result in (failures or results) if result.message
+                )
+            )
+            return ReconfigureElasticPPReqOutput(
+                success=False,
+                message=" | ".join(messages)
+                or "Elastic PP replicas committed different targets",
+                old_generation=first.old_generation,
+                new_generation=first.new_generation,
+                old_layer_counts=first.old_layer_counts,
+                new_layer_counts=first.new_layer_counts,
+                migration_phase=first.migration_phase,
+                source_usable=all(result.source_usable for result in results),
+                fence_microstep=first.fence_microstep,
+                prepare_seconds=max(
+                    (
+                        result.prepare_seconds
+                        for result in results
+                        if result.prepare_seconds is not None
+                    ),
+                    default=None,
+                ),
+                fence_seconds=max(
+                    (
+                        result.fence_seconds
+                        for result in results
+                        if result.fence_seconds is not None
+                    ),
+                    default=None,
+                ),
+                total_seconds=max(
+                    (
+                        result.total_seconds
+                        for result in results
+                        if result.total_seconds is not None
+                    ),
+                    default=None,
+                ),
+            )
+        return first
 
     async def start_profile(
         self: TokenizerManager,

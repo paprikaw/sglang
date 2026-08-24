@@ -7761,6 +7761,11 @@ class ServerArgs:
                 "elastic PP currently supports --tp-size 1 while KV migration "
                 "and batch-local PP routing are being validated"
             )
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "elastic PP currently requires colocated serving; the separate "
+                "prefill/decode PP drain loops are not yet wired to the topology fence"
+            )
 
         raw_partition = self.elastic_pp_initial_partition or os.getenv(
             "SGLANG_PP_LAYER_PARTITION"
