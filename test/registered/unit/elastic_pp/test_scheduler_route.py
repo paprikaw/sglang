@@ -72,6 +72,15 @@ class _FakeScheduler(SchedulerPPMixin):
         self.require_attn_tp_allgather = False
         self._pp_tensor_dict_inbox = defaultdict(deque)
         self.device_module = _FakeDeviceModule()
+        self.forward_ct = 0
+        self._sched_idled = True
+
+    def _record_batch_launch(self, batch):
+        self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
+        batch.launch_ts = 1.0
+        batch.after_idle_gap = self._sched_idled
+        self._sched_idled = False
 
 
 class _FakeSender:
@@ -271,9 +280,10 @@ def test_inactive_rank_neither_receives_proxy_nor_launches_forward():
 
     assert scheduler._pp_recv_proxy_tensors() is None
     metadata = [None]
+    batch = SimpleNamespace()
     result, event = scheduler._pp_launch_or_skip_batch(
         0,
-        object(),
+        batch,
         None,
         metadata,
         deque(),
@@ -282,6 +292,11 @@ def test_inactive_rank_neither_receives_proxy_nor_launches_forward():
     assert result is None
     assert metadata == [PPBatchMetadata(can_run_cuda_graph=False)]
     assert event.recorded_stream == "schedule-stream"
+    assert batch.forward_iter == 1
+    assert batch.launch_ts == 1.0
+    assert batch.after_idle_gap
+    assert scheduler.forward_ct == 1
+    assert not scheduler._sched_idled
 
 
 def test_topology_install_requires_static_endpoints_new_generation_and_fence():

@@ -3792,6 +3792,21 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _record_batch_launch(self, batch: ScheduleBatch) -> None:
+        """Advance scheduler-visible launch state for one PP microbatch.
+
+        Elastic PP zero-layer ranks still retire the same request/output ring
+        as compute ranks.  They skip model forward, but must retain identical
+        forward iteration and idle-gap bookkeeping so result processing and
+        scheduler metrics remain well-defined.
+        """
+
+        self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
+        batch.launch_ts = time.monotonic()
+        batch.after_idle_gap = self._sched_idled
+        self._sched_idled = False
+
     @scheduler_nvtx_method("scheduler.run_batch")
     def run_batch(
         self,
@@ -3799,11 +3814,7 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
-        self.forward_ct += 1
-        batch.forward_iter = self.forward_ct
-        batch.launch_ts = time.monotonic()
-        batch.after_idle_gap = self._sched_idled
-        self._sched_idled = False
+        self._record_batch_launch(batch)
 
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.on_run_batch(batch)

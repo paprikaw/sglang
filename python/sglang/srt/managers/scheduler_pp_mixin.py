@@ -509,6 +509,9 @@ class SchedulerPPMixin:
         # Inactive ranks retain scheduler/request state but own no model
         # layers.  Recording an event keeps the common microbatch retirement
         # path valid without launching GPU forward or receiving a proxy tensor.
+        # They must still advance scheduler-visible launch bookkeeping: output
+        # processing reads these fields even when this rank skipped compute.
+        self._record_batch_launch(cur_batch)
         mb_metadata[mb_id] = PPBatchMetadata(can_run_cuda_graph=False)
         event = self.device_module.Event()
         event.record(self.device_module.current_stream())
