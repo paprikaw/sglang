@@ -1,6 +1,7 @@
 import sys
 from types import ModuleType, SimpleNamespace
 
+import pytest
 import torch
 
 from sglang.srt.elastic_pp.topology import LayerRange
@@ -211,6 +212,32 @@ def test_kvcached_token_allocator_tracks_bulk_and_delta_live_slots():
     )
     allocator.finish_elastic_pp_slot_tracking(generation=4)
     assert allocator.available_size() == 5
+
+
+def test_kvcached_token_allocator_snapshot_after_committed_free_group():
+    pool = _make_pool()
+    allocator = KVCacheDTokenToKVPoolAllocator(
+        size=8,
+        dtype=torch.float32,
+        device="cpu",
+        kvcache=pool,
+        need_sort=False,
+    )
+    allocated = allocator.alloc(2)
+    allocator.free_group_begin()
+    allocator.free(allocated[:1])
+
+    with pytest.raises(RuntimeError, match="closed allocator free group"):
+        allocator.begin_elastic_pp_slot_tracking(generation=1)
+
+    allocator.free_group_end()
+    assert allocator.is_not_in_free_group
+    assert allocator.free_group == []
+    assert torch.equal(
+        allocator.begin_elastic_pp_slot_tracking(generation=1),
+        allocated[1:],
+    )
+    allocator.finish_elastic_pp_slot_tracking(generation=1)
 
 
 def test_kvcached_paged_allocator_tracks_complete_page_rows():
