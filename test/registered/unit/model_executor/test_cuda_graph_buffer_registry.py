@@ -192,6 +192,35 @@ class TestFillFromAndExtract(unittest.TestCase):
         )
         return r
 
+    def test_shape_mismatch_identifies_the_slot_and_batch_shape(self):
+        r = _make_registry(max_bs=4, max_num_tokens=8)
+        r.register_slot(
+            GraphSlot(
+                name="positions",
+                shape_fn=lambda bs, mt: (mt,),
+                dtype=torch.int64,
+                axis="tokens",
+            )
+        )
+        fb = _MiniForwardBatch(
+            batch_size=2,
+            positions=torch.arange(2, dtype=torch.int64),
+            forward_mode="decode",
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"mode=decode, raw_bs=2, raw_num_tokens=4.*"
+            r"positions: dst=\(4,\) src=\(2,\)",
+        ):
+            r.fill_from(
+                fb,
+                raw_bs=2,
+                padded_bs=2,
+                raw_num_tokens=4,
+                padded_num_tokens=4,
+            )
+
     def test_fill_with_padding_resets_zero_and_sentinel(self):
         r = self._build_registry()
         # Pre-poison the padded tail to a non-zero value so we can prove
