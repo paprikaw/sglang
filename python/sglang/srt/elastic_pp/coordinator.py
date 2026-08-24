@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,6 +14,8 @@ from typing import Any
 import torch
 
 from sglang.srt.elastic_pp.topology import DynamicPPTransition, PPTopology
+
+logger = logging.getLogger(__name__)
 
 
 class ElasticPPMigrationPhase(str, Enum):
@@ -239,19 +242,52 @@ class ElasticPPMigrationCoordinator:
 
     def _prepare_worker(self) -> None:
         transition = self._require_transition()
+        generation = transition.target.generation
         try:
             local_error = None
             try:
+                stage_started = time.monotonic()
+                logger.info(
+                    "Elastic PP generation=%d rank=%d layer prepare begin",
+                    generation,
+                    self.rank,
+                )
                 self.layer_transport.prepare_target(transition)
                 self._layer_prepared = True
+                logger.info(
+                    "Elastic PP generation=%d rank=%d layer prepare complete "
+                    "in %.3f s",
+                    generation,
+                    self.rank,
+                    time.monotonic() - stage_started,
+                )
+                stage_started = time.monotonic()
+                logger.info(
+                    "Elastic PP generation=%d rank=%d KV prepare begin",
+                    generation,
+                    self.rank,
+                )
                 self._bulk_slots = self.kv_transport.prepare_transition(transition)
                 self._kv_prepared = True
                 self._slot_tracking = True
                 slot_signature = self._slot_signature(self._bulk_slots)
+                logger.info(
+                    "Elastic PP generation=%d rank=%d KV prepare complete "
+                    "in %.3f s with %d live slots",
+                    generation,
+                    self.rank,
+                    time.monotonic() - stage_started,
+                    slot_signature[0],
+                )
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
                 slot_signature = None
 
+            logger.info(
+                "Elastic PP generation=%d rank=%d allocation consensus begin",
+                generation,
+                self.rank,
+            )
             reports = self._consensus(
                 "prepare_allocations",
                 success=local_error is None,
@@ -259,6 +295,11 @@ class ElasticPPMigrationCoordinator:
                 details=slot_signature,
             )
             self._raise_peer_failures("prepare allocations", reports)
+            logger.info(
+                "Elastic PP generation=%d rank=%d allocation consensus complete",
+                generation,
+                self.rank,
+            )
             # In-flight PP stages can observe different allocator states at
             # the background-copy boundary.  Each layer-transfer source owns
             # the authoritative sparse slot stream for that edge.
@@ -266,15 +307,40 @@ class ElasticPPMigrationCoordinator:
             local_error = None
             works = ()
             try:
+                stage_started = time.monotonic()
+                logger.info(
+                    "Elastic PP generation=%d rank=%d layer copy begin",
+                    generation,
+                    self.rank,
+                )
                 works = self.layer_transport.start_sends(transition)
                 try:
                     self.layer_transport.receive(transition)
                 finally:
                     self.layer_transport.wait(works)
+                logger.info(
+                    "Elastic PP generation=%d rank=%d layer copy complete in %.3f s",
+                    generation,
+                    self.rank,
+                    time.monotonic() - stage_started,
+                )
+                stage_started = time.monotonic()
+                logger.info(
+                    "Elastic PP generation=%d rank=%d KV bulk copy begin",
+                    generation,
+                    self.rank,
+                )
                 self.kv_transport.exchange_phase(
                     transition,
                     phase="bulk",
                     slot_ids=self._bulk_slots,
+                )
+                logger.info(
+                    "Elastic PP generation=%d rank=%d KV bulk copy complete "
+                    "in %.3f s",
+                    generation,
+                    self.rank,
+                    time.monotonic() - stage_started,
                 )
                 if not self.model_runner.elastic_pp_generation_ready(
                     generation=transition.target.generation
@@ -291,6 +357,11 @@ class ElasticPPMigrationCoordinator:
                 error=local_error,
             )
             self._raise_peer_failures("bulk copy", reports)
+            logger.info(
+                "Elastic PP generation=%d rank=%d bulk-copy consensus complete",
+                generation,
+                self.rank,
+            )
 
             # Scheduler loops on different ranks can observe background-copy
             # completion at slightly different wall-clock times.  Stopping as
@@ -321,6 +392,12 @@ class ElasticPPMigrationCoordinator:
                     f"elastic PP arm fence returned invalid microsteps: {peer_steps!r}"
                 )
             fence_microstep = max(peer_steps) + self.fence_lead_steps
+            logger.info(
+                "Elastic PP generation=%d rank=%d armed fence at microstep=%d",
+                generation,
+                self.rank,
+                fence_microstep,
+            )
             with self._condition:
                 self._fence_microstep = fence_microstep
                 self._bulk_ready_at = time.monotonic()
