@@ -10,6 +10,7 @@ import torch.distributed as dist
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_default_distributed_backend,
+    get_elastic_pp_migration_group,
     get_pp_group,
     get_tp_group,
     get_world_group,
@@ -62,6 +63,7 @@ class TorchDistributedResult(msgspec.Struct, frozen=True, kw_only=True):
     pp_group: object
     attention_tp_group: object
     pre_model_load_memory: float
+    elastic_pp_migration_group: object = None
 
 
 def init_torch_distributed(
@@ -140,6 +142,9 @@ def init_torch_distributed(
     )
     tp_group = get_tp_group()
     pp_group = get_pp_group()
+    elastic_pp_migration_group = (
+        get_elastic_pp_migration_group() if get_parallel().enable_elastic_pp else None
+    )
     attention_tp_group = get_parallel().attn_tp_group
 
     # Check memory for tensor parallelism
@@ -159,6 +164,7 @@ def init_torch_distributed(
         pp_group=pp_group,
         attention_tp_group=attention_tp_group,
         pre_model_load_memory=pre_model_load_memory,
+        elastic_pp_migration_group=elastic_pp_migration_group,
     )
 
 
@@ -258,6 +264,7 @@ def _init_parallel_groups(
         moe_data_model_parallel_size=moe_dp_size,
         decode_context_parallel_size=dcp_size,
         duplicate_tp_group=server_args.enable_pdmux,
+        duplicate_pp_group=get_parallel().enable_elastic_pp,
         duplicate_attn_cp_group=(
             is_hip()
             and server_args.enable_two_batch_overlap

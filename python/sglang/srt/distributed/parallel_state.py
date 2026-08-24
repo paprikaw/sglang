@@ -2044,11 +2044,19 @@ def get_moe_tp_group() -> GroupCoordinator:
 get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
+_ELASTIC_PP_MIGRATION: Optional[GroupCoordinator] = None
 
 
 def get_pp_group() -> GroupCoordinator:
     assert _PP is not None, "pipeline model parallel group is not initialized"
     return _PP
+
+
+def get_elastic_pp_migration_group() -> GroupCoordinator:
+    assert (
+        _ELASTIC_PP_MIGRATION is not None
+    ), "elastic PP migration group is not initialized"
+    return _ELASTIC_PP_MIGRATION
 
 
 # kept for backward compatibility
@@ -2335,6 +2343,7 @@ def initialize_model_parallel(
     decode_context_parallel_size: int = 1,
     backend: Optional[str] = None,
     duplicate_tp_group: bool = False,
+    duplicate_pp_group: bool = False,
     duplicate_attn_cp_group: bool = False,
     enable_symm_mem: bool = False,
     recovered_rank: bool = False,
@@ -2696,6 +2705,22 @@ def initialize_model_parallel(
         rank_offset=rank_offset,
         max_world_size=max_world_size,
     )
+    global _ELASTIC_PP_MIGRATION
+    assert (
+        _ELASTIC_PP_MIGRATION is None
+    ), "elastic PP migration group is already initialized"
+    if duplicate_pp_group:
+        _ELASTIC_PP_MIGRATION = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            group_name="elastic_pp_migration",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
 
 
 def create_custom_parallel_group(
@@ -2929,6 +2954,11 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _ELASTIC_PP_MIGRATION
+    if _ELASTIC_PP_MIGRATION:
+        _ELASTIC_PP_MIGRATION.destroy()
+    _ELASTIC_PP_MIGRATION = None
 
     global _DCP
     if _DCP:

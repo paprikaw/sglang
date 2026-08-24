@@ -8,6 +8,11 @@ from sglang.srt.elastic_pp.layer_residency import (
     ElasticLayerResidency,
     LayerPreparation,
 )
+from sglang.srt.elastic_pp.layer_transport import (
+    ElasticPPLayerTransport,
+    flatten_layer_states,
+    unflatten_layer_states,
+)
 from sglang.srt.elastic_pp.topology import (
     DynamicPPTransition,
     DynamicPPTransitionState,
@@ -26,6 +31,7 @@ __all__ = [
     "DynamicPPTransition",
     "DynamicPPTransitionState",
     "ElasticLayerResidency",
+    "ElasticPPLayerTransport",
     "ElasticPPCapacityEstimate",
     "ElasticPPWeightProfile",
     "FirstLoadWeightProfiler",
@@ -36,4 +42,6 @@ __all__ = [
     "TransitionPhase",
     "WeightTensorMetadata",
     "estimate_kv_capacity",
+    "flatten_layer_states",
+    "unflatten_layer_states",
 ]

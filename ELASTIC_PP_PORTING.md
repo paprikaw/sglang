@@ -37,6 +37,7 @@ persistent-data-plane tests.
 | Long-lived dynamic PP data plane | `vllm/v1/executor/dynamic_ray_distributed_executor.py`, `dynamic_utils.py` | existing `scheduler_pp_mixin.py` ring and `GroupCoordinator`; add batch-local peers, do not add Ray |
 | Scheduler cut and post-cut route publish | `DynamicEngineCore._commit_autoscaling_topology_after_sync` | PP scheduler control message ordered with microbatches |
 | Dynamic layer materialization | `dynamic_gpu_model_runner.py::{add_layers,remove_layers}` | model layer factory plus model-loader partial weight filter |
+| Direct weight migration | owner-to-owner worker transfer | `elastic_pp/layer_transport.py` over a dedicated duplicate of the maximal PP group |
 | Sparse live-slot KV copy and catch-up | `dynamic_kv_synchronizer.py` and `KVPatchMeta` | SGLang token-to-KV pool transfer adapter plus per-generation delta log |
 | KVCacheD VMM/page lifetime | `vllm/kvcached_integration.py` | optional SGLang KV storage backend; no hard dependency for default serving |
 | Autoscaling policy | `autoscaling_policy.py` | controller above the mechanism; manual transition API lands first |
@@ -66,6 +67,24 @@ persistent-data-plane tests.
    independently.
 5. There is no scheduler-ordered prepare/fence/commit/cleanup control protocol
    for PP topology changes.
+
+## Landed mechanism pieces
+
+- The logical route is generation-stamped and may skip resident zero-layer
+  middle ranks while retaining the fixed maximal process group.
+- The first checkpoint load records every weight tensor and then calibrates
+  actual resident parameter and buffer bytes across ranks.
+- Unquantized Llama decoder layers have a transactional residency lifecycle:
+  target-only modules are prepared and loaded before commit, while retired
+  modules remain resident until CUDA-safe cleanup.
+- Weight migration uses an independent PP-shaped NCCL/Gloo communicator.  Its
+  manifest validates the generation, source, destination, and exact half-open
+  layer interval before installing runtime tensors.
+
+The next mechanism piece is transactional KV residency.  The first supported
+backend is the standard unquantized MHA token-to-KV pool; hybrid, MLA,
+page-major, and quantized layouts remain explicit follow-up work rather than
+silently taking an unsafe path.
 
 ## Delivery order
 

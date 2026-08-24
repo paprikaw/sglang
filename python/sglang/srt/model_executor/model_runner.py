@@ -1065,6 +1065,16 @@ class ModelRunner:
         )
         self.tp_group = result.tp_group
         self.pp_group = result.pp_group
+        self.elastic_pp_migration_group = result.elastic_pp_migration_group
+        self.elastic_pp_layer_transport = None
+        if self.elastic_pp_migration_group is not None:
+            from sglang.srt.elastic_pp.layer_transport import ElasticPPLayerTransport
+
+            self.elastic_pp_layer_transport = ElasticPPLayerTransport(
+                group=self.elastic_pp_migration_group,
+                model_runner=self,
+                rank=self.ps.pp_rank,
+            )
         self.attention_tp_group = result.attention_tp_group
         self.pre_model_load_memory = result.pre_model_load_memory
 

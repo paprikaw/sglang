@@ -118,6 +118,7 @@ def test_parallel_group_construction_tp8_attn_cp2():
         patch.object(parallel_state, "_ATTN_CP", None),
         patch.object(parallel_state, "_ATTN_TP", None),
         patch.object(parallel_state, "_PP", None),
+        patch.object(parallel_state, "_ELASTIC_PP_MIGRATION", None),
         patch("torch.distributed.is_initialized", return_value=True),
         patch("torch.distributed.get_world_size", return_value=world_size),
         patch("torch.distributed.get_rank", return_value=0),
@@ -156,6 +157,7 @@ def test_parallel_group_construction_tp8_attn_cp2():
                 tensor_model_parallel_size=8,
                 pipeline_model_parallel_size=1,
                 attention_context_model_parallel_size=2,
+                duplicate_pp_group=True,
             )
 
             # Verify TP groups
@@ -186,6 +188,13 @@ def test_parallel_group_construction_tp8_attn_cp2():
             assert (
                 attn_cp_groups == expected_attn_cp
             ), f"Wrong ATTN_CP groups: {attn_cp_groups}"
+
+            # Elastic PP uses the same maximal rank layout as the live PP data
+            # plane, but a separately constructed communicator.  This prevents
+            # background weight/KV traffic from reordering serving messages.
+            elastic_pp_migration_groups = created_groups.get("elastic_pp_migration", [])
+            assert elastic_pp_migration_groups == created_groups.get("pp", [])
+            assert parallel_state._ELASTIC_PP_MIGRATION is not parallel_state._PP
 
             print("TP=8, Attn CP=2 group construction verified")
 
@@ -218,6 +227,7 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
         patch.object(parallel_state, "_MOE_DP", None),
         patch.object(parallel_state, "_MOE_TP", None),
         patch.object(parallel_state, "_PP", None),
+        patch.object(parallel_state, "_ELASTIC_PP_MIGRATION", None),
         patch("torch.distributed.is_initialized", return_value=True),
         patch("torch.distributed.get_world_size", return_value=world_size),
         patch("torch.distributed.get_rank", return_value=0),
