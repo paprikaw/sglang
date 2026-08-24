@@ -8,10 +8,19 @@ from sglang.srt.mem_cache.kvcached_pool import (
     KVCacheDMHATokenToKVPool,
     KVCacheDPagedTokenToKVPoolAllocator,
     KVCacheDTokenToKVPoolAllocator,
+    _explicit_kvcached_device,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+def test_indexless_cuda_device_resolves_to_process_active_gpu(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+
+    assert _explicit_kvcached_device("cuda") == "cuda:3"
+    assert _explicit_kvcached_device(torch.device("cuda:1")) == "cuda:1"
+    assert _explicit_kvcached_device("cpu") == "cpu"
 
 
 class _FakeKVCacheDManager:

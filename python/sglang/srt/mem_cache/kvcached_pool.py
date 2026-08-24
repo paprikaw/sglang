@@ -34,6 +34,15 @@ _LISTENER_LOCK = threading.Lock()
 _LISTENER_KEYS: set[tuple[int, int, int]] = set()
 
 
+def _explicit_kvcached_device(device: str | torch.device) -> str:
+    """Resolve index-less CUDA devices against this process's active GPU."""
+
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    return str(resolved)
+
+
 def _supported_kwargs(callable_obj, kwargs: dict[str, Any]) -> dict[str, Any]:
     """Keep compatibility with both upstream and the autoscaling KVCacheD API."""
 
@@ -175,7 +184,7 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
             "world_size": int(get_parallel().tp_size),
             "pp_rank": int(get_parallel().pp_rank),
             "is_worker": False,
-            "device": self.device,
+            "device": _explicit_kvcached_device(self.device),
             "async_sched": True,
         }
         interfaces.init_kvcached(
@@ -210,6 +219,7 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
             raise ValueError("KVCacheD elastic PP backing requires a CUDA device")
         self._initialize_kvcached()
         interfaces = self._kvcached_interfaces
+        kvcached_device = _explicit_kvcached_device(self.device)
         if self._kvcached_partitioning_requested:
             if self.page_size != 1:
                 raise NotImplementedError(
@@ -228,7 +238,7 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
                 ),
                 "block_size": self.page_size,
                 "dtype": self.store_dtype,
-                "device": self.device,
+                "device": kvcached_device,
                 "num_layers": self._kvcached_total_num_layers,
                 "attention_type": "MHA",
                 "kv_layout": "NHD",
@@ -262,7 +272,7 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
                 self.head_dim,
             ),
             "dtype": self.store_dtype,
-            "device": self.device,
+            "device": kvcached_device,
             "num_layers": self._kvcached_total_num_layers,
             "page_size": self.page_size,
             "attention_type": "MHA",
