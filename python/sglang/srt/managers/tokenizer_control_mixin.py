@@ -9,6 +9,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
 
+from sglang.srt.elastic_pp.autoscaling import (
+    ElasticPPBacklogPolicy,
+    parse_elastic_pp_partitions,
+)
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -32,6 +36,8 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    GetElasticPPStateReqInput,
+    GetElasticPPStateReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -126,6 +132,7 @@ _COMMUNICATOR_SPECS = [
     ("expert_distribution", ExpertDistributionReqOutput),
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
+    ("get_elastic_pp_state", GetElasticPPStateReqOutput),
     ("reconfigure_elastic_pp", ReconfigureElasticPPReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
 ]
@@ -171,6 +178,166 @@ class TokenizerControlMixin:
             setattr(self, f"{name}_communicator", comm)
             dispatch_pairs.append((resp_type, comm.handle_recv))
         self._result_dispatcher += TypeBasedDispatcher(dispatch_pairs)
+        self._init_elastic_pp_autoscaler(server_args)
+
+    def _init_elastic_pp_autoscaler(
+        self: TokenizerManager, server_args: ServerArgs
+    ) -> None:
+        self._elastic_pp_reconfigure_lock = asyncio.Lock()
+        self._elastic_pp_autoscale_started = False
+        self._elastic_pp_autoscale_policy: Optional[ElasticPPBacklogPolicy] = None
+        self._elastic_pp_current_layer_counts: Optional[Tuple[int, ...]] = None
+        if not server_args.enable_elastic_pp_autoscaling:
+            return
+
+        partitions = parse_elastic_pp_partitions(
+            server_args.elastic_pp_autoscale_partitions
+        )
+        self._elastic_pp_current_layer_counts = tuple(
+            int(item) for item in server_args.elastic_pp_initial_partition.split(",")
+        )
+        self._elastic_pp_autoscale_policy = ElasticPPBacklogPolicy(
+            partitions=partitions,
+            scale_up_total_requests=server_args.elastic_pp_autoscale_up_requests,
+            scale_down_total_requests=server_args.elastic_pp_autoscale_down_requests,
+            scale_up_stable_checks=(server_args.elastic_pp_autoscale_up_stable_polls),
+            scale_down_stable_checks=(
+                server_args.elastic_pp_autoscale_down_stable_polls
+            ),
+            min_operation_interval_s=(server_args.elastic_pp_autoscale_min_residence_s),
+            failure_backoff_s=(server_args.elastic_pp_autoscale_failure_backoff_s),
+            max_operations=server_args.elastic_pp_autoscale_max_operations,
+        )
+
+    def start_elastic_pp_autoscaler(
+        self: TokenizerManager, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        if (
+            self._elastic_pp_autoscale_policy is None
+            or self._elastic_pp_autoscale_started
+        ):
+            return
+        self._elastic_pp_autoscale_started = True
+        task = loop.create_task(self._elastic_pp_autoscale_loop())
+        self.asyncio_tasks.add(task)
+        logger.info(
+            "Elastic PP autoscaler started: partitions=%s up=%s down=%s "
+            "poll=%.3fs min_residence=%.3fs",
+            self._elastic_pp_autoscale_policy.partitions,
+            self._elastic_pp_autoscale_policy.scale_up_total_requests,
+            self._elastic_pp_autoscale_policy.scale_down_total_requests,
+            self.server_args.elastic_pp_autoscale_poll_interval_s,
+            self._elastic_pp_autoscale_policy.min_operation_interval_s,
+        )
+
+    async def _elastic_pp_autoscale_loop(self: TokenizerManager) -> None:
+        poll_interval_s = self.server_args.elastic_pp_autoscale_poll_interval_s
+        while not self.gracefully_exit:
+            try:
+                await asyncio.sleep(poll_interval_s)
+                await self._elastic_pp_autoscale_tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Elastic PP autoscaler observation failed")
+
+    async def _elastic_pp_autoscale_tick(
+        self: TokenizerManager,
+    ) -> Optional[ReconfigureElasticPPReqOutput]:
+        policy = self._elastic_pp_autoscale_policy
+        if policy is None:
+            return None
+        lock = getattr(self, "_elastic_pp_reconfigure_lock", None)
+        if lock is None:
+            lock = self._elastic_pp_reconfigure_lock = asyncio.Lock()
+        async with lock:
+            return await self._elastic_pp_autoscale_tick_locked(policy)
+
+    async def _elastic_pp_autoscale_tick_locked(
+        self: TokenizerManager,
+        policy: ElasticPPBacklogPolicy,
+    ) -> Optional[ReconfigureElasticPPReqOutput]:
+        """Observe and act while excluding a concurrent manual transition."""
+
+        states: List[GetElasticPPStateReqOutput] = (
+            await self.get_elastic_pp_state_communicator(GetElasticPPStateReqInput())
+        )
+        if not states or any(not state.enabled for state in states):
+            logger.warning("Elastic PP autoscaler received disabled/empty state")
+            return None
+        topology_signatures = {
+            (state.generation, tuple(state.layer_counts)) for state in states
+        }
+        if len(topology_signatures) != 1:
+            logger.error(
+                "Elastic PP autoscaler observed divergent replicas: %s",
+                sorted(topology_signatures),
+            )
+            return None
+        if any(not state.source_usable for state in states):
+            logger.critical(
+                "Elastic PP autoscaler stopped because a replica no longer has "
+                "a usable source generation"
+            )
+            return None
+        stable_phases = {"idle", "done", "failed"}
+        if any(state.migration_phase not in stable_phases for state in states):
+            return None
+
+        generation, current_partition = next(iter(topology_signatures))
+        self._elastic_pp_current_layer_counts = current_partition
+        waiting_requests = sum(state.waiting_requests for state in states)
+        running_requests = sum(state.running_requests for state in states)
+        now_s = time.monotonic()
+        try:
+            target = policy.observe(
+                current_partition=current_partition,
+                waiting_requests=waiting_requests,
+                running_requests=running_requests,
+                now_s=now_s,
+            )
+        except ValueError:
+            logger.exception(
+                "Elastic PP autoscaler current topology is outside its frontier"
+            )
+            return None
+        if target is None:
+            return None
+
+        logger.info(
+            "Elastic PP autoscaler decision: generation=%d current=%s target=%s "
+            "waiting=%d running=%d total=%d",
+            generation,
+            current_partition,
+            target,
+            waiting_requests,
+            running_requests,
+            waiting_requests + running_requests,
+        )
+        result = await self._reconfigure_elastic_pp_unlocked(
+            ReconfigureElasticPPReqInput(layer_counts=list(target)),
+        )
+        self._record_elastic_pp_reconfigure_result(result, automatic=True)
+        if result.success:
+            logger.info(
+                "Elastic PP autoscaler committed: generation=%d partition=%s "
+                "prepare_seconds=%s fence_seconds=%s total_seconds=%s",
+                result.new_generation,
+                tuple(result.new_layer_counts),
+                result.prepare_seconds,
+                result.fence_seconds,
+                result.total_seconds,
+            )
+        else:
+            logger.error(
+                "Elastic PP autoscaler transition failed: target=%s phase=%s "
+                "source_usable=%s message=%s",
+                target,
+                result.migration_phase,
+                result.source_usable,
+                result.message,
+            )
+        return result
 
     def update_control_communicator_fan_out(self: TokenizerManager, worker_count: int):
         primary_group_control = (
@@ -188,6 +355,7 @@ class TokenizerControlMixin:
             getattr(self, f"{spec[0]}_communicator").set_fan_out(worker_count)
 
         self.get_internal_state_communicator.set_fan_out(control_fan_out)
+        self.get_elastic_pp_state_communicator.set_fan_out(control_fan_out)
 
     async def add_external_corpus(
         self: TokenizerManager, obj: AddExternalCorpusReqInput
@@ -384,6 +552,51 @@ class TokenizerControlMixin:
         """Reconfigure every DP replica to the same logical PP topology."""
 
         self.auto_create_handle_loop()
+        return await self._serialized_elastic_pp_reconfigure(
+            obj,
+            automatic=False,
+        )
+
+    async def _serialized_elastic_pp_reconfigure(
+        self: TokenizerManager,
+        obj: ReconfigureElasticPPReqInput,
+        *,
+        automatic: bool,
+    ) -> ReconfigureElasticPPReqOutput:
+        lock = getattr(self, "_elastic_pp_reconfigure_lock", None)
+        if lock is None:
+            lock = self._elastic_pp_reconfigure_lock = asyncio.Lock()
+        async with lock:
+            result = await self._reconfigure_elastic_pp_unlocked(obj)
+            self._record_elastic_pp_reconfigure_result(
+                result,
+                automatic=automatic,
+            )
+        return result
+
+    def _record_elastic_pp_reconfigure_result(
+        self: TokenizerManager,
+        result: ReconfigureElasticPPReqOutput,
+        *,
+        automatic: bool,
+    ) -> None:
+        policy = getattr(self, "_elastic_pp_autoscale_policy", None)
+        if result.success:
+            new_partition = tuple(result.new_layer_counts)
+            changed = tuple(result.old_layer_counts) != new_partition
+            self._elastic_pp_current_layer_counts = new_partition
+            if policy is not None and changed:
+                policy.mark_operation_completed(
+                    time.monotonic(),
+                    count_toward_limit=automatic,
+                )
+        elif policy is not None and automatic:
+            policy.mark_operation_failed(time.monotonic())
+
+    async def _reconfigure_elastic_pp_unlocked(
+        self: TokenizerManager,
+        obj: ReconfigureElasticPPReqInput,
+    ) -> ReconfigureElasticPPReqOutput:
         results: List[ReconfigureElasticPPReqOutput] = (
             await self.reconfigure_elastic_pp_communicator(obj)
         )

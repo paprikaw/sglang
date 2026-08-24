@@ -1093,6 +1093,59 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "native"
+    enable_elastic_pp_autoscaling: A[
+        bool,
+        "Enable the tokenizer-side backlog controller for elastic PP.",
+        NS("parallel"),
+    ] = False
+    elastic_pp_autoscale_partitions: A[
+        Optional[str],
+        (
+            "Semicolon-separated elastic PP partitions ordered by increasing "
+            "active-rank count, for example '40,0,0,40;20,20,20,20'."
+        ),
+        NS("parallel"),
+    ] = None
+    elastic_pp_autoscale_up_requests: A[
+        int,
+        "Global waiting-plus-running request threshold for scaling up elastic PP.",
+        NS("parallel"),
+    ] = 64
+    elastic_pp_autoscale_down_requests: A[
+        int,
+        "Global waiting-plus-running request threshold for scaling down elastic PP.",
+        NS("parallel"),
+    ] = 0
+    elastic_pp_autoscale_up_stable_polls: A[
+        int,
+        "Consecutive high-backlog observations required before elastic PP scale-up.",
+        NS("parallel"),
+    ] = 2
+    elastic_pp_autoscale_down_stable_polls: A[
+        int,
+        "Consecutive low-backlog observations required before elastic PP scale-down.",
+        NS("parallel"),
+    ] = 4
+    elastic_pp_autoscale_poll_interval_s: A[
+        float,
+        "Scheduler-state polling interval for the elastic PP autoscaler.",
+        NS("parallel"),
+    ] = 1.0
+    elastic_pp_autoscale_min_residence_s: A[
+        float,
+        "Minimum time after a committed transition before another automatic one.",
+        NS("parallel"),
+    ] = 10.0
+    elastic_pp_autoscale_failure_backoff_s: A[
+        float,
+        "Retry backoff after a failed automatic elastic PP transition.",
+        NS("parallel"),
+    ] = 5.0
+    elastic_pp_autoscale_max_operations: A[
+        Optional[int],
+        "Optional maximum number of successful automatic elastic PP transitions.",
+        NS("parallel"),
+    ] = None
     dp_size: A[
         int,
         Arg(
@@ -7767,6 +7820,15 @@ class ServerArgs:
         if not self.enable_elastic_pp:
             if self.elastic_pp_kv_backend != "native":
                 raise ValueError("--elastic-pp-kv-backend requires --enable-elastic-pp")
+            if self.enable_elastic_pp_autoscaling:
+                raise ValueError(
+                    "--enable-elastic-pp-autoscaling requires --enable-elastic-pp"
+                )
+            if self.elastic_pp_autoscale_partitions is not None:
+                raise ValueError(
+                    "--elastic-pp-autoscale-partitions requires "
+                    "--enable-elastic-pp-autoscaling"
+                )
             return
         if self.pp_size <= 1:
             raise ValueError("--enable-elastic-pp requires --pp-size greater than 1")
@@ -7822,6 +7884,76 @@ class ServerArgs:
         normalized_partition = ",".join(str(count) for count in partition)
         self.elastic_pp_initial_partition = normalized_partition
         os.environ["SGLANG_PP_LAYER_PARTITION"] = normalized_partition
+
+        if not self.enable_elastic_pp_autoscaling:
+            if self.elastic_pp_autoscale_partitions is not None:
+                raise ValueError(
+                    "--elastic-pp-autoscale-partitions requires "
+                    "--enable-elastic-pp-autoscaling"
+                )
+            return
+
+        if self.tokenizer_worker_num != 1:
+            raise ValueError(
+                "elastic PP autoscaling currently requires "
+                "--tokenizer-worker-num 1 so exactly one controller owns decisions"
+            )
+        if self.elastic_pp_autoscale_partitions is None:
+            raise ValueError(
+                "--enable-elastic-pp-autoscaling requires "
+                "--elastic-pp-autoscale-partitions"
+            )
+
+        from sglang.srt.elastic_pp.autoscaling import (
+            parse_elastic_pp_partitions,
+            serialize_elastic_pp_partitions,
+            validate_elastic_pp_autoscale_partitions,
+        )
+
+        partitions = validate_elastic_pp_autoscale_partitions(
+            parse_elastic_pp_partitions(self.elastic_pp_autoscale_partitions),
+            pp_size=self.pp_size,
+            num_layers=sum(partition),
+        )
+        if partition not in partitions:
+            raise ValueError(
+                "elastic PP initial partition must be present on the autoscale "
+                f"frontier: initial={partition}, frontier={partitions}"
+            )
+        if (
+            self.elastic_pp_autoscale_up_requests
+            <= self.elastic_pp_autoscale_down_requests
+        ):
+            raise ValueError(
+                "--elastic-pp-autoscale-up-requests must exceed "
+                "--elastic-pp-autoscale-down-requests"
+            )
+        if self.elastic_pp_autoscale_down_requests < 0:
+            raise ValueError(
+                "elastic PP autoscale request thresholds must be non-negative"
+            )
+        if (
+            self.elastic_pp_autoscale_up_stable_polls < 1
+            or self.elastic_pp_autoscale_down_stable_polls < 1
+        ):
+            raise ValueError("elastic PP autoscale stable-poll counts must be positive")
+        if self.elastic_pp_autoscale_poll_interval_s <= 0:
+            raise ValueError("elastic PP autoscale poll interval must be positive")
+        if (
+            self.elastic_pp_autoscale_min_residence_s < 0
+            or self.elastic_pp_autoscale_failure_backoff_s < 0
+        ):
+            raise ValueError("elastic PP autoscale intervals must be non-negative")
+        if (
+            self.elastic_pp_autoscale_max_operations is not None
+            and self.elastic_pp_autoscale_max_operations < 1
+        ):
+            raise ValueError(
+                "elastic PP autoscale max operations must be positive or None"
+            )
+        self.elastic_pp_autoscale_partitions = serialize_elastic_pp_partitions(
+            partitions
+        )
 
     def _validate_prefill_only_disable_kv_cache_args(self):
         """Validate --prefill-only-disable-kv-cache flag/precondition constraints.

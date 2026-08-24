@@ -27,6 +27,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.io_struct import (
+    GetElasticPPStateReqInput,
+    GetElasticPPStateReqOutput,
     ReconfigureElasticPPReqInput,
     ReconfigureElasticPPReqOutput,
 )
@@ -76,6 +78,40 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def handle_get_elastic_pp_state(
+        self: Scheduler, recv_req: GetElasticPPStateReqInput
+    ) -> GetElasticPPStateReqOutput:
+        """Return only the state needed by the central autoscaling policy."""
+
+        del recv_req
+        topology = self._pp_topology()
+        coordinator = getattr(self, "elastic_pp_migration_coordinator", None)
+        if topology is None:
+            generation = -1
+            layer_counts: List[int] = []
+            phase = "disabled"
+            source_usable = False
+        else:
+            generation = topology.generation
+            layer_counts = self._elastic_pp_layer_counts(topology)
+            snapshot = None if coordinator is None else coordinator.snapshot()
+            phase = "idle" if snapshot is None else snapshot.phase.value
+            source_usable = True if snapshot is None else snapshot.source_usable
+
+        running_batch = getattr(self, "running_batch", None)
+        running_requests = (
+            0 if running_batch is None else len(getattr(running_batch, "reqs", ()))
+        )
+        return GetElasticPPStateReqOutput(
+            enabled=topology is not None and coordinator is not None,
+            generation=generation,
+            layer_counts=layer_counts,
+            migration_phase=phase,
+            source_usable=source_usable,
+            waiting_requests=len(getattr(self, "waiting_queue", ())),
+            running_requests=running_requests,
+        )
+
     def _pp_install_topology(self: Scheduler, topology: PPTopology) -> None:
         """Install a drained, generation-stamped logical PP route.
 

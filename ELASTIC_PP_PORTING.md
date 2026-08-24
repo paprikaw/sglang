@@ -40,7 +40,7 @@ persistent-data-plane tests.
 | Direct weight migration | owner-to-owner worker transfer | `elastic_pp/layer_transport.py` over a dedicated duplicate of the maximal PP group |
 | Sparse live-slot KV copy and catch-up | `dynamic_kv_synchronizer.py` and `KVPatchMeta` | SGLang token-to-KV pool transfer adapter plus per-generation delta log |
 | KVCacheD VMM/page lifetime | `vllm/kvcached_integration.py` | optional SGLang KV storage backend; no hard dependency for default serving |
-| Autoscaling policy | `autoscaling_policy.py` | controller above the mechanism; manual transition API lands first |
+| Autoscaling policy | `autoscaling_policy.py` | `elastic_pp/autoscaling.py` plus the tokenizer-side controller; decisions reuse the manual transaction path |
 
 ## Existing SGLang machinery retained
 
@@ -53,20 +53,20 @@ persistent-data-plane tests.
 - Elastic-EP is not reused as PP policy, but its maximal-group/joiner control
   patterns can be reused where their semantics match.
 
-## SGLang gaps that require code changes
+## Current boundary
 
-1. `GroupCoordinator.prev_rank`, `next_rank`, `is_first_rank`, and
-   `is_last_rank` currently describe only the static physical group.
-2. PP requests and proxy tensors do not carry a topology generation or
-   batch-local source/destination ranks.
-3. Model layers and first/last-stage modules are instantiated from the startup
-   partition only.  Dynamic ownership needs on-demand decoder layers and a
-   safe way to activate embedding/norm/lm-head roles.
-4. Token-to-KV pools assume a startup-fixed local layer interval.  Dynamic PP
-   needs stable per-layer views whose backing pages can be prepared and retired
-   independently.
-5. There is no scheduler-ordered prepare/fence/commit/cleanup control protocol
-   for PP topology changes.
+The implementation now supports real changes in the number of active logical
+pipeline stages while the maximal process/NCCL group remains resident.  For
+example, a four-rank group may switch between logical PP2
+`40,0,0,40` and logical PP4 `20,20,20,20`; zero-layer middle ranks are bypassed
+by generation-local peers.
+
+The physical first and last ranks must still remain active because embedding,
+final norm, and language-head modules are materialized according to startup
+endpoint roles.  A transition such as `80,0,0,0 -> 40,40,0,0` therefore remains
+out of scope until endpoint-role materialization lands.  This also means the
+current autoscaler changes logical GPU use but does not terminate or return the
+warm resident processes to an external cluster resource manager.
 
 ## Landed mechanism pieces
 
@@ -93,12 +93,48 @@ persistent-data-plane tests.
 - KV gather, transport, and scatter run on a dedicated migration CUDA stream
   and send fixed-size slot chunks over the migration communicator.  This is a
   migration memory bound, not dynamic inference chunking.
+- Background preparation publishes one common future microstep.  Every PP rank
+  drains its microbatch ring at that scheduler fence, launches final-delta
+  collectives on the scheduler thread in deterministic rank order, then commits
+  model, KV, and route generation atomically.
+- The KVCacheD backend refreshes gained layer-group mappings at the fence and
+  trims incompatible reserved pages before the new topology becomes visible.
+  Deferred cleanup waits on a CUDA event and stays outside the serving pause.
+- The optional backlog autoscaler runs only in the central TokenizerManager. It
+  polls a compact waiting/running state from every DP replica, checks replica
+  topology agreement, applies high/low hysteresis, stable observations,
+  post-commit residence time, retry backoff, and an optional operation budget.
+  Automatic and manual transitions share one asyncio lock and the exact same
+  generation-stamped reconfiguration communicator.
 
 Hybrid, MLA, page-major, post-capture VMM, speculative-copy-table, and
 quantized KV layouts remain explicit follow-up work rather than silently
-taking an unsafe path.  The next mechanism piece is scheduler-ordered runtime
-coordination: background prepare/bulk copy, a drained final-delta fence, atomic
-model/KV/route commit, and CUDA-event-safe cleanup.
+taking an unsafe path.  Dynamic endpoint modules and physical process/GPU
+release are also explicit follow-up work.
+
+## Automatic-controller example
+
+The controller is opt-in.  The ordered partitions must cover every model layer,
+keep the physical endpoints non-empty, and strictly increase the number of
+active ranks:
+
+```bash
+python -m sglang.launch_server \
+  --pp-size 4 \
+  --enable-elastic-pp \
+  --elastic-pp-initial-partition 40,0,0,40 \
+  --enable-elastic-pp-autoscaling \
+  --elastic-pp-autoscale-partitions '40,0,0,40;20,20,20,20' \
+  --elastic-pp-autoscale-up-requests 16 \
+  --elastic-pp-autoscale-down-requests 0 \
+  --elastic-pp-autoscale-up-stable-polls 2 \
+  --elastic-pp-autoscale-down-stable-polls 4 \
+  --elastic-pp-autoscale-poll-interval-s 0.5 \
+  --elastic-pp-autoscale-min-residence-s 10
+```
+
+The up/down thresholds are calibration inputs, not universal defaults.  A
+performance result must record the complete frontier and controller settings.
 
 ## Delivery order
 
@@ -110,5 +146,6 @@ model/KV/route commit, and CUDA-event-safe cleanup.
    profiling recorded during the first load.
 4. Native SGLang KV-pool sparse migration and final-delta catch-up.
 5. Optional KVCacheD page-backed adapter and aligned capacity formula.
-6. Manual PP scale-up/down integration test, then autoscaling policy and
-   performance/overlap profiling.
+6. Manual PP redistribution with live requests and KVCacheD on H100.
+7. Load-driven controller with hysteresis, serialized manual/automatic control,
+   and automatic logical PP2-to-PP4-to-PP2 H100 validation.

@@ -141,6 +141,7 @@ from sglang.srt.managers.io_struct import (
     ExpertDistributionReqType,
     FlushCacheReqInput,
     FreezeGCReq,
+    GetElasticPPStateReqInput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
     GetWeightsByNameReqInput,
@@ -1702,6 +1703,10 @@ class Scheduler(
                 (FreezeGCReq, self.handle_freeze_gc),
                 (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
+                (
+                    GetElasticPPStateReqInput,
+                    self.handle_get_elastic_pp_state,
+                ),
                 (SetInternalStateReq, self.set_internal_state),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),

@@ -2059,6 +2059,22 @@ class ReconfigureElasticPPReqOutput(BaseReq, kw_only=True):
     total_seconds: Optional[float] = None
 
 
+class GetElasticPPStateReqInput(BaseReq, kw_only=True):
+    """Read the small, decision-relevant state of one elastic PP replica."""
+
+    pass
+
+
+class GetElasticPPStateReqOutput(BaseReq, kw_only=True):
+    enabled: bool
+    generation: int
+    layer_counts: List[int]
+    migration_phase: str
+    source_usable: bool
+    waiting_requests: int
+    running_requests: int
+
+
 class GetInternalStateReq(BaseReq, kw_only=True):
     pass
 

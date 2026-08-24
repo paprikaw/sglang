@@ -9,7 +9,10 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationPhase
 from sglang.srt.elastic_pp.topology import DynamicPPTransition, PPTopology
-from sglang.srt.managers.io_struct import ReconfigureElasticPPReqInput
+from sglang.srt.managers.io_struct import (
+    GetElasticPPStateReqInput,
+    ReconfigureElasticPPReqInput,
+)
 from sglang.srt.managers.scheduler_pp_mixin import (
     PPBatchMetadata,
     SchedulerPPMixin,
@@ -306,3 +309,26 @@ def test_reconfigure_rejects_invalid_partition_before_prepare():
     assert not response.success
     assert "cover every model layer" in response.message
     assert not coordinator.begun
+
+
+def test_autoscale_state_reports_topology_and_backlog():
+    scheduler = _FakeScheduler(rank=0)
+    topology = _pp2_topology(generation=3)
+    target = PPTopology.from_layer_counts([2, 2, 0, 4], generation=4)
+    scheduler._pp_install_topology(topology)
+    scheduler.elastic_pp_migration_coordinator = _FakeMigrationCoordinator(
+        DynamicPPTransition.build(topology, target),
+        phase=ElasticPPMigrationPhase.IDLE,
+    )
+    scheduler.waiting_queue = [object(), object(), object()]
+    scheduler.running_batch = SimpleNamespace(reqs=[object(), object()])
+
+    state = scheduler.handle_get_elastic_pp_state(GetElasticPPStateReqInput())
+
+    assert state.enabled
+    assert state.generation == 3
+    assert state.layer_counts == [4, 0, 0, 4]
+    assert state.migration_phase == "idle"
+    assert state.source_usable
+    assert state.waiting_requests == 3
+    assert state.running_requests == 2

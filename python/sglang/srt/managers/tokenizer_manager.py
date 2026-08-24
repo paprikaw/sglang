@@ -2149,6 +2149,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
+        self.start_elastic_pp_autoscaler(loop)
 
     async def handle_loop(self):
         """The event loop that handles requests"""

@@ -1,5 +1,11 @@
 """Elastic pipeline-parallel control-plane primitives."""
 
+from sglang.srt.elastic_pp.autoscaling import (
+    ElasticPPBacklogPolicy,
+    parse_elastic_pp_partitions,
+    serialize_elastic_pp_partitions,
+    validate_elastic_pp_autoscale_partitions,
+)
 from sglang.srt.elastic_pp.capacity import (
     ElasticPPCapacityEstimate,
     estimate_kv_capacity,
@@ -45,6 +51,7 @@ from sglang.srt.elastic_pp.weight_profile import (
 __all__ = [
     "DynamicPPTransition",
     "DynamicPPTransitionState",
+    "ElasticPPBacklogPolicy",
     "ElasticLayerResidency",
     "ElasticPPMigrationCoordinator",
     "ElasticPPMigrationPhase",
@@ -66,6 +73,9 @@ __all__ = [
     "estimate_kv_capacity",
     "flatten_layer_states",
     "flatten_kv_chunk",
+    "parse_elastic_pp_partitions",
+    "serialize_elastic_pp_partitions",
     "unflatten_layer_states",
     "unflatten_kv_chunk",
+    "validate_elastic_pp_autoscale_partitions",
 ]
