@@ -78,6 +78,33 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    @staticmethod
+    def _elastic_pp_batch_debug_summary(batch: Optional[ScheduleBatch]):
+        if batch is None:
+            return None
+        reqs = list(getattr(batch, "reqs", ()))
+        seq_lens_cpu = getattr(batch, "seq_lens_cpu", None)
+        seq_lens_preview = (
+            seq_lens_cpu[:8].tolist()
+            if isinstance(seq_lens_cpu, torch.Tensor)
+            else None
+        )
+
+        def tensor_shape(name: str):
+            value = getattr(batch, name, None)
+            return tuple(value.shape) if isinstance(value, torch.Tensor) else None
+
+        return {
+            "mode": str(getattr(batch, "forward_mode", None)),
+            "num_reqs": len(reqs),
+            "rids": [str(getattr(req, "rid", "")) for req in reqs[:8]],
+            "output_lens": [len(getattr(req, "output_ids", ())) for req in reqs[:8]],
+            "seq_lens": seq_lens_preview,
+            "input_shape": tensor_shape("input_ids"),
+            "prefill_shape": tensor_shape("prefill_input_ids_cpu"),
+            "out_cache_shape": tensor_shape("out_cache_loc"),
+        }
+
     def handle_get_elastic_pp_state(
         self: Scheduler, recv_req: GetElasticPPStateReqInput
     ) -> GetElasticPPStateReqOutput:
@@ -165,11 +192,27 @@ class SchedulerPPMixin:
             # active rank pairs rank 0's next proxy tensor with its own
             # previous microbatch.
             self._elastic_pp_refill_steps_remaining = self.ps.pp_rank
+            self._elastic_pp_post_commit_launch_logs_remaining = self.ps.pp_size
             logger.info(
                 "Elastic PP generation=%d rank=%d armed %d pipeline refill bubbles",
                 topology.generation,
                 self.ps.pp_rank,
                 self._elastic_pp_refill_steps_remaining,
+            )
+            logger.info(
+                "Elastic PP generation=%d rank=%d fence ring state microstep=%d "
+                "running=%s last=%s",
+                topology.generation,
+                self.ps.pp_rank,
+                getattr(self, "_pp_microstep", -1),
+                [
+                    self._elastic_pp_batch_debug_summary(batch)
+                    for batch in getattr(self, "running_mbs", ())
+                ],
+                [
+                    self._elastic_pp_batch_debug_summary(batch)
+                    for batch in getattr(self, "last_mbs", ())
+                ],
             )
 
     def _pp_topology(self: Scheduler) -> Optional[PPTopology]:
@@ -1083,6 +1126,7 @@ class SchedulerPPMixin:
         self._pp_microstep = 0
         self._elastic_pp_draining = False
         self._elastic_pp_refill_steps_remaining = 0
+        self._elastic_pp_post_commit_launch_logs_remaining = 0
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -1828,6 +1872,29 @@ class SchedulerPPMixin:
         mb_metadata: List[Optional[PPBatchMetadata]],
         last_rank_comm_queue: deque,
     ):
+        log_remaining = getattr(
+            self, "_elastic_pp_post_commit_launch_logs_remaining", 0
+        )
+        if log_remaining > 0:
+            proxy_shapes = (
+                None
+                if pp_proxy_tensors is None
+                else {
+                    key: tuple(value.shape)
+                    for key, value in pp_proxy_tensors.tensors.items()
+                    if isinstance(value, torch.Tensor)
+                }
+            )
+            logger.info(
+                "Elastic PP generation=%s rank=%d post-commit launch mb_id=%d "
+                "batch=%s proxy_shapes=%s",
+                getattr(self._pp_topology(), "generation", None),
+                self.ps.pp_rank,
+                mb_id,
+                self._elastic_pp_batch_debug_summary(cur_batch),
+                proxy_shapes,
+            )
+            self._elastic_pp_post_commit_launch_logs_remaining = log_remaining - 1
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
