@@ -1,12 +1,15 @@
 from collections import defaultdict, deque
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+from sglang.srt.distributed.parallel_state import GroupCoordinator, TensorMetadata
 from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationPhase
 from sglang.srt.elastic_pp.topology import DynamicPPTransition, PPTopology
 from sglang.srt.managers.io_struct import (
@@ -23,6 +26,7 @@ class _FakePPGroup:
     def __init__(self, rank: int, size: int = 4):
         self.rank = rank
         self.size = size
+        self.pynccl_comm = SimpleNamespace(available=True)
         self.sent = []
         self.received = deque()
 
@@ -140,6 +144,7 @@ def test_proxy_send_bypasses_inactive_middle_ranks_and_carries_generation():
     assert len(scheduler.pp_group.sent) == 1
     sent = scheduler.pp_group.sent[0]
     assert sent["dst"] == 3
+    assert sent["use_pynccl"]
     assert sent["tensor_dict"]["__pp_generation__"] == 5
     assert sent["tensor_dict"]["__msg_type__"] == "proxy"
 
@@ -152,6 +157,7 @@ def test_static_pp_send_path_is_unchanged_without_topology():
 
     sent = scheduler.pp_group.sent[0]
     assert sent["dst"] is None
+    assert not sent["use_pynccl"]
     assert "__pp_generation__" not in sent["tensor_dict"]
 
 
@@ -170,6 +176,7 @@ def test_proxy_receive_uses_previous_active_rank_and_rejects_stale_generation():
 
     assert proxy["hidden_states"] == "payload"
     assert scheduler.pp_group.last_recv_kwargs["src"] == 0
+    assert scheduler.pp_group.last_recv_kwargs["pynccl_message_types"] == ("proxy",)
 
     scheduler.pp_group.received.append(
         {
@@ -180,6 +187,82 @@ def test_proxy_receive_uses_previous_active_rank_and_rejects_stale_generation():
     )
     with pytest.raises(RuntimeError, match="generation mismatch"):
         scheduler._pp_recv_proxy_tensors()
+
+
+def test_elastic_output_ring_stays_on_process_group_nccl():
+    scheduler = _FakeScheduler(rank=3)
+    scheduler._pp_install_topology(_pp2_topology(generation=5))
+
+    scheduler._pp_send_dict_to_next_stage(
+        {"next_token_ids": "payload"}, msg_type="output"
+    )
+
+    sent = scheduler.pp_group.sent[0]
+    assert sent["dst"] is None
+    assert not sent["use_pynccl"]
+
+
+def test_elastic_proxy_route_rejects_missing_pynccl():
+    scheduler = _FakeScheduler(rank=0)
+    scheduler._pp_install_topology(_pp2_topology())
+    scheduler.pp_group.pynccl_comm = None
+
+    with pytest.raises(RuntimeError, match="requires the full-group PyNCCL"):
+        scheduler._pp_send_dict_to_next_stage(
+            {"hidden_states": "payload"}, msg_type="proxy"
+        )
+
+
+@pytest.mark.parametrize(
+    ("message_type", "expect_pynccl"),
+    [("proxy", True), ("output", False)],
+)
+def test_tensor_dict_receive_selects_transport_from_actual_metadata(
+    monkeypatch, message_type, expect_pynccl
+):
+    group = object.__new__(GroupCoordinator)
+    group.world_size = 2
+    group.rank_in_group = 1
+    group.ranks = [0, 1]
+    group.device_group = object()
+    group.cpu_group = object()
+    group.unique_name = "test-pp"
+    group.recv_object = lambda src: [
+        ("__msg_type__", message_type),
+        ("payload", TensorMetadata("meta", torch.float32, (2,))),
+    ]
+
+    pynccl_recvs = []
+    group.pynccl_comm = SimpleNamespace(
+        available=True,
+        change_state=lambda enable: nullcontext(),
+        recv=lambda tensor, src: pynccl_recvs.append((tensor, src)),
+    )
+    process_group_recvs = []
+
+    class _Work:
+        @staticmethod
+        def wait():
+            return None
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "irecv",
+        lambda tensor, src, group: (
+            process_group_recvs.append((tensor, src, group)) or _Work()
+        ),
+    )
+
+    received = group.recv_tensor_dict(
+        src=0,
+        pynccl_message_types=("proxy",),
+    )
+
+    assert received["__msg_type__"] == message_type
+    assert tuple(received["payload"].shape) == (2,)
+    assert bool(pynccl_recvs) is expect_pynccl
+    assert bool(process_group_recvs) is not expect_pynccl
 
 
 def test_inactive_rank_neither_receives_proxy_nor_launches_forward():

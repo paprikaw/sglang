@@ -123,6 +123,12 @@ def init_torch_distributed(
                 tp_size=ps.tp_size, pp_size=ps.pp_size, moe_ep_size=ps.moe_ep_size
             )
 
+        # This is a correctness boundary rather than an optional benchmark
+        # warmup: elastic activations and the reverse scheduler output ring
+        # intentionally use separate NCCL communication domains.
+        if device == "cuda" and get_parallel().enable_elastic_pp and ps.pp_size > 1:
+            _prewarm_elastic_pp_data_plane()
+
         # CUDA graph capture enables the PyNCCL communicator for TP LM-head
         # all-to-all. Exercise that exact send/recv path before measuring
         # pre_model_load_memory so its persistent transport allocations are
@@ -297,6 +303,84 @@ def _prewarm_nccl(*, tp_size: int, pp_size: int, moe_ep_size: int) -> None:
     logger.info(
         f"NCCL/RCCL/HCCL warmup completed in {warmup_elapsed:.3f}s "
         f"(tp_size={tp_size}, pp_size={pp_size}, ep_size={moe_ep_size})"
+    )
+
+
+def _prewarm_elastic_pp_data_plane() -> None:
+    """Materialize both communication domains used by elastic PP.
+
+    Output tokens continue around the resident ProcessGroupNCCL ring so every
+    scheduler replica advances request state.  Activations may bypass
+    zero-layer ranks and therefore use the full-group PyNCCL communicator.
+    Prewarming both domains keeps directed lazy-peer setup out of the first
+    request.
+    """
+
+    pp_group = get_pp_group()
+    if pp_group.world_size <= 1:
+        return
+
+    warmup_start = time.perf_counter()
+    rank = pp_group.rank_in_group
+    payload = torch.empty(1, dtype=torch.uint8, device=pp_group.device)
+
+    # The scheduler output ring uses exactly these directed physical edges.
+    # ProcessGroupNCCL caches lazy P2P communicators by directed peer pair, so
+    # exercise last->first as well as every forward physical edge.
+    for src in range(pp_group.world_size):
+        dst = (src + 1) % pp_group.world_size
+        work = None
+        if rank == src:
+            payload.fill_(src + 1)
+            work = dist.isend(
+                payload,
+                dst=pp_group.ranks[dst],
+                group=pp_group.device_group,
+            )
+        elif rank == dst:
+            payload.zero_()
+            work = dist.irecv(
+                payload,
+                src=pp_group.ranks[src],
+                group=pp_group.device_group,
+            )
+        if work is not None:
+            work.wait()
+        current_platform.synchronize()
+        pp_group.barrier()
+
+    pynccl_comm = pp_group.pynccl_comm
+    if pynccl_comm is None or not pynccl_comm.available:
+        raise RuntimeError(
+            "Elastic PP activation routing requires an available full-group "
+            "PyNCCL communicator"
+        )
+
+    # Layer partitions preserve rank order, so every possible direct
+    # activation edge has src < dst.  These probes reuse one full
+    # communicator; they do not create O(PP^2) persistent process groups.
+    with pynccl_comm.change_state(enable=True):
+        for src in range(pp_group.world_size):
+            for dst in range(src + 1, pp_group.world_size):
+                if rank == src:
+                    payload.fill_(src + 1)
+                    pynccl_comm.send(payload, dst)
+                elif rank == dst:
+                    payload.zero_()
+                    pynccl_comm.recv(payload, src)
+                current_platform.synchronize()
+                pp_group.barrier()
+
+    del payload
+    current_platform.empty_cache()
+    warmup_elapsed = time.perf_counter() - warmup_start
+    logger.info(
+        "Elastic PP data-plane warmup completed in %.3fs "
+        "(resident_pp_size=%d, output_edges=%d, activation_edges=%d)",
+        warmup_elapsed,
+        pp_group.world_size,
+        pp_group.world_size,
+        pp_group.world_size * (pp_group.world_size - 1) // 2,
     )
 
 

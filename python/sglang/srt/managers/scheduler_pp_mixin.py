@@ -192,6 +192,19 @@ class SchedulerPPMixin:
             return None
         return topology.next_rank(self.ps.pp_rank)
 
+    def _pp_proxy_uses_pynccl(self: Scheduler) -> bool:
+        """Keep elastic activation traffic off the output-token ring."""
+
+        if self._pp_topology() is None:
+            return False
+        communicator = getattr(self.pp_group, "pynccl_comm", None)
+        if communicator is None or not getattr(communicator, "available", False):
+            raise RuntimeError(
+                "elastic PP proxy routing requires the full-group PyNCCL "
+                "communicator"
+            )
+        return True
+
     @staticmethod
     def _elastic_pp_layer_counts(topology: PPTopology) -> List[int]:
         return [layer_range.size for layer_range in topology.layer_ranges]
@@ -1522,6 +1535,7 @@ class SchedulerPPMixin:
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
                 async_send=async_send,
+                use_pynccl=(msg_type == "proxy" and self._pp_proxy_uses_pynccl()),
             )
         )
         return p2p_work
@@ -1544,7 +1558,11 @@ class SchedulerPPMixin:
 
         while True:
             tensor_dict = self.pp_group.recv_tensor_dict(
-                src=src, all_gather_group=all_gather_group
+                src=src,
+                all_gather_group=all_gather_group,
+                pynccl_message_types=(
+                    ("proxy",) if self._pp_proxy_uses_pynccl() else None
+                ),
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
