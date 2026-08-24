@@ -604,29 +604,10 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
             generation=generation,
             total_num_layers=total_num_layers,
         )
-        if prepared and self.physical_layer_partitioned:
-            if self._logical_allocator is None:
-                error = RuntimeError(
-                    "KVCacheD physical layer migration has no attached logical allocator"
-                )
-            else:
-                error = None
-                try:
-                    self._map_layer_slots(
-                        layer_ids=prepared,
-                        slot_ids=self._logical_allocator.elastic_pp_live_slots(),
-                    )
-                except BaseException as exc:
-                    error = exc
-            if error is not None:
-                try:
-                    self.abort_elastic_pp_kv_layers(generation=generation)
-                except BaseException as abort_error:
-                    raise RuntimeError(
-                        "KVCacheD target-layer mapping failed and its prepared "
-                        "generation could not be rolled back"
-                    ) from abort_error
-                raise error
+        # Creating unpublished global tensor views is safe off-path, but
+        # mapping new VMM pages performs a whole-device fence. Defer mapping
+        # until staged KV rows are applied by the scheduler at its drained PP
+        # fence; otherwise a background map can wait on an in-flight NCCL recv.
         return prepared
 
     def import_elastic_pp_kv_slots(

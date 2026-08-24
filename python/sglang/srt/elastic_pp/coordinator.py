@@ -342,12 +342,6 @@ class ElasticPPMigrationCoordinator:
                     self.rank,
                     time.monotonic() - stage_started,
                 )
-                if not self.model_runner.elastic_pp_generation_ready(
-                    generation=transition.target.generation
-                ):
-                    raise RuntimeError(
-                        "local model/KV generation is not ready after bulk copy"
-                    )
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
 
@@ -440,6 +434,7 @@ class ElasticPPMigrationCoordinator:
                     phase="delta",
                     slot_ids=delta_slots,
                 )
+                self.kv_transport.apply_staged(transition)
                 if not self.model_runner.elastic_pp_generation_ready(
                     generation=transition.target.generation
                 ):
@@ -538,6 +533,10 @@ class ElasticPPMigrationCoordinator:
         if transition is None:
             return
         generation = transition.target.generation
+        try:
+            self.kv_transport.abort_staged(transition)
+        except BaseException:
+            pass
         if self._slot_tracking:
             try:
                 self.kv_transport.finish_slot_tracking(transition)

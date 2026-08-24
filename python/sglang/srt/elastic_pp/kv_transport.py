@@ -187,6 +187,10 @@ class ElasticPPKVTransport:
         self._runner_device = torch.device(getattr(model_runner, "device", "cpu"))
         self._send_stream = None
         self._receive_stream = None
+        self._staged_chunks: dict[
+            tuple[int, str, int, int, int, int, int],
+            tuple[torch.Tensor, dict[int, tuple[torch.Tensor, torch.Tensor]]],
+        ] = {}
         if self._runner_device.type == "cuda" and torch.cuda.is_available():
             with torch.cuda.device(self._runner_device):
                 self._send_stream = torch.cuda.Stream(device=self._runner_device)
@@ -357,11 +361,6 @@ class ElasticPPKVTransport:
             # This is a migration-thread wait, not a serving-stream sync.  The
             # control plane cannot publish buffers while NCCL/scatter is pending.
             ready_event.synchronize()
-        if phase == "bulk" and loaded:
-            self.pool.mark_elastic_pp_kv_layers_loaded(
-                generation=transition.target.generation,
-                layer_ids=loaded,
-            )
         return frozenset(loaded)
 
     @staticmethod
@@ -442,15 +441,19 @@ class ElasticPPKVTransport:
                 chunk_index=chunk_index,
                 total_chunks=total_chunks,
             )
-            for layer_id, (cache_k, cache_v) in layer_kv.items():
-                self.pool.import_elastic_pp_kv_slots(
-                    generation=transition.target.generation,
-                    layer_id=layer_id,
-                    slot_ids=slot_ids,
-                    cache_k=cache_k,
-                    cache_v=cache_v,
-                )
-                loaded.add(layer_id)
+            key = (
+                transition.target.generation,
+                phase,
+                transfer.src_rank,
+                transfer.dst_rank,
+                transfer.layer_range.start,
+                transfer.layer_range.end,
+                chunk_index,
+            )
+            if key in self._staged_chunks:
+                raise RuntimeError(f"duplicate staged elastic PP KV chunk: {key!r}")
+            self._staged_chunks[key] = (slot_ids, layer_kv)
+            loaded.update(layer_kv)
         return frozenset(loaded)
 
     def exchange_phase(
@@ -515,12 +518,96 @@ class ElasticPPKVTransport:
                 ready_event = self._record_ready_event(stream)
             if ready_event is not None:
                 ready_event.synchronize()
-        if phase == "bulk" and loaded:
+        return frozenset(loaded)
+
+    def apply_staged(self, transition: DynamicPPTransition) -> frozenset[int]:
+        """Scatter received bulk and delta rows at the drained PP fence.
+
+        KVCacheD can need a CUDA VMM map before the first write into a newly
+        owned layer. Its mapping fence synchronizes the device, so doing that
+        from the background receive thread can wait forever on a serving NCCL
+        operation. Network receive remains off-path; only the final sparse
+        scatter and any required VMM map execute after the scheduler has
+        drained its microbatch ring.
+        """
+
+        generation = transition.target.generation
+        inbound = self.inbound_transfers(transition)
+        staged = [
+            (key, value)
+            for key, value in self._staged_chunks.items()
+            if key[0] == generation
+        ]
+        if not inbound:
+            if staged:
+                raise RuntimeError(
+                    "elastic PP rank has staged KV chunks without an inbound transfer"
+                )
+            return frozenset()
+
+        expected_edges = {
+            (
+                transfer.src_rank,
+                transfer.dst_rank,
+                transfer.layer_range.start,
+                transfer.layer_range.end,
+            )
+            for transfer in inbound
+        }
+        for phase in ("bulk", "delta"):
+            observed_edges = {
+                (key[2], key[3], key[4], key[5]) for key, _ in staged if key[1] == phase
+            }
+            if observed_edges != expected_edges:
+                raise RuntimeError(
+                    "elastic PP staged KV transfer set is incomplete: "
+                    f"phase={phase}, expected={sorted(expected_edges)}, "
+                    f"observed={sorted(observed_edges)}"
+                )
+
+        phase_order = {"bulk": 0, "delta": 1}
+        loaded: set[int] = set()
+        with self._stream_context(self._receive_stream):
+            ordered = sorted(
+                staged,
+                key=lambda item: (
+                    phase_order[item[0][1]],
+                    item[0][2],
+                    item[0][3],
+                    item[0][4],
+                    item[0][5],
+                    item[0][6],
+                ),
+            )
+            for _, (slot_ids, layer_kv) in ordered:
+                for layer_id, (cache_k, cache_v) in layer_kv.items():
+                    self.pool.import_elastic_pp_kv_slots(
+                        generation=generation,
+                        layer_id=layer_id,
+                        slot_ids=slot_ids,
+                        cache_k=cache_k,
+                        cache_v=cache_v,
+                    )
+                    loaded.add(layer_id)
+            ready_event = self._record_ready_event(self._receive_stream)
+        if ready_event is not None:
+            ready_event.synchronize()
+        if loaded:
             self.pool.mark_elastic_pp_kv_layers_loaded(
-                generation=transition.target.generation,
+                generation=generation,
                 layer_ids=loaded,
             )
+        for key, _ in staged:
+            del self._staged_chunks[key]
         return frozenset(loaded)
+
+    def abort_staged(self, transition: DynamicPPTransition) -> None:
+        generation = transition.target.generation
+        self._staged_chunks = {
+            key: value
+            for key, value in self._staged_chunks.items()
+            if key[0] != generation
+        }
 
     def finish_slot_tracking(self, transition: DynamicPPTransition) -> None:
         self.allocator.finish_elastic_pp_slot_tracking(

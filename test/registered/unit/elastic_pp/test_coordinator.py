@@ -63,6 +63,8 @@ class _KVTransport:
     def __init__(self):
         self.phases = []
         self.finished = False
+        self.applied = False
+        self.aborted_staged = False
 
     def prepare_transition(self, transition):
         del transition
@@ -80,6 +82,15 @@ class _KVTransport:
     def finish_slot_tracking(self, transition):
         del transition
         self.finished = True
+
+    def apply_staged(self, transition):
+        del transition
+        self.applied = True
+        return frozenset({1})
+
+    def abort_staged(self, transition):
+        del transition
+        self.aborted_staged = True
 
 
 class _Runner:
@@ -147,6 +158,7 @@ def test_prepare_fence_commit_and_deferred_cleanup():
     assert runner.committed
     assert installed == [transition.target]
     assert kv_transport.phases[-1] == ("delta", (5,))
+    assert kv_transport.applied
     assert kv_transport.finished
 
     coordinator.start_cleanup()

@@ -289,12 +289,21 @@ def _prepare_physical_move():
     return pool, allocator
 
 
-def test_physical_prepare_failure_rolls_back_mapping_and_transaction():
+def test_physical_mapping_is_deferred_until_import_at_drained_fence():
     pool, _ = _prepare_physical_move()
+    assert pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(2, 4), generation=1, total_num_layers=4
+    ) == frozenset({2, 3})
+    assert pool.mapped == []
+
     pool.fail_next_map = True
     try:
-        pool.prepare_elastic_pp_kv_layers(
-            target=LayerRange(2, 4), generation=1, total_num_layers=4
+        pool.import_elastic_pp_kv_slots(
+            generation=1,
+            layer_id=2,
+            slot_ids=torch.tensor([1, 2]),
+            cache_k=torch.zeros((2, 1, 2)),
+            cache_v=torch.zeros((2, 1, 2)),
         )
     except RuntimeError as exc:
         assert "injected physical map failure" in str(exc)
@@ -303,6 +312,8 @@ def test_physical_prepare_failure_rolls_back_mapping_and_transaction():
 
     assert pool.mapped[0][0] == frozenset({2, 3})
     assert torch.equal(pool.mapped[0][1], torch.tensor([1, 2]))
+    assert set(pool._elastic_pp_pending_kv) == {2, 3}
+    pool.abort_elastic_pp_kv_layers(generation=1)
     assert pool.unmapped == [frozenset({2, 3})]
     assert pool._elastic_pp_pending_kv == {}
     assert pool._elastic_pp_residency.pending is None
