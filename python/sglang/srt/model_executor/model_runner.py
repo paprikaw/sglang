@@ -20,7 +20,7 @@ import inspect
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Iterable, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -51,6 +51,7 @@ from sglang.srt.elastic_ep.elastic_ep import (
     try_admit_scale_ranks,
 )
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
+from sglang.srt.elastic_pp.topology import LayerRange
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
 from sglang.srt.eplb.expert_distribution import (
@@ -1260,6 +1261,68 @@ class ModelRunner:
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
+
+    def _elastic_pp_model_method(self, name: str):
+        if not getattr(get_parallel(), "enable_elastic_pp", False):
+            raise RuntimeError("elastic PP is not enabled for this model runner")
+        method = getattr(self.model, name, None)
+        if method is None:
+            raise RuntimeError(
+                f"model {type(self.model).__name__} does not implement {name}"
+            )
+        return method
+
+    def prepare_elastic_pp_layers(
+        self, *, target: LayerRange, generation: int
+    ) -> frozenset[int]:
+        """Create target-only layer modules without changing the active range."""
+
+        method = self._elastic_pp_model_method("prepare_elastic_pp_layers")
+        return method(
+            target=target,
+            generation=generation,
+            device=torch.device(self.device),
+            dtype=self.model_config.dtype,
+        )
+
+    def export_elastic_pp_layer_state(
+        self, layer_ids: Iterable[int]
+    ) -> dict[int, dict[str, torch.Tensor]]:
+        method = self._elastic_pp_model_method("export_elastic_pp_layer_state")
+        return method(layer_ids)
+
+    def import_elastic_pp_layer_state(
+        self,
+        *,
+        generation: int,
+        layer_states: dict[int, dict[str, torch.Tensor]],
+    ) -> frozenset[int]:
+        method = self._elastic_pp_model_method("import_elastic_pp_layer_state")
+        return method(generation=generation, layer_states=layer_states)
+
+    def commit_elastic_pp_layers(self, *, generation: int) -> LayerRange:
+        """Switch the model range and invalidate graphs with stale pointers."""
+
+        method = self._elastic_pp_model_method("commit_elastic_pp_layers")
+        target = method(generation=generation)
+        # Captured graphs retain both the old layer path and parameter pointers.
+        # Dropping them at the scheduler fence keeps the first post-commit batch
+        # correct; a later milestone can recapture the stable target topology.
+        self.decode_cuda_graph_runner = None
+        self.prefill_cuda_graph_runner = None
+        return target
+
+    def cleanup_elastic_pp_layers(
+        self, *, generation: int
+    ) -> tuple[torch.nn.Module, ...]:
+        method = self._elastic_pp_model_method("cleanup_elastic_pp_layers")
+        return method(generation=generation)
+
+    def abort_elastic_pp_layers(
+        self, *, generation: int
+    ) -> tuple[torch.nn.Module, ...]:
+        method = self._elastic_pp_model_method("abort_elastic_pp_layers")
+        return method(generation=generation)
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:

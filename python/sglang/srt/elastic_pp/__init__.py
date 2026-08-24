@@ -4,6 +4,10 @@ from sglang.srt.elastic_pp.capacity import (
     ElasticPPCapacityEstimate,
     estimate_kv_capacity,
 )
+from sglang.srt.elastic_pp.layer_residency import (
+    ElasticLayerResidency,
+    LayerPreparation,
+)
 from sglang.srt.elastic_pp.topology import (
     DynamicPPTransition,
     DynamicPPTransitionState,
@@ -21,10 +25,12 @@ from sglang.srt.elastic_pp.weight_profile import (
 __all__ = [
     "DynamicPPTransition",
     "DynamicPPTransitionState",
+    "ElasticLayerResidency",
     "ElasticPPCapacityEstimate",
     "ElasticPPWeightProfile",
     "FirstLoadWeightProfiler",
     "LayerRange",
+    "LayerPreparation",
     "LayerTransfer",
     "PPTopology",
     "TransitionPhase",

@@ -19,6 +19,8 @@
 """Inference-only LLaMA model compatible with HuggingFace weights."""
 
 import logging
+from contextlib import contextmanager, nullcontext
+from threading import RLock
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -29,6 +31,8 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_pp_indices,
 )
+from sglang.srt.elastic_pp.layer_residency import ElasticLayerResidency
+from sglang.srt.elastic_pp.topology import LayerRange
 from sglang.srt.elastic_pp.weight_profile import (
     ElasticPPWeightProfile,
     FirstLoadWeightProfiler,
@@ -51,6 +55,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
@@ -382,6 +387,7 @@ class LlamaModel(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.quant_config = quant_config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
@@ -400,6 +406,14 @@ class LlamaModel(nn.Module):
             self.pp_group.rank_in_group,
             self.pp_group.world_size,
         )
+        self._elastic_layer_prefix = add_prefix("layers", prefix)
+        self._elastic_layer_factory = lambda idx, start_layer: LlamaDecoderLayer(
+            config=config,
+            quant_config=quant_config,
+            layer_id=idx,
+            start_layer=start_layer,
+            prefix=add_prefix(str(idx), self._elastic_layer_prefix),
+        )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LlamaDecoderLayer(
@@ -411,7 +425,19 @@ class LlamaModel(nn.Module):
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
-            prefix="model.layers",
+            prefix=self._elastic_layer_prefix,
+        )
+
+        self._elastic_pp_enabled = getattr(get_parallel(), "enable_elastic_pp", False)
+        self._elastic_layer_lock = RLock()
+        self._elastic_layer_residency = (
+            ElasticLayerResidency(
+                num_layers=config.num_hidden_layers,
+                initial_generation=0,
+                initial_range=LayerRange(self.start_layer, self.end_layer),
+            )
+            if self._elastic_pp_enabled
+            else None
         )
 
         if self.pp_group.is_last_rank:
@@ -419,6 +445,186 @@ class LlamaModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
         self.layers_to_capture = []
+
+    def _resident_elastic_layer_ids(self) -> set[int]:
+        return {
+            layer_id
+            for layer_id, layer in enumerate(self.layers)
+            if not isinstance(layer, PPMissingLayer)
+        }
+
+    def prepare_elastic_pp_layers(
+        self,
+        *,
+        target: LayerRange,
+        generation: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> frozenset[int]:
+        """Materialize missing target layers without changing the live range."""
+
+        if self._elastic_layer_residency is None:
+            raise RuntimeError("elastic PP layer residency is not enabled")
+        if self.quant_config is not None:
+            raise NotImplementedError(
+                "elastic PP runtime layer transfer currently supports "
+                "unquantized Llama weights"
+            )
+        with self._elastic_layer_lock:
+            preparation = self._elastic_layer_residency.begin_prepare(
+                generation=generation,
+                target=target,
+                resident_layer_ids=self._resident_elastic_layer_ids(),
+            )
+        if not preparation.new_layer_ids:
+            return preparation.new_layer_ids
+
+        create_ids = tuple(
+            layer_id
+            for layer_id in sorted(preparation.new_layer_ids)
+            if isinstance(self.layers[layer_id], PPMissingLayer)
+        )
+        created: dict[int, nn.Module] = {}
+        try:
+            with set_default_torch_dtype(dtype), device:
+                for layer_id in create_ids:
+                    created[layer_id] = self._elastic_layer_factory(
+                        layer_id, target.start
+                    ).eval()
+            with self._elastic_layer_lock:
+                for layer_id, layer in created.items():
+                    if not isinstance(self.layers[layer_id], PPMissingLayer):
+                        raise RuntimeError(
+                            "elastic layer slot changed during preparation: "
+                            f"layer={layer_id}"
+                        )
+                    self.layers[layer_id] = layer
+        except BaseException:
+            with self._elastic_layer_lock:
+                remove_ids = self._elastic_layer_residency.abort(generation)
+                for layer_id in remove_ids:
+                    self.layers[layer_id] = PPMissingLayer()
+            raise
+        return preparation.new_layer_ids
+
+    def mark_elastic_pp_layers_loaded(
+        self, generation: int, layer_ids: set[int]
+    ) -> None:
+        if self._elastic_layer_residency is None:
+            raise RuntimeError("elastic PP layer residency is not enabled")
+        with self._elastic_layer_lock:
+            self._elastic_layer_residency.mark_loaded(generation, layer_ids)
+
+    def elastic_pp_layers_ready(self, generation: int) -> bool:
+        if self._elastic_layer_residency is None:
+            raise RuntimeError("elastic PP layer residency is not enabled")
+        with self._elastic_layer_lock:
+            return self._elastic_layer_residency.ready_to_commit(generation)
+
+    def export_elastic_pp_layer_state(
+        self, layer_ids: Iterable[int]
+    ) -> dict[int, dict[str, torch.Tensor]]:
+        """Expose read-only runtime tensors for direct owner-to-owner transfer."""
+
+        with self._elastic_layer_lock:
+            exported: dict[int, dict[str, torch.Tensor]] = {}
+            for layer_id in layer_ids:
+                layer_id = int(layer_id)
+                layer = self.layers[layer_id]
+                if isinstance(layer, PPMissingLayer):
+                    raise ValueError(f"cannot export nonresident layer {layer_id}")
+                exported[layer_id] = {
+                    name: tensor.detach() for name, tensor in layer.state_dict().items()
+                }
+            return exported
+
+    def import_elastic_pp_layer_state(
+        self,
+        *,
+        generation: int,
+        layer_states: dict[int, dict[str, torch.Tensor]],
+    ) -> frozenset[int]:
+        """Load transferred runtime tensors into still-inactive target layers."""
+
+        if self._elastic_layer_residency is None:
+            raise RuntimeError("elastic PP layer residency is not enabled")
+        with self._elastic_layer_lock:
+            pending = self._elastic_layer_residency.pending
+            if pending is None or pending.generation != generation:
+                raise RuntimeError(
+                    f"no layer preparation exists for generation {generation}"
+                )
+            layer_ids = frozenset(int(layer_id) for layer_id in layer_states)
+            unexpected = layer_ids - pending.new_layer_ids
+            if unexpected:
+                raise ValueError(
+                    f"received state for unrequested layers: {sorted(unexpected)}"
+                )
+            for layer_id in sorted(layer_ids):
+                layer = self.layers[layer_id]
+                if isinstance(layer, PPMissingLayer):
+                    raise RuntimeError(f"layer {layer_id} is not materialized")
+                layer.load_state_dict(layer_states[layer_id], strict=True, assign=False)
+            self._elastic_layer_residency.mark_loaded(generation, set(layer_ids))
+            return layer_ids
+
+    def commit_elastic_pp_layers(self, generation: int) -> LayerRange:
+        """Atomically publish a prepared layer range at the scheduler fence."""
+
+        if self._elastic_layer_residency is None:
+            raise RuntimeError("elastic PP layer residency is not enabled")
+        with self._elastic_layer_lock:
+            target = self._elastic_layer_residency.commit(generation)
+            for layer_id in range(target.start, target.end):
+                layer = self.layers[layer_id]
+                if isinstance(layer, PPMissingLayer):
+                    raise RuntimeError(
+                        f"committed elastic layer {layer_id} is not resident"
+                    )
+                self_attn = getattr(layer, "self_attn", None)
+                if self_attn is not None:
+                    self_attn.start_layer = target.start
+            self.start_layer = target.start
+            self.end_layer = target.end
+            return target
+
+    def abort_elastic_pp_layers(self, generation: int) -> tuple[nn.Module, ...]:
+        if self._elastic_layer_residency is None:
+            raise RuntimeError("elastic PP layer residency is not enabled")
+        with self._elastic_layer_lock:
+            new_layer_ids = self._elastic_layer_residency.abort(generation)
+            removed = []
+            for layer_id in sorted(new_layer_ids):
+                layer = self.layers[layer_id]
+                if not isinstance(layer, PPMissingLayer):
+                    removed.append(layer)
+                    self.layers[layer_id] = PPMissingLayer()
+            return tuple(removed)
+
+    def take_elastic_pp_cleanup_layers(self, generation: int) -> tuple[nn.Module, ...]:
+        """Detach old-generation layers after the target stream has drained."""
+
+        if self._elastic_layer_residency is None:
+            raise RuntimeError("elastic PP layer residency is not enabled")
+        with self._elastic_layer_lock:
+            cleanup_ids = self._elastic_layer_residency.cleanup_candidates(
+                generation, self._resident_elastic_layer_ids()
+            )
+            removed = []
+            removed_ids = set()
+            for layer_id in sorted(cleanup_ids):
+                layer = self.layers[layer_id]
+                if not isinstance(layer, PPMissingLayer):
+                    removed.append(layer)
+                    removed_ids.add(layer_id)
+                    self.layers[layer_id] = PPMissingLayer()
+            self._elastic_layer_residency.finish_cleanup(generation, removed_ids)
+            return tuple(removed)
+
+    def get_elastic_pp_layer_range(self) -> LayerRange:
+        if self._elastic_layer_residency is None:
+            return LayerRange(self.start_layer, self.end_layer)
+        return self._elastic_layer_residency.scheduled_range
 
     def forward(
         self,
@@ -428,30 +634,34 @@ class LlamaModel(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
-        if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
+        lock_context = (
+            self._elastic_layer_lock if self._elastic_pp_enabled else nullcontext()
+        )
+        with lock_context:
+            if self.pp_group.is_first_rank:
+                if input_embeds is None:
+                    hidden_states = self.embed_tokens(input_ids)
+                else:
+                    hidden_states = input_embeds
+                residual = None
             else:
-                hidden_states = input_embeds
-            residual = None
-        else:
-            assert pp_proxy_tensors is not None
-            # FIXME(@ying): reduce the number of proxy tensors by not fusing layer norms
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
-            deferred_norm = None
+                assert pp_proxy_tensors is not None
+                # FIXME(@ying): reduce the number of proxy tensors by not fusing layer norms
+                hidden_states = pp_proxy_tensors["hidden_states"]
+                residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
-        for i in range(self.start_layer, self.end_layer):
-            if i in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states + residual)
-            layer = self.layers[i]
-            hidden_states, residual = layer(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-            )
+            layer_range = self.get_elastic_pp_layer_range()
+            aux_hidden_states = []
+            for i in range(layer_range.start, layer_range.end):
+                if i in self.layers_to_capture:
+                    aux_hidden_states.append(hidden_states + residual)
+                layer = self.layers[i]
+                hidden_states, residual = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                )
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
@@ -534,6 +744,8 @@ class LlamaForCausalLM(nn.Module):
             if getattr(get_parallel(), "enable_elastic_pp", False)
             else None
         )
+        self._elastic_pp_weight_load_lock = RLock()
+        self._elastic_pp_loading_layer_ids: frozenset[int] | None = None
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
@@ -690,6 +902,65 @@ class LlamaForCausalLM(nn.Module):
             raise RuntimeError("elastic PP weight profiling is not enabled")
         return self._elastic_pp_weight_profiler.get_profile()
 
+    @contextmanager
+    def elastic_pp_weight_load(self, generation: int, layer_ids: frozenset[int]):
+        """Scope checkpoint filtering and readiness to one prepared layer set."""
+
+        with self._elastic_pp_weight_load_lock:
+            if self._elastic_pp_loading_layer_ids is not None:
+                raise RuntimeError("another elastic PP weight load is active")
+            self._elastic_pp_loading_layer_ids = layer_ids
+            try:
+                yield
+            except BaseException:
+                raise
+            else:
+                self.model.mark_elastic_pp_layers_loaded(generation, set(layer_ids))
+            finally:
+                self._elastic_pp_loading_layer_ids = None
+
+    def elastic_pp_layers_ready(self, generation: int) -> bool:
+        return self.model.elastic_pp_layers_ready(generation)
+
+    def prepare_elastic_pp_layers(
+        self,
+        *,
+        target: LayerRange,
+        generation: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> frozenset[int]:
+        return self.model.prepare_elastic_pp_layers(
+            target=target,
+            generation=generation,
+            device=device,
+            dtype=dtype,
+        )
+
+    def export_elastic_pp_layer_state(
+        self, layer_ids: Iterable[int]
+    ) -> dict[int, dict[str, torch.Tensor]]:
+        return self.model.export_elastic_pp_layer_state(layer_ids)
+
+    def import_elastic_pp_layer_state(
+        self,
+        *,
+        generation: int,
+        layer_states: dict[int, dict[str, torch.Tensor]],
+    ) -> frozenset[int]:
+        return self.model.import_elastic_pp_layer_state(
+            generation=generation, layer_states=layer_states
+        )
+
+    def commit_elastic_pp_layers(self, *, generation: int) -> LayerRange:
+        return self.model.commit_elastic_pp_layers(generation)
+
+    def cleanup_elastic_pp_layers(self, *, generation: int) -> tuple[nn.Module, ...]:
+        return self.model.take_elastic_pp_cleanup_layers(generation)
+
+    def abort_elastic_pp_layers(self, *, generation: int) -> tuple[nn.Module, ...]:
+        return self.model.abort_elastic_pp_layers(generation)
+
     def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -709,15 +980,15 @@ class LlamaForCausalLM(nn.Module):
                 name = name.replace(".weight_scale_inv", ".weight_scale")
 
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
+            if layer_id is not None:
+                if self._elastic_pp_loading_layer_ids is not None:
+                    if layer_id not in self._elastic_pp_loading_layer_ids:
+                        continue
+                elif hasattr(self.model, "start_layer") and (
                     layer_id < self.model.start_layer
                     or layer_id >= self.model.end_layer
-                )
-            ):
-                continue
+                ):
+                    continue
             if "rotary_emb.inv_freq" in name or "projector" in name:
                 continue
             if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
@@ -771,7 +1042,14 @@ class LlamaForCausalLM(nn.Module):
             get_weight_remap,
         )
 
-        if hasattr(self.model, "start_layer"):
+        if self._elastic_pp_loading_layer_ids is not None:
+            layer_ids = self._elastic_pp_loading_layer_ids
+            weights = (
+                (name, tensor)
+                for name, tensor in weights
+                if get_layer_id(name) in layer_ids
+            )
+        elif hasattr(self.model, "start_layer"):
             weights = filter_pp_weights(
                 weights, self.model.start_layer, self.model.end_layer
             )
