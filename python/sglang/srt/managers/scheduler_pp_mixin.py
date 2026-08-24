@@ -184,21 +184,7 @@ class SchedulerPPMixin:
             )
         self._elastic_pp_topology = topology
         if current is not None:
-            # The request-control ring always advances through the resident
-            # physical PP ranks, so rank r schedules a batch r microsteps after
-            # rank 0.  A common migration fence temporarily lines up every
-            # scheduler at the same microstep.  Refill the physical pipeline
-            # before consuming generation-N activations; otherwise a newly
-            # active rank pairs rank 0's next proxy tensor with its own
-            # previous microbatch.
-            self._elastic_pp_refill_steps_remaining = self.ps.pp_rank
             self._elastic_pp_post_commit_launch_logs_remaining = self.ps.pp_size
-            logger.info(
-                "Elastic PP generation=%d rank=%d armed %d pipeline refill bubbles",
-                topology.generation,
-                self.ps.pp_rank,
-                self._elastic_pp_refill_steps_remaining,
-            )
             logger.info(
                 "Elastic PP generation=%d rank=%d fence ring state microstep=%d "
                 "running=%s last=%s",
@@ -352,13 +338,6 @@ class SchedulerPPMixin:
             if self._pp_microstep >= snapshot.fence_microstep:
                 self._elastic_pp_draining = True
         return self._elastic_pp_draining
-
-    def _elastic_pp_consume_refill_bubble(self: Scheduler) -> bool:
-        remaining = getattr(self, "_elastic_pp_refill_steps_remaining", 0)
-        if remaining <= 0:
-            return False
-        self._elastic_pp_refill_steps_remaining = remaining - 1
-        return True
 
     def _elastic_pp_fence_is_drained(self: Scheduler) -> bool:
         if any(batch is not None for batch in self.mbs):
@@ -576,7 +555,14 @@ class SchedulerPPMixin:
         # path valid without launching GPU forward or receiving a proxy tensor.
         # They must still advance scheduler-visible launch bookkeeping: output
         # processing reads these fields even when this rank skipped compute.
+        # Also consume the forward-only staging lifecycle.  Active ranks clear
+        # these fields in resolve_forward_inputs(); leaving an old prefill
+        # tensor on a zero-layer rank makes it override the current decode
+        # token when that rank is activated by a later topology.
         self._record_batch_launch(cur_batch)
+        cur_batch.input_ids = None
+        cur_batch.prefill_input_ids_cpu = None
+        cur_batch.mix_running_indices = None
         mb_metadata[mb_id] = PPBatchMetadata(can_run_cuda_graph=False)
         event = self.device_module.Event()
         event.record(self.device_module.current_stream())
@@ -631,11 +617,6 @@ class SchedulerPPMixin:
                         # retiring every already-launched ring slot.  Requests
                         # received during the fence remain queued and resume on
                         # the target topology after commit.
-                        self.mbs[mb_id] = None
-                        server_is_idle = False
-                    elif self._elastic_pp_consume_refill_bubble():
-                        # Leave this ring slot's running batch untouched while
-                        # restoring the physical request/activation phase.
                         self.mbs[mb_id] = None
                         server_is_idle = False
                     else:
@@ -1125,7 +1106,6 @@ class SchedulerPPMixin:
         )
         self._pp_microstep = 0
         self._elastic_pp_draining = False
-        self._elastic_pp_refill_steps_remaining = 0
         self._elastic_pp_post_commit_launch_logs_remaining = 0
 
     def profile_and_init_predictor(self: Scheduler):
