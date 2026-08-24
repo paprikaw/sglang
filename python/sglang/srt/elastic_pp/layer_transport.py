@@ -14,6 +14,38 @@ _MANIFEST_KEY = "__elastic_pp_layer_manifest__"
 _TENSOR_KEY_PREFIX = "elastic_pp_layer_tensor_"
 
 
+def _transport_tensor_view(
+    tensor: torch.Tensor, *, copy_noncontiguous: bool
+) -> tuple[torch.Tensor, tuple[tuple[int, ...], tuple[int, ...], int] | None]:
+    """Return a contiguous transport view without copying dense full storage."""
+
+    detached = tensor.detach()
+    if detached.is_contiguous():
+        return detached, None
+
+    storage_bytes = detached.untyped_storage().nbytes()
+    tensor_bytes = detached.numel() * detached.element_size()
+    overlap = torch._debug_has_internal_overlap(detached)
+    if (
+        detached.storage_offset() == 0
+        and storage_bytes == tensor_bytes
+        and int(overlap) == 0
+    ):
+        layout = (
+            tuple(detached.size()),
+            tuple(detached.stride()),
+            int(detached.storage_offset()),
+        )
+        return detached.as_strided((detached.numel(),), (1,), 0), layout
+
+    if not copy_noncontiguous:
+        raise ValueError(
+            "direct elastic PP destination tensor must be contiguous or a "
+            "dense full-storage view"
+        )
+    return detached.contiguous(), None
+
+
 def flatten_layer_states(
     *,
     generation: int,
@@ -31,23 +63,25 @@ def flatten_layer_states(
         )
 
     payload: dict[str, Any] = {}
-    entries: list[tuple[str, int, str]] = []
+    entries: list[
+        tuple[
+            str,
+            int,
+            str,
+            tuple[tuple[int, ...], tuple[int, ...], int] | None,
+        ]
+    ] = []
     tensor_index = 0
     for layer_id in sorted(layer_states):
         for state_name, tensor in sorted(layer_states[layer_id].items()):
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"layer state {layer_id}:{state_name} is not a tensor")
             key = f"{_TENSOR_KEY_PREFIX}{tensor_index:06d}"
-            detached = tensor.detach()
-            if not detached.is_contiguous():
-                if not copy_noncontiguous:
-                    raise ValueError(
-                        "direct elastic PP destination tensor must be contiguous: "
-                        f"layer={layer_id}, state={state_name}"
-                    )
-                detached = detached.contiguous()
-            payload[key] = detached
-            entries.append((key, int(layer_id), state_name))
+            transport_view, layout = _transport_tensor_view(
+                tensor, copy_noncontiguous=copy_noncontiguous
+            )
+            payload[key] = transport_view
+            entries.append((key, int(layer_id), state_name, layout))
             tensor_index += 1
     payload[_MANIFEST_KEY] = {
         "generation": int(generation),
@@ -65,7 +99,15 @@ def _validate_manifest(
     *,
     generation: int,
     transfer: LayerTransfer,
-) -> tuple[tuple[str, int, str], ...]:
+) -> tuple[
+    tuple[
+        str,
+        int,
+        str,
+        tuple[tuple[int, ...], tuple[int, ...], int] | None,
+    ],
+    ...,
+]:
     if not isinstance(manifest, dict):
         raise ValueError("elastic PP layer payload has no manifest")
     expected_header = {
@@ -85,16 +127,37 @@ def _validate_manifest(
     raw_entries = manifest.get("entries")
     if not isinstance(raw_entries, (tuple, list)):
         raise ValueError("elastic PP layer manifest entries are invalid")
-    entries: list[tuple[str, int, str]] = []
+    entries: list[
+        tuple[
+            str,
+            int,
+            str,
+            tuple[tuple[int, ...], tuple[int, ...], int] | None,
+        ]
+    ] = []
     seen_keys: set[str] = set()
     seen_states: set[tuple[int, str]] = set()
     seen_layers: set[int] = set()
     for raw_entry in raw_entries:
-        if not isinstance(raw_entry, (tuple, list)) or len(raw_entry) != 3:
+        if not isinstance(raw_entry, (tuple, list)) or len(raw_entry) not in (3, 4):
             raise ValueError(f"invalid elastic PP layer manifest entry: {raw_entry!r}")
-        key, layer_id, state_name = raw_entry
+        key, layer_id, state_name = raw_entry[:3]
+        layout = None if len(raw_entry) == 3 else raw_entry[3]
         if not isinstance(key, str) or not isinstance(state_name, str):
             raise ValueError(f"invalid elastic PP layer manifest entry: {raw_entry!r}")
+        if layout is not None:
+            if (
+                not isinstance(layout, (tuple, list))
+                or len(layout) != 3
+                or not isinstance(layout[0], (tuple, list))
+                or not isinstance(layout[1], (tuple, list))
+            ):
+                raise ValueError(f"invalid elastic PP tensor layout: {layout!r}")
+            layout = (
+                tuple(int(item) for item in layout[0]),
+                tuple(int(item) for item in layout[1]),
+                int(layout[2]),
+            )
         layer_id = int(layer_id)
         if not (transfer.layer_range.start <= layer_id < transfer.layer_range.end):
             raise ValueError(
@@ -111,7 +174,7 @@ def _validate_manifest(
         seen_keys.add(key)
         seen_states.add(state_key)
         seen_layers.add(layer_id)
-        entries.append((key, layer_id, state_name))
+        entries.append((key, layer_id, state_name, layout))
 
     expected_layers = set(range(transfer.layer_range.start, transfer.layer_range.end))
     if seen_layers != expected_layers:
@@ -133,12 +196,15 @@ def unflatten_layer_states(
     states: dict[int, dict[str, torch.Tensor]] = {}
     expected_tensor_keys: set[str] = set()
     for entry in entries:
-        key, layer_id, state_name = entry
+        key, layer_id, state_name, layout = entry
         tensor = payload.get(key)
         if not isinstance(tensor, torch.Tensor):
             raise ValueError(f"elastic PP layer tensor {key!r} is missing")
         expected_tensor_keys.add(key)
         layer_state = states.setdefault(layer_id, {})
+        if layout is not None:
+            size, stride, storage_offset = layout
+            tensor = tensor.as_strided(size, stride, storage_offset)
         layer_state[state_name] = tensor
 
     unexpected_keys = set(payload) - expected_tensor_keys - {_MANIFEST_KEY}
@@ -154,12 +220,15 @@ def _validate_receive_metadata(
     *,
     generation: int,
     transfer: LayerTransfer,
+    expected_entries: tuple[Any, ...] | None = None,
 ) -> None:
     manifests = [value for key, value in metadata_list if key == _MANIFEST_KEY]
     if len(manifests) != 1:
         raise ValueError("elastic PP layer metadata must contain exactly one manifest")
     entries = _validate_manifest(manifests[0], generation=generation, transfer=transfer)
-    expected_tensor_keys = {key for key, _, _ in entries}
+    if expected_entries is not None and entries != expected_entries:
+        raise ValueError("elastic PP source and destination tensor layouts differ")
+    expected_tensor_keys = {entry[0] for entry in entries}
     received_tensor_keys = {key for key, _ in metadata_list if key != _MANIFEST_KEY}
     if received_tensor_keys != expected_tensor_keys:
         raise ValueError(
@@ -272,6 +341,11 @@ class ElasticPPLayerTransport:
                     for key, tensor in target_payload.items()
                     if isinstance(tensor, torch.Tensor)
                 }
+                target_entries = _validate_manifest(
+                    target_payload[_MANIFEST_KEY],
+                    generation=generation,
+                    transfer=transfer,
+                )
                 payload = self.group.recv_tensor_dict_into(
                     destinations,
                     src=transfer.src_rank,
@@ -280,6 +354,7 @@ class ElasticPPLayerTransport:
                             metadata,
                             generation=generation,
                             transfer=transfer,
+                            expected_entries=target_entries,
                         )
                     ),
                 )

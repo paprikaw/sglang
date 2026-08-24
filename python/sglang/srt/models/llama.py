@@ -453,6 +453,37 @@ class LlamaModel(nn.Module):
             if not isinstance(layer, PPMissingLayer)
         }
 
+    @staticmethod
+    def _prepare_elastic_quantized_layer(layer: nn.Module) -> None:
+        """Put a new compressed-tensors layer in its post-load runtime layout.
+
+        Runtime transfer writes the already-processed source state directly
+        into the destination parameters.  Seed temporary parameters with safe
+        values before invoking the same post-load hooks as the model loader;
+        the seeds are never published and are overwritten by the transfer.
+        """
+
+        for module in layer.modules():
+            quant_method = getattr(module, "quant_method", None)
+            if quant_method is None:
+                continue
+            with torch.no_grad():
+                for name, parameter in module.named_parameters(recurse=False):
+                    if parameter is None:
+                        continue
+                    if "scale" in name:
+                        parameter.fill_(1)
+                    else:
+                        parameter.zero_()
+                for name, buffer in module.named_buffers(recurse=False):
+                    if buffer is None:
+                        continue
+                    if "scale" in name:
+                        buffer.fill_(1)
+                    else:
+                        buffer.zero_()
+            quant_method.process_weights_after_loading(module)
+
     def prepare_elastic_pp_layers(
         self,
         *,
@@ -465,10 +496,12 @@ class LlamaModel(nn.Module):
 
         if self._elastic_layer_residency is None:
             raise RuntimeError("elastic PP layer residency is not enabled")
-        if self.quant_config is not None:
+        quant_name = None if self.quant_config is None else self.quant_config.get_name()
+        if quant_name not in (None, "compressed_tensors"):
             raise NotImplementedError(
                 "elastic PP runtime layer transfer currently supports "
-                "unquantized Llama weights"
+                "unquantized or compressed-tensors Llama weights, got "
+                f"{quant_name!r}"
             )
         with self._elastic_layer_lock:
             preparation = self._elastic_layer_residency.begin_prepare(
@@ -488,9 +521,10 @@ class LlamaModel(nn.Module):
         try:
             with set_default_torch_dtype(dtype), device:
                 for layer_id in create_ids:
-                    created[layer_id] = self._elastic_layer_factory(
-                        layer_id, target.start
-                    ).eval()
+                    layer = self._elastic_layer_factory(layer_id, target.start).eval()
+                    if quant_name is not None:
+                        self._prepare_elastic_quantized_layer(layer)
+                    created[layer_id] = layer
             with self._elastic_layer_lock:
                 for layer_id, layer in created.items():
                     if not isinstance(self.layers[layer_id], PPMissingLayer):

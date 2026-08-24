@@ -85,6 +85,27 @@ def test_manifest_round_trip_and_generation_validation():
         unflatten_layer_states(payload, generation=8, transfer=transfer)
 
 
+def test_noncontiguous_full_storage_uses_zero_copy_transport_view():
+    transfer = LayerTransfer(0, 1, LayerRange(2, 3))
+    physical = torch.arange(6).reshape(2, 3)
+    logical = physical.t()
+    payload = flatten_layer_states(
+        generation=7, transfer=transfer, layer_states={2: {"weight": logical}}
+    )
+    transported = next(
+        value for value in payload.values() if isinstance(value, torch.Tensor)
+    )
+
+    assert transported.is_contiguous()
+    assert transported.shape == (6,)
+    assert transported.data_ptr() == logical.data_ptr()
+    decoded = unflatten_layer_states(payload, generation=7, transfer=transfer)
+    assert decoded[2]["weight"].shape == logical.shape
+    assert decoded[2]["weight"].stride() == logical.stride()
+    assert decoded[2]["weight"].data_ptr() == logical.data_ptr()
+    assert torch.equal(decoded[2]["weight"], logical)
+
+
 def test_dedicated_transport_moves_only_local_transition_segment():
     transition = DynamicPPTransition.build(
         PPTopology.from_layer_counts([2, 0, 0, 2], generation=0),
@@ -111,3 +132,31 @@ def test_dedicated_transport_moves_only_local_transition_segment():
     assert {tensor.data_ptr() for tensor in target_group.received_into.values()} == {
         destination_ptr
     }
+
+
+def test_dedicated_transport_writes_noncontiguous_state_storage_directly():
+    transition = DynamicPPTransition.build(
+        PPTopology.from_layer_counts([2, 0], generation=0),
+        PPTopology.from_layer_counts([1, 1], generation=1),
+    )
+    mailbox = _Mailbox()
+    source_weight = torch.arange(6, dtype=torch.float32).reshape(2, 3).t()
+    template_weight = torch.empty(2, 3).t()
+    source_runner = _Runner({1: {"weight": source_weight}})
+    target_runner = _Runner({}, templates={1: {"weight": template_weight}})
+    source = ElasticPPLayerTransport(
+        group=_Group(mailbox, 0), model_runner=source_runner, rank=0
+    )
+    target = ElasticPPLayerTransport(
+        group=_Group(mailbox, 1), model_runner=target_runner, rank=1
+    )
+
+    target.prepare_target(transition)
+    destination = target_runner.resident[1]["weight"]
+    destination_ptr = destination.data_ptr()
+    source.start_sends(transition)
+    target.receive(transition)
+
+    assert destination.data_ptr() == destination_ptr
+    assert destination.stride() == source_weight.stride()
+    assert torch.equal(destination, source_weight)
