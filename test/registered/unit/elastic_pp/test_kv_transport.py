@@ -48,6 +48,9 @@ class _Allocator:
         self.tracking = True
         return self.slots
 
+    def elastic_pp_live_slots(self):
+        return self.slots
+
     def elastic_pp_delta_slots(self, generation):
         del generation
         return self.slots[:0]

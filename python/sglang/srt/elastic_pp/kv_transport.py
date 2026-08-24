@@ -167,6 +167,7 @@ class ElasticPPKVTransport:
     ) -> None:
         required_allocator_methods = (
             "begin_elastic_pp_slot_tracking",
+            "elastic_pp_live_slots",
             "elastic_pp_delta_slots",
             "finish_elastic_pp_slot_tracking",
         )
@@ -301,6 +302,19 @@ class ElasticPPKVTransport:
         return self.allocator.elastic_pp_delta_slots(
             generation=transition.target.generation
         )
+
+    def fence_slots(self, transition: DynamicPPTransition) -> torch.Tensor:
+        """Return the authoritative live rows at the drained scheduler fence.
+
+        The background allocator snapshot is intentionally not reused here.
+        Requests can allocate, free, or reuse slots while target backing is
+        prepared.  Once every PP rank has drained at the common fence, the
+        current source-owner snapshot is both complete and stable for the
+        synchronous transfer.
+        """
+
+        del transition
+        return self.allocator.elastic_pp_live_slots()
 
     def send_phase(
         self,

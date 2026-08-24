@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import torch
 
 from sglang.srt.elastic_pp.coordinator import (
@@ -39,6 +41,7 @@ class _LayerTransport:
     def __init__(self):
         self.prepared = False
         self.received = False
+        self.copy_threads = []
 
     def prepare_target(self, transition):
         del transition
@@ -47,11 +50,13 @@ class _LayerTransport:
 
     def start_sends(self, transition):
         del transition
+        self.copy_threads.append(threading.current_thread().name)
         return ()
 
     def receive(self, transition):
         del transition
         self.received = True
+        self.copy_threads.append(threading.current_thread().name)
         return frozenset({1})
 
     @staticmethod
@@ -65,6 +70,7 @@ class _KVTransport:
         self.finished = False
         self.applied = False
         self.aborted_staged = False
+        self.exchange_threads = []
 
     def prepare_transition(self, transition):
         del transition
@@ -73,7 +79,12 @@ class _KVTransport:
     def exchange_phase(self, transition, phase, slot_ids):
         del transition
         self.phases.append((phase, tuple(slot_ids.tolist())))
+        self.exchange_threads.append(threading.current_thread().name)
         return frozenset({1})
+
+    def fence_slots(self, transition):
+        del transition
+        return torch.tensor([1, 3, 5], dtype=torch.long)
 
     def delta_slots(self, transition):
         del transition
@@ -151,13 +162,22 @@ def test_prepare_fence_commit_and_deferred_cleanup():
     coordinator.begin(transition)
     ready = coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
     assert ready.source_usable
-    assert kv_transport.phases == [("bulk", (1, 3))]
+    assert kv_transport.phases == []
+    assert not coordinator.layer_transport.received
 
     assert coordinator.finalize_at_fence(installed.append) == transition.target
     assert coordinator.phase == ElasticPPMigrationPhase.COMMITTED
     assert runner.committed
     assert installed == [transition.target]
-    assert kv_transport.phases[-1] == ("delta", (5,))
+    assert kv_transport.phases == [("bulk", (1, 3, 5)), ("delta", ())]
+    assert kv_transport.exchange_threads == [
+        threading.current_thread().name,
+        threading.current_thread().name,
+    ]
+    assert coordinator.layer_transport.copy_threads == [
+        threading.current_thread().name,
+        threading.current_thread().name,
+    ]
     assert kv_transport.applied
     assert kv_transport.finished
 
@@ -190,6 +210,33 @@ def test_prepare_peer_failure_aborts_without_changing_source_generation():
     failed = coordinator.wait_for_phase(ElasticPPMigrationPhase.FAILED, timeout=2)
     assert failed.source_usable
     assert coordinator.current_topology == transition.source
+    assert runner.aborted_layers
+    assert runner.aborted_kv
+    assert kv_transport.finished
+
+
+def test_fence_slot_failure_reaches_consensus_before_abort():
+    group = _Group()
+    coordinator, transition, runner, kv_transport = _coordinator(group)
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+
+    def fail_fence_slots(transition):
+        del transition
+        raise RuntimeError("injected live-slot failure")
+
+    kv_transport.fence_slots = fail_fence_slots
+    try:
+        coordinator.finalize_at_fence(lambda topology: None)
+    except RuntimeError as exc:
+        assert "fence slots failed" in str(exc)
+        assert "injected live-slot failure" in str(exc)
+    else:
+        raise AssertionError("fence slot failure unexpectedly committed")
+
+    assert group.stages[-1] == "fence_slots"
+    assert coordinator.phase == ElasticPPMigrationPhase.FAILED
+    assert coordinator.snapshot().source_usable
     assert runner.aborted_layers
     assert runner.aborted_kv
     assert kv_transport.finished

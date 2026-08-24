@@ -42,13 +42,15 @@ class ElasticPPMigrationSnapshot:
 
 
 class ElasticPPMigrationCoordinator:
-    """Prepare off-path, commit at a drained fence, then clean up later.
+    """Prepare backing off-path, copy/commit at a fence, then clean up later.
 
     One coordinator exists in every resident PP scheduler process.  Long
-    allocation and bulk-copy work runs on a daemon migration thread.  The
-    scheduler thread calls :meth:`finalize_at_fence` only after its microbatch
-    ring is empty; that method performs the small final KV delta and publishes
-    the new model/KV/route generation.
+    allocation work runs on a daemon migration thread.  The scheduler thread
+    calls :meth:`finalize_at_fence` only after its microbatch ring is empty;
+    that method owns every migration NCCL launch, copies the current live KV
+    rows, and publishes the new model/KV/route generation.  Keeping serving
+    and migration communicator launches on one host thread avoids undefined
+    multi-thread NCCL ordering on the same device.
     """
 
     def __init__(
@@ -300,69 +302,12 @@ class ElasticPPMigrationCoordinator:
                 generation,
                 self.rank,
             )
-            # In-flight PP stages can observe different allocator states at
-            # the background-copy boundary.  Each layer-transfer source owns
-            # the authoritative sparse slot stream for that edge.
-
-            local_error = None
-            works = ()
-            try:
-                stage_started = time.monotonic()
-                logger.info(
-                    "Elastic PP generation=%d rank=%d layer copy begin",
-                    generation,
-                    self.rank,
-                )
-                works = self.layer_transport.start_sends(transition)
-                try:
-                    self.layer_transport.receive(transition)
-                finally:
-                    self.layer_transport.wait(works)
-                logger.info(
-                    "Elastic PP generation=%d rank=%d layer copy complete in %.3f s",
-                    generation,
-                    self.rank,
-                    time.monotonic() - stage_started,
-                )
-                stage_started = time.monotonic()
-                logger.info(
-                    "Elastic PP generation=%d rank=%d KV bulk copy begin",
-                    generation,
-                    self.rank,
-                )
-                self.kv_transport.exchange_phase(
-                    transition,
-                    phase="bulk",
-                    slot_ids=self._bulk_slots,
-                )
-                logger.info(
-                    "Elastic PP generation=%d rank=%d KV bulk copy complete "
-                    "in %.3f s",
-                    generation,
-                    self.rank,
-                    time.monotonic() - stage_started,
-                )
-            except BaseException as exc:
-                local_error = f"{type(exc).__name__}: {exc}"
-
-            reports = self._consensus(
-                "bulk_copy",
-                success=local_error is None,
-                error=local_error,
-            )
-            self._raise_peer_failures("bulk copy", reports)
-            logger.info(
-                "Elastic PP generation=%d rank=%d bulk-copy consensus complete",
-                generation,
-                self.rank,
-            )
-
-            # Scheduler loops on different ranks can observe background-copy
-            # completion at slightly different wall-clock times.  Stopping as
-            # soon as each local thread becomes ready can therefore leave one
-            # stage launching a microbatch whose neighbour has already begun
-            # draining.  Agree on a sufficiently-future *logical* PP step so
-            # every stage stops scheduling at exactly the same boundary.
+            # Scheduler loops on different ranks can observe background
+            # allocation completion at slightly different wall-clock times.
+            # Stopping as soon as each local thread becomes ready can therefore
+            # leave one stage launching a microbatch whose neighbour has already
+            # begun draining. Agree on a sufficiently-future *logical* PP step
+            # so every stage stops scheduling at exactly the same boundary.
             local_error = None
             local_step = None
             try:
@@ -404,7 +349,13 @@ class ElasticPPMigrationCoordinator:
     def finalize_at_fence(
         self, commit_topology: Callable[[PPTopology], None]
     ) -> PPTopology:
-        """Apply the final KV delta and publish a fully drained generation."""
+        """Copy weights/current KV and publish a fully drained generation.
+
+        This method is called by the scheduler thread on every resident rank.
+        No migration communicator operation is launched by the background
+        prepare thread, so serving and migration NCCL have a deterministic
+        single-host-thread order on each device.
+        """
 
         transition = self._require_transition()
         with self._condition:
@@ -419,22 +370,75 @@ class ElasticPPMigrationCoordinator:
 
         commit_started = False
         try:
-            delta_slots = self.kv_transport.delta_slots(transition)
+            local_error = None
+            fence_slots = None
+            slot_signature = None
+            try:
+                fence_slots = self.kv_transport.fence_slots(transition)
+                slot_signature = self._slot_signature(fence_slots)
+            except BaseException as exc:
+                local_error = f"{type(exc).__name__}: {exc}"
             reports = self._consensus(
                 "fence_slots",
-                success=True,
-                details=self._slot_signature(delta_slots),
+                success=local_error is None,
+                error=local_error,
+                details=slot_signature,
             )
             self._raise_peer_failures("fence slots", reports)
+            assert fence_slots is not None
 
             local_error = None
+            works = ()
             try:
+                stage_started = time.monotonic()
+                logger.info(
+                    "Elastic PP generation=%d rank=%d fenced layer copy begin",
+                    transition.target.generation,
+                    self.rank,
+                )
+                works = self.layer_transport.start_sends(transition)
+                try:
+                    self.layer_transport.receive(transition)
+                finally:
+                    self.layer_transport.wait(works)
+                logger.info(
+                    "Elastic PP generation=%d rank=%d fenced layer copy complete "
+                    "in %.3f s",
+                    transition.target.generation,
+                    self.rank,
+                    time.monotonic() - stage_started,
+                )
+
+                stage_started = time.monotonic()
+                logger.info(
+                    "Elastic PP generation=%d rank=%d fenced KV copy begin "
+                    "with %d live slots",
+                    transition.target.generation,
+                    self.rank,
+                    int(fence_slots.numel()),
+                )
+                self.kv_transport.exchange_phase(
+                    transition,
+                    phase="bulk",
+                    slot_ids=fence_slots,
+                )
+                # Keep the existing two-phase staging invariant while the
+                # authoritative snapshot is now taken only once at the fence.
+                # An empty delta still carries one manifest per ownership edge
+                # and proves the receive set is complete before publication.
                 self.kv_transport.exchange_phase(
                     transition,
                     phase="delta",
-                    slot_ids=delta_slots,
+                    slot_ids=fence_slots[:0],
                 )
                 self.kv_transport.apply_staged(transition)
+                logger.info(
+                    "Elastic PP generation=%d rank=%d fenced KV copy complete "
+                    "in %.3f s",
+                    transition.target.generation,
+                    self.rank,
+                    time.monotonic() - stage_started,
+                )
                 if not self.model_runner.elastic_pp_generation_ready(
                     generation=transition.target.generation
                 ):
@@ -444,11 +448,11 @@ class ElasticPPMigrationCoordinator:
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
             reports = self._consensus(
-                "delta_copy",
+                "fence_copy",
                 success=local_error is None,
                 error=local_error,
             )
-            self._raise_peer_failures("delta copy", reports)
+            self._raise_peer_failures("fence copy", reports)
 
             local_error = None
             try:
