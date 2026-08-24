@@ -1,0 +1,369 @@
+"""Sparse owner-to-owner KV transfer for elastic pipeline parallelism."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from typing import Any, Literal
+
+import torch
+
+from sglang.srt.elastic_pp.layer_transport import ElasticPPLayerTransport
+from sglang.srt.elastic_pp.topology import DynamicPPTransition, LayerTransfer
+
+KVTransferPhase = Literal["bulk", "delta"]
+
+_MANIFEST_KEY = "__elastic_pp_kv_manifest__"
+_SLOT_IDS_KEY = "elastic_pp_kv_slot_ids"
+_TENSOR_KEY_PREFIX = "elastic_pp_kv_tensor_"
+
+
+def _slot_chunks(slot_ids: torch.Tensor, chunk_size: int) -> tuple[torch.Tensor, ...]:
+    if chunk_size <= 0:
+        raise ValueError("elastic PP KV slot chunk size must be positive")
+    if slot_ids.ndim != 1:
+        raise ValueError("elastic PP KV slot ids must be one-dimensional")
+    if slot_ids.numel() == 0:
+        return (slot_ids,)
+    return tuple(
+        slot_ids[start : start + chunk_size]
+        for start in range(0, slot_ids.numel(), chunk_size)
+    )
+
+
+def flatten_kv_chunk(
+    *,
+    generation: int,
+    transfer: LayerTransfer,
+    phase: KVTransferPhase,
+    chunk_index: int,
+    total_chunks: int,
+    slot_ids: torch.Tensor,
+    layer_kv: dict[int, tuple[torch.Tensor, torch.Tensor]],
+) -> dict[str, Any]:
+    expected_layers = set(range(transfer.layer_range.start, transfer.layer_range.end))
+    if set(layer_kv) != expected_layers:
+        raise ValueError(
+            "KV payload does not exactly cover transfer layers: "
+            f"expected={sorted(expected_layers)}, got={sorted(layer_kv)}"
+        )
+    if phase not in ("bulk", "delta"):
+        raise ValueError(f"invalid elastic PP KV phase: {phase!r}")
+    if not 0 <= chunk_index < total_chunks:
+        raise ValueError(f"invalid elastic PP KV chunk {chunk_index}/{total_chunks}")
+
+    payload: dict[str, Any] = {_SLOT_IDS_KEY: slot_ids.detach().contiguous()}
+    entries: list[tuple[str, int, str]] = []
+    tensor_index = 0
+    for layer_id in sorted(layer_kv):
+        cache_k, cache_v = layer_kv[layer_id]
+        for kind, tensor in (("k", cache_k), ("v", cache_v)):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"KV state {layer_id}:{kind} is not a tensor")
+            key = f"{_TENSOR_KEY_PREFIX}{tensor_index:06d}"
+            payload[key] = tensor.detach().contiguous()
+            entries.append((key, int(layer_id), kind))
+            tensor_index += 1
+    payload[_MANIFEST_KEY] = {
+        "generation": int(generation),
+        "src_rank": transfer.src_rank,
+        "dst_rank": transfer.dst_rank,
+        "start_layer": transfer.layer_range.start,
+        "end_layer": transfer.layer_range.end,
+        "phase": phase,
+        "chunk_index": int(chunk_index),
+        "total_chunks": int(total_chunks),
+        "slot_count": int(slot_ids.numel()),
+        "entries": tuple(entries),
+    }
+    return payload
+
+
+def unflatten_kv_chunk(
+    payload: dict[str, Any],
+    *,
+    generation: int,
+    transfer: LayerTransfer,
+    phase: KVTransferPhase,
+    chunk_index: int,
+    total_chunks: int,
+) -> tuple[torch.Tensor, dict[int, tuple[torch.Tensor, torch.Tensor]]]:
+    manifest = payload.get(_MANIFEST_KEY)
+    if not isinstance(manifest, dict):
+        raise ValueError("elastic PP KV payload has no manifest")
+    expected_header = {
+        "generation": int(generation),
+        "src_rank": transfer.src_rank,
+        "dst_rank": transfer.dst_rank,
+        "start_layer": transfer.layer_range.start,
+        "end_layer": transfer.layer_range.end,
+        "phase": phase,
+        "chunk_index": int(chunk_index),
+        "total_chunks": int(total_chunks),
+    }
+    for field, expected in expected_header.items():
+        if manifest.get(field) != expected:
+            raise ValueError(
+                "elastic PP KV manifest mismatch: "
+                f"{field}={manifest.get(field)!r}, expected={expected!r}"
+            )
+    slot_ids = payload.get(_SLOT_IDS_KEY)
+    if not isinstance(slot_ids, torch.Tensor) or slot_ids.ndim != 1:
+        raise ValueError("elastic PP KV payload has invalid slot ids")
+    if slot_ids.dtype != torch.int64:
+        raise ValueError(f"elastic PP KV slot ids must be int64, got {slot_ids.dtype}")
+    if manifest.get("slot_count") != slot_ids.numel():
+        raise ValueError("elastic PP KV slot count does not match its manifest")
+
+    raw_entries = manifest.get("entries")
+    if not isinstance(raw_entries, (tuple, list)):
+        raise ValueError("elastic PP KV manifest entries are invalid")
+    by_layer: dict[int, dict[str, torch.Tensor]] = {}
+    tensor_keys: set[str] = set()
+    for entry in raw_entries:
+        if not isinstance(entry, (tuple, list)) or len(entry) != 3:
+            raise ValueError(f"invalid elastic PP KV manifest entry: {entry!r}")
+        key, layer_id, kind = entry
+        if not isinstance(key, str) or kind not in ("k", "v"):
+            raise ValueError(f"invalid elastic PP KV manifest entry: {entry!r}")
+        layer_id = int(layer_id)
+        if not (transfer.layer_range.start <= layer_id < transfer.layer_range.end):
+            raise ValueError(
+                f"elastic PP KV layer {layer_id} is outside {transfer.layer_range}"
+            )
+        if key in tensor_keys or kind in by_layer.setdefault(layer_id, {}):
+            raise ValueError(f"duplicate elastic PP KV manifest entry: {entry!r}")
+        tensor = payload.get(key)
+        if not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"elastic PP KV tensor {key!r} is missing")
+        tensor_keys.add(key)
+        by_layer[layer_id][kind] = tensor
+
+    expected_layers = set(range(transfer.layer_range.start, transfer.layer_range.end))
+    if set(by_layer) != expected_layers or any(
+        set(item) != {"k", "v"} for item in by_layer.values()
+    ):
+        raise ValueError(
+            "elastic PP KV payload does not contain one K/V pair per layer"
+        )
+    unexpected = set(payload) - tensor_keys - {_MANIFEST_KEY, _SLOT_IDS_KEY}
+    if unexpected:
+        raise ValueError(f"unexpected elastic PP KV payload keys: {sorted(unexpected)}")
+    return slot_ids, {
+        layer_id: (item["k"], item["v"]) for layer_id, item in by_layer.items()
+    }
+
+
+class ElasticPPKVTransport:
+    """Move sparse live KV rows on the dedicated elastic PP communicator."""
+
+    def __init__(
+        self,
+        *,
+        group,
+        model_runner,
+        allocator,
+        rank: int,
+        slot_chunk_size: int = 1024,
+    ) -> None:
+        required_allocator_methods = (
+            "begin_elastic_pp_slot_tracking",
+            "elastic_pp_delta_slots",
+            "finish_elastic_pp_slot_tracking",
+        )
+        missing = [
+            name for name in required_allocator_methods if not hasattr(allocator, name)
+        ]
+        if missing:
+            raise NotImplementedError(
+                "elastic PP sparse KV migration currently requires the standard "
+                f"token allocator; missing={missing}"
+            )
+        self.group = group
+        self.model_runner = model_runner
+        self.pool = model_runner.token_to_kv_pool
+        self.allocator = allocator
+        self.rank = int(rank)
+        self.slot_chunk_size = int(slot_chunk_size)
+        self._runner_device = torch.device(getattr(model_runner, "device", "cpu"))
+        self._migration_stream = None
+        if self._runner_device.type == "cuda" and torch.cuda.is_available():
+            with torch.cuda.device(self._runner_device):
+                self._migration_stream = torch.cuda.Stream(device=self._runner_device)
+
+    @contextmanager
+    def _stream_context(self):
+        if self._migration_stream is None:
+            yield
+            return
+        with (
+            torch.cuda.device(self._runner_device),
+            torch.cuda.stream(self._migration_stream),
+        ):
+            yield
+
+    def _record_ready_event(self):
+        if self._migration_stream is None:
+            return None
+        ready_event = torch.cuda.Event()
+        ready_event.record(self._migration_stream)
+        return ready_event
+
+    @staticmethod
+    def _sort_key(transfer: LayerTransfer) -> tuple[int, int, int, int]:
+        return (
+            transfer.src_rank,
+            transfer.dst_rank,
+            transfer.layer_range.start,
+            transfer.layer_range.end,
+        )
+
+    def outbound_transfers(
+        self, transition: DynamicPPTransition
+    ) -> tuple[LayerTransfer, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in transition.kv_transfers
+                    if item.src_rank == self.rank
+                ),
+                key=self._sort_key,
+            )
+        )
+
+    def inbound_transfers(
+        self, transition: DynamicPPTransition
+    ) -> tuple[LayerTransfer, ...]:
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in transition.kv_transfers
+                    if item.dst_rank == self.rank
+                ),
+                key=self._sort_key,
+            )
+        )
+
+    def prepare_transition(self, transition: DynamicPPTransition) -> torch.Tensor:
+        with self._stream_context():
+            self.model_runner.prepare_elastic_pp_kv_layers(
+                target=transition.target.layer_range(self.rank),
+                generation=transition.target.generation,
+            )
+            slots = self.allocator.begin_elastic_pp_slot_tracking(
+                generation=transition.target.generation
+            )
+            ready_event = self._record_ready_event()
+        if ready_event is not None:
+            # Allocation is on the migration stream so it may overlap serving,
+            # but the bulk copy cannot publish readiness before the backing
+            # tensors themselves exist.
+            ready_event.synchronize()
+        return slots
+
+    def bulk_slots(self, transition: DynamicPPTransition) -> torch.Tensor:
+        return self.allocator.begin_elastic_pp_slot_tracking(
+            generation=transition.target.generation
+        )
+
+    def delta_slots(self, transition: DynamicPPTransition) -> torch.Tensor:
+        return self.allocator.elastic_pp_delta_slots(
+            generation=transition.target.generation
+        )
+
+    def send_phase(
+        self,
+        transition: DynamicPPTransition,
+        *,
+        phase: KVTransferPhase,
+        slot_ids: torch.Tensor,
+    ) -> int:
+        """Send bounded chunks; run this on the migration sender thread."""
+
+        chunks = _slot_chunks(slot_ids, self.slot_chunk_size)
+        sent = 0
+        with self._stream_context():
+            for transfer in self.outbound_transfers(transition):
+                for chunk_index, chunk in enumerate(chunks):
+                    layer_kv = {
+                        layer_id: self.pool.export_elastic_pp_kv_slots(
+                            layer_id=layer_id, slot_ids=chunk
+                        )
+                        for layer_id in range(
+                            transfer.layer_range.start, transfer.layer_range.end
+                        )
+                    }
+                    payload = flatten_kv_chunk(
+                        generation=transition.target.generation,
+                        transfer=transfer,
+                        phase=phase,
+                        chunk_index=chunk_index,
+                        total_chunks=len(chunks),
+                        slot_ids=chunk,
+                        layer_kv=layer_kv,
+                    )
+                    works = self.group.send_tensor_dict(
+                        payload, dst=transfer.dst_rank, async_send=True
+                    )
+                    ElasticPPLayerTransport.wait(works or ())
+                    sent += 1
+            ready_event = self._record_ready_event()
+        if ready_event is not None:
+            ready_event.synchronize()
+        return sent
+
+    def receive_phase(
+        self,
+        transition: DynamicPPTransition,
+        *,
+        phase: KVTransferPhase,
+        expected_slot_ids: torch.Tensor,
+    ) -> frozenset[int]:
+        chunks = _slot_chunks(expected_slot_ids, self.slot_chunk_size)
+        loaded: set[int] = set()
+        with self._stream_context():
+            for transfer in self.inbound_transfers(transition):
+                for chunk_index, expected_chunk in enumerate(chunks):
+                    payload = self.group.recv_tensor_dict(src=transfer.src_rank)
+                    if not isinstance(payload, dict):
+                        raise RuntimeError(
+                            f"did not receive KV rows from rank {transfer.src_rank}"
+                        )
+                    slot_ids, layer_kv = unflatten_kv_chunk(
+                        payload,
+                        generation=transition.target.generation,
+                        transfer=transfer,
+                        phase=phase,
+                        chunk_index=chunk_index,
+                        total_chunks=len(chunks),
+                    )
+                    if not torch.equal(slot_ids.cpu(), expected_chunk.cpu()):
+                        raise ValueError(
+                            "elastic PP KV source/destination live-slot snapshots differ"
+                        )
+                    for layer_id, (cache_k, cache_v) in layer_kv.items():
+                        self.pool.import_elastic_pp_kv_slots(
+                            generation=transition.target.generation,
+                            layer_id=layer_id,
+                            slot_ids=slot_ids,
+                            cache_k=cache_k,
+                            cache_v=cache_v,
+                        )
+                        loaded.add(layer_id)
+            ready_event = self._record_ready_event()
+        if ready_event is not None:
+            # This is a migration-thread wait, not a serving-stream sync.  The
+            # control plane cannot publish buffers while NCCL/scatter is pending.
+            ready_event.synchronize()
+        if phase == "bulk" and loaded:
+            self.pool.mark_elastic_pp_kv_layers_loaded(
+                generation=transition.target.generation,
+                layer_ids=loaded,
+            )
+        return frozenset(loaded)
+
+    def finish_slot_tracking(self, transition: DynamicPPTransition) -> None:
+        self.allocator.finish_elastic_pp_slot_tracking(
+            generation=transition.target.generation
+        )

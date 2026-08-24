@@ -844,6 +844,16 @@ class ModelRunner:
         # Keep a reference so the shared byte buffer is not GC'd.
         self._unified_memory_pool = result.unified_memory_pool
 
+        if self.elastic_pp_migration_group is not None:
+            from sglang.srt.elastic_pp.kv_transport import ElasticPPKVTransport
+
+            self.elastic_pp_kv_transport = ElasticPPKVTransport(
+                group=self.elastic_pp_migration_group,
+                model_runner=self,
+                allocator=self.token_to_kv_pool_allocator,
+                rank=self.ps.pp_rank,
+            )
+
         self._init_post_memory_pool_components()
 
     def _init_post_memory_pool_components(self):
@@ -1067,6 +1077,7 @@ class ModelRunner:
         self.pp_group = result.pp_group
         self.elastic_pp_migration_group = result.elastic_pp_migration_group
         self.elastic_pp_layer_transport = None
+        self.elastic_pp_kv_transport = None
         if self.elastic_pp_migration_group is not None:
             from sglang.srt.elastic_pp.layer_transport import ElasticPPLayerTransport
 
@@ -1310,6 +1321,16 @@ class ModelRunner:
         method = self._elastic_pp_model_method("import_elastic_pp_layer_state")
         return method(generation=generation, layer_states=layer_states)
 
+    def mark_elastic_pp_layers_loaded(
+        self, *, generation: int, layer_ids: set[int]
+    ) -> None:
+        method = self._elastic_pp_model_method("mark_elastic_pp_layers_loaded")
+        method(generation=generation, layer_ids=layer_ids)
+
+    def elastic_pp_layers_ready(self, *, generation: int) -> bool:
+        method = self._elastic_pp_model_method("elastic_pp_layers_ready")
+        return method(generation=generation)
+
     def commit_elastic_pp_layers(self, *, generation: int) -> LayerRange:
         """Switch the model range and invalidate graphs with stale pointers."""
 
@@ -1333,6 +1354,77 @@ class ModelRunner:
     ) -> tuple[torch.nn.Module, ...]:
         method = self._elastic_pp_model_method("abort_elastic_pp_layers")
         return method(generation=generation)
+
+    def prepare_elastic_pp_kv_layers(
+        self, *, target: LayerRange, generation: int
+    ) -> frozenset[int]:
+        method = getattr(self.token_to_kv_pool, "prepare_elastic_pp_kv_layers", None)
+        if method is None:
+            raise RuntimeError(
+                f"KV pool {type(self.token_to_kv_pool).__name__} does not support "
+                "elastic PP residency"
+            )
+        return method(
+            target=target,
+            generation=generation,
+            total_num_layers=self.model_config.num_hidden_layers,
+        )
+
+    def commit_elastic_pp_kv_layers(self, *, generation: int) -> LayerRange:
+        return self.token_to_kv_pool.commit_elastic_pp_kv_layers(generation=generation)
+
+    def elastic_pp_kv_ready(self, *, generation: int) -> bool:
+        return self.token_to_kv_pool.elastic_pp_kv_ready(generation=generation)
+
+    def abort_elastic_pp_kv_layers(
+        self, *, generation: int
+    ) -> tuple[torch.Tensor, ...]:
+        return self.token_to_kv_pool.abort_elastic_pp_kv_layers(generation=generation)
+
+    def cleanup_elastic_pp_kv_layers(
+        self, *, generation: int
+    ) -> tuple[torch.Tensor, ...]:
+        return self.token_to_kv_pool.cleanup_elastic_pp_kv_layers(generation=generation)
+
+    def elastic_pp_generation_ready(self, *, generation: int) -> bool:
+        return self.elastic_pp_layers_ready(
+            generation=generation
+        ) and self.elastic_pp_kv_ready(generation=generation)
+
+    def commit_elastic_pp_generation(self, *, generation: int) -> LayerRange:
+        """Commit model and KV mappings while the scheduler is fully drained."""
+
+        if not self.elastic_pp_generation_ready(generation=generation):
+            raise RuntimeError(
+                f"elastic PP generation {generation} is not ready to commit"
+            )
+        kv_target = self.commit_elastic_pp_kv_layers(generation=generation)
+        model_target = self.commit_elastic_pp_layers(generation=generation)
+        if model_target != kv_target:
+            # Both state machines validated before mutation.  A mismatch here
+            # is a programming error and serving must not resume with a split
+            # model/KV generation.
+            raise RuntimeError(
+                "elastic PP model/KV commit ranges differ: "
+                f"model={model_target}, KV={kv_target}"
+            )
+        return model_target
+
+    def abort_elastic_pp_generation(
+        self, *, generation: int
+    ) -> tuple[tuple[torch.nn.Module, ...], tuple[torch.Tensor, ...]]:
+        return (
+            self.abort_elastic_pp_layers(generation=generation),
+            self.abort_elastic_pp_kv_layers(generation=generation),
+        )
+
+    def cleanup_elastic_pp_generation(
+        self, *, generation: int
+    ) -> tuple[tuple[torch.nn.Module, ...], tuple[torch.Tensor, ...]]:
+        return (
+            self.cleanup_elastic_pp_layers(generation=generation),
+            self.cleanup_elastic_pp_kv_layers(generation=generation),
+        )
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:

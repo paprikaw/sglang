@@ -952,6 +952,11 @@ class LlamaForCausalLM(nn.Module):
             generation=generation, layer_states=layer_states
         )
 
+    def mark_elastic_pp_layers_loaded(
+        self, *, generation: int, layer_ids: set[int]
+    ) -> None:
+        self.model.mark_elastic_pp_layers_loaded(generation, layer_ids)
+
     def commit_elastic_pp_layers(self, *, generation: int) -> LayerRange:
         return self.model.commit_elastic_pp_layers(generation)
 

@@ -80,11 +80,25 @@ persistent-data-plane tests.
 - Weight migration uses an independent PP-shaped NCCL/Gloo communicator.  Its
   manifest validates the generation, source, destination, and exact half-open
   layer interval before installing runtime tensors.
+- Weight receives write directly into prepared parameter storage, avoiding a
+  second full-size GPU tensor allocation during scale-up.
+- The standard unquantized NHD MHA KV pool now has the same transactional
+  prepare/commit/deferred-cleanup lifecycle.  A zero-layer resident rank can
+  allocate unpublished per-layer backing and atomically publish its pointer
+  tables at the scheduler fence.
+- Sparse KV bulk copy snapshots all allocated token slots (including radix
+  cache residents).  While it runs, the token allocator records new slot
+  allocations; the final delta includes only those slots that remain live,
+  including old slot ids that were freed and reused.
+- KV gather, transport, and scatter run on a dedicated migration CUDA stream
+  and send fixed-size slot chunks over the migration communicator.  This is a
+  migration memory bound, not dynamic inference chunking.
 
-The next mechanism piece is transactional KV residency.  The first supported
-backend is the standard unquantized MHA token-to-KV pool; hybrid, MLA,
-page-major, and quantized layouts remain explicit follow-up work rather than
-silently taking an unsafe path.
+Hybrid, MLA, page-major, post-capture VMM, speculative-copy-table, and
+quantized KV layouts remain explicit follow-up work rather than silently
+taking an unsafe path.  The next mechanism piece is scheduler-ordered runtime
+coordination: background prepare/bulk copy, a drained final-delta fence, atomic
+model/KV/route commit, and CUDA-event-safe cleanup.
 
 ## Delivery order
 

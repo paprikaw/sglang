@@ -31,6 +31,7 @@ import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, fields
 from functools import cached_property
+from threading import RLock
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
@@ -51,6 +52,8 @@ from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.elastic_pp.kv_residency import ElasticKVResidency
+from sglang.srt.elastic_pp.topology import LayerRange
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
@@ -1880,6 +1883,324 @@ class MHATokenToKVPool(KVCache):
         self.row_dim = self.head_num * self.head_dim
         self.v_row_dim = self.head_num * self.v_head_dim
 
+        self._elastic_pp_enabled = bool(
+            getattr(get_parallel(), "enable_elastic_pp", False)
+        )
+        self._elastic_pp_lock = RLock()
+        self._elastic_pp_residency: Optional[ElasticKVResidency] = None
+        self._elastic_pp_pending_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._elastic_pp_retired_kv: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        self._elastic_pp_enable_kv_cache_copy = bool(enable_kv_cache_copy)
+
+    def _require_elastic_pp_kv_supported(self) -> None:
+        if not self._elastic_pp_enabled:
+            raise RuntimeError("elastic PP is not enabled for this KV pool")
+        if type(self) is not MHATokenToKVPool:
+            raise NotImplementedError(
+                "elastic PP KV migration currently supports only the standard "
+                "MHATokenToKVPool implementation"
+            )
+        if self.is_quantized_kv_cache:
+            raise NotImplementedError(
+                "elastic PP KV migration currently supports unquantized KV only"
+            )
+        if self.store_dtype != self.dtype:
+            raise NotImplementedError(
+                "elastic PP KV migration does not yet support packed/FP8 storage"
+            )
+        if self.post_capture_active:
+            raise NotImplementedError(
+                "elastic PP KV migration does not yet support post-capture VMM backing"
+            )
+        if self.use_hnd or self.kv_cache_layout != "nhd":
+            raise NotImplementedError(
+                "elastic PP KV migration currently supports the standard NHD layout"
+            )
+        if self._elastic_pp_enable_kv_cache_copy:
+            raise NotImplementedError(
+                "elastic PP KV migration does not yet support speculative KV-copy tables"
+            )
+
+    def _current_elastic_pp_kv_map(
+        self,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        end_layer = self.start_layer + len(self.k_buffer)
+        return {
+            layer_id: (
+                self.k_buffer[layer_id - self.start_layer],
+                self.v_buffer[layer_id - self.start_layer],
+            )
+            for layer_id in range(self.start_layer, end_layer)
+        }
+
+    def _allocate_elastic_pp_kv_pair(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        k_shape, v_shape = self._kv_buffer_shapes()
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                return (
+                    torch.empty(k_shape, dtype=self.store_dtype, device=self.device),
+                    torch.empty(v_shape, dtype=self.store_dtype, device=self.device),
+                )
+
+    def prepare_elastic_pp_kv_layers(
+        self,
+        *,
+        target: LayerRange,
+        generation: int,
+        total_num_layers: int,
+    ) -> frozenset[int]:
+        """Allocate target-only backing without changing the serving mapping."""
+
+        self._require_elastic_pp_kv_supported()
+        with self._elastic_pp_lock:
+            current = self._current_elastic_pp_kv_map()
+            if self._elastic_pp_residency is None:
+                self._elastic_pp_residency = ElasticKVResidency(
+                    num_layers=total_num_layers,
+                    initial_generation=0,
+                    initial_range=LayerRange(
+                        self.start_layer, self.start_layer + len(self.k_buffer)
+                    ),
+                )
+            elif self._elastic_pp_residency.num_layers != total_num_layers:
+                raise ValueError(
+                    "elastic PP model-layer count changed: "
+                    f"{self._elastic_pp_residency.num_layers} != {total_num_layers}"
+                )
+            preparation = self._elastic_pp_residency.begin_prepare(
+                generation=generation,
+                target=target,
+                resident_layer_ids=set(current),
+            )
+            if self._elastic_pp_pending_kv:
+                if set(self._elastic_pp_pending_kv) != set(preparation.new_layer_ids):
+                    raise RuntimeError("pending elastic PP KV backing is inconsistent")
+                return preparation.new_layer_ids
+
+        allocated: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        try:
+            for layer_id in sorted(preparation.new_layer_ids):
+                allocated[layer_id] = self._allocate_elastic_pp_kv_pair()
+            with self._elastic_pp_lock:
+                if self._elastic_pp_residency.pending != preparation:
+                    raise RuntimeError(
+                        "elastic PP KV preparation changed during allocation"
+                    )
+                self._elastic_pp_pending_kv = allocated
+        except BaseException:
+            with self._elastic_pp_lock:
+                if (
+                    self._elastic_pp_residency is not None
+                    and self._elastic_pp_residency.pending == preparation
+                ):
+                    self._elastic_pp_residency.abort(generation)
+                self._elastic_pp_pending_kv = {}
+            raise
+        return preparation.new_layer_ids
+
+    def get_elastic_pp_pending_kv_buffer(
+        self, *, generation: int, layer_id: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with self._elastic_pp_lock:
+            if (
+                self._elastic_pp_residency is None
+                or self._elastic_pp_residency.pending is None
+                or self._elastic_pp_residency.pending.generation != generation
+            ):
+                raise RuntimeError(
+                    f"no KV preparation exists for generation {generation}"
+                )
+            try:
+                return self._elastic_pp_pending_kv[int(layer_id)]
+            except KeyError as exc:
+                raise ValueError(f"layer {layer_id} has no pending KV backing") from exc
+
+    def export_elastic_pp_kv_slots(
+        self, *, layer_id: int, slot_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather immutable live NHD rows from the committed source mapping."""
+
+        self._require_elastic_pp_kv_supported()
+        with self._elastic_pp_lock:
+            try:
+                k_buffer, v_buffer = self._current_elastic_pp_kv_map()[int(layer_id)]
+            except KeyError as exc:
+                raise ValueError(
+                    f"cannot export nonresident KV layer {layer_id}"
+                ) from exc
+        slots = slot_ids.to(device=k_buffer.device, dtype=torch.long)
+        return k_buffer.index_select(0, slots), v_buffer.index_select(0, slots)
+
+    def import_elastic_pp_kv_slots(
+        self,
+        *,
+        generation: int,
+        layer_id: int,
+        slot_ids: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ) -> None:
+        """Scatter transferred NHD rows into unpublished target backing."""
+
+        self._require_elastic_pp_kv_supported()
+        k_buffer, v_buffer = self.get_elastic_pp_pending_kv_buffer(
+            generation=generation, layer_id=layer_id
+        )
+        slots = slot_ids.to(device=k_buffer.device, dtype=torch.long)
+        expected_k_shape = (slots.numel(), *k_buffer.shape[1:])
+        expected_v_shape = (slots.numel(), *v_buffer.shape[1:])
+        if tuple(cache_k.shape) != expected_k_shape:
+            raise ValueError(
+                f"K payload shape {tuple(cache_k.shape)} != {expected_k_shape}"
+            )
+        if tuple(cache_v.shape) != expected_v_shape:
+            raise ValueError(
+                f"V payload shape {tuple(cache_v.shape)} != {expected_v_shape}"
+            )
+        if slots.numel():
+            k_buffer.index_copy_(0, slots, cache_k.to(k_buffer.device))
+            v_buffer.index_copy_(0, slots, cache_v.to(v_buffer.device))
+
+    def mark_elastic_pp_kv_layers_loaded(
+        self, *, generation: int, layer_ids: set[int]
+    ) -> None:
+        with self._elastic_pp_lock:
+            if self._elastic_pp_residency is None:
+                raise RuntimeError("elastic PP KV residency is not initialized")
+            self._elastic_pp_residency.mark_loaded(generation, layer_ids)
+
+    def elastic_pp_kv_ready(self, *, generation: int) -> bool:
+        with self._elastic_pp_lock:
+            if self._elastic_pp_residency is None:
+                raise RuntimeError("elastic PP KV residency is not initialized")
+            return self._elastic_pp_residency.ready_to_commit(generation)
+
+    def _build_elastic_pp_pointer_tables(
+        self,
+        k_buffer: list[torch.Tensor],
+        v_buffer: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        k_data_ptrs = torch.tensor(
+            [item.data_ptr() for item in k_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        v_data_ptrs = torch.tensor(
+            [item.data_ptr() for item in v_buffer],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        all_buffers = [*k_buffer, *v_buffer]
+        data_ptrs = torch.tensor(
+            [item.data_ptr() for item in all_buffers],
+            dtype=torch.uint64,
+            device=self.device,
+        )
+        data_strides = torch.tensor(
+            [np.prod(item.shape[1:]) * item.dtype.itemsize for item in all_buffers],
+            dtype=torch.int64,
+            device=self.device,
+        )
+        return k_data_ptrs, v_data_ptrs, data_ptrs, data_strides
+
+    def commit_elastic_pp_kv_layers(self, *, generation: int) -> LayerRange:
+        """Publish the prepared buffer list at a drained scheduler fence."""
+
+        self._require_elastic_pp_kv_supported()
+        with self._elastic_pp_lock:
+            if self._elastic_pp_residency is None:
+                raise RuntimeError("elastic PP KV residency is not initialized")
+            pending = self._elastic_pp_residency.pending
+            if pending is None or pending.generation != generation:
+                raise RuntimeError(
+                    f"no KV preparation exists for generation {generation}"
+                )
+            if not self._elastic_pp_residency.ready_to_commit(generation):
+                raise RuntimeError(f"KV generation {generation} is not ready to commit")
+
+            current = self._current_elastic_pp_kv_map()
+            prepared = {**current, **self._elastic_pp_pending_kv}
+            target_ids = range(pending.target.start, pending.target.end)
+            missing = set(target_ids) - set(prepared)
+            if missing:
+                raise RuntimeError(
+                    f"prepared KV mapping is missing layers: {sorted(missing)}"
+                )
+            target_ids = range(pending.target.start, pending.target.end)
+            new_k = [prepared[layer_id][0] for layer_id in target_ids]
+            target_ids = range(pending.target.start, pending.target.end)
+            new_v = [prepared[layer_id][1] for layer_id in target_ids]
+            pointer_tables = self._build_elastic_pp_pointer_tables(new_k, new_v)
+            new_descs = self._build_kv_buffer_descs_for(
+                new_k, new_v, layer_num=len(new_k)
+            )
+            target = self._elastic_pp_residency.commit(generation)
+            target_set = set(range(target.start, target.end))
+            self._elastic_pp_retired_kv = {
+                layer_id: buffers
+                for layer_id, buffers in current.items()
+                if layer_id not in target_set
+            }
+            self.k_buffer = new_k
+            self.v_buffer = new_v
+            self.start_layer = target.start
+            self.end_layer = target.end
+            self.layer_num = target.size
+            (
+                self.k_data_ptrs,
+                self.v_data_ptrs,
+                self.data_ptrs,
+                self.data_strides,
+            ) = pointer_tables
+            self._kv_buffer_descs = new_descs
+            self._elastic_pp_pending_kv = {}
+            self.layer_transfer_counter = None
+            self._kv_copy_config = None
+            k_bytes, v_bytes = self.get_kv_size_bytes()
+            self.mem_usage = (k_bytes + v_bytes) / GB
+            return target
+
+    def abort_elastic_pp_kv_layers(
+        self, *, generation: int
+    ) -> tuple[torch.Tensor, ...]:
+        with self._elastic_pp_lock:
+            if self._elastic_pp_residency is None:
+                raise RuntimeError("elastic PP KV residency is not initialized")
+            new_layer_ids = self._elastic_pp_residency.abort(generation)
+            released = tuple(
+                tensor
+                for layer_id in sorted(new_layer_ids)
+                for tensor in self._elastic_pp_pending_kv[layer_id]
+            )
+            self._elastic_pp_pending_kv = {}
+            return released
+
+    def cleanup_elastic_pp_kv_layers(
+        self, *, generation: int
+    ) -> tuple[torch.Tensor, ...]:
+        """Detach retired tensors after their final CUDA/NCCL event completes."""
+
+        with self._elastic_pp_lock:
+            if self._elastic_pp_residency is None:
+                raise RuntimeError("elastic PP KV residency is not initialized")
+            cleanup_ids = self._elastic_pp_residency.cleanup_candidates(
+                generation, set(self._elastic_pp_retired_kv)
+            )
+            released = tuple(
+                tensor
+                for layer_id in sorted(cleanup_ids)
+                for tensor in self._elastic_pp_retired_kv[layer_id]
+            )
+            self._elastic_pp_residency.finish_cleanup(generation, set(cleanup_ids))
+            self._elastic_pp_retired_kv = {}
+            return released
+
     def _init_kv_copy_and_warmup(self):
         # Zero-layer pool (e.g. all-SWA model's full sub-pool) has no buffers.
         if self.layer_num == 0:
@@ -2114,7 +2435,13 @@ class MHATokenToKVPool(KVCache):
 
     # -- post-capture VA backing (opt-in; overridable per layout) --------------
 
-    def _build_kv_buffer_descs(self):
+    def _build_kv_buffer_descs_for(
+        self,
+        k_buffer: list[torch.Tensor],
+        v_buffer: list[torch.Tensor],
+        *,
+        layer_num: int,
+    ):
         """Per-buffer layout descriptors, k0..k(L-1) then v0..v(L-1). Drives both the
         CUDA-VMM post-capture backing and PD-transfer registration
         (get_contiguous_buf_infos). Override per layout."""
@@ -2122,9 +2449,9 @@ class MHATokenToKVPool(KVCache):
         # Derive from the real buffers when they exist (covers arbitrary layouts,
         # e.g. vectorized_5d); fall back to _kv_buffer_shapes for the pre-allocation
         # post-capture call, which only runs for NHD/HND.
-        if self.k_buffer and self.v_buffer:
-            k_shape = tuple(self.k_buffer[0].shape)
-            v_shape = tuple(self.v_buffer[0].shape)
+        if k_buffer and v_buffer:
+            k_shape = tuple(k_buffer[0].shape)
+            v_shape = tuple(v_buffer[0].shape)
         else:
             k_shape, v_shape = self._kv_buffer_shapes()
         # A row is a whole page when the leading dim is pages (hnd, vectorized_5d),
@@ -2136,7 +2463,7 @@ class MHATokenToKVPool(KVCache):
         descs = []
         for prefix, shape in (("k", k_shape), ("v", v_shape)):
             row_bytes = int(np.prod(shape[1:])) * itemsize
-            for layer in range(self.layer_num):
+            for layer in range(layer_num):
                 descs.append(
                     KvBufferDesc(
                         f"{prefix}{layer}",
@@ -2146,6 +2473,11 @@ class MHATokenToKVPool(KVCache):
                     )
                 )
         return descs
+
+    def _build_kv_buffer_descs(self):
+        return self._build_kv_buffer_descs_for(
+            self.k_buffer, self.v_buffer, layer_num=self.layer_num
+        )
 
     def _assign_post_capture_tensors(self, tensors):
         """Map owner tensors (in ``_build_kv_buffer_descs`` order) to k/v_buffer."""

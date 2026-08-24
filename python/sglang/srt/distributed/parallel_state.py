@@ -1797,6 +1797,104 @@ class GroupCoordinator:
                 tensor_dict[key] = value
         return tensor_dict
 
+    def recv_tensor_dict_into(
+        self,
+        destination_tensors: Dict[str, torch.Tensor],
+        src: Optional[int] = None,
+        metadata_validator: Optional[Callable[[List[Tuple[str, Any]]], None]] = None,
+    ) -> Dict[str, Union[torch.Tensor, Any]]:
+        """Receive a tensor dictionary directly into caller-owned buffers.
+
+        ``recv_tensor_dict`` allocates one temporary tensor for every received
+        value.  That is convenient for ordinary messages, but it can nearly
+        double peak GPU memory while elastic PP moves model layers.  This
+        variant validates the remote metadata first and then posts the receives
+        directly into already-materialized parameter or cache buffers.
+
+        The destination keys must exactly match the tensor keys advertised by
+        the sender.  Non-tensor values (for example a generation-stamped
+        manifest) are returned alongside the destination tensors.
+        """
+
+        if not torch.distributed.is_initialized() or self.world_size == 1:
+            raise RuntimeError("direct P2P receive requires a distributed group")
+
+        if src is None:
+            src = (self.rank_in_group - 1) % self.world_size
+        assert src < self.world_size, f"Invalid src rank ({src})"
+
+        metadata_list = self.recv_object(src=src)
+        if not isinstance(metadata_list, list):
+            raise ValueError("tensor dictionary metadata must be a list")
+        if metadata_validator is not None:
+            metadata_validator(metadata_list)
+
+        tensor_metadata: Dict[str, TensorMetadata] = {}
+        result: Dict[str, Union[torch.Tensor, Any]] = {}
+        for item in metadata_list:
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                raise ValueError(f"invalid tensor dictionary metadata item: {item!r}")
+            key, value = item
+            if not isinstance(key, str):
+                raise ValueError(f"tensor dictionary key must be a string: {key!r}")
+            if key in result or key in tensor_metadata:
+                raise ValueError(f"duplicate tensor dictionary key: {key!r}")
+            if isinstance(value, TensorMetadata):
+                tensor_metadata[key] = value
+            else:
+                result[key] = value
+
+        expected_keys = set(tensor_metadata)
+        destination_keys = set(destination_tensors)
+        if expected_keys != destination_keys:
+            raise ValueError(
+                "direct receive destination keys do not match sender metadata: "
+                f"missing={sorted(expected_keys - destination_keys)}, "
+                f"unexpected={sorted(destination_keys - expected_keys)}"
+            )
+
+        # Validate every buffer before posting any receive.  A partial write is
+        # never exposed as a prepared elastic generation.
+        for key, metadata in tensor_metadata.items():
+            tensor = destination_tensors[key]
+            if tensor.dtype != metadata.dtype:
+                raise ValueError(
+                    f"direct receive dtype mismatch for {key!r}: "
+                    f"destination={tensor.dtype}, sender={metadata.dtype}"
+                )
+            if tensor.size() != metadata.size:
+                raise ValueError(
+                    f"direct receive shape mismatch for {key!r}: "
+                    f"destination={tuple(tensor.size())}, "
+                    f"sender={tuple(metadata.size)}"
+                )
+            if tensor.device.type != metadata.device:
+                raise ValueError(
+                    f"direct receive device mismatch for {key!r}: "
+                    f"destination={tensor.device.type}, sender={metadata.device}"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(
+                    f"direct receive destination {key!r} must be contiguous"
+                )
+
+        pending: List[Tuple[str, torch.Tensor, torch.distributed.Work]] = []
+        for key, metadata in tensor_metadata.items():
+            tensor = destination_tensors[key]
+            if tensor.numel() == 0:
+                result[key] = tensor
+                continue
+            comm_group = self.cpu_group if tensor.is_cpu else self.device_group
+            work = torch.distributed.irecv(
+                tensor, src=self.ranks[src], group=comm_group
+            )
+            pending.append((key, tensor, work))
+
+        for key, tensor, work in pending:
+            work.wait()
+            result[key] = tensor
+        return result
+
     def barrier(self):
         """Barrier synchronization among the group.
         NOTE: don't use `device_group` here! `barrier` in NCCL is
