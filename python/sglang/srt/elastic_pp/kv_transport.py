@@ -252,7 +252,26 @@ class ElasticPPKVTransport:
         slots = self.allocator.begin_elastic_pp_slot_tracking(
             generation=transition.target.generation
         )
-        self.prepare_target(transition)
+        try:
+            self.prepare_target(transition)
+        except BaseException:
+            # The coordinator cannot set its prepared/tracking flags until this
+            # method returns. Roll back locally so a failure after backing
+            # allocation (for example a KVCacheD VMM map failure) cannot leak a
+            # pending generation or leave slot-delta tracking active.
+            try:
+                self.model_runner.abort_elastic_pp_kv_layers(
+                    generation=transition.target.generation
+                )
+            except BaseException:
+                pass
+            try:
+                self.allocator.finish_elastic_pp_slot_tracking(
+                    generation=transition.target.generation
+                )
+            except BaseException:
+                pass
+            raise
         return slots
 
     def prepare_target(self, transition: DynamicPPTransition) -> frozenset[int]:

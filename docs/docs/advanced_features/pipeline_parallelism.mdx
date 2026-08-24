@@ -19,6 +19,82 @@ The key mechanisms of the implementation include:
 * **Decoupled Sync/Async Logic in the Event Loop:** The scheduler uses `async_send` in `_pp_send_pyobj_to_next_stage`. Instead of waiting for a transfer to complete, it returns a `P2PWork` handle. The actual synchronization (`P2PWork.work.wait()`) is deferred until `_pp_commit_comm_work` is called, allowing the CPU to perform other work—like scheduling the next batch or processing metadata—while data is in flight.
 * **Multi-Stream Execution:** In addition to the main `default_stream`, which serves as the synchronization stream, SGLang utilizes dedicated `forward_stream` and `copy_stream` to execute forward pass GPU computation and Data-to-Host (D2H) memory transfers separately for better overlapping. While `_pp_launch_batch` is executing the current micro-batch on the GPU for the current stage, the CPU processes the previous micro-batch's results using `_pp_process_batch_result`.
 
+## Experimental Elastic PP Reconfiguration
+
+Elastic PP changes the layer partition inside an already resident PP group. It
+does not start Ray actors or replace the PP process group. Model weights and
+live KV rows move over dedicated P2P groups while the existing dynamic PP
+communicator continues to route serving batches over the committed topology.
+
+Enable it at startup with one initial layer count per resident rank:
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path <MODEL> \
+  --tp-size 1 --pp-size 4 \
+  --enable-elastic-pp \
+  --elastic-pp-initial-partition 8,8,8,8 \
+  --elastic-pp-kv-backend native
+```
+
+Start a transaction through the admin endpoint. The generation may be omitted;
+when supplied, it must be exactly the current generation plus one.
+
+```bash Command
+curl -X POST http://127.0.0.1:30000/reconfigure_elastic_pp \
+  -H 'Content-Type: application/json' \
+  -d '{"layer_counts":[6,10,8,8],"generation":1}'
+```
+
+The target counts must contain one entry per resident rank and sum to the model
+layer count. Physical first and last ranks must remain non-empty. Preparation
+copies weights and the initial live-KV snapshot while serving continues. The
+scheduler then drains to a common microstep, transfers only changed KV slots,
+commits the new layer/KV views, and reclaims retired backing after its final
+CUDA/NCCL event. The response reports `prepare_seconds`, `fence_seconds`, and
+`total_seconds`; the short `fence_seconds` interval is the request-visible
+migration pause.
+
+`--elastic-pp-kv-backend native` allocates ordinary tensors for incoming
+layers. `--elastic-pp-kv-backend kvcached` instead reserves one stable global
+virtual address space and lazily maps physical pages for the layer groups owned
+by each PP rank. The latter requires an autoscaling-capable KVCacheD build with
+the layer-stacking migration APIs; the upstream compatibility path preserves
+correctness but cannot reclaim physical KV pages per layer owner.
+
+For ownership-aware KVCacheD, configure the backing before Python imports the
+package:
+
+```bash Command
+export KVCACHED_AUTOPATCH=0
+export KVCACHED_LAYER_STACKING=true
+export KVCACHED_CONTIGUOUS_LAYOUT=false
+export KVCACHED_PAGE_PREALLOC_ENABLED=false
+export KVCACHED_PAGE_SIZE_MB=2
+# Legacy name: this is the effective per-layer stacked block, not the CUDA page.
+export KVCACHED_PHYSICAL_BLOCK_SIZE_KB=1024
+
+python -m sglang.launch_server \
+  --model-path <MODEL> \
+  --tp-size 1 --pp-size 4 \
+  --enable-elastic-pp \
+  --elastic-pp-initial-partition 8,8,8,8 \
+  --elastic-pp-kv-backend kvcached
+```
+
+The physical page size must be divisible by the effective stacked block size.
+Their ratio is the layer-group granularity, so every initial and target PP
+boundary must align to that granularity. The current ownership-aware path also
+requires SGLang page size 1, standard unquantized NHD MHA, colocated serving,
+TP size 1, and no speculative or hybrid KV layout. These restrictions are
+validated at startup rather than silently falling back.
+
+The low-level CUDA VMM lifecycle can be checked without loading a model:
+
+```bash Command
+python test/manual/elastic_pp/test_kvcached_physical_smoke.py
+```
+
 ## Guidance about Dynamic Chunking
 
 ### Why Dynamic Chunking

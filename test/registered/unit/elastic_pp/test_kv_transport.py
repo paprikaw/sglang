@@ -41,9 +41,11 @@ class _Allocator:
     def __init__(self, slots):
         self.slots = slots
         self.finished = False
+        self.tracking = False
 
     def begin_elastic_pp_slot_tracking(self, generation):
         del generation
+        self.tracking = True
         return self.slots
 
     def elastic_pp_delta_slots(self, generation):
@@ -53,16 +55,24 @@ class _Allocator:
     def finish_elastic_pp_slot_tracking(self, generation):
         del generation
         self.finished = True
+        self.tracking = False
 
 
 class _Runner:
-    def __init__(self, pool):
+    def __init__(self, pool, *, fail_after_prepare=False):
         self.token_to_kv_pool = pool
+        self.fail_after_prepare = fail_after_prepare
 
     def prepare_elastic_pp_kv_layers(self, target, generation):
-        return self.token_to_kv_pool.prepare_elastic_pp_kv_layers(
+        prepared = self.token_to_kv_pool.prepare_elastic_pp_kv_layers(
             target=target, generation=generation, total_num_layers=4
         )
+        if self.fail_after_prepare:
+            raise RuntimeError("injected failure after KV preparation")
+        return prepared
+
+    def abort_elastic_pp_kv_layers(self, generation):
+        return self.token_to_kv_pool.abort_elastic_pp_kv_layers(generation=generation)
 
 
 def _make_pool(*, start_layer, layer_num):
@@ -204,3 +214,26 @@ def test_global_exchange_order_moves_a_boundary_with_bounded_chunks():
     assert torch.equal(
         target_pool.get_value_buffer(1)[slots], source_pool.v_buffer[1][slots]
     )
+
+
+def test_prepare_transition_rolls_back_before_coordinator_flags_exist():
+    transition = DynamicPPTransition.build(
+        PPTopology.from_layer_counts([2, 2], generation=0),
+        PPTopology.from_layer_counts([1, 3], generation=1),
+    )
+    pool = _make_pool(start_layer=2, layer_num=2)
+    allocator = _Allocator(torch.tensor([1, 3], dtype=torch.long))
+    transport = ElasticPPKVTransport(
+        group=_Group(_Mailbox(), 1),
+        model_runner=_Runner(pool, fail_after_prepare=True),
+        allocator=allocator,
+        rank=1,
+    )
+
+    with pytest.raises(RuntimeError, match="injected failure"):
+        transport.prepare_transition(transition)
+
+    assert allocator.finished
+    assert not allocator.tracking
+    assert pool._elastic_pp_pending_kv == {}
+    assert pool._elastic_pp_residency.pending is None

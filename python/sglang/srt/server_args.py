@@ -1081,6 +1081,18 @@ class ServerArgs:
         "Comma-separated initial layer counts for every resident elastic PP rank.",
         NS("parallel"),
     ] = None
+    elastic_pp_kv_backend: A[
+        str,
+        Arg(
+            help=(
+                "KV-cache backend used by elastic PP. 'native' allocates one "
+                "ordinary tensor per currently resident layer; 'kvcached' "
+                "uses KVCacheD global virtual backing and lazy token pages."
+            ),
+            choices=["native", "kvcached"],
+        ),
+        NS("parallel"),
+    ] = "native"
     dp_size: A[
         int,
         Arg(
@@ -7753,6 +7765,8 @@ class ServerArgs:
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
 
         if not self.enable_elastic_pp:
+            if self.elastic_pp_kv_backend != "native":
+                raise ValueError("--elastic-pp-kv-backend requires --enable-elastic-pp")
             return
         if self.pp_size <= 1:
             raise ValueError("--enable-elastic-pp requires --pp-size greater than 1")
@@ -7765,6 +7779,14 @@ class ServerArgs:
             raise ValueError(
                 "elastic PP currently requires colocated serving; the separate "
                 "prefill/decode PP drain loops are not yet wired to the topology fence"
+            )
+        if self.elastic_pp_kv_backend == "kvcached" and os.getenv(
+            "KVCACHED_AUTOPATCH", ""
+        ).lower() in {"1", "true", "yes", "on"}:
+            raise ValueError(
+                "elastic PP uses SGLang's explicit KVCacheD backend; unset "
+                "KVCACHED_AUTOPATCH to avoid replacing the transactional pool "
+                "and allocator classes"
             )
 
         raw_partition = self.elastic_pp_initial_partition or os.getenv(

@@ -968,6 +968,36 @@ class KVCacheConfigurator:
         mha_pool_class = (
             PageMajorMHATokenToKVPool if enable_page_major else MHATokenToKVPool
         )
+        if get_parallel().elastic_pp_kv_backend == "kvcached":
+            unsupported = []
+            if not get_parallel().enable_elastic_pp:
+                unsupported.append("elastic PP is disabled")
+            if enable_page_major:
+                unsupported.append("page-major KV layout")
+            if self.use_mla_backend:
+                unsupported.append("MLA")
+            if self.is_hybrid_swa:
+                unsupported.append("hybrid SWA")
+            if self.mambaish_config:
+                unsupported.append("hybrid linear/Mamba")
+            if is_dsa_model or is_dsv4_model:
+                unsupported.append("DSA/DSV4")
+            if not self.spec_algorithm.is_none():
+                unsupported.append("speculative decoding")
+            if self.kv_cache_dtype_str in {"mxfp8", "nvfp4", "fp4_mx_block16"}:
+                unsupported.append(f"KV dtype {self.kv_cache_dtype_str}")
+            if envs.SGLANG_USE_HND_KVCACHE.get():
+                unsupported.append("HND KV layout")
+            if unsupported:
+                raise NotImplementedError(
+                    "elastic PP KVCacheD currently supports plain, unquantized "
+                    f"MHA serving only; unsupported={unsupported}"
+                )
+            from sglang.srt.mem_cache.kvcached_pool import (
+                KVCacheDMHATokenToKVPool,
+            )
+
+            mha_pool_class = KVCacheDMHATokenToKVPool
 
         if is_dsv4_model:
             token_to_kv_pool = self._build_dsv4_kv_pool(
@@ -1646,6 +1676,8 @@ class KVCacheConfigurator:
             pool_kwargs["quant_method"] = quant_method
         else:
             pool_kwargs["post_capture_active"] = self.post_capture_kv_active
+        if getattr(pool_cls, "is_kvcached_elastic_pool", False):
+            pool_kwargs["total_num_layers"] = self.model_config.num_hidden_layers
         token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -1678,7 +1710,31 @@ class KVCacheConfigurator:
         # Initialize token_to_kv_pool_allocator
         need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
-            if current_platform.is_out_of_tree():
+            if getattr(token_to_kv_pool, "is_kvcached_elastic_pool", False):
+                from sglang.srt.mem_cache.kvcached_pool import (
+                    KVCacheDPagedTokenToKVPoolAllocator,
+                    KVCacheDTokenToKVPoolAllocator,
+                )
+
+                if get_schedule().page_size == 1:
+                    token_to_kv_pool_allocator = KVCacheDTokenToKVPoolAllocator(
+                        sizes.max_total_num_tokens,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+                else:
+                    token_to_kv_pool_allocator = KVCacheDPagedTokenToKVPoolAllocator(
+                        sizes.max_total_num_tokens * get_parallel().attn_dcp_size,
+                        page_size=get_schedule().page_size
+                        * get_parallel().attn_dcp_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=token_to_kv_pool,
+                        need_sort=need_sort,
+                    )
+            elif current_platform.is_out_of_tree():
                 AllocatorCls = current_platform.get_paged_allocator_cls()
                 token_to_kv_pool_allocator = AllocatorCls(
                     sizes.max_total_num_tokens,

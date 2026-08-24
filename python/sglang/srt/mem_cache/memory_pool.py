@@ -1934,7 +1934,7 @@ class MHATokenToKVPool(KVCache):
         }
 
     def _allocate_elastic_pp_kv_pair(
-        self,
+        self, *, layer_id: Optional[int] = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         k_shape, v_shape = self._kv_buffer_shapes()
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -1986,7 +1986,9 @@ class MHATokenToKVPool(KVCache):
         allocated: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         try:
             for layer_id in sorted(preparation.new_layer_ids):
-                allocated[layer_id] = self._allocate_elastic_pp_kv_pair()
+                allocated[layer_id] = self._allocate_elastic_pp_kv_pair(
+                    layer_id=layer_id
+                )
             with self._elastic_pp_lock:
                 if self._elastic_pp_residency.pending != preparation:
                     raise RuntimeError(
