@@ -183,21 +183,16 @@ def test_prepare_peer_failure_aborts_without_changing_source_generation():
     assert kv_transport.finished
 
 
-def test_delta_snapshot_mismatch_fails_before_commit_and_keeps_source():
-    group = _Group(mismatch_stage="fence_slots")
+def test_rank_skewed_bulk_and_delta_snapshots_are_allowed():
+    group = _Group(mismatch_stage="prepare_allocations")
     coordinator, transition, runner, _ = _coordinator(group)
     coordinator.begin(transition)
     coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    group.mismatch_stage = "fence_slots"
 
-    try:
-        coordinator.finalize_at_fence(lambda topology: None)
-    except RuntimeError as exc:
-        assert "rank snapshots differ" in str(exc)
-    else:
-        raise AssertionError("delta snapshot mismatch unexpectedly committed")
-    assert coordinator.phase == ElasticPPMigrationPhase.FAILED
-    assert coordinator.snapshot().source_usable
-    assert not runner.committed
+    assert coordinator.finalize_at_fence(lambda topology: None) == transition.target
+    assert coordinator.phase == ElasticPPMigrationPhase.COMMITTED
+    assert runner.committed
 
 
 def test_peer_commit_failure_is_reported_as_nonrecoverable_partial_commit():

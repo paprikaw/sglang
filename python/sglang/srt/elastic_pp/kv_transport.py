@@ -347,39 +347,11 @@ class ElasticPPKVTransport:
         transition: DynamicPPTransition,
         *,
         phase: KVTransferPhase,
-        expected_slot_ids: torch.Tensor,
     ) -> frozenset[int]:
-        chunks = _slot_chunks(expected_slot_ids, self.slot_chunk_size)
         loaded: set[int] = set()
         with self._stream_context(self._receive_stream):
             for transfer in self.inbound_transfers(transition):
-                for chunk_index, expected_chunk in enumerate(chunks):
-                    payload = self.group.recv_tensor_dict(src=transfer.src_rank)
-                    if not isinstance(payload, dict):
-                        raise RuntimeError(
-                            f"did not receive KV rows from rank {transfer.src_rank}"
-                        )
-                    slot_ids, layer_kv = unflatten_kv_chunk(
-                        payload,
-                        generation=transition.target.generation,
-                        transfer=transfer,
-                        phase=phase,
-                        chunk_index=chunk_index,
-                        total_chunks=len(chunks),
-                    )
-                    if not torch.equal(slot_ids.cpu(), expected_chunk.cpu()):
-                        raise ValueError(
-                            "elastic PP KV source/destination live-slot snapshots differ"
-                        )
-                    for layer_id, (cache_k, cache_v) in layer_kv.items():
-                        self.pool.import_elastic_pp_kv_slots(
-                            generation=transition.target.generation,
-                            layer_id=layer_id,
-                            slot_ids=slot_ids,
-                            cache_k=cache_k,
-                            cache_v=cache_v,
-                        )
-                        loaded.add(layer_id)
+                loaded.update(self._receive_transfer(transition, transfer, phase))
             ready_event = self._record_ready_event(self._receive_stream)
         if ready_event is not None:
             # This is a migration-thread wait, not a serving-stream sync.  The
@@ -390,6 +362,95 @@ class ElasticPPKVTransport:
                 generation=transition.target.generation,
                 layer_ids=loaded,
             )
+        return frozenset(loaded)
+
+    @staticmethod
+    def _manifest_total_chunks(
+        payload: dict[str, Any],
+        *,
+        transition: DynamicPPTransition,
+        transfer: LayerTransfer,
+        phase: KVTransferPhase,
+    ) -> int:
+        manifest = payload.get(_MANIFEST_KEY)
+        if not isinstance(manifest, dict):
+            raise ValueError("elastic PP KV payload has no manifest")
+        expected = {
+            "generation": transition.target.generation,
+            "src_rank": transfer.src_rank,
+            "dst_rank": transfer.dst_rank,
+            "start_layer": transfer.layer_range.start,
+            "end_layer": transfer.layer_range.end,
+            "phase": phase,
+            "chunk_index": 0,
+        }
+        for field, value in expected.items():
+            if manifest.get(field) != value:
+                raise ValueError(
+                    "elastic PP KV first-chunk manifest mismatch: "
+                    f"{field}={manifest.get(field)!r}, expected={value!r}"
+                )
+        total_chunks = manifest.get("total_chunks")
+        if not isinstance(total_chunks, int) or isinstance(total_chunks, bool):
+            raise ValueError(f"elastic PP KV total_chunks is invalid: {total_chunks!r}")
+        if total_chunks <= 0:
+            raise ValueError(
+                f"elastic PP KV total_chunks must be positive: {total_chunks}"
+            )
+        return total_chunks
+
+    def _receive_transfer(
+        self,
+        transition: DynamicPPTransition,
+        transfer: LayerTransfer,
+        phase: KVTransferPhase,
+    ) -> frozenset[int]:
+        """Receive one source-authored sparse slot stream.
+
+        PP stages can be at different points in the in-flight wave while the
+        background snapshot starts.  The source rank that owns the migrating
+        layers is therefore authoritative for both the slot ids and the chunk
+        count; the destination allocator's instantaneous live set is not an
+        equality invariant.
+        """
+
+        first_payload = self.group.recv_tensor_dict(src=transfer.src_rank)
+        if not isinstance(first_payload, dict):
+            raise RuntimeError(f"did not receive KV rows from rank {transfer.src_rank}")
+        total_chunks = self._manifest_total_chunks(
+            first_payload,
+            transition=transition,
+            transfer=transfer,
+            phase=phase,
+        )
+        loaded: set[int] = set()
+        for chunk_index in range(total_chunks):
+            payload = (
+                first_payload
+                if chunk_index == 0
+                else self.group.recv_tensor_dict(src=transfer.src_rank)
+            )
+            if not isinstance(payload, dict):
+                raise RuntimeError(
+                    f"did not receive KV rows from rank {transfer.src_rank}"
+                )
+            slot_ids, layer_kv = unflatten_kv_chunk(
+                payload,
+                generation=transition.target.generation,
+                transfer=transfer,
+                phase=phase,
+                chunk_index=chunk_index,
+                total_chunks=total_chunks,
+            )
+            for layer_id, (cache_k, cache_v) in layer_kv.items():
+                self.pool.import_elastic_pp_kv_slots(
+                    generation=transition.target.generation,
+                    layer_id=layer_id,
+                    slot_ids=slot_ids,
+                    cache_k=cache_k,
+                    cache_v=cache_v,
+                )
+                loaded.add(layer_id)
         return frozenset(loaded)
 
     def exchange_phase(
@@ -409,7 +470,6 @@ class ElasticPPKVTransport:
         impossible without rebuilding the serving communicator.
         """
 
-        chunks = _slot_chunks(slot_ids, self.slot_chunk_size)
         transfers = tuple(sorted(transition.kv_transfers, key=self._sort_key))
         loaded: set[int] = set()
         for transfer in transfers:
@@ -420,11 +480,15 @@ class ElasticPPKVTransport:
             else:
                 continue
             with self._stream_context(stream):
-                for chunk_index, expected_chunk in enumerate(chunks):
-                    if transfer.src_rank == self.rank:
+                if transfer.src_rank == self.rank:
+                    # The migrating layer owner defines the sparse KV rows for
+                    # this edge.  Receiver-local live slots may legitimately
+                    # differ while PP microbatches are still in flight.
+                    chunks = _slot_chunks(slot_ids, self.slot_chunk_size)
+                    for chunk_index, source_chunk in enumerate(chunks):
                         layer_kv = {
                             layer_id: self.pool.export_elastic_pp_kv_slots(
-                                layer_id=layer_id, slot_ids=expected_chunk
+                                layer_id=layer_id, slot_ids=source_chunk
                             )
                             for layer_id in range(
                                 transfer.layer_range.start,
@@ -437,7 +501,7 @@ class ElasticPPKVTransport:
                             phase=phase,
                             chunk_index=chunk_index,
                             total_chunks=len(chunks),
-                            slot_ids=expected_chunk,
+                            slot_ids=source_chunk,
                             layer_kv=layer_kv,
                         )
                         works = self.group.send_tensor_dict(
@@ -446,35 +510,8 @@ class ElasticPPKVTransport:
                             async_send=True,
                         )
                         ElasticPPLayerTransport.wait(works or ())
-                    elif transfer.dst_rank == self.rank:
-                        payload = self.group.recv_tensor_dict(src=transfer.src_rank)
-                        if not isinstance(payload, dict):
-                            raise RuntimeError(
-                                "did not receive KV rows from rank "
-                                f"{transfer.src_rank}"
-                            )
-                        received_slots, layer_kv = unflatten_kv_chunk(
-                            payload,
-                            generation=transition.target.generation,
-                            transfer=transfer,
-                            phase=phase,
-                            chunk_index=chunk_index,
-                            total_chunks=len(chunks),
-                        )
-                        if not torch.equal(received_slots.cpu(), expected_chunk.cpu()):
-                            raise ValueError(
-                                "elastic PP KV source/destination live-slot "
-                                "snapshots differ"
-                            )
-                        for layer_id, (cache_k, cache_v) in layer_kv.items():
-                            self.pool.import_elastic_pp_kv_slots(
-                                generation=transition.target.generation,
-                                layer_id=layer_id,
-                                slot_ids=received_slots,
-                                cache_k=cache_k,
-                                cache_v=cache_v,
-                            )
-                            loaded.add(layer_id)
+                else:
+                    loaded.update(self._receive_transfer(transition, transfer, phase))
                 ready_event = self._record_ready_event(stream)
             if ready_event is not None:
                 ready_event.synchronize()

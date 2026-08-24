@@ -237,12 +237,6 @@ class ElasticPPMigrationCoordinator:
                 f"elastic PP {stage} failed on resident ranks: " + " | ".join(messages)
             )
 
-    @staticmethod
-    def _require_matching_details(stage: str, reports: list[dict[str, Any]]) -> None:
-        details = [report.get("details") for report in reports]
-        if any(item != details[0] for item in details[1:]):
-            raise RuntimeError(f"elastic PP {stage} rank snapshots differ: {details!r}")
-
     def _prepare_worker(self) -> None:
         transition = self._require_transition()
         try:
@@ -265,7 +259,9 @@ class ElasticPPMigrationCoordinator:
                 details=slot_signature,
             )
             self._raise_peer_failures("prepare allocations", reports)
-            self._require_matching_details("bulk slot", reports)
+            # In-flight PP stages can observe different allocator states at
+            # the background-copy boundary.  Each layer-transfer source owns
+            # the authoritative sparse slot stream for that edge.
 
             local_error = None
             works = ()
@@ -358,7 +354,7 @@ class ElasticPPMigrationCoordinator:
                 success=True,
                 details=self._slot_signature(delta_slots),
             )
-            self._require_matching_details("delta slot", reports)
+            self._raise_peer_failures("fence slots", reports)
 
             local_error = None
             try:
