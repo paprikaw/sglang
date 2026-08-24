@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import threading
+import time
 from typing import Any, Iterable, Optional
 
 import torch
@@ -609,6 +610,77 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
         # until staged KV rows are applied by the scheduler at its drained PP
         # fence; otherwise a background map can wait on an in-flight NCCL recv.
         return prepared
+
+    def prepare_elastic_pp_kv_fence(self, *, generation: int) -> None:
+        """Refresh on-demand VMM ownership before importing target KV rows.
+
+        A KVCacheD physical page can remain mapped in its reserve pool after
+        all logical rows on that page are freed.  If this rank later acquires a
+        layer group, such a reserved page can be reused without invoking the
+        normal map callback, leaving the new layer group unmapped.  Flush those
+        stale reserves at the drained fence, then explicitly extend every
+        currently in-use page to the gained groups.  Future free pages pass
+        through the normal callback after commit and observe the new active
+        range through ``_filter_worker_offsets``.
+        """
+
+        if not self.physical_layer_partitioned:
+            return
+        with self._elastic_pp_lock:
+            residency = self._elastic_pp_residency
+            pending = None if residency is None else residency.pending
+            if pending is None or pending.generation != generation:
+                raise RuntimeError(
+                    f"no KV preparation exists for generation {generation}"
+                )
+            current = LayerRange(self.start_layer, self.end_layer)
+            gained_groups = self._active_layer_groups(
+                pending.target
+            ) - self._active_layer_groups(current)
+        if not gained_groups:
+            return
+
+        manager = self.kvcached_allocator
+        snapshot_inuse = getattr(manager, "snapshot_inuse_page_ids", None)
+        if snapshot_inuse is None:
+            raise RuntimeError(
+                "KVCacheD elastic ownership refresh requires snapshot_inuse_page_ids"
+            )
+        reserved_before = int(manager.page_allocator.get_num_reserved_pages())
+        started = time.monotonic()
+        manager.trim()
+        reserved_after = int(manager.page_allocator.get_num_reserved_pages())
+        if reserved_after:
+            raise RuntimeError(
+                "KVCacheD could not flush stale reserved pages before elastic "
+                f"ownership expansion: remaining={reserved_after}"
+            )
+        page_ids = [int(page_id) for page_id in snapshot_inuse()]
+        group_span = self._layer_group_total_span()
+        map_size = int(manager.physical_group_page_size)
+        offsets = [
+            group * group_span + page_id * map_size
+            for group in sorted(gained_groups)
+            for page_id in page_ids
+        ]
+        if offsets:
+            from kvcached.tp_ipc_util import map_worker_offsets_for_migration
+
+            if not map_worker_offsets_for_migration(offsets, group_id=self._group_id):
+                raise RuntimeError(
+                    "KVCacheD failed to refresh gained elastic PP layer groups: "
+                    f"groups={sorted(gained_groups)}, pages={page_ids}"
+                )
+        logger.info(
+            "Elastic PP KVCacheD ownership refresh generation=%d "
+            "gained_groups=%s inuse_pages=%d trimmed_reserved_pages=%d "
+            "time=%.3fs",
+            generation,
+            sorted(gained_groups),
+            len(page_ids),
+            reserved_before,
+            time.monotonic() - started,
+        )
 
     def import_elastic_pp_kv_slots(
         self,

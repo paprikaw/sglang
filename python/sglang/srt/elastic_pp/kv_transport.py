@@ -538,11 +538,9 @@ class ElasticPPKVTransport:
         """Scatter received bulk and delta rows at the drained PP fence.
 
         KVCacheD can need a CUDA VMM map before the first write into a newly
-        owned layer. Its mapping fence synchronizes the device, so doing that
-        from the background receive thread can wait forever on a serving NCCL
-        operation. Network receive remains off-path; only the final sparse
-        scatter and any required VMM map execute after the scheduler has
-        drained its microbatch ring.
+        owned layer. Its mapping fence synchronizes the device, so migration
+        receive, ownership refresh, and the final sparse scatter all execute
+        only after the scheduler has drained its microbatch ring.
         """
 
         generation = transition.target.generation
@@ -578,6 +576,10 @@ class ElasticPPKVTransport:
                     f"phase={phase}, expected={sorted(expected_edges)}, "
                     f"observed={sorted(observed_edges)}"
                 )
+
+        prepare_fence = getattr(self.pool, "prepare_elastic_pp_kv_fence", None)
+        if prepare_fence is not None:
+            prepare_fence(generation=generation)
 
         phase_order = {"bulk": 0, "delta": 1}
         loaded: set[int] = set()

@@ -33,8 +33,12 @@ class _FakeKVCacheDManager:
         self.block_mem_size = 1
         self.block_level_layer_groups = True
         self.null_block = [0]
+        self.inuse_page_ids = [0, 2]
+        self.trim_calls = 0
+        self.reserved_pages = 3
         self.page_allocator = SimpleNamespace(
-            get_page_id=lambda block_id, block_mem_size: int(block_id) // 2
+            get_page_id=lambda block_id, block_mem_size: int(block_id) // 2,
+            get_num_reserved_pages=lambda: self.reserved_pages,
         )
         self.clear()
 
@@ -67,6 +71,13 @@ class _FakeKVCacheDManager:
 
     def get_layer_group_total_span(self):
         return ((self.num_blocks + 1) // 2) * self.physical_group_page_size
+
+    def trim(self):
+        self.trim_calls += 1
+        self.reserved_pages = 0
+
+    def snapshot_inuse_page_ids(self):
+        return list(self.inuse_page_ids)
 
 
 class _FakeKVCacheDPool(KVCacheDMHATokenToKVPool):
@@ -317,6 +328,25 @@ def test_physical_mapping_is_deferred_until_import_at_drained_fence():
     assert pool.unmapped == [frozenset({2, 3})]
     assert pool._elastic_pp_pending_kv == {}
     assert pool._elastic_pp_residency.pending is None
+
+
+def test_physical_fence_refreshes_gained_groups_for_reusable_pages(monkeypatch):
+    pool, _ = _prepare_physical_move()
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(2, 4), generation=1, total_num_layers=4
+    )
+    mapped_offsets = []
+    fake_tp_ipc = ModuleType("kvcached.tp_ipc_util")
+    fake_tp_ipc.map_worker_offsets_for_migration = (
+        lambda offsets, group_id=0: mapped_offsets.extend(offsets) or True
+    )
+    monkeypatch.setitem(sys.modules, "kvcached.tp_ipc_util", fake_tp_ipc)
+
+    pool.prepare_elastic_pp_kv_fence(generation=1)
+
+    group_span = pool.kvcached_allocator.get_layer_group_total_span()
+    assert pool.kvcached_allocator.trim_calls == 1
+    assert mapped_offsets == [group_span, group_span + 2 * 128]
 
 
 def test_physical_abort_keeps_transaction_retryable_until_unmap_succeeds():

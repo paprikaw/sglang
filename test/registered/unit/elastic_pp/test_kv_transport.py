@@ -137,6 +137,10 @@ def test_sparse_transport_populates_unpublished_zero_rank_backing():
     slots = torch.tensor([1, 3], dtype=torch.long)
     source_pool = _make_pool(start_layer=0, layer_num=2)
     target_pool = _make_pool(start_layer=2, layer_num=0)
+    fence_generations = []
+    target_pool.prepare_elastic_pp_kv_fence = (
+        lambda *, generation: fence_generations.append(generation)
+    )
     source_pool.k_buffer[1][slots] = torch.tensor([[[11.0, 12.0]], [[31.0, 32.0]]])
     source_pool.v_buffer[1][slots] = torch.tensor([[[13.0, 14.0]], [[33.0, 34.0]]])
 
@@ -163,6 +167,7 @@ def test_sparse_transport_populates_unpublished_zero_rank_backing():
     assert source.send_phase(transition, phase="delta", slot_ids=source_slots[:0]) == 1
     assert target.receive_phase(transition, phase="delta") == frozenset({1})
     assert target.apply_staged(transition) == frozenset({1})
+    assert fence_generations == [1]
     assert target_pool.elastic_pp_kv_ready(generation=1)
     target_pool.commit_elastic_pp_kv_layers(generation=1)
     assert torch.equal(
