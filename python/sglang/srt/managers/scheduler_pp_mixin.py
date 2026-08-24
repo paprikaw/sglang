@@ -156,6 +156,21 @@ class SchedulerPPMixin:
                 "microbatch ring reaches its scheduler fence"
             )
         self._elastic_pp_topology = topology
+        if current is not None:
+            # The request-control ring always advances through the resident
+            # physical PP ranks, so rank r schedules a batch r microsteps after
+            # rank 0.  A common migration fence temporarily lines up every
+            # scheduler at the same microstep.  Refill the physical pipeline
+            # before consuming generation-N activations; otherwise a newly
+            # active rank pairs rank 0's next proxy tensor with its own
+            # previous microbatch.
+            self._elastic_pp_refill_steps_remaining = self.ps.pp_rank
+            logger.info(
+                "Elastic PP generation=%d rank=%d armed %d pipeline refill bubbles",
+                topology.generation,
+                self.ps.pp_rank,
+                self._elastic_pp_refill_steps_remaining,
+            )
 
     def _pp_topology(self: Scheduler) -> Optional[PPTopology]:
         return getattr(self, "_elastic_pp_topology", None)
@@ -294,6 +309,13 @@ class SchedulerPPMixin:
             if self._pp_microstep >= snapshot.fence_microstep:
                 self._elastic_pp_draining = True
         return self._elastic_pp_draining
+
+    def _elastic_pp_consume_refill_bubble(self: Scheduler) -> bool:
+        remaining = getattr(self, "_elastic_pp_refill_steps_remaining", 0)
+        if remaining <= 0:
+            return False
+        self._elastic_pp_refill_steps_remaining = remaining - 1
+        return True
 
     def _elastic_pp_fence_is_drained(self: Scheduler) -> bool:
         if any(batch is not None for batch in self.mbs):
@@ -566,6 +588,11 @@ class SchedulerPPMixin:
                         # retiring every already-launched ring slot.  Requests
                         # received during the fence remain queued and resume on
                         # the target topology after commit.
+                        self.mbs[mb_id] = None
+                        server_is_idle = False
+                    elif self._elastic_pp_consume_refill_bubble():
+                        # Leave this ring slot's running batch untouched while
+                        # restoring the physical request/activation phase.
                         self.mbs[mb_id] = None
                         server_is_idle = False
                     else:
@@ -1055,6 +1082,7 @@ class SchedulerPPMixin:
         )
         self._pp_microstep = 0
         self._elastic_pp_draining = False
+        self._elastic_pp_refill_steps_remaining = 0
 
     def profile_and_init_predictor(self: Scheduler):
         """

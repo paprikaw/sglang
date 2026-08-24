@@ -318,6 +318,23 @@ def test_topology_install_requires_static_endpoints_new_generation_and_fence():
         )
 
 
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_topology_change_refills_the_physical_pipeline_phase(rank):
+    scheduler = _FakeScheduler(rank=rank)
+    scheduler._pp_install_topology(_pp2_topology(generation=0))
+    scheduler.mbs = [None] * 4
+
+    scheduler._pp_install_topology(
+        PPTopology.from_layer_counts([2, 2, 2, 2], generation=1)
+    )
+
+    assert scheduler._elastic_pp_refill_steps_remaining == rank
+    assert [scheduler._elastic_pp_consume_refill_bubble() for _ in range(rank)] == [
+        True
+    ] * rank
+    assert not scheduler._elastic_pp_consume_refill_bubble()
+
+
 def test_common_future_microstep_arms_drain_on_the_exact_boundary():
     scheduler = _FakeScheduler(rank=0)
     source = _pp2_topology(generation=0)
