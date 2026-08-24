@@ -1071,6 +1071,16 @@ class ServerArgs:
     pp_async_batch_depth: A[
         int, "The async batch depth of pipeline parallelism.", NS("parallel")
     ] = 0
+    enable_elastic_pp: A[
+        bool,
+        "Enable generation-stamped elastic pipeline parallelism over the fixed resident PP group.",
+        NS("parallel"),
+    ] = False
+    elastic_pp_initial_partition: A[
+        Optional[str],
+        "Comma-separated initial layer counts for every resident elastic PP rank.",
+        NS("parallel"),
+    ] = None
     dp_size: A[
         int,
         Arg(
@@ -7741,6 +7751,50 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
+
+        if not self.enable_elastic_pp:
+            return
+        if self.pp_size <= 1:
+            raise ValueError("--enable-elastic-pp requires --pp-size greater than 1")
+        if self.tp_size != 1:
+            raise ValueError(
+                "elastic PP currently supports --tp-size 1 while KV migration "
+                "and batch-local PP routing are being validated"
+            )
+
+        raw_partition = self.elastic_pp_initial_partition or os.getenv(
+            "SGLANG_PP_LAYER_PARTITION"
+        )
+        if raw_partition is None:
+            raise ValueError(
+                "--enable-elastic-pp requires "
+                "--elastic-pp-initial-partition (one count per resident rank)"
+            )
+        try:
+            partition = tuple(int(item.strip()) for item in raw_partition.split(","))
+        except ValueError as exc:
+            raise ValueError(
+                "elastic PP initial partition must contain comma-separated integers: "
+                f"{raw_partition!r}"
+            ) from exc
+        if len(partition) != self.pp_size:
+            raise ValueError(
+                "elastic PP initial partition must contain one count per "
+                f"resident rank: got {len(partition)}, expected {self.pp_size}"
+            )
+        if any(count < 0 for count in partition):
+            raise ValueError(
+                f"elastic PP layer counts must be non-negative: {partition}"
+            )
+        if partition[0] == 0 or partition[-1] == 0:
+            raise ValueError(
+                "elastic PP currently requires non-empty physical first/last "
+                "ranks until dynamic endpoint modules are prepared"
+            )
+
+        normalized_partition = ",".join(str(count) for count in partition)
+        self.elastic_pp_initial_partition = normalized_partition
+        os.environ["SGLANG_PP_LAYER_PARTITION"] = normalized_partition
 
     def _validate_prefill_only_disable_kv_cache_args(self):
         """Validate --prefill-only-disable-kv-cache flag/precondition constraints.

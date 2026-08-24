@@ -16,6 +16,7 @@ from tqdm import tqdm
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.elastic_pp.topology import PPTopology
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
@@ -70,6 +71,111 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    def _pp_install_topology(self: Scheduler, topology: PPTopology) -> None:
+        """Install a drained, generation-stamped logical PP route.
+
+        Request metadata still traverses every resident scheduler.  Proxy
+        tensors use this logical route and bypass zero-layer middle ranks.  The
+        first implementation keeps the physical endpoints active because most
+        SGLang models instantiate embedding/norm/lm-head modules according to
+        the startup PP endpoints.  Dynamic endpoint-role materialization is a
+        separate transition-preparation step.
+        """
+
+        if topology.max_pp_size != self.ps.pp_size:
+            raise ValueError(
+                "elastic PP topology must cover the resident PP group: "
+                f"topology={topology.max_pp_size}, resident={self.ps.pp_size}"
+            )
+        if self.ps.pp_size > 1 and (
+            topology.first_rank != 0 or topology.last_rank != self.ps.pp_size - 1
+        ):
+            raise NotImplementedError(
+                "elastic PP currently requires physical first/last ranks to "
+                "remain active until dynamic endpoint modules are prepared"
+            )
+
+        current = getattr(self, "_elastic_pp_topology", None)
+        if current is not None:
+            if topology.generation <= current.generation:
+                raise ValueError(
+                    "elastic PP topology generation must increase: "
+                    f"{topology.generation} <= {current.generation}"
+                )
+            if topology.num_layers != current.num_layers:
+                raise ValueError(
+                    "elastic PP topology cannot change model layer count: "
+                    f"{topology.num_layers} != {current.num_layers}"
+                )
+
+        in_flight = getattr(self, "mbs", None)
+        if in_flight is not None and any(batch is not None for batch in in_flight):
+            raise RuntimeError(
+                "elastic PP topology can only be installed after the PP "
+                "microbatch ring reaches its scheduler fence"
+            )
+        self._elastic_pp_topology = topology
+
+    def _pp_topology(self: Scheduler) -> Optional[PPTopology]:
+        return getattr(self, "_elastic_pp_topology", None)
+
+    def _pp_rank_is_active(self: Scheduler) -> bool:
+        topology = self._pp_topology()
+        return topology is None or self.ps.pp_rank in topology.active_ranks
+
+    def _pp_is_first_rank(self: Scheduler) -> bool:
+        topology = self._pp_topology()
+        return (
+            self.pp_group.is_first_rank
+            if topology is None
+            else self.ps.pp_rank == topology.first_rank
+        )
+
+    def _pp_is_last_rank(self: Scheduler) -> bool:
+        topology = self._pp_topology()
+        return (
+            self.pp_group.is_last_rank
+            if topology is None
+            else self.ps.pp_rank == topology.last_rank
+        )
+
+    def _pp_prev_active_rank(self: Scheduler) -> Optional[int]:
+        topology = self._pp_topology()
+        if topology is None:
+            return None
+        return topology.prev_rank(self.ps.pp_rank)
+
+    def _pp_next_active_rank(self: Scheduler) -> Optional[int]:
+        topology = self._pp_topology()
+        if topology is None:
+            return None
+        return topology.next_rank(self.ps.pp_rank)
+
+    def _pp_launch_or_skip_batch(
+        self: Scheduler,
+        mb_id: int,
+        cur_batch: ScheduleBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        mb_metadata: List[Optional[PPBatchMetadata]],
+        last_rank_comm_queue: deque,
+    ):
+        if self._pp_rank_is_active():
+            return self._pp_launch_batch(
+                mb_id,
+                cur_batch,
+                pp_proxy_tensors,
+                mb_metadata,
+                last_rank_comm_queue,
+            )
+
+        # Inactive ranks retain scheduler/request state but own no model
+        # layers.  Recording an event keeps the common microbatch retirement
+        # path valid without launching GPU forward or receiving a proxy tensor.
+        mb_metadata[mb_id] = PPBatchMetadata(can_run_cuda_graph=False)
+        event = self.device_module.Event()
+        event.record(self.device_module.current_stream())
+        return None, event
+
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
         """
@@ -137,7 +243,7 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if cur_batch:
-                    result, self.launch_event = self._pp_launch_batch(
+                    result, self.launch_event = self._pp_launch_or_skip_batch(
                         mb_id,
                         cur_batch,
                         pp_proxy_tensors,
@@ -159,7 +265,7 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-                if not self.pp_group.is_last_rank:
+                if self._pp_rank_is_active() and not self._pp_is_last_rank():
                     if cur_batch:
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -285,7 +391,7 @@ class SchedulerPPMixin:
                 if cur_batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(cur_batch)
-                    result, self.launch_event = self._pp_launch_batch(
+                    result, self.launch_event = self._pp_launch_or_skip_batch(
                         mb_id,
                         cur_batch,
                         pp_proxy_tensors,
@@ -345,7 +451,11 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if cur_batch:
+                    if (
+                        cur_batch
+                        and self._pp_rank_is_active()
+                        and not self._pp_is_last_rank()
+                    ):
                         self.device_module.current_stream().wait_event(
                             self.launch_event
                         )
@@ -445,7 +555,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(self.send_proxy_work)
 
                 if cur_batch:
-                    result, self.launch_event = self._pp_launch_batch(
+                    result, self.launch_event = self._pp_launch_or_skip_batch(
                         mb_id,
                         cur_batch,
                         pp_proxy_tensors,
@@ -534,7 +644,12 @@ class SchedulerPPMixin:
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
-                    if cur_batch and not cur_batch.forward_mode.is_prebuilt():
+                    if (
+                        cur_batch
+                        and not cur_batch.forward_mode.is_prebuilt()
+                        and self._pp_rank_is_active()
+                        and not self._pp_is_last_rank()
+                    ):
                         self.device_module.current_stream().wait_event(
                             self.launch_event
                         )
@@ -1044,6 +1159,7 @@ class SchedulerPPMixin:
         tensor_dict: Dict[str, torch.Tensor],
         async_send: bool = True,
         msg_type: str = "default",
+        dst: Optional[int] = None,
     ):
         # Warn once if using default untyped messages
         if msg_type == "default":
@@ -1052,10 +1168,18 @@ class SchedulerPPMixin:
                 "Consider adding msg_type='proxy' or 'output' to avoid recv conflicts."
             )
         tensor_dict["__msg_type__"] = msg_type
+        topology = self._pp_topology()
+        if topology is not None:
+            tensor_dict["__pp_generation__"] = topology.generation
+            if msg_type == "proxy" and dst is None:
+                dst = self._pp_next_active_rank()
+                if dst is None:
+                    raise RuntimeError("logical last PP rank cannot send proxy tensors")
         p2p_work = []
         p2p_work.extend(
             self.pp_group.send_tensor_dict(
                 tensor_dict=tensor_dict,
+                dst=dst,
                 all_gather_group=(
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
@@ -1068,6 +1192,7 @@ class SchedulerPPMixin:
         self: Scheduler,
         expected_kind: str = "default",
         all_gather_group: Optional = None,
+        src: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
@@ -1081,10 +1206,18 @@ class SchedulerPPMixin:
 
         while True:
             tensor_dict = self.pp_group.recv_tensor_dict(
-                all_gather_group=all_gather_group
+                src=src, all_gather_group=all_gather_group
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
+                topology = self._pp_topology()
+                received_generation = tensor_dict.get("__pp_generation__")
+                if topology is not None and received_generation != topology.generation:
+                    raise RuntimeError(
+                        "elastic PP tensor generation mismatch: expected "
+                        f"{topology.generation}, received "
+                        f"{received_generation!r} for {expected_kind}"
+                    )
                 if received_kind == "default":
                     logger.warning_once(
                         f"PP recv: got default untyped message. Content keys: {tensor_dict.keys()}"
@@ -1099,10 +1232,11 @@ class SchedulerPPMixin:
 
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
-        if not self.pp_group.is_first_rank:
+        if self._pp_rank_is_active() and not self._pp_is_first_rank():
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
+                    src=self._pp_prev_active_rank(),
                     all_gather_group=(
                         self.attn_tp_group if self.require_attn_tp_allgather else None
                     ),

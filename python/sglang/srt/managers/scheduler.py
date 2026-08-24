@@ -102,6 +102,7 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
+from sglang.srt.elastic_pp.topology import PPTopology
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -522,6 +523,7 @@ class Scheduler(
 
         # Launch a model worker and draft model worker if using speculative decoding
         self.init_model_worker()
+        self.init_elastic_pp()
 
         if (t := envs.SGLANG_TEST_STUCK_SCHEDULER_INIT.get()) > 0:
             time.sleep(t)
@@ -878,6 +880,35 @@ class Scheduler(
                     "grammar-gated reasoning is disabled.",
                     reasoning_parser.detector.think_end_token,
                 )
+
+    def init_elastic_pp(self):
+        """Install the startup logical route after the physical PP group exists."""
+
+        self._elastic_pp_topology = None
+        if not get_parallel().enable_elastic_pp:
+            return
+
+        raw_partition = get_parallel().elastic_pp_initial_partition
+        if raw_partition is None:
+            raise RuntimeError(
+                "elastic PP was enabled without a resolved initial partition"
+            )
+        counts = tuple(int(item) for item in raw_partition.split(","))
+        topology = PPTopology.from_layer_counts(counts, generation=0)
+        if topology.num_layers != self.model_config.num_hidden_layers:
+            raise ValueError(
+                "elastic PP initial partition must cover every model layer: "
+                f"partition={topology.num_layers}, "
+                f"model={self.model_config.num_hidden_layers}"
+            )
+        self._pp_install_topology(topology)
+        logger.info(
+            "Elastic PP startup topology generation=%d active_ranks=%s "
+            "layer_ranges=%s",
+            topology.generation,
+            topology.active_ranks,
+            topology.layer_ranges,
+        )
 
     def init_mamba_backend(self) -> None:
         if initialize_mamba_selective_state_update_backend is not None:
