@@ -82,6 +82,8 @@ class ElasticPPWeightProfile:
     checkpoint_non_layer_weight_size: int
     checkpoint_tensor_count: int
     resident_tensor_count: int
+    checkpoint_tensors: tuple[WeightTensorMetadata, ...] = ()
+    resident_tensors: tuple[WeightTensorMetadata, ...] = ()
 
     def transformer_weight_size(self, start_layer: int, end_layer: int) -> int:
         """Return exact Transformer bytes for half-open ``[start, end)``."""
@@ -105,6 +107,61 @@ class ElasticPPWeightProfile:
             start_layer, end_layer
         )
 
+    @property
+    def resident_layer_ids(self) -> frozenset[int]:
+        return frozenset(
+            tensor.layer_id
+            for tensor in self.resident_tensors
+            if tensor.layer_id is not None
+        )
+
+    def with_peer_layer_calibration(
+        self, peer_profiles: Iterable[ElasticPPWeightProfile]
+    ) -> ElasticPPWeightProfile:
+        """Use physical resident sizes from every startup PP owner.
+
+        Every rank records the complete checkpoint stream, so any disagreement
+        in that metadata is a correctness error.  The rank-local non-layer
+        term remains unchanged because embedding/norm/lm-head residency differs
+        between physical endpoint and middle ranks.
+        """
+
+        peers = tuple(peer_profiles)
+        if not peers:
+            raise ValueError("peer weight profiles must not be empty")
+        calibrated: dict[int, int] = {}
+        for peer in peers:
+            if len(peer.layer_weight_sizes) != len(self.layer_weight_sizes):
+                raise ValueError("peer weight profiles have different layer counts")
+            if (
+                self.checkpoint_tensors
+                and peer.checkpoint_tensors != self.checkpoint_tensors
+            ):
+                raise ValueError("peer checkpoint weight metadata does not match")
+            resident_sizes, _ = _sum_bytes_by_layer(
+                {tensor.name: tensor.nbytes for tensor in peer.resident_tensors}
+            )
+            for layer_id, size in resident_sizes.items():
+                previous = calibrated.setdefault(layer_id, size)
+                if previous != size:
+                    raise ValueError(
+                        "resident layer size differs across startup ranks: "
+                        f"layer={layer_id}, sizes={previous}/{size}"
+                    )
+
+        missing = set(range(len(self.layer_weight_sizes))) - calibrated.keys()
+        if missing:
+            raise ValueError(
+                "startup PP placement did not physically calibrate every layer: "
+                f"missing={sorted(missing)}"
+            )
+        return replace(
+            self,
+            layer_weight_sizes=tuple(
+                calibrated[layer_id] for layer_id in range(len(self.layer_weight_sizes))
+            ),
+        )
+
 
 class FirstLoadWeightProfiler:
     """Record exactly one complete checkpoint stream and calibrate residency."""
@@ -113,7 +170,7 @@ class FirstLoadWeightProfiler:
         if num_hidden_layers <= 0:
             raise ValueError("num_hidden_layers must be positive")
         self.num_hidden_layers = int(num_hidden_layers)
-        self._checkpoint_weight_bytes_by_name: dict[str, int] = {}
+        self._checkpoint_tensors_by_name: dict[str, WeightTensorMetadata] = {}
         self._recording_started = False
         self._recording_complete = False
         self._profile: ElasticPPWeightProfile | None = None
@@ -134,32 +191,36 @@ class FirstLoadWeightProfiler:
 
         self._recording_started = True
         for name, weight in weights:
-            weight_bytes = _tensor_nbytes(weight)
-            previous = self._checkpoint_weight_bytes_by_name.setdefault(
-                name, weight_bytes
-            )
-            if previous != weight_bytes:
+            metadata = WeightTensorMetadata.from_tensor(name, weight, kind="checkpoint")
+            previous = self._checkpoint_tensors_by_name.setdefault(name, metadata)
+            if previous != metadata:
                 raise ValueError(
-                    "weight size changed in the initial checkpoint stream: "
-                    f"{name} was {previous} bytes, now {weight_bytes} bytes"
+                    "weight metadata changed in the initial checkpoint stream: "
+                    f"{name} was {previous}, now {metadata}"
                 )
             yield name, weight
         self._recording_complete = True
 
     @staticmethod
-    def _resident_parameter_bytes(module: nn.Module) -> dict[str, int]:
-        named_parameters = list(module.named_parameters())
+    def _resident_tensors(module: nn.Module) -> tuple[WeightTensorMetadata, ...]:
+        named_parameters = list(module.named_parameters(remove_duplicate=True))
+        named_buffers = list(module.named_buffers(remove_duplicate=True))
         accelerator_types = {
-            parameter.device.type
-            for _, parameter in named_parameters
-            if parameter.device.type not in {"cpu", "meta"}
+            tensor.device.type
+            for _, tensor in (*named_parameters, *named_buffers)
+            if tensor.device.type not in {"cpu", "meta"}
         }
-        return {
-            name: _tensor_nbytes(parameter)
-            for name, parameter in named_parameters
-            if parameter.device.type != "meta"
-            and (not accelerator_types or parameter.device.type in accelerator_types)
-        }
+        resident = [
+            WeightTensorMetadata.from_tensor(name, tensor, kind=kind)
+            for kind, named_tensors in (
+                ("parameter", named_parameters),
+                ("buffer", named_buffers),
+            )
+            for name, tensor in named_tensors
+            if tensor.device.type != "meta"
+            and (not accelerator_types or tensor.device.type in accelerator_types)
+        ]
+        return tuple(sorted(resident, key=lambda item: (item.name, item.kind)))
 
     def finalize(self, module: nn.Module) -> ElasticPPWeightProfile:
         """Calibrate checkpoint sizes against post-processed resident tensors."""
@@ -172,7 +233,10 @@ class FirstLoadWeightProfiler:
             )
 
         checkpoint_layer_sizes, checkpoint_non_layer_size = _sum_bytes_by_layer(
-            self._checkpoint_weight_bytes_by_name
+            {
+                name: tensor.nbytes
+                for name, tensor in self._checkpoint_tensors_by_name.items()
+            }
         )
         expected_layers = set(range(self.num_hidden_layers))
         missing_layers = expected_layers - checkpoint_layer_sizes.keys()
@@ -184,7 +248,10 @@ class FirstLoadWeightProfiler:
                 f"unexpected={sorted(unexpected_layers)}"
             )
 
-        resident_weight_bytes_by_name = self._resident_parameter_bytes(module)
+        resident_tensors = self._resident_tensors(module)
+        resident_weight_bytes_by_name = {
+            tensor.name: tensor.nbytes for tensor in resident_tensors
+        }
         resident_layer_sizes, resident_non_layer_size = _sum_bytes_by_layer(
             resident_weight_bytes_by_name
         )
@@ -202,11 +269,18 @@ class FirstLoadWeightProfiler:
             non_layer_weight_size=resident_non_layer_size,
             total_weight_size=sum(resident_weight_bytes_by_name.values()),
             checkpoint_total_weight_size=sum(
-                self._checkpoint_weight_bytes_by_name.values()
+                tensor.nbytes for tensor in self._checkpoint_tensors_by_name.values()
             ),
             checkpoint_non_layer_weight_size=checkpoint_non_layer_size,
-            checkpoint_tensor_count=len(self._checkpoint_weight_bytes_by_name),
+            checkpoint_tensor_count=len(self._checkpoint_tensors_by_name),
             resident_tensor_count=len(resident_weight_bytes_by_name),
+            checkpoint_tensors=tuple(
+                sorted(
+                    self._checkpoint_tensors_by_name.values(),
+                    key=lambda item: item.name,
+                )
+            ),
+            resident_tensors=resident_tensors,
         )
         self._profile = profile
         logger.info(
@@ -227,7 +301,7 @@ class FirstLoadWeightProfiler:
         )
         logger.debug(
             "Elastic PP checkpoint tensor bytes: %s",
-            self._checkpoint_weight_bytes_by_name,
+            self._checkpoint_tensors_by_name,
         )
         logger.debug(
             "Elastic PP resident tensor bytes: %s", resident_weight_bytes_by_name

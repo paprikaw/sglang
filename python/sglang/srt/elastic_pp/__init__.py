@@ -15,6 +15,7 @@ from sglang.srt.elastic_pp.topology import (
 from sglang.srt.elastic_pp.weight_profile import (
     ElasticPPWeightProfile,
     FirstLoadWeightProfiler,
+    WeightTensorMetadata,
 )
 
 __all__ = [
@@ -27,5 +28,6 @@ __all__ = [
     "LayerTransfer",
     "PPTopology",
     "TransitionPhase",
+    "WeightTensorMetadata",
     "estimate_kv_capacity",
 ]

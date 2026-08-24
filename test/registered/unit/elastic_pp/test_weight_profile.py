@@ -6,6 +6,7 @@ from sglang.srt.elastic_pp.capacity import estimate_kv_capacity
 from sglang.srt.elastic_pp.weight_profile import (
     ElasticPPWeightProfile,
     FirstLoadWeightProfiler,
+    WeightTensorMetadata,
 )
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -54,6 +55,13 @@ def test_first_stream_profiles_all_layers_and_calibrates_resident_bytes():
     assert profile.checkpoint_non_layer_weight_size == 14
     assert profile.checkpoint_tensor_count == 4
     assert profile.resident_tensor_count == 2
+    assert [tensor.name for tensor in profile.checkpoint_tensors] == [
+        "model.embed_tokens.weight",
+        "model.layers.0.weight",
+        "model.layers.1.weight",
+        "model.layers.2.weight",
+    ]
+    assert {tensor.kind for tensor in profile.resident_tensors} == {"parameter"}
     assert profile.transformer_weight_size(1, 3) == 14
     assert profile.target_weight_size(1, 3) == 34
 
@@ -121,3 +129,64 @@ def test_capacity_uses_exact_layer_weights_and_heterogeneous_kv_pages():
     assert estimate.kv_bytes_per_block == 10
     assert estimate.raw_num_blocks == 10
     assert estimate.aligned_num_blocks == 8
+
+
+def test_peer_calibration_uses_every_owner_and_preserves_local_endpoints():
+    local = ElasticPPWeightProfile(
+        layer_weight_sizes=(4, 6, 8),
+        non_layer_weight_size=20,
+        total_weight_size=32,
+        checkpoint_total_weight_size=32,
+        checkpoint_non_layer_weight_size=14,
+        checkpoint_tensor_count=0,
+        resident_tensor_count=2,
+        resident_tensors=(
+            WeightTensorMetadata(
+                "model.layers.0.weight",
+                (3,),
+                "torch.float32",
+                12,
+                0,
+                "parameter",
+            ),
+            WeightTensorMetadata(
+                "model.embed_tokens.weight",
+                (5,),
+                "torch.float32",
+                20,
+                None,
+                "parameter",
+            ),
+        ),
+    )
+    peer = ElasticPPWeightProfile(
+        layer_weight_sizes=(4, 6, 8),
+        non_layer_weight_size=7,
+        total_weight_size=40,
+        checkpoint_total_weight_size=32,
+        checkpoint_non_layer_weight_size=14,
+        checkpoint_tensor_count=0,
+        resident_tensor_count=2,
+        resident_tensors=(
+            WeightTensorMetadata(
+                "model.layers.1.weight",
+                (4,),
+                "torch.float32",
+                16,
+                1,
+                "parameter",
+            ),
+            WeightTensorMetadata(
+                "model.layers.2.weight",
+                (6,),
+                "torch.float32",
+                24,
+                2,
+                "parameter",
+            ),
+        ),
+    )
+
+    calibrated = local.with_peer_layer_calibration((local, peer))
+    assert calibrated.layer_weight_sizes == (12, 16, 24)
+    assert calibrated.non_layer_weight_size == 20

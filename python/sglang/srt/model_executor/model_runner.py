@@ -1152,7 +1152,11 @@ class ModelRunner:
                     "--enable-elastic-pp requires a model implementation with "
                     "first-load weight profiling; currently Llama is supported"
                 )
-            self.elastic_pp_weight_profile = finalize_profile()
+            local_profile = finalize_profile()
+            peer_profiles = self.pp_group.all_gather_object(local_profile)
+            self.elastic_pp_weight_profile = local_profile.with_peer_layer_calibration(
+                peer_profiles
+            )
 
         self.maybe_precompile_model_kernels_after_loading()
 
