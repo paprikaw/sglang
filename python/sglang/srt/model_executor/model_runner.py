@@ -1142,6 +1142,18 @@ class ModelRunner:
         if not self.is_draft_worker:
             get_offloader().post_init()
 
+        self.elastic_pp_weight_profile = None
+        if getattr(get_parallel(), "enable_elastic_pp", False):
+            finalize_profile = getattr(
+                self.model, "finalize_elastic_pp_weight_profile", None
+            )
+            if finalize_profile is None:
+                raise RuntimeError(
+                    "--enable-elastic-pp requires a model implementation with "
+                    "first-load weight profiling; currently Llama is supported"
+                )
+            self.elastic_pp_weight_profile = finalize_profile()
+
         self.maybe_precompile_model_kernels_after_loading()
 
         # Register model for layerwise NVTX profiling if enabled

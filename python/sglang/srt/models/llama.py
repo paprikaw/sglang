@@ -29,6 +29,10 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_pp_indices,
 )
+from sglang.srt.elastic_pp.weight_profile import (
+    ElasticPPWeightProfile,
+    FirstLoadWeightProfiler,
+)
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -525,6 +529,11 @@ class LlamaForCausalLM(nn.Module):
         self.pp_group = get_pp_group()
         self.config = config
         self.quant_config = quant_config
+        self._elastic_pp_weight_profiler = (
+            FirstLoadWeightProfiler(config.num_hidden_layers)
+            if getattr(get_parallel(), "enable_elastic_pp", False)
+            else None
+        )
         self.model = self._init_model(config, quant_config, add_prefix("model", prefix))
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
@@ -663,9 +672,23 @@ class LlamaForCausalLM(nn.Module):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         from sglang.srt.environ import envs
 
+        if self._elastic_pp_weight_profiler is not None:
+            # This wrapper must precede both PP filtering implementations so
+            # the first stream captures weights for every possible topology.
+            weights = self._elastic_pp_weight_profiler.record_initial_stream(weights)
         if envs.SGLANG_ENABLE_WEIGHT_LOADER_V2.get():
             return self._load_weights_v2(weights)
         return self._legacy_load_weights(weights)
+
+    def finalize_elastic_pp_weight_profile(self) -> ElasticPPWeightProfile:
+        if self._elastic_pp_weight_profiler is None:
+            raise RuntimeError("elastic PP weight profiling is not enabled")
+        return self._elastic_pp_weight_profiler.finalize(self)
+
+    def get_elastic_pp_weight_profile(self) -> ElasticPPWeightProfile:
+        if self._elastic_pp_weight_profiler is None:
+            raise RuntimeError("elastic PP weight profiling is not enabled")
+        return self._elastic_pp_weight_profiler.get_profile()
 
     def _legacy_load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
