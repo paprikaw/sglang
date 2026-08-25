@@ -1565,6 +1565,24 @@ class GroupCoordinator:
         torch.distributed.all_gather_object(objs, obj, group=self.cpu_group)
         return objs
 
+    def all_reduce_cpu(
+        self,
+        tensor: torch.Tensor,
+        *,
+        async_op: bool = False,
+    ) -> Optional[torch.distributed.Work]:
+        """Reduce a CPU control tensor on this coordinator's CPU group."""
+
+        if not tensor.is_cpu:
+            raise ValueError("all_reduce_cpu requires a CPU tensor")
+        if self.world_size == 1:
+            return None
+        return torch.distributed.all_reduce(
+            tensor,
+            group=self.cpu_group,
+            async_op=async_op,
+        )
+
     def send_object(
         self,
         obj: Any,

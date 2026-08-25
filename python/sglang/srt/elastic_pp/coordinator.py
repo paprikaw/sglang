@@ -93,6 +93,8 @@ class ElasticPPMigrationCoordinator:
         self._kv_prepared = False
         self._slot_tracking = False
         self._bulk_slots: torch.Tensor | None = None
+        self._drain_consensus_tensor: torch.Tensor | None = None
+        self._drain_consensus_work: Any = None
 
     @property
     def phase(self) -> ElasticPPMigrationPhase:
@@ -178,6 +180,8 @@ class ElasticPPMigrationCoordinator:
             self._kv_prepared = False
             self._slot_tracking = False
             self._bulk_slots = None
+            self._drain_consensus_tensor = None
+            self._drain_consensus_work = None
             self._thread = Thread(
                 target=self._prepare_worker,
                 name=f"elastic-pp-prepare-g{transition.target.generation}-r{self.rank}",
@@ -241,6 +245,96 @@ class ElasticPPMigrationCoordinator:
             raise RuntimeError(
                 f"elastic PP {stage} failed on resident ranks: " + " | ".join(messages)
             )
+
+    def poll_all_ranks_drained_at_fence(self, local_drained: bool) -> bool:
+        """Poll a non-blocking consensus that every scheduler ring is empty.
+
+        A rank that drains early must keep advancing the resident data plane;
+        blocking it in a control collective can prevent its peers from draining.
+        Keep at most one CPU all-reduce in flight and poll it between PP
+        microsteps instead.
+        """
+
+        transition = self._require_transition()
+        if self.group.world_size == 1:
+            return bool(local_drained)
+
+        if self._drain_consensus_work is None:
+            self._drain_consensus_tensor = torch.tensor(
+                [int(bool(local_drained)), transition.target.generation],
+                dtype=torch.int64,
+                device="cpu",
+            )
+            self._drain_consensus_work = self.group.all_reduce_cpu(
+                self._drain_consensus_tensor,
+                async_op=True,
+            )
+            if self._drain_consensus_work is None:
+                raise RuntimeError(
+                    "elastic PP drain consensus did not return asynchronous work"
+                )
+            return False
+
+        if not self._drain_consensus_work.is_completed():
+            return False
+
+        self._drain_consensus_work.wait()
+        assert self._drain_consensus_tensor is not None
+        ready_count, generation_sum = self._drain_consensus_tensor.tolist()
+        self._drain_consensus_tensor = None
+        self._drain_consensus_work = None
+
+        expected_generation_sum = transition.target.generation * self.group.world_size
+        if generation_sum != expected_generation_sum:
+            raise RuntimeError(
+                "elastic PP drain generation mismatch: "
+                f"expected_sum={expected_generation_sum}, got={generation_sum}"
+            )
+        if ready_count < 0 or ready_count > self.group.world_size:
+            raise RuntimeError(
+                "elastic PP drain consensus returned an invalid ready count: "
+                f"{ready_count}"
+            )
+        return ready_count == self.group.world_size
+
+    def aligned_resume_microstep(self, microstep: int, ring_size: int) -> int:
+        """Agree on one post-commit ring boundary across scheduler ranks."""
+
+        microstep = int(microstep)
+        ring_size = int(ring_size)
+        if microstep < 0:
+            raise ValueError(f"elastic PP microstep must be non-negative: {microstep}")
+        if ring_size <= 0:
+            raise ValueError(f"elastic PP ring size must be positive: {ring_size}")
+
+        reports = self._consensus(
+            "scheduler_alignment",
+            success=True,
+            details=(microstep, ring_size),
+        )
+        peer_microsteps = []
+        for report in reports:
+            details = report.get("details")
+            if (
+                not isinstance(details, (tuple, list))
+                or len(details) != 2
+                or type(details[0]) is not int
+                or type(details[1]) is not int
+            ):
+                raise RuntimeError(
+                    "elastic PP scheduler alignment returned invalid details: "
+                    f"{details!r}"
+                )
+            peer_microstep, peer_ring_size = details
+            if peer_microstep < 0 or peer_ring_size != ring_size:
+                raise RuntimeError(
+                    "elastic PP scheduler alignment mismatch: "
+                    f"local_ring_size={ring_size}, peer={details!r}"
+                )
+            peer_microsteps.append(peer_microstep)
+
+        max_microstep = max(peer_microsteps)
+        return (max_microstep // ring_size + 1) * ring_size
 
     def _prepare_worker(self) -> None:
         transition = self._require_transition()

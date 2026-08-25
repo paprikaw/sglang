@@ -62,6 +62,14 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
 
+@dataclass(frozen=True)
+class _ElasticPPRequestRingFence:
+    """In-band marker that causally closes the resident request ring."""
+
+    generation: int
+    fence_microstep: int
+
+
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
@@ -350,59 +358,113 @@ class SchedulerPPMixin:
         snapshot = coordinator.snapshot()
         if snapshot.phase == ElasticPPMigrationPhase.FAILED:
             self._elastic_pp_draining = False
+            self._elastic_pp_request_ring_fence_seen = False
+            self._elastic_pp_request_ring_drained = False
             self._elastic_pp_emit_terminal_response()
             return False
-        if snapshot.phase == ElasticPPMigrationPhase.BULK_READY:
+        if (
+            self.ps.pp_rank == 0
+            and snapshot.phase == ElasticPPMigrationPhase.BULK_READY
+        ):
             if snapshot.fence_microstep is None:
                 raise RuntimeError("elastic PP bulk-ready state has no fence microstep")
             if self._pp_microstep >= snapshot.fence_microstep:
                 self._elastic_pp_draining = True
         return self._elastic_pp_draining
 
+    def _elastic_pp_extract_request_ring_fence(
+        self: Scheduler,
+        recv_reqs: List,
+    ) -> Optional[_ElasticPPRequestRingFence]:
+        fences = [
+            req for req in recv_reqs if isinstance(req, _ElasticPPRequestRingFence)
+        ]
+        if not fences:
+            return None
+        if self.ps.pp_rank == 0 or len(fences) != 1 or len(recv_reqs) != 1:
+            raise RuntimeError(
+                "elastic PP request-ring fence must be the sole downstream payload"
+            )
+
+        fence = fences[0]
+        snapshot = self.elastic_pp_migration_coordinator.snapshot()
+        if (
+            snapshot.phase != ElasticPPMigrationPhase.BULK_READY
+            or fence.generation != snapshot.generation
+            or fence.fence_microstep != snapshot.fence_microstep
+        ):
+            raise RuntimeError(
+                "elastic PP request-ring fence mismatch: "
+                f"received={fence}, generation={snapshot.generation}, "
+                f"phase={snapshot.phase.value}, "
+                f"fence_microstep={snapshot.fence_microstep}"
+            )
+        return fence
+
     def _elastic_pp_fence_is_drained(self: Scheduler) -> bool:
+        if not self._elastic_pp_request_ring_drained:
+            return False
         if any(batch is not None for batch in self.mbs):
             return False
         if self.last_rank_comm_queue:
             return False
         if self.pp_outputs is not None:
             return False
+        if self.send_proxy_work:
+            return False
+        if self.send_output_handoff_work:
+            return False
+        if self.send_output_work:
+            return False
+        if self.send_req_work:
+            return False
         return not any(self._pp_tensor_dict_inbox.values())
 
-    def _elastic_pp_finalize_if_drained(self: Scheduler) -> None:
+    def _elastic_pp_finalize_if_drained(self: Scheduler) -> bool:
         coordinator = self.elastic_pp_migration_coordinator
-        if (
-            coordinator is None
-            or not self._elastic_pp_draining
-            or not self._elastic_pp_fence_is_drained()
+        if coordinator is None or not self._elastic_pp_draining:
+            self._elastic_pp_emit_terminal_response()
+            return False
+
+        # A pipeline ring drains asymmetrically.  Poll a non-blocking control
+        # reduction so early ranks keep advancing the resident request/output
+        # rings until every rank has reported no local or in-flight work.
+        if not coordinator.poll_all_ranks_drained_at_fence(
+            self._elastic_pp_fence_is_drained()
         ):
             self._elastic_pp_emit_terminal_response()
-            return
+            return False
 
-        # Proxy/output sends are topology-dependent and must retire before
-        # route publication.  Request metadata, however, always follows the
-        # resident physical CPU ring.  Its async send from this microstep is
-        # matched by the next rank's recv at the start of the *next* microstep,
-        # even when the payload is empty.  Waiting for it here makes an idle
-        # fence circularly wait before any rank can post that matching recv.
-        # Leave it outstanding: the unchanged physical ring consumes and
-        # commits it when scheduling resumes on the new logical topology.
+        # Every topology-dependent send and the resident request ring have
+        # explicitly drained before route publication.  No rank can enter the
+        # blocking alignment while another rank still needs it as a receiver.
+        self._pp_commit_comm_work(self.send_req_work)
         self._pp_commit_comm_work(self.send_proxy_work)
         self._pp_commit_comm_work(self.send_output_handoff_work)
         self._pp_commit_comm_work(self.send_output_work)
         try:
+            resume_microstep = coordinator.aligned_resume_microstep(
+                self._pp_microstep,
+                self.pp_loop_size,
+            )
             coordinator.finalize_at_fence(self._pp_install_topology)
         except BaseException:
             snapshot = coordinator.snapshot()
             self._elastic_pp_draining = False
+            self._elastic_pp_request_ring_fence_seen = False
+            self._elastic_pp_request_ring_drained = False
             self._elastic_pp_emit_terminal_response()
             if not snapshot.source_usable:
                 raise RuntimeError(
                     "elastic PP suffered a partial commit; serving cannot safely resume: "
                     f"{snapshot.error}"
                 )
-            return
+            return False
 
         self._elastic_pp_draining = False
+        self._elastic_pp_request_ring_fence_seen = False
+        self._elastic_pp_request_ring_drained = False
+        self._pp_microstep = resume_microstep
         self._elastic_pp_emit_terminal_response()
 
         # The old generation has no scheduler or communication references now.
@@ -411,6 +473,7 @@ class SchedulerPPMixin:
         completion_event = self.device_module.Event()
         completion_event.record(self.device_module.current_stream())
         coordinator.start_cleanup(completion_event)
+        return True
 
     def handle_reconfigure_elastic_pp(
         self: Scheduler, recv_req: ReconfigureElasticPPReqInput
@@ -641,22 +704,66 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+                elastic_pp_draining = self._elastic_pp_drain_due()
+                request_ring_fence = None
+                if (
+                    self.ps.pp_rank == 0
+                    and elastic_pp_draining
+                    and not self._elastic_pp_request_ring_fence_seen
+                ):
+                    snapshot = self.elastic_pp_migration_coordinator.snapshot()
+                    if snapshot.fence_microstep is None:
+                        raise RuntimeError(
+                            "elastic PP bulk-ready state has no fence microstep"
+                        )
+                    request_ring_fence = _ElasticPPRequestRingFence(
+                        generation=snapshot.generation,
+                        fence_microstep=snapshot.fence_microstep,
+                    )
                 with torch.profiler.record_function("recv_requests"):
-                    recv_reqs = self.request_receiver.recv_requests()
+                    recv_reqs = (
+                        []
+                        if elastic_pp_draining
+                        else self.request_receiver.recv_requests()
+                    )
+                    received_fence = self._elastic_pp_extract_request_ring_fence(
+                        recv_reqs
+                    )
+                    if received_fence is not None:
+                        request_ring_fence = received_fence
+                        recv_reqs = []
+                        self._elastic_pp_draining = True
+                        elastic_pp_draining = True
+                    if request_ring_fence is not None:
+                        self._elastic_pp_request_ring_fence_seen = True
                     self.process_input_requests(recv_reqs)
                 if not self._pp_is_physical_last_rank():
                     self._pp_commit_comm_work(self.send_req_work)
-                    with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
-                            async_send=True,
-                        )
+                    if request_ring_fence is not None:
+                        with torch.profiler.record_function(
+                            "send_pp_fence_to_next_stage"
+                        ):
+                            self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                                [request_ring_fence],
+                                async_send=True,
+                            )
+                    elif not elastic_pp_draining:
+                        with torch.profiler.record_function("send_reqs_to_next_stage"):
+                            self.send_req_work = self._pp_send_pyobj_to_next_stage(
+                                recv_reqs,
+                                async_send=True,
+                            )
+                if elastic_pp_draining:
+                    self._elastic_pp_request_ring_drained = (
+                        self._elastic_pp_request_ring_fence_seen
+                        and not self.send_req_work
+                    )
                 with torch.profiler.record_function("get_next_batch_to_run"):
-                    if self._elastic_pp_drain_due():
+                    if elastic_pp_draining:
                         # Preserve scheduler/request state in running_mbs while
                         # retiring every already-launched ring slot.  Requests
-                        # received during the fence remain queued and resume on
-                        # the target topology after commit.
+                        # already in the resident ring are delivered exactly
+                        # once; new rank-zero admission resumes after commit.
                         self.mbs[mb_id] = None
                         server_is_idle = False
                     else:
@@ -723,7 +830,11 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
                 self._pp_microstep += 1
-                self._elastic_pp_finalize_if_drained()
+                if self._elastic_pp_finalize_if_drained():
+                    # Every rank restarts at slot zero after the blocking
+                    # alignment/commit collectives, regardless of which local
+                    # slot observed the asynchronous drain consensus.
+                    break
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -1150,6 +1261,8 @@ class SchedulerPPMixin:
         )
         self._pp_microstep = 0
         self._elastic_pp_draining = False
+        self._elastic_pp_request_ring_fence_seen = False
+        self._elastic_pp_request_ring_drained = False
         self._elastic_pp_post_commit_launch_logs_remaining = 0
 
     def profile_and_init_predictor(self: Scheduler):
