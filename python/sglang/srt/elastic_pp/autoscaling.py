@@ -68,11 +68,11 @@ def validate_elastic_pp_autoscale_partitions(
 ) -> Tuple[LayerPartition, ...]:
     """Validate an increasing logical-PP resource frontier.
 
-    The current model path materializes embedding and output modules on the
-    physical endpoints at startup.  Until endpoint-role migration lands, every
-    automatic partition therefore keeps ranks 0 and ``pp_size - 1`` active.
-    Middle ranks may be empty, which still supports real PP2 <-> PP4 scaling in
-    a resident four-rank group (for example ``40,0,0,40`` <-> ``20,20,20,20``).
+    Rank 0 remains active because it owns the input embedding.  The logical
+    last rank may move because elastic Llama materializes norm/lm-head endpoint
+    state on every resident candidate rank.  This supports vLLM-compatible
+    PP2 <-> PP4 placement in a resident four-rank group (for example
+    ``40,40,0,0`` <-> ``20,20,20,20``).
     """
 
     normalized = tuple(tuple(int(count) for count in part) for part in partitions)
@@ -92,10 +92,10 @@ def validate_elastic_pp_autoscale_partitions(
                 "each elastic PP autoscale partition must cover every model "
                 f"layer: got={sum(partition)}, expected={num_layers}"
             )
-        if pp_size > 1 and (partition[0] == 0 or partition[-1] == 0):
+        if pp_size > 1 and partition[0] == 0:
             raise ValueError(
-                "elastic PP autoscale partitions currently require non-empty "
-                "physical first/last ranks"
+                "elastic PP autoscale partitions require non-empty rank 0 "
+                "because it owns the input embedding"
             )
 
     active_counts = tuple(

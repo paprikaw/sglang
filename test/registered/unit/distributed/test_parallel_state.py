@@ -50,6 +50,44 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
 
 
+def test_group_coordinator_logical_routing_keeps_physical_group_resident():
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.ranks = [10, 20, 30, 40]
+    coordinator.world_size = 4
+    coordinator.rank = 10
+    coordinator.rank_in_group = 0
+
+    coordinator.set_routing_rank_indices([0, 1])
+    assert tuple(coordinator.routing_ranks) == (10, 20)
+    assert coordinator.is_first_rank
+    assert not coordinator.is_last_rank
+    assert coordinator.next_rank == 20
+    assert coordinator.prev_rank == 20
+
+    coordinator.rank = 20
+    coordinator.rank_in_group = 1
+    assert coordinator.is_last_rank
+    assert coordinator.prev_rank == 10
+    assert coordinator.next_rank == 10
+
+    coordinator.rank = 30
+    coordinator.rank_in_group = 2
+    assert not coordinator.is_first_rank
+    assert not coordinator.is_last_rank
+    assert coordinator.next_rank == 30
+    assert coordinator.prev_rank == 30
+
+    coordinator.set_routing_rank_indices([0, 1, 2, 3])
+    assert coordinator.next_rank == 40
+    assert coordinator.prev_rank == 20
+    with pytest.raises(ValueError, match="duplicates"):
+        coordinator.set_routing_rank_indices([0, 0])
+    with pytest.raises(ValueError, match="outside"):
+        coordinator.set_routing_rank_indices([4])
+
+
 def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator = parallel_state.GroupCoordinator.__new__(
         parallel_state.GroupCoordinator

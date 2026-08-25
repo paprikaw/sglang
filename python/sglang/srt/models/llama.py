@@ -391,6 +391,7 @@ class LlamaModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        self._elastic_pp_enabled = getattr(get_parallel(), "enable_elastic_pp", False)
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -428,7 +429,6 @@ class LlamaModel(nn.Module):
             prefix=self._elastic_layer_prefix,
         )
 
-        self._elastic_pp_enabled = getattr(get_parallel(), "enable_elastic_pp", False)
         self._elastic_layer_lock = RLock()
         self._elastic_layer_residency = (
             ElasticLayerResidency(
@@ -440,7 +440,10 @@ class LlamaModel(nn.Module):
             else None
         )
 
-        if self.pp_group.is_last_rank:
+        # The logical last rank can move during elastic PP. Match vLLM's
+        # dynamic model by preparing the small output endpoint on every
+        # resident candidate rank; the logical route decides who executes it.
+        if self.pp_group.is_last_rank or self._elastic_pp_enabled:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)

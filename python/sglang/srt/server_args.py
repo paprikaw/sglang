@@ -7875,10 +7875,10 @@ class ServerArgs:
             raise ValueError(
                 f"elastic PP layer counts must be non-negative: {partition}"
             )
-        if partition[0] == 0 or partition[-1] == 0:
+        if partition[0] == 0:
             raise ValueError(
-                "elastic PP currently requires non-empty physical first/last "
-                "ranks until dynamic endpoint modules are prepared"
+                "elastic PP requires non-empty rank 0 because it owns the "
+                "input embedding; the logical last rank may move"
             )
 
         normalized_partition = ",".join(str(count) for count in partition)

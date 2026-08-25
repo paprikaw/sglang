@@ -35,7 +35,17 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
-from typing import Any, Callable, Collection, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 from unittest.mock import patch
 
 import torch
@@ -409,6 +419,11 @@ class GroupCoordinator:
 
         assert self.cpu_group is not None
         assert self.device_group is not None
+        # Pipeline autoscaling keeps the physical process group resident and
+        # changes only the subset used by model/proxy-tensor routing. Keep
+        # this separate from ``active_ranks`` above: that tensor belongs to
+        # the elastic-EP/Mooncake process-group implementation.
+        self._routing_ranks: Optional[Tuple[int, ...]] = None
 
         # Import communicators
         self.use_pynccl = use_pynccl
@@ -549,14 +564,49 @@ class GroupCoordinator:
         )
 
     @property
+    def routing_ranks(self) -> Sequence[int]:
+        """Return the global ranks in the current logical P2P route."""
+
+        routing_ranks = getattr(self, "_routing_ranks", None)
+        return self.ranks if routing_ranks is None else routing_ranks
+
+    def set_routing_rank_indices(self, rank_indices: Optional[Sequence[int]]) -> None:
+        """Select a logical route using group-local rank indices.
+
+        The distributed process groups and their communicators remain fixed.
+        Passing ``None`` restores the complete physical route.
+        """
+
+        if rank_indices is None:
+            self._routing_ranks = None
+            return
+
+        normalized = tuple(int(rank_index) for rank_index in rank_indices)
+        if not normalized:
+            raise ValueError("routing rank indices must not be empty")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(f"routing rank indices contain duplicates: {normalized}")
+        invalid = [
+            rank_index
+            for rank_index in normalized
+            if rank_index < 0 or rank_index >= self.world_size
+        ]
+        if invalid:
+            raise ValueError(
+                "routing rank indices are outside the process group "
+                f"[0, {self.world_size}): {invalid}"
+            )
+        self._routing_ranks = tuple(self.ranks[index] for index in normalized)
+
+    @property
     def first_rank(self):
-        """Return the global rank of the first process in the group"""
-        return self.ranks[0]
+        """Return the global rank of the first process in the logical route."""
+        return self.routing_ranks[0]
 
     @property
     def last_rank(self):
-        """Return the global rank of the last process in the group"""
-        return self.ranks[-1]
+        """Return the global rank of the last process in the logical route."""
+        return self.routing_ranks[-1]
 
     @property
     def is_first_rank(self):
@@ -571,16 +621,20 @@ class GroupCoordinator:
     @property
     def next_rank(self):
         """Return the global rank of the process that follows the caller"""
-        rank_in_group = self.rank_in_group
-        world_size = self.world_size
-        return self.ranks[(rank_in_group + 1) % world_size]
+        ranks = self.routing_ranks
+        if self.rank not in ranks:
+            return self.rank
+        rank_in_group = ranks.index(self.rank)
+        return ranks[(rank_in_group + 1) % len(ranks)]
 
     @property
     def prev_rank(self):
         """Return the global rank of the process that precedes the caller"""
-        rank_in_group = self.rank_in_group
-        world_size = self.world_size
-        return self.ranks[(rank_in_group - 1) % world_size]
+        ranks = self.routing_ranks
+        if self.rank not in ranks:
+            return self.rank
+        rank_in_group = ranks.index(self.rank)
+        return ranks[(rank_in_group - 1) % len(ranks)]
 
     @contextmanager
     def graph_capture(

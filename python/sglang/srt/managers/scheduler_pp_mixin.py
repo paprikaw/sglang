@@ -143,11 +143,10 @@ class SchedulerPPMixin:
         """Install a drained, generation-stamped logical PP route.
 
         Request metadata still traverses every resident scheduler.  Proxy
-        tensors use this logical route and bypass zero-layer middle ranks.  The
-        first implementation keeps the physical endpoints active because most
-        SGLang models instantiate embedding/norm/lm-head modules according to
-        the startup PP endpoints.  Dynamic endpoint-role materialization is a
-        separate transition-preparation step.
+        tensors use this logical route and bypass zero-layer ranks.  Rank 0
+        remains the embedding owner, while the logical last rank may move
+        because the elastic Llama path pre-materializes output endpoints on
+        every resident candidate rank.
         """
 
         if topology.max_pp_size != self.ps.pp_size:
@@ -155,12 +154,10 @@ class SchedulerPPMixin:
                 "elastic PP topology must cover the resident PP group: "
                 f"topology={topology.max_pp_size}, resident={self.ps.pp_size}"
             )
-        if self.ps.pp_size > 1 and (
-            topology.first_rank != 0 or topology.last_rank != self.ps.pp_size - 1
-        ):
+        if self.ps.pp_size > 1 and topology.first_rank != 0:
             raise NotImplementedError(
-                "elastic PP currently requires physical first/last ranks to "
-                "remain active until dynamic endpoint modules are prepared"
+                "elastic PP currently requires rank 0 to remain active as the "
+                "embedding owner"
             )
 
         current = getattr(self, "_elastic_pp_topology", None)
@@ -182,6 +179,7 @@ class SchedulerPPMixin:
                 "elastic PP topology can only be installed after the PP "
                 "microbatch ring reaches its scheduler fence"
             )
+        self.pp_group.set_routing_rank_indices(topology.active_ranks)
         self._elastic_pp_topology = topology
         if current is not None:
             self._elastic_pp_post_commit_launch_logs_remaining = self.ps.pp_size
@@ -208,6 +206,16 @@ class SchedulerPPMixin:
         topology = self._pp_topology()
         return topology is None or self.ps.pp_rank in topology.active_ranks
 
+    def _pp_is_physical_first_rank(self: Scheduler) -> bool:
+        """Whether this scheduler starts the resident metadata ring."""
+
+        return self.ps.pp_rank == 0
+
+    def _pp_is_physical_last_rank(self: Scheduler) -> bool:
+        """Whether this scheduler terminates the resident metadata ring."""
+
+        return self.ps.pp_rank == self.ps.pp_size - 1
+
     def _pp_is_first_rank(self: Scheduler) -> bool:
         topology = self._pp_topology()
         return (
@@ -223,6 +231,12 @@ class SchedulerPPMixin:
             if topology is None
             else self.ps.pp_rank == topology.last_rank
         )
+
+    def _pp_requires_immediate_output_relay(self: Scheduler) -> bool:
+        """Whether results must complete the resident output ring immediately."""
+
+        topology = self._pp_topology()
+        return topology is not None and topology.last_rank != self.ps.pp_size - 1
 
     def _pp_prev_active_rank(self: Scheduler) -> Optional[int]:
         topology = self._pp_topology()
@@ -358,10 +372,14 @@ class SchedulerPPMixin:
             self._elastic_pp_emit_terminal_response()
             return
 
-        # No tensor or request send may outlive route publication.  These waits
-        # happen only once per migration, after matching receives have already
-        # been posted while the common microbatch ring was draining.
-        self._pp_commit_comm_work(self.send_req_work)
+        # Proxy/output sends are topology-dependent and must retire before
+        # route publication.  Request metadata, however, always follows the
+        # resident physical CPU ring.  Its async send from this microstep is
+        # matched by the next rank's recv at the start of the *next* microstep,
+        # even when the payload is empty.  Waiting for it here makes an idle
+        # fence circularly wait before any rank can post that matching recv.
+        # Leave it outstanding: the unchanged physical ring consumes and
+        # commits it when scheduling resumes on the new logical topology.
         self._pp_commit_comm_work(self.send_proxy_work)
         self._pp_commit_comm_work(self.send_output_work)
         try:
@@ -460,14 +478,12 @@ class SchedulerPPMixin:
                 new_counts=requested_counts,
                 phase=coordinator.phase.value,
             )
-        if self.ps.pp_size > 1 and (
-            requested_counts[0] == 0 or requested_counts[-1] == 0
-        ):
+        if self.ps.pp_size > 1 and requested_counts[0] == 0:
             return make_output(
                 success=False,
                 message=(
-                    "Elastic PP currently requires the physical first and last "
-                    "ranks to remain active"
+                    "Elastic PP requires rank 0 to remain active because it owns "
+                    "the input embedding"
                 ),
                 target_generation=requested_generation,
                 new_counts=requested_counts,
@@ -604,7 +620,7 @@ class SchedulerPPMixin:
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
-                if not self.pp_group.is_last_rank:
+                if not self._pp_is_physical_last_rank():
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
                         self.send_req_work = self._pp_send_pyobj_to_next_stage(
@@ -756,7 +772,7 @@ class SchedulerPPMixin:
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
 
-                if not self.pp_group.is_last_rank:
+                if not self._pp_is_physical_last_rank():
                     self._pp_commit_comm_work(self.send_req_work)
 
                 bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
@@ -844,7 +860,7 @@ class SchedulerPPMixin:
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
-                if not self.pp_group.is_last_rank:
+                if not self._pp_is_physical_last_rank():
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
@@ -914,7 +930,7 @@ class SchedulerPPMixin:
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
 
-                if not self.pp_group.is_last_rank:
+                if not self._pp_is_physical_last_rank():
                     self._pp_commit_comm_work(self.send_req_work)
 
                 # reaching consensus through PP ranks
@@ -1034,7 +1050,7 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if not self.pp_group.is_last_rank:
+                if not self._pp_is_physical_last_rank():
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
                         recv_reqs, async_send=True
                     )
@@ -1834,6 +1850,64 @@ class SchedulerPPMixin:
                 )
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
+
+        if self._pp_requires_immediate_output_relay():
+            # A result generated in this microstep belongs to next_mb_id at
+            # the receiving rank. The logical last rank therefore retains it
+            # for one microstep, then sends it when all other ranks enter the
+            # matching receive slot. Sending the fresh result immediately can
+            # deadlock during lazy NCCL P2P initialization because the next
+            # rank is still waiting for the next control-ring message.
+            is_logical_last = self._pp_is_last_rank()
+            if not is_logical_last and pp_outputs is not None:
+                raise RuntimeError(
+                    "elastic PP output relay found a retained result on a "
+                    "non-logical-last rank"
+                )
+            if is_logical_last:
+                if pp_outputs is not None:
+                    if mbs[next_mb_id] is None:
+                        raise RuntimeError(
+                            "elastic PP logical last rank has a retained output "
+                            "without a matching receive slot"
+                        )
+                    with torch.profiler.record_function("send_res_dict_to_next_stage"):
+                        send_output_work = self._pp_send_dict_to_next_stage(
+                            pp_outputs.tensors,
+                            async_send=True,
+                            msg_type="output",
+                        )
+                _do_recv()
+
+                # Stage the output just produced for next_first_rank_mb_id so
+                # it is sent in the receiver-aligned microstep. Waiting on the
+                # launch event is enqueued on the schedule stream; the actual
+                # P2P send remains asynchronous in the following iteration.
+                fresh_pp_outputs = None
+                fresh_target = mbs[next_first_rank_mb_id]
+                if fresh_target is not None:
+                    q_event, produced_pp_outputs = last_rank_comm_queue.popleft()
+                    if (
+                        not fresh_target.forward_mode.is_prebuilt()
+                        and not _pp_can_skip_output_comm(fresh_target)
+                    ):
+                        self.device_module.current_stream().wait_event(q_event)
+                        fresh_pp_outputs = produced_pp_outputs
+                next_pp_outputs = fresh_pp_outputs
+            else:
+                _do_recv()
+                if next_pp_outputs is not None:
+                    send_output_work = self._pp_send_output_to_next_stage(
+                        next_first_rank_mb_id,
+                        mbs,
+                        last_rank_comm_queue,
+                        next_pp_outputs,
+                    )
+                # Non-last ranks relay the received result immediately and
+                # never retain it into the next scheduler microstep.
+                next_pp_outputs = None
+
+            return next_pp_outputs, batch_result, d2h_event, send_output_work
 
         if send_first:
             send_output_work = _do_send()
