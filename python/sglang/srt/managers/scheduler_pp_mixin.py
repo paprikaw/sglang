@@ -232,12 +232,6 @@ class SchedulerPPMixin:
             else self.ps.pp_rank == topology.last_rank
         )
 
-    def _pp_requires_immediate_output_relay(self: Scheduler) -> bool:
-        """Whether results must complete the resident output ring immediately."""
-
-        topology = self._pp_topology()
-        return topology is not None and topology.last_rank != self.ps.pp_size - 1
-
     def _pp_prev_active_rank(self: Scheduler) -> Optional[int]:
         topology = self._pp_topology()
         if topology is None:
@@ -1850,64 +1844,6 @@ class SchedulerPPMixin:
                 )
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
-
-        if self._pp_requires_immediate_output_relay():
-            # A result generated in this microstep belongs to next_mb_id at
-            # the receiving rank. The logical last rank therefore retains it
-            # for one microstep, then sends it when all other ranks enter the
-            # matching receive slot. Sending the fresh result immediately can
-            # deadlock during lazy NCCL P2P initialization because the next
-            # rank is still waiting for the next control-ring message.
-            is_logical_last = self._pp_is_last_rank()
-            if not is_logical_last and pp_outputs is not None:
-                raise RuntimeError(
-                    "elastic PP output relay found a retained result on a "
-                    "non-logical-last rank"
-                )
-            if is_logical_last:
-                if pp_outputs is not None:
-                    if mbs[next_mb_id] is None:
-                        raise RuntimeError(
-                            "elastic PP logical last rank has a retained output "
-                            "without a matching receive slot"
-                        )
-                    with torch.profiler.record_function("send_res_dict_to_next_stage"):
-                        send_output_work = self._pp_send_dict_to_next_stage(
-                            pp_outputs.tensors,
-                            async_send=True,
-                            msg_type="output",
-                        )
-                _do_recv()
-
-                # Stage the output just produced for next_first_rank_mb_id so
-                # it is sent in the receiver-aligned microstep. Waiting on the
-                # launch event is enqueued on the schedule stream; the actual
-                # P2P send remains asynchronous in the following iteration.
-                fresh_pp_outputs = None
-                fresh_target = mbs[next_first_rank_mb_id]
-                if fresh_target is not None:
-                    q_event, produced_pp_outputs = last_rank_comm_queue.popleft()
-                    if (
-                        not fresh_target.forward_mode.is_prebuilt()
-                        and not _pp_can_skip_output_comm(fresh_target)
-                    ):
-                        self.device_module.current_stream().wait_event(q_event)
-                        fresh_pp_outputs = produced_pp_outputs
-                next_pp_outputs = fresh_pp_outputs
-            else:
-                _do_recv()
-                if next_pp_outputs is not None:
-                    send_output_work = self._pp_send_output_to_next_stage(
-                        next_first_rank_mb_id,
-                        mbs,
-                        last_rank_comm_queue,
-                        next_pp_outputs,
-                    )
-                # Non-last ranks relay the received result immediately and
-                # never retain it into the next scheduler microstep.
-                next_pp_outputs = None
-
-            return next_pp_outputs, batch_result, d2h_event, send_output_work
 
         if send_first:
             send_output_work = _do_send()

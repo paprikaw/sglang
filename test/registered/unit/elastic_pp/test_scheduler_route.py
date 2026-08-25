@@ -378,7 +378,7 @@ def test_reconfigure_supports_compact_pp2_to_pp4():
     assert coordinator.transition.target == target
 
 
-def test_resident_rank_immediately_relays_output_after_logical_last_moves():
+def test_resident_rank_stages_output_for_next_physical_ring_hop():
     scheduler = _FakeScheduler(rank=2)
     scheduler._pp_install_topology(PPTopology.from_layer_counts([4, 4, 0, 0]))
     scheduler.pp_group.received.append(
@@ -409,18 +409,15 @@ def test_resident_rank_immediately_relays_output_after_logical_last_moves():
         )
     )
 
-    assert next_outputs is None
+    assert next_outputs["next_token_ids"] == "tokens"
     assert batch_result[0] is target
     assert d2h_event.recorded_stream == "schedule-stream"
     assert scheduler.copy_stream.waited_for == "schedule-stream"
-    assert len(scheduler.pp_group.sent) == 1
-    assert scheduler.pp_group.sent[0]["tensor_dict"]["next_token_ids"] == "tokens"
-    assert scheduler.pp_group.sent[0]["tensor_dict"]["__msg_type__"] == "output"
-    assert not scheduler.pp_group.sent[0]["use_pynccl"]
+    assert scheduler.pp_group.sent == []
     assert send_work == []
 
 
-def test_logical_last_defers_fresh_output_until_receiver_aligned_microstep():
+def test_logical_last_starts_physical_output_ring_from_fresh_result():
     scheduler = _FakeScheduler(rank=1)
     scheduler._pp_install_topology(PPTopology.from_layer_counts([4, 4, 0, 0]))
     waited_events = []
@@ -446,13 +443,46 @@ def test_logical_last_defers_fresh_output_until_receiver_aligned_microstep():
         )
     )
 
-    assert next_outputs is produced
+    assert next_outputs is None
     assert batch_result is None
     assert d2h_event is None
     assert send_work == []
-    assert scheduler.pp_group.sent == []
+    assert len(scheduler.pp_group.sent) == 1
+    sent = scheduler.pp_group.sent[0]
+    assert sent["dst"] is None
+    assert sent["tensor_dict"]["next_token_ids"] == "fresh"
+    assert sent["tensor_dict"]["__msg_type__"] == "output"
+    assert not sent["use_pynccl"]
     assert output_queue == deque()
     assert waited_events == ["launch-event"]
+
+
+def test_resident_rank_forwards_staged_output_on_next_microstep():
+    scheduler = _FakeScheduler(rank=2)
+    scheduler._pp_install_topology(PPTopology.from_layer_counts([4, 4, 0, 0]))
+    retained = SimpleNamespace(tensors={"next_token_ids": "tokens"})
+
+    next_outputs, batch_result, d2h_event, send_work = (
+        scheduler._pp_send_recv_and_preprocess_output_tensors(
+            next_first_rank_mb_id=0,
+            next_mb_id=1,
+            mbs=[None, None],
+            mb_metadata=[None, None],
+            last_rank_comm_queue=deque(),
+            pp_outputs=retained,
+        )
+    )
+
+    assert next_outputs is None
+    assert batch_result is None
+    assert d2h_event is None
+    assert send_work == []
+    assert len(scheduler.pp_group.sent) == 1
+    sent = scheduler.pp_group.sent[0]
+    assert sent["dst"] is None
+    assert sent["tensor_dict"]["next_token_ids"] == "tokens"
+    assert sent["tensor_dict"]["__msg_type__"] == "output"
+    assert not sent["use_pynccl"]
 
 
 def test_common_future_microstep_arms_drain_on_the_exact_boundary():
