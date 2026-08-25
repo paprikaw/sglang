@@ -56,6 +56,8 @@ from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
+_ELASTIC_PP_OUTPUT_HANDOFF_TAG = 17
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -70,6 +72,10 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+def _pp_needs_output_comm(batch: ScheduleBatch) -> bool:
+    return not batch.forward_mode.is_prebuilt() and not _pp_can_skip_output_comm(batch)
 
 
 @dataclass
@@ -232,8 +238,8 @@ class SchedulerPPMixin:
             else self.ps.pp_rank == topology.last_rank
         )
 
-    def _pp_requires_delayed_output_origin(self: Scheduler) -> bool:
-        """Whether the logical output origin moved before the resident tail."""
+    def _pp_requires_output_handoff(self: Scheduler) -> bool:
+        """Whether logical output must be handed to the resident ring tail."""
 
         topology = self._pp_topology()
         return topology is not None and topology.last_rank != self.ps.pp_size - 1
@@ -381,6 +387,7 @@ class SchedulerPPMixin:
         # Leave it outstanding: the unchanged physical ring consumes and
         # commits it when scheduling resumes on the new logical topology.
         self._pp_commit_comm_work(self.send_proxy_work)
+        self._pp_commit_comm_work(self.send_output_handoff_work)
         self._pp_commit_comm_work(self.send_output_work)
         try:
             coordinator.finalize_at_fence(self._pp_install_topology)
@@ -566,6 +573,21 @@ class SchedulerPPMixin:
                 last_rank_comm_queue,
             )
 
+        output_handoff = None
+        if (
+            self._pp_requires_output_handoff()
+            and self._pp_is_physical_last_rank()
+            and _pp_needs_output_comm(cur_batch)
+        ):
+            topology = self._pp_topology()
+            output_handoff = PPProxyTensors(
+                self._pp_recv_typed_dict(
+                    expected_kind="output_handoff",
+                    src=topology.last_rank,
+                    metadata_tag=_ELASTIC_PP_OUTPUT_HANDOFF_TAG,
+                )
+            )
+
         # Inactive ranks retain scheduler/request state but own no model
         # layers.  Recording an event keeps the common microbatch retirement
         # path valid without launching GPU forward or receiving a proxy tensor.
@@ -582,6 +604,8 @@ class SchedulerPPMixin:
         mb_metadata[mb_id] = PPBatchMetadata(can_run_cuda_graph=False)
         event = self.device_module.Event()
         event.record(self.device_module.current_stream())
+        if output_handoff is not None:
+            last_rank_comm_queue.append((event, output_handoff))
         return None, event
 
     @DynamicGradMode()
@@ -659,6 +683,7 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_commit_comm_work(self.send_output_handoff_work)
                 if cur_batch:
                     result, self.launch_event = self._pp_launch_or_skip_batch(
                         mb_id,
@@ -807,6 +832,7 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_commit_comm_work(self.send_output_handoff_work)
                 if cur_batch:
                     if self.enable_staging:
                         self.maybe_prefetch_staging_for_batch(cur_batch)
@@ -972,6 +998,7 @@ class SchedulerPPMixin:
                         )
                     )
                 self._pp_commit_comm_work(self.send_proxy_work)
+                self._pp_commit_comm_work(self.send_output_handoff_work)
 
                 if cur_batch:
                     result, self.launch_event = self._pp_launch_or_skip_batch(
@@ -1115,6 +1142,7 @@ class SchedulerPPMixin:
 
         self.send_req_work = []
         self.send_proxy_work = []
+        self.send_output_handoff_work = []
         self.send_output_work = []
         self.launch_event = None
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
@@ -1582,6 +1610,7 @@ class SchedulerPPMixin:
         async_send: bool = True,
         msg_type: str = "default",
         dst: Optional[int] = None,
+        metadata_tag: int = 0,
     ):
         # Warn once if using default untyped messages
         if msg_type == "default":
@@ -1606,7 +1635,11 @@ class SchedulerPPMixin:
                     self.attn_tp_group if self.require_attn_tp_allgather else None
                 ),
                 async_send=async_send,
-                use_pynccl=(msg_type == "proxy" and self._pp_proxy_uses_pynccl()),
+                use_pynccl=(
+                    msg_type in {"proxy", "output_handoff"}
+                    and self._pp_proxy_uses_pynccl()
+                ),
+                metadata_tag=metadata_tag,
             )
         )
         return p2p_work
@@ -1616,6 +1649,7 @@ class SchedulerPPMixin:
         expected_kind: str = "default",
         all_gather_group: Optional = None,
         src: Optional[int] = None,
+        metadata_tag: int = 0,
     ) -> Dict[str, torch.Tensor]:
         """Receive a typed tensor dict, demultiplexing by msg_type.
 
@@ -1632,8 +1666,12 @@ class SchedulerPPMixin:
                 src=src,
                 all_gather_group=all_gather_group,
                 pynccl_message_types=(
-                    ("proxy",) if self._pp_proxy_uses_pynccl() else None
+                    (expected_kind,)
+                    if expected_kind in {"proxy", "output_handoff"}
+                    and self._pp_proxy_uses_pynccl()
+                    else None
                 ),
+                metadata_tag=metadata_tag,
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
@@ -1764,7 +1802,7 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors | None,
     ) -> List[P2PWork]:
         send_output_work = []
-        if self.pp_group.is_last_rank:
+        if self._pp_is_physical_last_rank():
             # send ready PP output to rank 0
             target = mbs[next_first_rank_mb_id]
             if target is not None:
@@ -1781,7 +1819,7 @@ class SchedulerPPMixin:
                             msg_type="output",
                         )
         # send the outputs from the last round to let the next stage worker run post processing
-        if not self.pp_group.is_last_rank:
+        if not self._pp_is_physical_last_rank():
             if pp_outputs:
                 with torch.profiler.record_function("send_res_dict_to_next_stage"):
                     send_output_work = self._pp_send_dict_to_next_stage(
@@ -1851,46 +1889,6 @@ class SchedulerPPMixin:
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
 
-        if self._pp_requires_delayed_output_origin() and self._pp_is_last_rank():
-            # The resident request ring advances one physical rank per
-            # microstep.  When the logical last rank moves before the resident
-            # tail, its freshly produced output is one slot ahead of the next
-            # physical rank's matching receive.  Delay only that origin by one
-            # microstep; every resident rank then uses the normal staged
-            # send-old/receive-new output-ring schedule.
-            def _send_retained_output():
-                if pp_outputs is None:
-                    return []
-                with torch.profiler.record_function("send_res_dict_to_next_stage"):
-                    return self._pp_send_dict_to_next_stage(
-                        pp_outputs.tensors,
-                        async_send=True,
-                        msg_type="output",
-                    )
-
-            if send_first:
-                send_output_work = _send_retained_output()
-                _do_recv()
-            else:
-                _do_recv()
-                send_output_work = _send_retained_output()
-
-            # A returned output has now completed its resident-ring circuit
-            # and must terminate here.  Replace it with the result produced in
-            # this microstep, which becomes the next microstep's retained send.
-            fresh_pp_outputs = None
-            fresh_target = mbs[next_first_rank_mb_id]
-            if fresh_target is not None:
-                q_event, produced_pp_outputs = last_rank_comm_queue.popleft()
-                if (
-                    not fresh_target.forward_mode.is_prebuilt()
-                    and not _pp_can_skip_output_comm(fresh_target)
-                ):
-                    self.device_module.current_stream().wait_event(q_event)
-                    fresh_pp_outputs = produced_pp_outputs
-            next_pp_outputs = fresh_pp_outputs
-            return next_pp_outputs, batch_result, d2h_event, send_output_work
-
         if send_first:
             send_output_work = _do_send()
             _do_recv()
@@ -1951,16 +1949,28 @@ class SchedulerPPMixin:
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
-                if self.pp_group.is_last_rank:
-                    # (last rank) buffer the outputs for async batch depth
-                    last_rank_comm_queue.append(
-                        (
-                            event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, cur_batch)
-                            ),
-                        )
+                if self._pp_is_last_rank():
+                    prepared_output = PPProxyTensors(
+                        self._pp_prepare_tensor_dict(result, cur_batch)
                     )
+                    if self._pp_is_physical_last_rank():
+                        # The resident tail buffers outputs for the unchanged
+                        # scheduler output ring and async batch depth.
+                        last_rank_comm_queue.append((event, prepared_output))
+                    elif _pp_needs_output_comm(cur_batch):
+                        # Keep the proven output-ring phase anchored at the
+                        # resident tail.  Only the compute endpoint moves: its
+                        # result takes a direct, separately tagged PyNCCL
+                        # handoff to the physical last rank.
+                        self.send_output_handoff_work = (
+                            self._pp_send_dict_to_next_stage(
+                                prepared_output.tensors,
+                                async_send=True,
+                                msg_type="output_handoff",
+                                dst=self.ps.pp_size - 1,
+                                metadata_tag=_ELASTIC_PP_OUTPUT_HANDOFF_TAG,
+                            )
+                        )
         return result, event
 
     def get_rids(

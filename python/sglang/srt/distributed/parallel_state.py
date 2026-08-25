@@ -1743,6 +1743,7 @@ class GroupCoordinator:
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
         use_pynccl: bool = False,
+        metadata_tag: int = 0,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
 
@@ -1781,7 +1782,12 @@ class GroupCoordinator:
         # Thus the net performance gain justifies this approach.
 
         send_func = torch.distributed.isend if async_send else torch.distributed.send
-        p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
+        p2p_works = self.send_object(
+            metadata_list,
+            dst=dst,
+            async_send=async_send,
+            tag=metadata_tag,
+        )
 
         pynccl_comm = self.pynccl_comm if use_pynccl else None
         if use_pynccl and (
@@ -1810,7 +1816,13 @@ class GroupCoordinator:
                 tensor.record_stream(self.device_module.current_stream())
             else:
                 comm_group = metadata_group if tensor.is_cpu else group
-                work = send_func(tensor, self.ranks[dst], group=comm_group)
+                send_kwargs = {"tag": metadata_tag} if tensor.is_cpu else {}
+                work = send_func(
+                    tensor,
+                    self.ranks[dst],
+                    group=comm_group,
+                    **send_kwargs,
+                )
                 if async_send:
                     p2p_works.append(P2PWork(work, tensor))
         return p2p_works
@@ -1821,6 +1833,7 @@ class GroupCoordinator:
         all_gather_group: Optional["GroupCoordinator"] = None,
         use_pynccl: bool = False,
         pynccl_message_types: Optional[Collection[str]] = None,
+        metadata_tag: int = 0,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
 
@@ -1849,7 +1862,7 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        recv_metadata_list = self.recv_object(src=src)
+        recv_metadata_list = self.recv_object(src=src, tag=metadata_tag)
         received_message_type = next(
             (
                 value
@@ -1898,8 +1911,12 @@ class GroupCoordinator:
                     # We have to use irecv here to make it work for both isend
                     # and send.
                     comm_group = metadata_group if tensor.is_cpu else group
+                    recv_kwargs = {"tag": metadata_tag} if tensor.is_cpu else {}
                     work = torch.distributed.irecv(
-                        tensor, src=self.ranks[src], group=comm_group
+                        tensor,
+                        src=self.ranks[src],
+                        group=comm_group,
+                        **recv_kwargs,
                     )
                     work.wait()
 

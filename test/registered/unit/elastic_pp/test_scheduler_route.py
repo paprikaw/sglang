@@ -17,6 +17,7 @@ from sglang.srt.managers.io_struct import (
     ReconfigureElasticPPReqInput,
 )
 from sglang.srt.managers.scheduler_pp_mixin import (
+    _ELASTIC_PP_OUTPUT_HANDOFF_TAG,
     PPBatchMetadata,
     SchedulerPPMixin,
 )
@@ -100,6 +101,7 @@ class _FakeScheduler(SchedulerPPMixin):
         self.copy_stream_ctx = _FakeStreamContext()
         self.forward_ct = 0
         self._sched_idled = True
+        self.send_output_handoff_work = []
 
     def _record_batch_launch(self, batch):
         self.forward_ct += 1
@@ -262,10 +264,14 @@ def test_tensor_dict_receive_selects_transport_from_actual_metadata(
     group.device_group = object()
     group.cpu_group = object()
     group.unique_name = "test-pp"
-    group.recv_object = lambda src: [
-        ("__msg_type__", message_type),
-        ("payload", TensorMetadata("meta", torch.float32, (2,))),
-    ]
+    recv_object_calls = []
+    group.recv_object = lambda src, tag=0: (
+        recv_object_calls.append((src, tag))
+        or [
+            ("__msg_type__", message_type),
+            ("payload", TensorMetadata("meta", torch.float32, (2,))),
+        ]
+    )
 
     pynccl_recvs = []
     group.pynccl_comm = SimpleNamespace(
@@ -296,6 +302,7 @@ def test_tensor_dict_receive_selects_transport_from_actual_metadata(
 
     assert received["__msg_type__"] == message_type
     assert tuple(received["payload"].shape) == (2,)
+    assert recv_object_calls == [(0, 0)]
     assert bool(pynccl_recvs) is expect_pynccl
     assert bool(process_group_recvs) is not expect_pynccl
 
@@ -417,8 +424,72 @@ def test_resident_rank_stages_output_for_next_physical_ring_hop():
     assert send_work == []
 
 
-def test_logical_last_delays_fresh_output_until_next_microstep():
+def test_logical_last_handoff_uses_pynccl_and_dedicated_metadata_tag():
     scheduler = _FakeScheduler(rank=1)
+    scheduler._pp_install_topology(PPTopology.from_layer_counts([4, 4, 0, 0]))
+
+    scheduler._pp_send_dict_to_next_stage(
+        {"next_token_ids": "tokens"},
+        msg_type="output_handoff",
+        dst=3,
+        metadata_tag=_ELASTIC_PP_OUTPUT_HANDOFF_TAG,
+    )
+
+    assert len(scheduler.pp_group.sent) == 1
+    sent = scheduler.pp_group.sent[0]
+    assert sent["dst"] == 3
+    assert sent["metadata_tag"] == _ELASTIC_PP_OUTPUT_HANDOFF_TAG
+    assert sent["tensor_dict"]["__msg_type__"] == "output_handoff"
+    assert sent["tensor_dict"]["__pp_generation__"] == 0
+    assert sent["use_pynccl"]
+
+
+def test_inactive_physical_tail_receives_output_handoff_into_ring_queue():
+    scheduler = _FakeScheduler(rank=3)
+    scheduler._pp_install_topology(PPTopology.from_layer_counts([4, 4, 0, 0]))
+    scheduler.pp_group.received.append(
+        {
+            "__msg_type__": "output_handoff",
+            "__pp_generation__": 0,
+            "next_token_ids": "tokens",
+        }
+    )
+    batch = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
+        input_ids=torch.tensor([1]),
+        prefill_input_ids_cpu=torch.tensor([1, 2]),
+        mix_running_indices=torch.tensor([0]),
+    )
+    metadata = [None]
+    output_queue = deque()
+
+    result, event = scheduler._pp_launch_or_skip_batch(
+        0,
+        batch,
+        None,
+        metadata,
+        output_queue,
+    )
+
+    assert result is None
+    assert metadata == [PPBatchMetadata(can_run_cuda_graph=False)]
+    assert event.recorded_stream == "schedule-stream"
+    assert len(output_queue) == 1
+    queued_event, queued_output = output_queue.popleft()
+    assert queued_event is event
+    assert queued_output["next_token_ids"] == "tokens"
+    assert scheduler.pp_group.last_recv_kwargs["src"] == 1
+    assert (
+        scheduler.pp_group.last_recv_kwargs["metadata_tag"]
+        == _ELASTIC_PP_OUTPUT_HANDOFF_TAG
+    )
+    assert scheduler.pp_group.last_recv_kwargs["pynccl_message_types"] == (
+        "output_handoff",
+    )
+
+
+def test_physical_tail_starts_output_ring_after_logical_last_moves():
+    scheduler = _FakeScheduler(rank=3)
     scheduler._pp_install_topology(PPTopology.from_layer_counts([4, 4, 0, 0]))
     waited_events = []
     scheduler.device_module = SimpleNamespace(
@@ -429,49 +500,17 @@ def test_logical_last_delays_fresh_output_until_next_microstep():
     target = SimpleNamespace(
         forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
     )
-    produced = SimpleNamespace(tensors={"next_token_ids": "fresh"})
-    output_queue = deque([("launch-event", produced)])
+    produced = SimpleNamespace(tensors={"next_token_ids": "tokens"})
 
-    next_outputs, batch_result, d2h_event, send_work = (
-        scheduler._pp_send_recv_and_preprocess_output_tensors(
-            next_first_rank_mb_id=0,
-            next_mb_id=1,
-            mbs=[target, None],
-            mb_metadata=[PPBatchMetadata(can_run_cuda_graph=False), None],
-            last_rank_comm_queue=output_queue,
-            pp_outputs=None,
-        )
+    send_work = scheduler._pp_send_output_to_next_stage(
+        next_first_rank_mb_id=0,
+        mbs=[target],
+        last_rank_comm_queue=deque([("handoff-event", produced)]),
+        pp_outputs=None,
     )
 
-    assert next_outputs is produced
-    assert batch_result is None
-    assert d2h_event is None
     assert send_work == []
-    assert scheduler.pp_group.sent == []
-    assert output_queue == deque()
-    assert waited_events == ["launch-event"]
-
-
-def test_logical_last_sends_retained_output_without_local_receive_slot():
-    scheduler = _FakeScheduler(rank=1)
-    scheduler._pp_install_topology(PPTopology.from_layer_counts([4, 4, 0, 0]))
-    retained = SimpleNamespace(tensors={"next_token_ids": "tokens"})
-
-    next_outputs, batch_result, d2h_event, send_work = (
-        scheduler._pp_send_recv_and_preprocess_output_tensors(
-            next_first_rank_mb_id=0,
-            next_mb_id=1,
-            mbs=[None, None],
-            mb_metadata=[None, None],
-            last_rank_comm_queue=deque(),
-            pp_outputs=retained,
-        )
-    )
-
-    assert next_outputs is None
-    assert batch_result is None
-    assert d2h_event is None
-    assert send_work == []
+    assert waited_events == ["handoff-event"]
     assert len(scheduler.pp_group.sent) == 1
     sent = scheduler.pp_group.sent[0]
     assert sent["dst"] is None
@@ -575,10 +614,13 @@ def test_drained_fence_does_not_wait_for_next_step_request_receive():
     request_work.wait = lambda: setattr(request_work, "waited", True)
     proxy_work = SimpleNamespace(waited=False)
     proxy_work.wait = lambda: setattr(proxy_work, "waited", True)
+    handoff_work = SimpleNamespace(waited=False)
+    handoff_work.wait = lambda: setattr(handoff_work, "waited", True)
     output_work = SimpleNamespace(waited=False)
     output_work.wait = lambda: setattr(output_work, "waited", True)
     scheduler.send_req_work = [SimpleNamespace(work=request_work)]
     scheduler.send_proxy_work = [SimpleNamespace(work=proxy_work)]
+    scheduler.send_output_handoff_work = [SimpleNamespace(work=handoff_work)]
     scheduler.send_output_work = [SimpleNamespace(work=output_work)]
 
     scheduler._elastic_pp_finalize_if_drained()
@@ -587,6 +629,8 @@ def test_drained_fence_does_not_wait_for_next_step_request_receive():
     assert len(scheduler.send_req_work) == 1
     assert proxy_work.waited
     assert scheduler.send_proxy_work == []
+    assert handoff_work.waited
+    assert scheduler.send_output_handoff_work == []
     assert output_work.waited
     assert scheduler.send_output_work == []
     assert scheduler._pp_topology() == target
