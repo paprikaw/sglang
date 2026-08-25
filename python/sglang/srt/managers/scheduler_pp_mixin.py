@@ -232,6 +232,12 @@ class SchedulerPPMixin:
             else self.ps.pp_rank == topology.last_rank
         )
 
+    def _pp_requires_delayed_output_origin(self: Scheduler) -> bool:
+        """Whether the logical output origin moved before the resident tail."""
+
+        topology = self._pp_topology()
+        return topology is not None and topology.last_rank != self.ps.pp_size - 1
+
     def _pp_prev_active_rank(self: Scheduler) -> Optional[int]:
         topology = self._pp_topology()
         if topology is None:
@@ -1844,6 +1850,46 @@ class SchedulerPPMixin:
                 )
                 d2h_event = self.device_module.Event()
                 d2h_event.record(self.device_module.current_stream())
+
+        if self._pp_requires_delayed_output_origin() and self._pp_is_last_rank():
+            # The resident request ring advances one physical rank per
+            # microstep.  When the logical last rank moves before the resident
+            # tail, its freshly produced output is one slot ahead of the next
+            # physical rank's matching receive.  Delay only that origin by one
+            # microstep; every resident rank then uses the normal staged
+            # send-old/receive-new output-ring schedule.
+            def _send_retained_output():
+                if pp_outputs is None:
+                    return []
+                with torch.profiler.record_function("send_res_dict_to_next_stage"):
+                    return self._pp_send_dict_to_next_stage(
+                        pp_outputs.tensors,
+                        async_send=True,
+                        msg_type="output",
+                    )
+
+            if send_first:
+                send_output_work = _send_retained_output()
+                _do_recv()
+            else:
+                _do_recv()
+                send_output_work = _send_retained_output()
+
+            # A returned output has now completed its resident-ring circuit
+            # and must terminate here.  Replace it with the result produced in
+            # this microstep, which becomes the next microstep's retained send.
+            fresh_pp_outputs = None
+            fresh_target = mbs[next_first_rank_mb_id]
+            if fresh_target is not None:
+                q_event, produced_pp_outputs = last_rank_comm_queue.popleft()
+                if (
+                    not fresh_target.forward_mode.is_prebuilt()
+                    and not _pp_can_skip_output_comm(fresh_target)
+                ):
+                    self.device_module.current_stream().wait_event(q_event)
+                    fresh_pp_outputs = produced_pp_outputs
+            next_pp_outputs = fresh_pp_outputs
+            return next_pp_outputs, batch_result, d2h_event, send_output_work
 
         if send_first:
             send_output_work = _do_send()
