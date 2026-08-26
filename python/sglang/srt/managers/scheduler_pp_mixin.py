@@ -32,7 +32,7 @@ from sglang.srt.managers.io_struct import (
     ReconfigureElasticPPReqInput,
     ReconfigureElasticPPReqOutput,
 )
-from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.managers.overlap_utils import RelayPayload, resolve_forward_inputs
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -512,8 +512,25 @@ class SchedulerPPMixin:
             )
 
         # Inactive ranks retain scheduler/request state but own no model
-        # layers.  Recording an event keeps the common microbatch retirement
-        # path valid without launching GPU forward or receiving a proxy tensor.
+        # layers.  Mirror run_batch's scheduler bookkeeping so result
+        # processing and per-step metrics see a valid, contiguous forward
+        # sequence even though this rank launches no GPU kernels.
+        self.forward_ct += 1
+        cur_batch.forward_iter = self.forward_ct
+        cur_batch.launch_ts = time.monotonic()
+        cur_batch.after_idle_gap = self._sched_idled
+        self._sched_idled = False
+
+        # Consume the same prefill/decode staging as an active run_batch and
+        # clear the one-iteration input tensor afterwards.  Without this, an
+        # inactive rank can retain a prefill-sized input_ids tensor and crash
+        # on its first decode after becoming active because positions/seq_lens
+        # already describe the smaller current batch.
+        resolve_forward_inputs(cur_batch, self.future_map)
+        cur_batch.input_ids = None
+
+        # Recording an event keeps the common microbatch retirement path valid
+        # without launching GPU forward or receiving a proxy tensor.
         mb_metadata[mb_id] = PPBatchMetadata(can_run_cuda_graph=False)
         event = self.device_module.Event()
         event.record(self.device_module.current_stream())

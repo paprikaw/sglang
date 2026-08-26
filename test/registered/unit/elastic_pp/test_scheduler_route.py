@@ -94,6 +94,9 @@ class _FakeScheduler(SchedulerPPMixin):
         self.schedule_stream = "schedule-stream"
         self.copy_stream = _FakeStream()
         self.copy_stream_ctx = _FakeStreamContext()
+        self.forward_ct = 0
+        self._sched_idled = True
+        self.future_map = None
 
 
 class _FakeSender:
@@ -214,9 +217,18 @@ def test_inactive_rank_neither_receives_proxy_nor_launches_forward():
 
     assert scheduler._pp_recv_proxy_tensors() is None
     metadata = [None]
+    batch = SimpleNamespace(
+        forward_iter=None,
+        launch_ts=None,
+        after_idle_gap=False,
+        prefill_input_ids_cpu=None,
+        input_ids="consumed-input",
+        enable_overlap=False,
+        spec_algorithm=SimpleNamespace(is_none=lambda: True),
+    )
     result, event = scheduler._pp_launch_or_skip_batch(
         0,
-        object(),
+        batch,
         None,
         metadata,
         deque(),
@@ -225,6 +237,12 @@ def test_inactive_rank_neither_receives_proxy_nor_launches_forward():
     assert result is None
     assert metadata == [PPBatchMetadata(can_run_cuda_graph=False)]
     assert event.recorded_stream == "schedule-stream"
+    assert batch.forward_iter == 1
+    assert batch.launch_ts is not None
+    assert batch.after_idle_gap
+    assert scheduler.forward_ct == 1
+    assert not scheduler._sched_idled
+    assert batch.input_ids is None
 
 
 def test_topology_install_allows_moving_last_but_keeps_rank_zero_and_fence():
