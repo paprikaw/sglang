@@ -45,10 +45,15 @@ def test_parse_autoscale_frontier_rejects_invalid_text(raw, match):
         parse_elastic_pp_partitions(raw)
 
 
-def test_validate_autoscale_frontier_requires_fixed_endpoints_and_more_ranks():
-    with pytest.raises(ValueError, match="first/last"):
+def test_validate_autoscale_frontier_allows_moving_last_and_requires_rank_zero():
+    assert validate_elastic_pp_autoscale_partitions(
+        ((8, 0), (4, 4)),
+        pp_size=2,
+        num_layers=8,
+    ) == ((8, 0), (4, 4))
+    with pytest.raises(ValueError, match="rank 0"):
         validate_elastic_pp_autoscale_partitions(
-            ((8, 0, 0, 0), (2, 2, 2, 2)),
+            ((0, 8, 0, 0), (2, 2, 2, 2)),
             pp_size=4,
             num_layers=8,
         )

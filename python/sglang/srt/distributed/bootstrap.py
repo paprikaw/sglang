@@ -275,6 +275,24 @@ def _init_parallel_groups(
         rank_offset=rank_offset,
         max_world_size=server_args.max_ep_size,
     )
+    if server_args.enable_elastic_pp:
+        # Install the initial logical route before model construction. This
+        # lets model/runner endpoint checks see [L, 0, ...] as logical PP1
+        # while every resident scheduler and communicator stays alive.
+        partition = tuple(
+            int(item) for item in server_args.elastic_pp_initial_partition.split(",")
+        )
+        active_rank_indices = [
+            rank_index
+            for rank_index, layer_count in enumerate(partition)
+            if layer_count > 0
+        ]
+        get_pp_group().set_routing_rank_indices(active_rank_indices)
+        logger.info(
+            "Installed initial elastic PP route: partition=%s active_ranks=%s",
+            partition,
+            active_rank_indices,
+        )
     _tag_groups_for_flashinfer_allreduce_only()
     initialize_dp_attention(
         server_args=server_args,

@@ -23,16 +23,23 @@ class _FakePPGroup:
     def __init__(self, rank: int, size: int = 4):
         self.rank = rank
         self.size = size
+        self.ranks = list(range(size))
+        self.routing_rank_indices = tuple(range(size))
         self.sent = []
         self.received = deque()
 
+    def set_routing_rank_indices(self, rank_indices):
+        self.routing_rank_indices = (
+            tuple(range(self.size)) if rank_indices is None else tuple(rank_indices)
+        )
+
     @property
     def is_first_rank(self):
-        return self.rank == 0
+        return self.rank == self.routing_rank_indices[0]
 
     @property
     def is_last_rank(self):
-        return self.rank == self.size - 1
+        return self.rank == self.routing_rank_indices[-1]
 
     def send_tensor_dict(self, **kwargs):
         self.sent.append(kwargs)
@@ -61,6 +68,22 @@ class _FakeDeviceModule:
         return "schedule-stream"
 
 
+class _FakeStream:
+    def __init__(self):
+        self.waited_for = None
+
+    def wait_stream(self, stream):
+        self.waited_for = stream
+
+
+class _FakeStreamContext:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+
 class _FakeScheduler(SchedulerPPMixin):
     def __init__(self, rank: int, size: int = 4):
         self.ps = SimpleNamespace(pp_rank=rank, pp_size=size)
@@ -68,6 +91,9 @@ class _FakeScheduler(SchedulerPPMixin):
         self.require_attn_tp_allgather = False
         self._pp_tensor_dict_inbox = defaultdict(deque)
         self.device_module = _FakeDeviceModule()
+        self.schedule_stream = "schedule-stream"
+        self.copy_stream = _FakeStream()
+        self.copy_stream_ctx = _FakeStreamContext()
 
 
 class _FakeSender:
@@ -201,12 +227,18 @@ def test_inactive_rank_neither_receives_proxy_nor_launches_forward():
     assert event.recorded_stream == "schedule-stream"
 
 
-def test_topology_install_requires_static_endpoints_new_generation_and_fence():
+def test_topology_install_allows_moving_last_but_keeps_rank_zero_and_fence():
     scheduler = _FakeScheduler(rank=0)
 
-    with pytest.raises(NotImplementedError, match="physical first/last"):
+    moving_last = PPTopology.from_layer_counts([4, 4, 0, 0], generation=0)
+    scheduler._pp_install_topology(moving_last)
+    assert scheduler.pp_group.routing_rank_indices == (0, 1)
+    assert scheduler.pp_group.is_first_rank
+    assert not scheduler.pp_group.is_last_rank
+
+    with pytest.raises(NotImplementedError, match="rank 0"):
         scheduler._pp_install_topology(
-            PPTopology.from_layer_counts([4, 4, 0, 0], generation=0)
+            PPTopology.from_layer_counts([0, 4, 0, 4], generation=1)
         )
 
     scheduler._pp_install_topology(_pp2_topology(generation=1))
@@ -218,6 +250,105 @@ def test_topology_install_requires_static_endpoints_new_generation_and_fence():
         scheduler._pp_install_topology(
             PPTopology.from_layer_counts([2, 2, 2, 2], generation=2)
         )
+
+
+def test_reconfigure_supports_resident_pp1_to_pp2():
+    scheduler = _FakeScheduler(rank=0, size=2)
+    source = PPTopology.from_layer_counts([8, 0], generation=0)
+    target = PPTopology.from_layer_counts([4, 4], generation=1)
+    coordinator = _FakeMigrationCoordinator(
+        DynamicPPTransition.build(source, target),
+        phase=ElasticPPMigrationPhase.IDLE,
+    )
+    scheduler._pp_install_topology(source)
+    scheduler.elastic_pp_migration_coordinator = coordinator
+    scheduler._elastic_pp_pending_req = None
+
+    assert scheduler.pp_group.is_first_rank
+    assert scheduler.pp_group.is_last_rank
+    response = scheduler.handle_reconfigure_elastic_pp(
+        ReconfigureElasticPPReqInput(layer_counts=[4, 4])
+    )
+
+    assert response is None
+    assert coordinator.begun
+    assert coordinator.transition.target == target
+
+
+def test_resident_rank_immediately_relays_output_when_logical_last_moves():
+    scheduler = _FakeScheduler(rank=1, size=2)
+    scheduler._pp_install_topology(PPTopology.from_layer_counts([8, 0]))
+    scheduler.pp_group.received.append(
+        {
+            "__msg_type__": "output",
+            "__pp_generation__": 0,
+            "next_token_ids": "tokens",
+        }
+    )
+    target = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
+    )
+    metadata = PPBatchMetadata(can_run_cuda_graph=False)
+    scheduler._pp_prep_batch_result = lambda batch, batch_metadata, outputs: (
+        batch,
+        batch_metadata,
+        outputs,
+    )
+
+    next_outputs, batch_result, d2h_event, send_work = (
+        scheduler._pp_send_recv_and_preprocess_output_tensors(
+            next_first_rank_mb_id=0,
+            next_mb_id=1,
+            mbs=[None, target],
+            mb_metadata=[None, metadata],
+            last_rank_comm_queue=deque(),
+            pp_outputs=None,
+        )
+    )
+
+    assert next_outputs is None
+    assert batch_result[0] is target
+    assert d2h_event.recorded_stream == "schedule-stream"
+    assert scheduler.copy_stream.waited_for == "schedule-stream"
+    assert len(scheduler.pp_group.sent) == 1
+    assert scheduler.pp_group.sent[0]["tensor_dict"]["next_token_ids"] == "tokens"
+    assert scheduler.pp_group.sent[0]["tensor_dict"]["__msg_type__"] == "output"
+    assert send_work == []
+
+
+def test_logical_last_defers_fresh_output_until_receiver_aligned_microstep():
+    scheduler = _FakeScheduler(rank=0, size=2)
+    scheduler._pp_install_topology(PPTopology.from_layer_counts([8, 0]))
+    waited_events = []
+    scheduler.device_module = SimpleNamespace(
+        current_stream=lambda: SimpleNamespace(
+            wait_event=lambda event: waited_events.append(event)
+        )
+    )
+    target = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
+    )
+    produced = SimpleNamespace(tensors={"next_token_ids": "fresh"})
+    output_queue = deque([("launch-event", produced)])
+
+    next_outputs, batch_result, d2h_event, send_work = (
+        scheduler._pp_send_recv_and_preprocess_output_tensors(
+            next_first_rank_mb_id=0,
+            next_mb_id=1,
+            mbs=[target, None],
+            mb_metadata=[PPBatchMetadata(can_run_cuda_graph=False), None],
+            last_rank_comm_queue=output_queue,
+            pp_outputs=None,
+        )
+    )
+
+    assert next_outputs is produced
+    assert batch_result is None
+    assert d2h_event is None
+    assert send_work == []
+    assert scheduler.pp_group.sent == []
+    assert output_queue == deque()
+    assert waited_events == ["launch-event"]
 
 
 def test_common_future_microstep_arms_drain_on_the_exact_boundary():
