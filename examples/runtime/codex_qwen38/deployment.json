@@ -1,7 +1,9 @@
 {
   "model": "orcarouter/Qwen3.8-27B-Uncensored",
   "model_revision": "9878936be9458522b5aeed0e13476bb8426f57f0",
-  "sglang_commit": "95f5ecd3d26665423d3e6577a2a00c04f5cde733",
+  "sglang_commit": "ea48cb04cc33233e01674e218102746931f72128",
+  "sglang_branch": "codex/sglang-serving",
+  "sglang_source": "/data/gpfs/projects/punim2715/vllm_workbench/sglang_autoscaling/sglang-serving",
   "node": "spartan-gpgpu142",
   "slurm_job_id": "29526906",
   "booking_expires_local": "2026-08-31T14:56:13+10:00",

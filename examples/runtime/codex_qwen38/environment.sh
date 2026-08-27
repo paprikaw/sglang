@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Read-only dependencies from the working SGLang environment; no shared installs.
 export QWEN_DEPLOY_ROOT=/data/gpfs/projects/punim2715/model_serving/qwen38-27b-uncensored
-export QWEN_SGLANG_SOURCE=/data/gpfs/projects/punim2715/vllm_workbench/sglang_autoscaling/sglang-upstream-95f5ecd
+export QWEN_SGLANG_SOURCE=/data/gpfs/projects/punim2715/vllm_workbench/sglang_autoscaling/sglang-serving
 export QWEN_PYTHON=/data/gpfs/projects/punim2715/vllm_workbench/sglang_overlap_compare/venv-dd15fb57-cu12/bin/python
 export PYTHONPATH="$QWEN_SGLANG_SOURCE/python"
 export CUDA_HOME=/apps/easybuild-2022/easybuild/software/Core/CUDA/12.8.0

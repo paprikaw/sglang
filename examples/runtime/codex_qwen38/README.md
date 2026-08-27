@@ -1,8 +1,10 @@
 # Qwen3.8-27B-Uncensored on Spartan
 
 This directory records the Codex compatibility and deployment layer used by the
-local Qwen service. It does not patch SGLang core source files. The branch is
-pinned to the clean upstream SGLang commit recorded in `deployment.json`.
+local Qwen service. It does not patch SGLang core source files. Normal model
+serving uses the stable `sglang-serving` worktree on branch
+`codex/sglang-serving`, based on the upstream SGLang commit recorded in
+`deployment.json`.
 
 Secrets and generated runtime artifacts are intentionally excluded. Create
 `api.key` from `api.key.example` before launching, keep it mode `0600`, and do
@@ -82,7 +84,7 @@ before rolling back/reloading clients that depend on it.
 | --- | --- |
 | Model | `orcarouter/Qwen3.8-27B-Uncensored` |
 | Model revision | `9878936be9458522b5aeed0e13476bb8426f57f0` |
-| Engine | SGLang 0.5.18, source commit `95f5ecd3d26665423d3e6577a2a00c04f5cde733` |
+| Engine | SGLang 0.5.18, upstream source commit `ea48cb04cc33233e01674e218102746931f72128` on `codex/sglang-serving` |
 | Node / GPU | `spartan-gpgpu142`, GPU 0, A100 80GB PCIe |
 | Existing Slurm booking | `29526906` |
 | Booking expiry | 2026-08-31 14:56:13 Australia/Melbourne |
