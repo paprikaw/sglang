@@ -48,8 +48,14 @@ was not restarted or visually inspected by this task.
 The router sends Qwen requests to SGLang using only the local deployment key.
 For predictable single-A100 latency it caps local Qwen requests to `low`
 reasoning effort by default, even if the global Codex setting is `max`/`xhigh`.
-Set `QWEN_REASONING_EFFORT` on the router process to change that policy. Router
-timing logs contain only input item types/counts and never prompt or tool text.
+Set `QWEN_REASONING_EFFORT` on the router process to change that policy.
+Tool turns default to `QWEN_TOOL_REASONING_EFFORT=none` so Qwen reaches a tool
+call instead of spending the whole response budget on hidden reasoning. Their
+output is bounded by `QWEN_MAX_TOOL_OUTPUT_TOKENS=2048`; non-tool and compaction
+turns use `QWEN_MAX_FINAL_OUTPUT_TOKENS=4096`. All values can be overridden in
+the router environment. These generation limits do not change the 256K input
+context window. Router timing logs contain only input item types/counts and
+never prompt or tool text.
 Codex remote-compaction items are bridged locally: the router asks Qwen for a
 handoff summary, returns it as a `compaction` item, and decodes that item back
 into local context on the next request. This avoids depending on OpenAI's

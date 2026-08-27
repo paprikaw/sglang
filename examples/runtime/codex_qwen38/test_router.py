@@ -63,17 +63,23 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(final["output"][0]["name"], "apply_patch")
         self.assertEqual(final["output"][0]["input"], events[0]["delta"])
 
-    def test_local_reasoning_is_capped_and_shape_has_no_prompt(self):
+    def test_tool_turn_disables_reasoning_and_caps_output(self):
         adapter = router.ToolAdapter({
             "reasoning": {"effort": "xhigh", "summary": "auto"},
             "input": [{"type": "message", "role": "user", "content": "private prompt"}],
             "tools": [{"type": "function", "name": "tool", "parameters": {"type": "object"}}],
         })
-        self.assertEqual(adapter.body["reasoning"]["effort"], "low")
+        self.assertEqual(adapter.body["reasoning"]["effort"], "none")
         self.assertEqual(adapter.body["reasoning"]["summary"], "auto")
+        self.assertEqual(adapter.body["max_output_tokens"], 2048)
         shape = router.request_shape(adapter.body)
         self.assertEqual(shape["input"]["roles"], ["user"])
         self.assertNotIn("private prompt", json.dumps(shape))
+
+    def test_non_tool_turn_keeps_low_reasoning_and_smaller_client_limit(self):
+        adapter = router.ToolAdapter({"max_output_tokens": 1024})
+        self.assertEqual(adapter.body["reasoning"]["effort"], "low")
+        self.assertEqual(adapter.body["max_output_tokens"], 1024)
 
     def test_backend_error_message(self):
         raw = json.dumps({"error": {"message": "No user query found in messages."}})

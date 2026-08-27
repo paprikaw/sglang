@@ -34,6 +34,9 @@ AUTH_PATH = Path(os.environ.get("CODEX_AUTH_PATH", Path.home() / ".codex" / "aut
 HOP = {"host", "connection", "upgrade", "content-length", "transfer-encoding",
        "keep-alive", "proxy-authorization", "proxy-authenticate", "te", "trailer"}
 QWEN_REASONING_EFFORT = os.environ.get("QWEN_REASONING_EFFORT", "low")
+QWEN_TOOL_REASONING_EFFORT = os.environ.get("QWEN_TOOL_REASONING_EFFORT", "none")
+QWEN_MAX_TOOL_OUTPUT_TOKENS = int(os.environ.get("QWEN_MAX_TOOL_OUTPUT_TOKENS", "2048"))
+QWEN_MAX_FINAL_OUTPUT_TOKENS = int(os.environ.get("QWEN_MAX_FINAL_OUTPUT_TOKENS", "4096"))
 LOCAL_COMPACTION_PREFIX = "local-qwen-v1:"
 LOCAL_COMPACTION_PROMPT = """Create a compact handoff summary of the conversation so far.
 Preserve the user's objective, constraints, decisions, files inspected or changed,
@@ -135,6 +138,15 @@ def response_text(response):
     return "\n".join(chunks).strip()
 
 
+def limited_output_tokens(requested, limit):
+    """Honor a smaller client limit while bounding local runaway generations."""
+    try:
+        requested = int(requested)
+    except (TypeError, ValueError):
+        requested = limit
+    return min(max(requested, 1), limit)
+
+
 def local_compaction_events(adapter, completed):
     response = completed.get("response", {})
     summary = response_text(response)
@@ -191,11 +203,17 @@ class ToolAdapter:
         self.body["tools"] = tools
         self.body["parallel_tool_calls"] = False
         self.body["store"] = False
-        self.body.setdefault("max_output_tokens", 8192)
+        requested_max_output_tokens = self.body.get("max_output_tokens")
+        output_limit = (QWEN_MAX_TOOL_OUTPUT_TOKENS if tools
+                        else QWEN_MAX_FINAL_OUTPUT_TOKENS)
+        self.body["max_output_tokens"] = limited_output_tokens(
+            requested_max_output_tokens, output_limit)
         reasoning = self.body.get("reasoning")
         if not isinstance(reasoning, dict):
             reasoning = {}
-        self.body["reasoning"] = {**reasoning, "effort": QWEN_REASONING_EFFORT}
+        reasoning_effort = (QWEN_TOOL_REASONING_EFFORT if tools
+                            else QWEN_REASONING_EFFORT)
+        self.body["reasoning"] = {**reasoning, "effort": reasoning_effort}
         self.body.pop("previous_response_id", None)
         choice = self.body.get("tool_choice")
         if isinstance(choice, dict) and "name" in choice:
@@ -238,7 +256,8 @@ class ToolAdapter:
                 })
                 self.body["tools"] = []
                 self.body["tool_choice"] = "none"
-                self.body["max_output_tokens"] = min(self.body["max_output_tokens"], 4096)
+                self.body["max_output_tokens"] = limited_output_tokens(
+                    requested_max_output_tokens, QWEN_MAX_FINAL_OUTPUT_TOKENS)
             self.body["input"] = translated_input
 
     def item(self, item):
