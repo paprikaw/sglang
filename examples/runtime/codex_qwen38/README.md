@@ -131,6 +131,10 @@ available; no shared packages or experimental source files were modified.
 
 ## Verification
 
+- A fresh app-server model list shows the local Qwen entry as `256K context`.
+- The live `/v1/loads` endpoint reports both `max_total_num_tokens` and
+  `memory.token_capacity` as 262,144 after the latest-source restart.
+
 - `checks/api-checks.json`: correct model identity, Chinese chat response,
   Responses SSE completion, function call arguments and function-result round trip.
 - `checks/vision-check.json`: correctly identified a generated solid-red test image.

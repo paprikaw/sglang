@@ -38,5 +38,10 @@
   "desktop_picker_backend_configured": true,
   "global_routing_verified": true,
   "freeform_patch_tool_verified": true,
-  "post_restart_api_verified": true
+  "post_restart_api_verified": true,
+  "last_restart_local": "2026-08-27T15:44:48+10:00",
+  "runtime_sglang_version": "0.5.18",
+  "runtime_max_total_num_tokens": 262144,
+  "runtime_token_capacity": 262144,
+  "codex_app_server_256k_verified": true
 }
