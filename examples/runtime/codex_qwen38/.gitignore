@@ -1,0 +1,6 @@
+api.key
+*.pid
+__pycache__/
+checks/
+logs/
+codex-models-combined.json

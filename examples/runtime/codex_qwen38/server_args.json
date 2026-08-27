@@ -1,0 +1,19 @@
+[
+  "--model-path", "/data/gpfs/projects/punim2715/huggingface/Qwen3.8-27B-Uncensored",
+  "--served-model-name", "orcarouter/Qwen3.8-27B-Uncensored",
+  "--host", "127.0.0.1",
+  "--port", "30038",
+  "--tp-size", "1",
+  "--dtype", "bfloat16",
+  "--context-length", "262144",
+  "--max-total-tokens", "262144",
+  "--max-running-requests", "4",
+  "--max-mamba-cache-size", "32",
+  "--chunked-prefill-size", "1024",
+  "--mem-fraction-static", "0.92",
+  "--cuda-graph-max-bs-decode", "4",
+  "--reasoning-parser", "qwen3",
+  "--tool-call-parser", "qwen3_coder",
+  "--watchdog-timeout", "600",
+  "--random-seed", "42"
+]
