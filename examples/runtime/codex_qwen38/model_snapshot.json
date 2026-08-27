@@ -1,0 +1,8 @@
+{
+  "repo": "orcarouter/Qwen3.8-27B-Uncensored",
+  "revision": "9878936be9458522b5aeed0e13476bb8426f57f0",
+  "path": "/data/gpfs/projects/punim2715/huggingface/Qwen3.8-27B-Uncensored",
+  "shards": 18,
+  "weight_bytes": 55563006776,
+  "finished_at": "2026-08-26T15:09:14.363850+00:00"
+}

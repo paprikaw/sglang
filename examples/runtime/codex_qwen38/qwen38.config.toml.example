@@ -1,0 +1,28 @@
+# Opt-in profile: codex --profile qwen38
+# Existing OpenAI defaults in config.toml are not changed.
+model = "orcarouter/Qwen3.8-27B-Uncensored"
+model_provider = "qwen38_sglang"
+model_catalog_json = "/data/gpfs/projects/punim2715/model_serving/qwen38-27b-uncensored/codex-models.json"
+model_context_window = 262144
+model_auto_compact_token_limit = 249000
+model_reasoning_effort = "low"
+model_reasoning_summary = "none"
+service_tier = "auto"
+web_search = "disabled"
+
+[model_providers.qwen38_sglang]
+name = "Qwen3.8 on Spartan A100 (SGLang)"
+base_url = "http://127.0.0.1:30038/v1"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
+request_max_retries = 1
+stream_max_retries = 1
+stream_idle_timeout_ms = 300000
+
+[model_providers.qwen38_sglang.auth]
+command = "/usr/bin/cat"
+args = ["/data/gpfs/projects/punim2715/model_serving/qwen38-27b-uncensored/api.key"]
+
+[features]
+enable_request_compression = false
