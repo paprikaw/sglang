@@ -155,7 +155,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.disable = params.disable
 
         if params.enable_metrics:
-            self.init_metrics_collector()
+            self.init_metrics_collector(extra_labels={"pp_rank": str(params.pp_rank)})
         self._enable_metrics_flag = params.enable_metrics
         self.enable_storage_metrics = False
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
@@ -630,6 +630,10 @@ class UnifiedRadixCache(BasePrefixCache):
             # Skip eviction walk if request is already met
             if tracker[ct] >= request_cnt:
                 continue
+            # A component's pressure may evict both full KV and Mamba states.
+            # Attribute collateral frees to this walk, not to the freed pool.
+            before_full = tracker.get(ComponentType.FULL, 0)
+            before_mamba = tracker.get(ComponentType.MAMBA, 0)
             self.tree_core.evict_device_start(ct, request_cnt)
             try:
                 while (
@@ -662,6 +666,15 @@ class UnifiedRadixCache(BasePrefixCache):
                             )
             finally:
                 self.tree_core.evict_device_end(ct)
+                observe = getattr(
+                    self.metrics_collector, "increment_hybrid_eviction", None
+                )
+                if observe is not None and ComponentType.MAMBA in tracker:
+                    observe(
+                        tracker.get(ComponentType.FULL, 0) - before_full,
+                        tracker.get(ComponentType.MAMBA, 0) - before_mamba,
+                        ct.name.lower(),
+                    )
 
     def _record_dropped_tokens(
         self,

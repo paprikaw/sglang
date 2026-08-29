@@ -12,6 +12,7 @@ eviction -- which is why the peak, not the decode steady state, sets the floor.
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
@@ -309,6 +310,68 @@ class TestPPMambaPoolSizing(unittest.TestCase):
         self.assertEqual(
             len(sizes), 1, f"per-rank pool sizes diverged: {sorted(sizes)}"
         )
+
+
+class TestHybridEvictionAccounting(unittest.TestCase):
+    """Record collateral pool eviction without changing allocator return units."""
+
+    def _cache(self, full_delta=1024, mamba_delta=1):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        cache = object.__new__(UnifiedRadixCache)
+        cache.disable = False
+        cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+        cache.tree_core = Mock()
+        cache.metrics_collector = Mock()
+        cache._evict_device_next_node = Mock(side_effect=[1, None])
+
+        def evict_leaf(node, tracker):
+            tracker[ComponentType.FULL] += full_delta
+            tracker[ComponentType.MAMBA] += mamba_delta
+
+        cache._evict_device_leaf = Mock(side_effect=evict_leaf)
+        return cache
+
+    def test_full_pressure_counts_collateral_mamba(self):
+        cache = self._cache()
+        result = cache.evict(EvictParams(num_tokens=1024, mamba_num=1))
+        self.assertEqual(result.num_tokens_evicted, 1024)
+        self.assertEqual(result.mamba_num_evicted, 1)
+        cache.metrics_collector.increment_hybrid_eviction.assert_called_once_with(
+            1024, 1, "full"
+        )
+        cache.metrics_collector.increment_eviction_num_tokens.assert_called_once_with(
+            1024
+        )
+
+    def test_mamba_pressure_counts_collateral_full(self):
+        cache = self._cache()
+        result = cache.evict(EvictParams(mamba_num=1))
+        self.assertEqual(result.num_tokens_evicted, 1024)
+        self.assertEqual(result.mamba_num_evicted, 1)
+        cache.metrics_collector.increment_hybrid_eviction.assert_called_once_with(
+            1024, 1, "mamba"
+        )
+        cache.metrics_collector.increment_eviction_num_tokens.assert_called_once_with(
+            1024
+        )
+
+    def test_mamba_internal_checkpoint_does_not_count_full_eviction(self):
+        cache = self._cache(full_delta=0)
+        result = cache.evict(EvictParams(mamba_num=1))
+        self.assertEqual(result.num_tokens_evicted, 0)
+        self.assertEqual(result.mamba_num_evicted, 1)
+        cache.metrics_collector.increment_hybrid_eviction.assert_called_once_with(
+            0, 1, "mamba"
+        )
+        cache.metrics_collector.increment_eviction_num_tokens.assert_not_called()
+
+    def test_disabled_or_no_pressure_does_not_emit_metrics(self):
+        cache = self._cache()
+        cache.evict(EvictParams())
+        cache.disable = True
+        cache.evict(EvictParams(num_tokens=1, mamba_num=1))
+        self.assertEqual(cache.metrics_collector.mock_calls, [])
 
 
 if __name__ == "__main__":

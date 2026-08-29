@@ -2100,6 +2100,21 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        # Hybrid cache eviction can release both pools, even when only one
+        # allocator requested space. Keep token and state units separate.
+        self.hybrid_evicted_tokens = Counter(
+            name="sglang:hybrid_evicted_tokens_total",
+            documentation="Full-attention KV tokens evicted by a hybrid cache, "
+            "including collateral eviction under mamba state pressure.",
+            labelnames=list(labels.keys()) + ["trigger"],
+        )
+        self.hybrid_evicted_mamba_states = Counter(
+            name="sglang:hybrid_evicted_mamba_states_total",
+            documentation="Mamba state slots evicted by a hybrid cache, "
+            "including collateral eviction under full-attention KV pressure.",
+            labelnames=list(labels.keys()) + ["trigger"],
+        )
+
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
             documentation="Time taken to load KV cache from CPU back to GPU in seconds.",
@@ -2163,6 +2178,18 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_hybrid_eviction(
+        self, num_tokens: int, num_mamba_states: int, trigger: str
+    ) -> None:
+        if num_tokens:
+            self.hybrid_evicted_tokens.labels(**self.labels, trigger=trigger).inc(
+                num_tokens
+            )
+        if num_mamba_states:
+            self.hybrid_evicted_mamba_states.labels(**self.labels, trigger=trigger).inc(
+                num_mamba_states
+            )
 
     def increment_load_back_num_tokens(self, num_tokens: int, pool: str) -> None:
         self.load_back_num_tokens.labels(**self.labels, pool=pool).inc(num_tokens)

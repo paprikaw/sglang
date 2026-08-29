@@ -138,6 +138,19 @@ class TestDefaultBackend(unittest.TestCase):
         self.assertIsInstance(
             collector.eviction_duration_seconds, prometheus_client.Histogram
         )
+        collector.increment_hybrid_eviction(1024, 2, "mamba")
+        self.assertEqual(
+            collector.hybrid_evicted_tokens.labels(
+                **labels, trigger="mamba"
+            )._value.get(),
+            1024,
+        )
+        self.assertEqual(
+            collector.hybrid_evicted_mamba_states.labels(
+                **labels, trigger="mamba"
+            )._value.get(),
+            2,
+        )
 
 
 if __name__ == "__main__":
