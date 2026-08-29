@@ -884,51 +884,86 @@ class Engine(EngineScoreMixin, EngineBase):
             )
             scheduler_pipe_readers = []
 
-            pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
-                _calculate_rank_ranges(
-                    server_args.nnodes,
-                    configured_pp_size(),
-                    server_args.tp_size,
-                    server_args.node_rank,
+            if server_args.pp_stage_tp_sizes is not None:
+                from sglang.srt.distributed.heterogeneous_pp import (
+                    HeterogeneousPPTopology,
                 )
-            )
 
-            for pp_rank in pp_rank_range:
-                for tp_rank in tp_rank_range:
-                    reader, writer = mp.Pipe(duplex=False)
-                    gpu_id = (
-                        server_args.base_gpu_id
-                        + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                        + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                topology = HeterogeneousPPTopology.parse(server_args.pp_stage_tp_sizes)
+                placements = topology.placements_for_node(
+                    nnodes=server_args.nnodes, node_rank=server_args.node_rank
+                )
+                rank_specs = [
+                    (
+                        placement.pp_rank,
+                        placement.tp_rank,
+                        placement.tp_size,
+                        placement.local_gpu_index,
                     )
-                    attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
-                        server_args, tp_rank
+                    for placement in placements
+                ]
+            else:
+                pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node = (
+                    _calculate_rank_ranges(
+                        server_args.nnodes,
+                        configured_pp_size(),
+                        server_args.tp_size,
+                        server_args.node_rank,
                     )
+                )
+                rank_specs = [
+                    (
+                        pp_rank,
+                        tp_rank,
+                        server_args.tp_size,
+                        (pp_rank % pp_size_per_node) * tp_size_per_node
+                        + (tp_rank % tp_size_per_node),
+                    )
+                    for pp_rank in pp_rank_range
+                    for tp_rank in tp_rank_range
+                ]
 
-                    with maybe_reindex_device_id(gpu_id) as gpu_id:
-                        proc = mp.Process(
-                            target=run_scheduler_process_func,
-                            args=(
-                                server_args,
-                                port_args,
-                                gpu_id,
-                                tp_rank,
-                                attn_cp_rank,
-                                moe_dp_rank,
-                                moe_ep_rank,
-                                pp_rank,
-                                None,
-                                writer,
-                            ),
-                        )
-                        with (
-                            memory_saver_adapter.configure_subprocess(),
-                            numa_utils.configure_subprocess(server_args, gpu_id),
-                        ):
-                            proc.start()
+            for pp_rank, tp_rank, stage_tp_size, local_gpu_index in rank_specs:
+                reader, writer = mp.Pipe(duplex=False)
+                gpu_id = (
+                    server_args.base_gpu_id + local_gpu_index * server_args.gpu_id_step
+                )
+                child_server_args = (
+                    server_args.replace_resolved(
+                        "heterogeneous_pp_stage",
+                        tp_size=stage_tp_size,
+                    )
+                    if server_args.pp_stage_tp_sizes is not None
+                    else server_args
+                )
+                attn_cp_rank, moe_dp_rank, moe_ep_rank = _compute_parallelism_ranks(
+                    child_server_args, tp_rank
+                )
 
-                    scheduler_procs.append(proc)
-                    scheduler_pipe_readers.append(reader)
+                with maybe_reindex_device_id(gpu_id) as gpu_id:
+                    proc = mp.Process(
+                        target=run_scheduler_process_func,
+                        args=(
+                            child_server_args,
+                            port_args,
+                            gpu_id,
+                            tp_rank,
+                            attn_cp_rank,
+                            moe_dp_rank,
+                            moe_ep_rank,
+                            pp_rank,
+                            None,
+                            writer,
+                        ),
+                    )
+                    with (
+                        memory_saver_adapter.configure_subprocess(),
+                        numa_utils.configure_subprocess(server_args, gpu_id),
+                    ):
+                        proc.start()
+
+                scheduler_procs.append(proc)
+                scheduler_pipe_readers.append(reader)
         else:
             # Launch the data parallel controller
             reader, writer = mp.Pipe(duplex=False)

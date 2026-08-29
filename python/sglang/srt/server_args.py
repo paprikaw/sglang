@@ -1063,6 +1063,24 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 1
+    pp_stage_tp_sizes: A[
+        Optional[str],
+        (
+            "Experimental heterogeneous pipeline topology. Provide one TP width "
+            "per PP stage, for example '4,1' for a TP4 prefix stage followed "
+            "by a TP1 suffix stage. The list determines --pp-size and its "
+            "largest entry determines the launcher-level --tp-size."
+        ),
+        NS("parallel"),
+    ] = None
+    pp_layer_partition: A[
+        Optional[str],
+        (
+            "Comma-separated transformer-layer counts for heterogeneous PP "
+            "stages, for example '73,19'. Required with --pp-stage-tp-sizes."
+        ),
+        NS("parallel"),
+    ] = None
     pp_max_micro_batch_size: A[
         Optional[int],
         "The maximum micro batch size in pipeline parallelism.",
@@ -3862,6 +3880,7 @@ class ServerArgs:
         self._handle_media_url_security()
         self._handle_hicache_ratio_default()
         self._validate_prefill_decode_interval()
+        self._handle_heterogeneous_pp_topology()
 
         # Reject an explicitly enabled but incompatible hardware runtime before
         # model path resolution, downloads, or the dummy-model short circuit.
@@ -7807,6 +7826,112 @@ class ServerArgs:
                     expert_distribution_recorder_buffer_size=1000,
                 )
 
+    def _handle_heterogeneous_pp_topology(self):
+        """Resolve the launcher-visible dimensions of a non-rectangular PP mesh."""
+
+        if self.pp_stage_tp_sizes is None:
+            if self.pp_layer_partition is not None:
+                raise ValueError("--pp-layer-partition requires --pp-stage-tp-sizes")
+            return
+
+        from sglang.srt.distributed.heterogeneous_pp import (
+            HeterogeneousPPTopology,
+        )
+
+        topology = HeterogeneousPPTopology.parse(self.pp_stage_tp_sizes)
+        # Keep the first runtime deliberately narrow while the dynamic join and
+        # layer-migration path is developed on top of this static data plane.
+        if topology.pp_size != 2:
+            raise ValueError(
+                "--pp-stage-tp-sizes currently supports exactly two stages"
+            )
+        if self.pp_layer_partition is None:
+            raise ValueError("--pp-stage-tp-sizes requires --pp-layer-partition")
+
+        normalized_sizes = ",".join(str(size) for size in topology.stage_tp_sizes)
+        self._declare(
+            "_handle_heterogeneous_pp_topology",
+            pp_stage_tp_sizes=normalized_sizes,
+            pp_size=topology.pp_size,
+            tp_size=max(topology.stage_tp_sizes),
+        )
+
+    def _validate_heterogeneous_pp_topology(self):
+        from sglang.srt.distributed.heterogeneous_pp import (
+            HeterogeneousPPTopology,
+            incompatible_attention_tp_sizes,
+            parse_pp_layer_partition,
+        )
+
+        view = resolved_view(self)
+        topology = HeterogeneousPPTopology.parse(view.pp_stage_tp_sizes)
+        model_config = self.get_model_config()
+        architectures = tuple(model_config.hf_config.architectures or ())
+        if "Glm4MoeForCausalLM" not in architectures:
+            raise ValueError(
+                "--pp-stage-tp-sizes is currently validated only for "
+                f"Glm4MoeForCausalLM, got architectures={architectures}"
+            )
+        partition = parse_pp_layer_partition(
+            view.pp_layer_partition,
+            pp_size=topology.pp_size,
+            num_hidden_layers=model_config.num_hidden_layers,
+        )
+
+        num_heads = model_config.hf_config.num_attention_heads
+        num_kv_heads = model_config.hf_config.num_key_value_heads
+        invalid_tp_sizes = incompatible_attention_tp_sizes(
+            topology.stage_tp_sizes,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
+        )
+        if invalid_tp_sizes:
+            raise ValueError(
+                "heterogeneous PP stage TP sizes must satisfy the model's Q/KV "
+                f"head sharding rules (Q={num_heads}, KV={num_kv_heads}); invalid "
+                f"sizes={invalid_tp_sizes}"
+            )
+
+        unsupported = []
+        if view.dp_size != 1:
+            unsupported.append("data parallelism")
+        if view.enable_dp_attention:
+            unsupported.append("DP attention")
+        if view.attn_cp_size != 1 or view.dcp_size != 1:
+            unsupported.append("context parallelism")
+        if view.ep_size != 1 or view.moe_dp_size != 1:
+            unsupported.append("expert/data-parallel MoE")
+        if view.enable_elastic_pp:
+            unsupported.append("elastic PP reconfiguration")
+        if view.disaggregation_mode != "null":
+            unsupported.append("prefill/decode disaggregation")
+        if view.enable_pdmux:
+            unsupported.append("PD multiplexing")
+        if view.weight_cache_mode != "off":
+            unsupported.append("weight-cache daemon/client mode")
+        if view.use_ray:
+            unsupported.append("Ray launcher")
+        if view.enable_dynamic_chunking:
+            unsupported.append("dynamic PP chunking")
+        if view.enable_hierarchical_cache:
+            unsupported.append("HiCache")
+        if unsupported:
+            raise ValueError(
+                "--pp-stage-tp-sizes does not yet support " + ", ".join(unsupported)
+            )
+
+        if view.nnodes not in (1, topology.pp_size):
+            raise ValueError(
+                "--pp-stage-tp-sizes currently supports either one node for all "
+                "stages or one complete stage per node; "
+                f"got nnodes={view.nnodes}, pp_size={topology.pp_size}"
+            )
+        normalized_partition = ",".join(str(count) for count in partition)
+        self._declare(
+            "_validate_heterogeneous_pp_topology",
+            pp_layer_partition=normalized_partition,
+        )
+
     def _handle_pipeline_parallelism(self):
         # Moved to the resolution pipeline (arg_groups/overrides.py:
         # _pipeline_parallel_overlap_disable), invoked here at its legacy slot.
@@ -7816,6 +7941,10 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
+
+        if self.pp_stage_tp_sizes is not None:
+            self._validate_heterogeneous_pp_topology()
+            return
 
         if not self.enable_elastic_pp:
             if self.elastic_pp_kv_backend != "native":
@@ -9997,7 +10126,15 @@ class ServerArgs:
 
     def check_server_args(self):
         # Check parallel size constraints
-        if self.ep_join_mode != "scale":
+        if self.pp_stage_tp_sizes is not None:
+            from sglang.srt.distributed.heterogeneous_pp import (
+                HeterogeneousPPTopology,
+            )
+
+            HeterogeneousPPTopology.parse(self.pp_stage_tp_sizes).placements_for_node(
+                nnodes=self.nnodes, node_rank=self.node_rank
+            )
+        elif self.ep_join_mode != "scale":
             assert (
                 self.tp_size * self.pp_size
             ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"

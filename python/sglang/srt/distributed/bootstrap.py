@@ -15,6 +15,7 @@ from sglang.srt.distributed import (
     get_tp_group,
     get_world_group,
     init_distributed_environment,
+    initialize_heterogeneous_model_parallel,
     initialize_model_parallel,
     set_custom_all_reduce,
     set_flashinfer_allreduce_only,
@@ -239,10 +240,30 @@ def _init_parallel_groups(
     is_ep_joiner = server_args.is_ep_joiner
     is_scale_joiner = server_args.is_ep_scale_joiner
     rank_offset = server_args.ep_join_rank_offset if is_scale_joiner else 0
-    world_size = (
-        rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
-    )
-    rank = rank_offset + tp_size * pp_rank + tp_rank
+    heterogeneous_topology = None
+    if server_args.pp_stage_tp_sizes is not None:
+        from sglang.srt.distributed.heterogeneous_pp import (
+            HeterogeneousPPTopology,
+        )
+
+        heterogeneous_topology = HeterogeneousPPTopology.parse(
+            server_args.pp_stage_tp_sizes
+        )
+        expected_tp_size = heterogeneous_topology.stage_tp_sizes[pp_rank]
+        if tp_size != expected_tp_size:
+            raise RuntimeError(
+                f"stage {pp_rank} was launched with TP size {tp_size}, expected "
+                f"{expected_tp_size} from --pp-stage-tp-sizes"
+            )
+        world_size = heterogeneous_topology.world_size
+        rank = heterogeneous_topology.global_rank(pp_rank, tp_rank)
+        assert server_args.pp_layer_partition is not None
+        os.environ["SGLANG_PP_LAYER_PARTITION"] = server_args.pp_layer_partition
+    else:
+        world_size = (
+            rank_offset + tp_size * pp_size if is_scale_joiner else tp_size * pp_size
+        )
+        rank = rank_offset + tp_size * pp_rank + tp_rank
 
     init_distributed_environment(
         backend=backend,
@@ -255,26 +276,33 @@ def _init_parallel_groups(
         recovered_rank=is_ep_joiner,
         max_world_size=server_args.max_ep_size,
     )
-    initialize_model_parallel(
-        tensor_model_parallel_size=tp_size,
-        attention_data_parallel_size=attn_dp_size,
-        pipeline_model_parallel_size=pp_size,
-        expert_model_parallel_size=moe_ep_size,
-        attention_context_model_parallel_size=attn_cp_size,
-        moe_data_model_parallel_size=moe_dp_size,
-        decode_context_parallel_size=dcp_size,
-        duplicate_tp_group=server_args.enable_pdmux,
-        duplicate_pp_group=get_parallel().enable_elastic_pp,
-        duplicate_attn_cp_group=(
-            is_hip()
-            and server_args.enable_two_batch_overlap
-            and get_parallel().enable_dsa_prefill_context_parallel
-        ),
-        enable_symm_mem=get_exec().comm.enable_symm_mem,
-        recovered_rank=is_ep_joiner,
-        rank_offset=rank_offset,
-        max_world_size=server_args.max_ep_size,
-    )
+    if heterogeneous_topology is not None:
+        initialize_heterogeneous_model_parallel(
+            stage_tp_sizes=heterogeneous_topology.stage_tp_sizes,
+            pipeline_rank=pp_rank,
+            enable_symm_mem=get_exec().comm.enable_symm_mem,
+        )
+    else:
+        initialize_model_parallel(
+            tensor_model_parallel_size=tp_size,
+            attention_data_parallel_size=attn_dp_size,
+            pipeline_model_parallel_size=pp_size,
+            expert_model_parallel_size=moe_ep_size,
+            attention_context_model_parallel_size=attn_cp_size,
+            moe_data_model_parallel_size=moe_dp_size,
+            decode_context_parallel_size=dcp_size,
+            duplicate_tp_group=server_args.enable_pdmux,
+            duplicate_pp_group=get_parallel().enable_elastic_pp,
+            duplicate_attn_cp_group=(
+                is_hip()
+                and server_args.enable_two_batch_overlap
+                and get_parallel().enable_dsa_prefill_context_parallel
+            ),
+            enable_symm_mem=get_exec().comm.enable_symm_mem,
+            recovered_rank=is_ep_joiner,
+            rank_offset=rank_offset,
+            max_world_size=server_args.max_ep_size,
+        )
     if server_args.enable_elastic_pp:
         # Install the initial logical route before model construction. This
         # lets model/runner endpoint checks see [L, 0, ...] as logical PP1

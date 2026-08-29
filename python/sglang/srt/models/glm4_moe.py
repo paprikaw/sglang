@@ -1038,10 +1038,12 @@ class Glm4MoeModel(nn.Module):
             self.embed_tokens = PPMissingLayer()
 
         self.alt_stream = get_stream("alt") if _is_cuda else None
+        pp_rank = self.pp_group.logical_rank_in_group
+        pp_size = self.pp_group.logical_world_size
         pp_start_layer, _ = get_pp_indices(
             config.num_hidden_layers,
-            self.pp_group.rank_in_group,
-            self.pp_group.world_size,
+            pp_rank,
+            pp_size,
         )
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -1053,8 +1055,8 @@ class Glm4MoeModel(nn.Module):
                 prefix=prefix,
                 alt_stream=self.alt_stream,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:

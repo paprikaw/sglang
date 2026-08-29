@@ -414,6 +414,14 @@ class GroupCoordinator:
         # this separate from ``active_ranks`` above: that tensor belongs to
         # the elastic-EP/Mooncake process-group implementation.
         self._routing_ranks: Optional[Tuple[int, ...]] = None
+        # A heterogeneous PP stage has one logical pipeline rank but may use a
+        # singleton physical PP communicator on its non-leader TP ranks.  Keep
+        # those identities separate: collectives and P2P methods continue to
+        # use ``rank_in_group``/``world_size`` while endpoint checks use these
+        # optional logical values.
+        self._logical_pipeline_rank: Optional[int] = None
+        self._logical_pipeline_size: Optional[int] = None
+        self._logical_pipeline_leaders: Optional[Tuple[int, ...]] = None
 
         # Import communicators
         self.use_pynccl = use_pynccl
@@ -588,29 +596,79 @@ class GroupCoordinator:
             )
         self._routing_ranks = tuple(self.ranks[index] for index in normalized)
 
+    def set_logical_pipeline_topology(
+        self,
+        *,
+        rank: int,
+        size: int,
+        leader_ranks: Sequence[int],
+    ) -> None:
+        """Attach a logical PP identity without changing the physical group."""
+
+        leaders = tuple(int(item) for item in leader_ranks)
+        if size < 1 or len(leaders) != size:
+            raise ValueError(
+                "logical pipeline leader list must contain exactly one rank per "
+                f"stage: size={size}, leaders={leaders}"
+            )
+        if rank < 0 or rank >= size:
+            raise ValueError(f"logical pipeline rank {rank} is outside [0, {size})")
+        if len(set(leaders)) != len(leaders):
+            raise ValueError(f"logical pipeline leaders contain duplicates: {leaders}")
+        self._logical_pipeline_rank = rank
+        self._logical_pipeline_size = size
+        self._logical_pipeline_leaders = leaders
+
+    @property
+    def logical_rank_in_group(self) -> int:
+        rank = getattr(self, "_logical_pipeline_rank", None)
+        return self.rank_in_group if rank is None else rank
+
+    @property
+    def logical_world_size(self) -> int:
+        size = getattr(self, "_logical_pipeline_size", None)
+        return self.world_size if size is None else size
+
     @property
     def first_rank(self):
         """Return the global rank of the first process in the group"""
+        logical_leaders = getattr(self, "_logical_pipeline_leaders", None)
+        if logical_leaders is not None:
+            return logical_leaders[0]
         return self.routing_ranks[0]
 
     @property
     def last_rank(self):
         """Return the global rank of the last process in the group"""
+        logical_leaders = getattr(self, "_logical_pipeline_leaders", None)
+        if logical_leaders is not None:
+            return logical_leaders[-1]
         return self.routing_ranks[-1]
 
     @property
     def is_first_rank(self):
         """Return whether the caller is the first process in the group"""
+        logical_rank = getattr(self, "_logical_pipeline_rank", None)
+        if logical_rank is not None:
+            return logical_rank == 0
         return self.rank == self.first_rank
 
     @property
     def is_last_rank(self):
         """Return whether the caller is the last process in the group"""
+        logical_rank = getattr(self, "_logical_pipeline_rank", None)
+        if logical_rank is not None:
+            return logical_rank == self._logical_pipeline_size - 1
         return self.rank == self.last_rank
 
     @property
     def next_rank(self):
         """Return the global rank of the process that follows the caller"""
+        logical_rank = getattr(self, "_logical_pipeline_rank", None)
+        if logical_rank is not None:
+            return self._logical_pipeline_leaders[
+                (logical_rank + 1) % self._logical_pipeline_size
+            ]
         ranks = self.routing_ranks
         if self.rank not in ranks:
             return self.rank
@@ -620,6 +678,11 @@ class GroupCoordinator:
     @property
     def prev_rank(self):
         """Return the global rank of the process that precedes the caller"""
+        logical_rank = getattr(self, "_logical_pipeline_rank", None)
+        if logical_rank is not None:
+            return self._logical_pipeline_leaders[
+                (logical_rank - 1) % self._logical_pipeline_size
+            ]
         ranks = self.routing_ranks
         if self.rank not in ranks:
             return self.rank
@@ -2475,6 +2538,103 @@ def init_distributed_environment(
         ), "world group already initialized with a different world size"
 
 
+def initialize_heterogeneous_model_parallel(
+    *,
+    stage_tp_sizes: Sequence[int],
+    pipeline_rank: int,
+    backend: Optional[str] = None,
+    enable_symm_mem: bool = False,
+) -> None:
+    """Initialize a static PP mesh whose stages use different TP widths.
+
+    This first implementation intentionally supports the colocated inference
+    subset used by the GLM experiments: attention DP/CP, DCP, expert parallel,
+    and MoE DP are all one.  Stage-local TP groups perform model collectives;
+    one group containing the stage leaders carries PP tensors and metadata.
+    """
+
+    from sglang.srt.distributed.heterogeneous_pp import HeterogeneousPPTopology
+    from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
+
+    assert torch.distributed.is_initialized()
+    topology = HeterogeneousPPTopology(tuple(int(size) for size in stage_tp_sizes))
+    world_size = torch.distributed.get_world_size()
+    if world_size != topology.world_size:
+        raise RuntimeError(
+            f"world_size ({world_size}) is not equal to the sum of heterogeneous "
+            f"PP stage TP sizes ({topology.world_size})"
+        )
+    if pipeline_rank < 0 or pipeline_rank >= topology.pp_size:
+        raise ValueError(
+            f"pipeline rank {pipeline_rank} is outside [0, {topology.pp_size})"
+        )
+
+    backend = backend or torch.distributed.get_backend(get_world_group().device_group)
+    local_rank = get_world_group().local_rank
+    tp_group_ranks = [list(group) for group in topology.tp_groups]
+    singleton_group_ranks = [list(group) for group in topology.singleton_groups]
+
+    global _TP
+    assert _TP is None, "tensor model parallel group is already initialized"
+    _TP = init_model_parallel_group(
+        tp_group_ranks,
+        local_rank,
+        backend,
+        use_message_queue_broadcaster=envs.SGLANG_USE_MESSAGE_QUEUE_BROADCASTER.get(),
+        group_name="tp",
+        use_torch_symm_mem_allreduce=enable_symm_mem,
+    )
+
+    # DCP/attention-CP/MoE-DP/MoE-EP are all size one in the supported subset.
+    # One physical singleton coordinator is sufficient for those identities.
+    singleton_group = init_model_parallel_group(
+        singleton_group_ranks,
+        local_rank,
+        backend,
+        use_pynccl=False,
+        use_custom_allreduce=False,
+        group_name="heterogeneous_singleton",
+    )
+
+    global _DCP, _ATTN_CP, _ATTN_TP
+    assert _DCP is None, "decode context parallel group is already initialized"
+    assert _ATTN_CP is None, "attention context parallel group is already initialized"
+    assert _ATTN_TP is None, "attention tensor parallel group is already initialized"
+    _DCP = singleton_group
+    _ATTN_CP = singleton_group
+    _ATTN_TP = _TP
+    if SYNC_TOKEN_IDS_ACROSS_TP and _ATTN_TP.pynccl_comm is not None:
+        _ATTN_TP.pynccl_comm.disabled = False
+
+    global _MOE_DP, _MOE_EP, _MOE_TP
+    assert _MOE_DP is None, "moe data parallel group is already initialized"
+    assert _MOE_EP is None, "expert model parallel group is already initialized"
+    assert _MOE_TP is None, "expert tensor parallel group is already initialized"
+    _MOE_DP = singleton_group
+    _MOE_EP = singleton_group
+    _MOE_TP = _TP
+
+    global _PP
+    assert _PP is None, "pipeline model parallel group is already initialized"
+    _PP = init_model_parallel_group(
+        [list(group) for group in topology.pp_transport_groups],
+        local_rank,
+        backend,
+        use_custom_allreduce=False,
+        group_name="pp",
+    )
+    _PP.set_logical_pipeline_topology(
+        rank=pipeline_rank,
+        size=topology.pp_size,
+        leader_ranks=topology.stage_leader_ranks,
+    )
+
+    global _ELASTIC_PP_MIGRATION
+    assert (
+        _ELASTIC_PP_MIGRATION is None
+    ), "elastic PP migration group is already initialized"
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     expert_model_parallel_size: int = 1,
@@ -3039,12 +3199,12 @@ def get_attn_context_model_parallel_rank():
 
 def get_pipeline_model_parallel_world_size():
     """Return world size for the pipeline model parallel group."""
-    return get_pp_group().world_size
+    return get_pp_group().logical_world_size
 
 
 def get_pipeline_model_parallel_rank():
     """Return my rank for the pipeline model parallel group."""
-    return get_pp_group().rank_in_group
+    return get_pp_group().logical_rank_in_group
 
 
 # MOE_DP

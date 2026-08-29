@@ -72,6 +72,10 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     )
 
 
+def _pp_stage_tp_sizes(scheduler: Scheduler) -> Optional[str]:
+    return getattr(getattr(scheduler, "server_args", None), "pp_stage_tp_sizes", None)
+
+
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
@@ -1054,6 +1058,7 @@ class SchedulerPPMixin:
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not get_parallel().enable_dsa_prefill_context_parallel
+            and _pp_stage_tp_sizes(self) is None
         )
         self.mbs = [None] * self.pp_loop_size
         self.last_mbs = [None] * self.pp_loop_size
@@ -1460,30 +1465,58 @@ class SchedulerPPMixin:
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            dp_offset = (
-                self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
-            )
+            stage_tp_sizes = _pp_stage_tp_sizes(self)
+            if stage_tp_sizes is not None:
+                from sglang.srt.distributed.heterogeneous_pp import (
+                    HeterogeneousPPTopology,
+                )
+
+                topology = HeterogeneousPPTopology.parse(stage_tp_sizes)
+                rank = topology.stage_leader_ranks[self.ps.pp_rank]
+                dst = topology.next_stage_leader(self.ps.pp_rank)
+            else:
+                dp_offset = (
+                    self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+                )
+                rank = self.ps.pp_rank * self.ps.tp_size + dp_offset
+                dst = (
+                    (self.ps.pp_rank + 1) % self.ps.pp_size
+                ) * self.ps.tp_size + dp_offset
             p2p_work = point_to_point_pyobj(
                 data,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                rank,
                 self.world_group.cpu_group,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
-                ((self.ps.pp_rank + 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
+                rank,
+                dst,
                 async_send=async_send,
             )
         return p2p_work
 
     def _pp_recv_pyobj_from_prev_stage(self: Scheduler):
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-            dp_offset = (
-                self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
-            )
+            stage_tp_sizes = _pp_stage_tp_sizes(self)
+            if stage_tp_sizes is not None:
+                from sglang.srt.distributed.heterogeneous_pp import (
+                    HeterogeneousPPTopology,
+                )
+
+                topology = HeterogeneousPPTopology.parse(stage_tp_sizes)
+                rank = topology.stage_leader_ranks[self.ps.pp_rank]
+                src = topology.previous_stage_leader(self.ps.pp_rank)
+            else:
+                dp_offset = (
+                    self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
+                )
+                rank = self.ps.pp_rank * self.ps.tp_size + dp_offset
+                src = (
+                    (self.ps.pp_rank - 1) % self.ps.pp_size
+                ) * self.ps.tp_size + dp_offset
             data = point_to_point_pyobj(
                 [],
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                rank,
                 self.world_group.cpu_group,
-                ((self.ps.pp_rank - 1) % self.ps.pp_size) * self.ps.tp_size + dp_offset,
-                self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                src,
+                rank,
             )
         else:
             data = None
@@ -1548,17 +1581,20 @@ class SchedulerPPMixin:
                 dst = self._pp_next_active_rank()
                 if dst is None:
                     raise RuntimeError("logical last PP rank cannot send proxy tensors")
+        if _pp_stage_tp_sizes(self) is not None and self.ps.attn_tp_rank != 0:
+            return []
+
         p2p_work = []
-        p2p_work.extend(
-            self.pp_group.send_tensor_dict(
-                tensor_dict=tensor_dict,
-                dst=dst,
-                all_gather_group=(
-                    self.attn_tp_group if self.require_attn_tp_allgather else None
-                ),
-                async_send=async_send,
-            )
+        send_work = self.pp_group.send_tensor_dict(
+            tensor_dict=tensor_dict,
+            dst=dst,
+            all_gather_group=(
+                self.attn_tp_group if self.require_attn_tp_allgather else None
+            ),
+            async_send=async_send,
         )
+        if send_work:
+            p2p_work.extend(send_work)
         return p2p_work
 
     def _pp_recv_typed_dict(
@@ -1578,9 +1614,19 @@ class SchedulerPPMixin:
                 return inbox_queue.popleft()
 
         while True:
-            tensor_dict = self.pp_group.recv_tensor_dict(
-                src=src, all_gather_group=all_gather_group
-            )
+            if _pp_stage_tp_sizes(self) is not None:
+                tensor_dict = (
+                    self.pp_group.recv_tensor_dict(src=src, all_gather_group=None)
+                    if self.ps.attn_tp_rank == 0
+                    else None
+                )
+                tensor_dict = self.attn_tp_group.broadcast_tensor_dict(
+                    tensor_dict, src=0
+                )
+            else:
+                tensor_dict = self.pp_group.recv_tensor_dict(
+                    src=src, all_gather_group=all_gather_group
+                )
             received_kind = tensor_dict.get("__msg_type__", "default")
             if received_kind == expected_kind:
                 topology = self._pp_topology()
