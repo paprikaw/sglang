@@ -98,10 +98,26 @@ class SchedulerPPMixin:
             phase = "idle" if snapshot is None else snapshot.phase.value
             source_usable = True if snapshot is None else snapshot.source_usable
 
-        running_batch = getattr(self, "running_batch", None)
-        running_requests = (
-            0 if running_batch is None else len(getattr(running_batch, "reqs", ()))
+        # running_batch is only the current ring slot. With a microbatch cap
+        # of one it can never report a larger serving load, even when all PP
+        # slots are occupied. Include in-flight prefills as well as decode
+        # batches, deduplicate shared Req objects, and ignore retired requests.
+        batches = (
+            getattr(self, "running_batch", None),
+            *getattr(self, "running_mbs", ()),
+            *getattr(self, "mbs", ()),
         )
+        active_reqs = {
+            id(req)
+            for batch in batches
+            if batch is not None
+            for req in batch.reqs
+            if not req.finished()
+        }
+        chunked_req = getattr(self, "chunked_req", None)
+        if chunked_req is not None and not chunked_req.finished():
+            active_reqs.add(id(chunked_req))
+        running_requests = len(active_reqs)
         return GetElasticPPStateReqOutput(
             enabled=topology is not None and coordinator is not None,
             generation=generation,
@@ -603,7 +619,8 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
-                if get_parallel().pp_async_batch_depth > 0:
+                early_proxy = self._pp_requires_immediate_output_relay()
+                if get_parallel().pp_async_batch_depth > 0 and not early_proxy:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -619,7 +636,16 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                if get_parallel().pp_async_batch_depth == 0:
+                if early_proxy:
+                    # Immediate output relays form a full resident-ring
+                    # circuit. Its logical last rank may still need this
+                    # activation before it can reach the output-send step.
+                    # Submit the activation first to avoid a proxy/output
+                    # wait cycle when several ring slots are occupied.
+                    self._pp_send_launched_proxy(
+                        cur_batch, result if cur_batch else None
+                    )
+                if get_parallel().pp_async_batch_depth == 0 or early_proxy:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -634,19 +660,10 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
-                if self._pp_rank_is_active() and not self._pp_is_last_rank():
-                    if cur_batch:
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        with torch.profiler.record_function(
-                            "send_proxy_dict_to_next_stage"
-                        ):
-                            self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                                result.pp_hidden_states_proxy_tensors.tensors,
-                                async_send=True,
-                                msg_type="proxy",
-                            )
+                if not early_proxy:
+                    self._pp_send_launched_proxy(
+                        cur_batch, result if cur_batch else None
+                    )
 
                 self.pp_outputs = next_pp_outputs
                 self._pp_microstep += 1
@@ -655,6 +672,16 @@ class SchedulerPPMixin:
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self.on_idle()
+
+    def _pp_send_launched_proxy(self: Scheduler, batch, result) -> None:
+        if batch and self._pp_rank_is_active() and not self._pp_is_last_rank():
+            self.device_module.current_stream().wait_event(self.launch_event)
+            with torch.profiler.record_function("send_proxy_dict_to_next_stage"):
+                self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                    result.pp_hidden_states_proxy_tensors.tensors,
+                    async_send=True,
+                    msg_type="proxy",
+                )
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -1798,48 +1825,35 @@ class SchedulerPPMixin:
                 d2h_event.record(self.device_module.current_stream())
 
         if self._pp_requires_immediate_output_relay():
-            # A result generated in this microstep belongs to next_mb_id at
-            # the receiving rank.  The logical last rank therefore retains it
-            # for one microstep, then sends it when all other ranks enter the
-            # matching receive slot.  Sending the fresh result immediately
-            # can deadlock during lazy NCCL P2P initialization because the
-            # next rank is still waiting for the next control-ring message.
+            # Every rank retires next_mb_id in this microstep. Keep produced
+            # results in the logical-last FIFO until that slot is due: a
+            # physical ring of N slots needs N-1 microsteps, not always one.
+            # Sending a fresh result earlier can also deadlock lazy NCCL P2P
+            # initialization before the next rank reaches its receive slot.
             is_logical_last = self._pp_is_last_rank()
-            if not is_logical_last and pp_outputs is not None:
+            if pp_outputs is not None:
                 raise RuntimeError(
-                    "elastic PP output relay found a retained result on a "
-                    "non-logical-last rank"
+                    "elastic PP output relay must retain results in the slot FIFO"
                 )
             if is_logical_last:
-                if pp_outputs is not None:
-                    if mbs[next_mb_id] is None:
-                        raise RuntimeError(
-                            "elastic PP logical last rank has a retained output "
-                            "without a matching receive slot"
-                        )
-                    with torch.profiler.record_function("send_res_dict_to_next_stage"):
-                        send_output_work = self._pp_send_dict_to_next_stage(
-                            pp_outputs.tensors,
-                            async_send=True,
-                            msg_type="output",
-                        )
-                _do_recv()
-
-                # Stage the output just produced for next_first_rank_mb_id so
-                # it is sent in the receiver-aligned microstep.  Waiting on the
-                # launch event is enqueued on the schedule stream; the actual
-                # P2P send remains asynchronous in the following iteration.
-                fresh_pp_outputs = None
-                fresh_target = mbs[next_first_rank_mb_id]
-                if fresh_target is not None:
+                target = mbs[next_mb_id]
+                if target is not None:
                     q_event, produced_pp_outputs = last_rank_comm_queue.popleft()
                     if (
-                        not fresh_target.forward_mode.is_prebuilt()
-                        and not _pp_can_skip_output_comm(fresh_target)
+                        not target.forward_mode.is_prebuilt()
+                        and not _pp_can_skip_output_comm(target)
                     ):
                         self.device_module.current_stream().wait_event(q_event)
-                        fresh_pp_outputs = produced_pp_outputs
-                next_pp_outputs = fresh_pp_outputs
+                        with torch.profiler.record_function(
+                            "send_res_dict_to_next_stage"
+                        ):
+                            send_output_work = self._pp_send_dict_to_next_stage(
+                                produced_pp_outputs.tensors,
+                                async_send=True,
+                                msg_type="output",
+                            )
+                _do_recv()
+                next_pp_outputs = None
             else:
                 _do_recv()
                 if next_pp_outputs is not None:

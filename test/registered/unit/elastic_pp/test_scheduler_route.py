@@ -334,39 +334,145 @@ def test_resident_rank_immediately_relays_output_when_logical_last_moves():
     assert send_work == []
 
 
-def test_logical_last_defers_fresh_output_until_receiver_aligned_microstep():
-    scheduler = _FakeScheduler(rank=0, size=2)
-    scheduler._pp_install_topology(PPTopology.from_layer_counts([8, 0]))
+@pytest.mark.parametrize("size, async_depth", [(2, 0), (4, 0), (8, 0), (8, 2)])
+def test_logical_last_defers_output_until_its_ring_slot_is_retired(size, async_depth):
+    scheduler = _FakeScheduler(rank=size - 2, size=size)
+    counts = [2 if rank % 2 == 0 else 0 for rank in range(size)]
+    scheduler._pp_install_topology(PPTopology.from_layer_counts(counts))
     waited_events = []
     scheduler.device_module = SimpleNamespace(
+        Event=_FakeEvent,
         current_stream=lambda: SimpleNamespace(
             wait_event=lambda event: waited_events.append(event)
-        )
+        ),
     )
     target = SimpleNamespace(
         forward_mode=SimpleNamespace(is_prebuilt=lambda: False),
     )
     produced = SimpleNamespace(tensors={"next_token_ids": "fresh"})
     output_queue = deque([("launch-event", produced)])
+    loop_size = size + async_depth
+    batches = [target] + [None] * (loop_size - 1)
+    metadata = [PPBatchMetadata(can_run_cuda_graph=False)] + [None] * (loop_size - 1)
+    scheduler._pp_prep_batch_result = lambda batch, batch_metadata, outputs: (
+        batch,
+        batch_metadata,
+        outputs,
+    )
+
+    # Sparse traffic must leave the output queued across all intervening
+    # empty slots. The old one-step staging only worked with a two-slot ring.
+    for mb_id in range(loop_size - 1):
+        next_outputs, batch_result, d2h_event, send_work = (
+            scheduler._pp_send_recv_and_preprocess_output_tensors(
+                next_first_rank_mb_id=(mb_id + size) % loop_size,
+                next_mb_id=(mb_id + 1) % loop_size,
+                mbs=batches,
+                mb_metadata=metadata,
+                last_rank_comm_queue=output_queue,
+                pp_outputs=None,
+            )
+        )
+        assert next_outputs is batch_result is d2h_event is None
+        assert send_work == []
+        assert scheduler.pp_group.sent == []
+        assert list(output_queue) == [("launch-event", produced)]
+        assert waited_events == []
+
+    scheduler.pp_group.received.append(
+        {"__msg_type__": "output", "__pp_generation__": 0, "next_token_ids": "fresh"}
+    )
 
     next_outputs, batch_result, d2h_event, send_work = (
         scheduler._pp_send_recv_and_preprocess_output_tensors(
-            next_first_rank_mb_id=0,
-            next_mb_id=1,
-            mbs=[target, None],
-            mb_metadata=[PPBatchMetadata(can_run_cuda_graph=False), None],
+            next_first_rank_mb_id=(loop_size - 1 + size) % loop_size,
+            next_mb_id=0,
+            mbs=batches,
+            mb_metadata=metadata,
             last_rank_comm_queue=output_queue,
             pp_outputs=None,
         )
     )
 
-    assert next_outputs is produced
-    assert batch_result is None
-    assert d2h_event is None
+    assert next_outputs is None
+    assert batch_result[0] is target
+    assert d2h_event is not None
     assert send_work == []
-    assert scheduler.pp_group.sent == []
+    assert scheduler.pp_group.sent[0]["tensor_dict"]["next_token_ids"] == "fresh"
     assert output_queue == deque()
     assert waited_events == ["launch-event"]
+
+
+@pytest.mark.parametrize("async_depth", [0, 2])
+def test_elastic_loop_sends_activation_before_waiting_for_output(
+    monkeypatch, async_depth
+):
+    from sglang.srt.managers import scheduler_pp_mixin
+
+    scheduler = _FakeScheduler(rank=0, size=4)
+    scheduler._pp_install_topology(PPTopology.from_layer_counts([2, 0, 2, 0]))
+    monkeypatch.setattr(
+        scheduler_pp_mixin,
+        "get_parallel",
+        lambda: SimpleNamespace(pp_async_batch_depth=async_depth),
+    )
+    calls = []
+    batch = SimpleNamespace()
+    scheduler.init_pp_loop_state = lambda: None
+    scheduler.pp_loop_size = 4 + async_depth
+    scheduler.running_mbs = [None] * scheduler.pp_loop_size
+    scheduler.last_mbs = [None] * scheduler.pp_loop_size
+    scheduler.mbs = [None, batch] + [None] * (scheduler.pp_loop_size - 2)
+    scheduler.mb_metadata = [None] * scheduler.pp_loop_size
+    scheduler.last_rank_comm_queue = deque()
+    scheduler.send_req_work = []
+    scheduler.send_proxy_work = []
+    scheduler._pp_microstep = 0
+    scheduler.request_receiver = SimpleNamespace(recv_requests=lambda: [])
+    scheduler.process_input_requests = lambda reqs: None
+    scheduler._pp_send_pyobj_to_next_stage = lambda reqs, **kw: []
+    scheduler._elastic_pp_drain_due = lambda: False
+    scheduler.get_next_batch_to_run = lambda **kw: SimpleNamespace(
+        running_batch=batch, batch_to_run=batch
+    )
+    scheduler._pp_recv_proxy_tensors = lambda: None
+    result = SimpleNamespace(pp_hidden_states_proxy_tensors=SimpleNamespace(tensors={}))
+
+    def launch(*args):
+        calls.append("launch")
+        return result, "forward-event"
+
+    scheduler._pp_launch_or_skip_batch = launch
+    scheduler.device_module = SimpleNamespace(
+        current_stream=lambda: SimpleNamespace(
+            wait_event=lambda event: calls.append("wait-forward")
+        )
+    )
+
+    def send(tensors, **kwargs):
+        assert kwargs["msg_type"] == "proxy"
+        calls.append("send-proxy")
+        return []
+
+    def retire(*args):
+        assert "send-proxy" in calls, "output wait can deadlock the activation path"
+        calls.append("receive-output")
+        return None, result, SimpleNamespace(synchronize=lambda: None)
+
+    scheduler._pp_send_dict_to_next_stage = send
+    scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = retire
+    scheduler._pp_process_batch_result = lambda *args: calls.append("retire")
+
+    class StopAfterMicrostep(Exception):
+        pass
+
+    def stop():
+        raise StopAfterMicrostep
+
+    scheduler._elastic_pp_finalize_if_drained = stop
+    with pytest.raises(StopAfterMicrostep):
+        scheduler.event_loop_pp()
+    assert calls == ["launch", "wait-forward", "send-proxy", "receive-output", "retire"]
 
 
 def test_common_future_microstep_arms_drain_on_the_exact_boundary():
@@ -470,7 +576,9 @@ def test_autoscale_state_reports_topology_and_backlog():
         phase=ElasticPPMigrationPhase.IDLE,
     )
     scheduler.waiting_queue = [object(), object(), object()]
-    scheduler.running_batch = SimpleNamespace(reqs=[object(), object()])
+    active = [SimpleNamespace(finished=lambda: False) for _ in range(4)]
+    finished = SimpleNamespace(finished=lambda: True)
+    scheduler.running_batch = SimpleNamespace(reqs=active[:2])
 
     state = scheduler.handle_get_elastic_pp_state(GetElasticPPStateReqInput())
 
@@ -481,3 +589,22 @@ def test_autoscale_state_reports_topology_and_backlog():
     assert state.source_usable
     assert state.waiting_requests == 3
     assert state.running_requests == 2
+
+    scheduler.running_mbs = [scheduler.running_batch, SimpleNamespace(reqs=[active[2]])]
+    scheduler.mbs = [
+        SimpleNamespace(reqs=[active[0], active[2], active[3], finished]),
+        None,
+    ]
+    scheduler.chunked_req = active[3]
+    state = scheduler.handle_get_elastic_pp_state(GetElasticPPStateReqInput())
+    assert state.running_requests == 4
+
+    # At the drained fence, request state can survive only in running_mbs or
+    # chunked_req while the transient mbs slots have all been cleared.
+    scheduler.mbs = [None, None]
+    assert (
+        scheduler.handle_get_elastic_pp_state(
+            GetElasticPPStateReqInput()
+        ).running_requests
+        == 4
+    )
