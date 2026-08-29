@@ -978,7 +978,7 @@ class KVCacheConfigurator:
                 unsupported.append("MLA")
             if self.is_hybrid_swa:
                 unsupported.append("hybrid SWA")
-            if self.mambaish_config:
+            if self.mambaish_config and self.hybrid_gdn_config is None:
                 unsupported.append("hybrid linear/Mamba")
             if is_dsa_model or is_dsv4_model:
                 unsupported.append("DSA/DSV4")
@@ -990,8 +990,8 @@ class KVCacheConfigurator:
                 unsupported.append("HND KV layout")
             if unsupported:
                 raise NotImplementedError(
-                    "elastic PP KVCacheD currently supports plain, unquantized "
-                    f"MHA serving only; unsupported={unsupported}"
+                    "elastic PP KVCacheD requires unquantized MHA backing "
+                    f"(including Qwen3.5 full-attention layers); unsupported={unsupported}"
                 )
             from sglang.srt.mem_cache.kvcached_pool import (
                 KVCacheDMHATokenToKVPool,
@@ -1617,7 +1617,28 @@ class KVCacheConfigurator:
             if self.kv_cache_dtype_str == "mxfp8" and not self.use_mla_backend
             else mha_pool_class
         )
-        token_to_kv_pool = HybridLinearKVPool(
+        hybrid_pool_class = HybridLinearKVPool
+        if get_parallel().enable_elastic_pp:
+            from sglang.srt.elastic_pp.hybrid_config import QWEN35_ELASTIC_ARCHITECTURES
+            from sglang.srt.mem_cache.elastic_hybrid_pool import (
+                ElasticHybridLinearKVPool,
+            )
+
+            if (
+                self.model_config.hf_config.architectures[0]
+                not in QWEN35_ELASTIC_ARCHITECTURES
+            ):
+                raise NotImplementedError(
+                    "elastic hybrid PP currently supports Qwen3.5"
+                )
+            hybrid_pool_class = ElasticHybridLinearKVPool
+            extra_args.update(
+                req_to_token_pool=req_to_token_pool,
+                all_full_attention_layer_ids=self.mambaish_config.full_attention_layer_ids,
+                total_num_layers=self.model_config.num_hidden_layers,
+                end_layer=self.layer_info.end_layer,
+            )
+        token_to_kv_pool = hybrid_pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,
             dtype=self.kv_cache_dtype,

@@ -242,12 +242,23 @@ class ElasticPPMigrationCoordinator:
                 f"elastic PP {stage} failed on resident ranks: " + " | ".join(messages)
             )
 
+    def _set_worker_device(self) -> None:
+        # CUDA's current device is thread-local. New preparation/cleanup
+        # threads otherwise default to GPU 0 even on another resident rank.
+        device = torch.device(getattr(self.model_runner, "device", "cpu"))
+        if device.type == "cuda":
+            index = device.index
+            if index is None:
+                index = self.model_runner.gpu_id
+            torch.cuda.set_device(index)
+
     def _prepare_worker(self) -> None:
         transition = self._require_transition()
         generation = transition.target.generation
         try:
             local_error = None
             try:
+                self._set_worker_device()
                 stage_started = time.monotonic()
                 logger.info(
                     "Elastic PP generation=%d rank=%d layer prepare begin",
@@ -376,6 +387,14 @@ class ElasticPPMigrationCoordinator:
             try:
                 fence_slots = self.kv_transport.fence_slots(transition)
                 slot_signature = self._slot_signature(fence_slots)
+                state_signature = getattr(
+                    self.kv_transport, "fence_state_signature", None
+                )
+                if state_signature is not None:
+                    slot_signature = {
+                        "kv": slot_signature,
+                        "recurrent": state_signature(),
+                    }
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
             reports = self._consensus(
@@ -385,6 +404,20 @@ class ElasticPPMigrationCoordinator:
                 details=slot_signature,
             )
             self._raise_peer_failures("fence slots", reports)
+            if isinstance(slot_signature, dict) and "recurrent" in slot_signature:
+                # All ranks retain scheduler state, including inactive ranks.
+                # A recurrent slot is meaningful only if every owner agrees on
+                # its request mapping. Reject skew before entering P2P copies.
+                for report in reports:
+                    details = report.get("details")
+                    if (
+                        not isinstance(details, dict)
+                        or details.get("recurrent") != slot_signature["recurrent"]
+                    ):
+                        raise RuntimeError(
+                            "elastic PP recurrent slot mapping differs across ranks; "
+                            "cannot migrate GDN state without request-slot remapping"
+                        )
             assert fence_slots is not None
 
             local_error = None
@@ -510,11 +543,28 @@ class ElasticPPMigrationCoordinator:
         try:
             local_error = None
             try:
+                self._set_worker_device()
                 if completion_event is not None:
                     completion_event.synchronize()
+                cuda_cleanup = (
+                    torch.device(getattr(self.model_runner, "device", "cpu")).type
+                    == "cuda"
+                )
+                allocated_before = (
+                    torch.cuda.memory_allocated() if cuda_cleanup else None
+                )
                 self.model_runner.cleanup_elastic_pp_generation(
                     generation=transition.target.generation
                 )
+                if cuda_cleanup:
+                    logger.info(
+                        "Elastic PP generation=%d rank=%d cleanup CUDA allocated "
+                        "%.3f -> %.3f GiB",
+                        transition.target.generation,
+                        self.rank,
+                        allocated_before / 2**30,
+                        torch.cuda.memory_allocated() / 2**30,
+                    )
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
             reports = self._consensus(
@@ -566,6 +616,12 @@ class ElasticPPMigrationCoordinator:
             self._source_usable = source_usable
             self._phase = ElasticPPMigrationPhase.FAILED
             self._condition.notify_all()
+        logger.error(
+            "Elastic PP rank=%d migration failed (source_usable=%s): %s",
+            self.rank,
+            source_usable,
+            self._error,
+        )
 
     def _require_transition(self) -> DynamicPPTransition:
         with self._lock:

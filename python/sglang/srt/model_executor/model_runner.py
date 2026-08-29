@@ -847,7 +847,14 @@ class ModelRunner:
         if self.elastic_pp_migration_group is not None:
             from sglang.srt.elastic_pp.kv_transport import ElasticPPKVTransport
 
-            self.elastic_pp_kv_transport = ElasticPPKVTransport(
+            transport_class = ElasticPPKVTransport
+            if hasattr(self.token_to_kv_pool, "recurrent_layer_ids"):
+                from sglang.srt.elastic_pp.hybrid_kv_transport import (
+                    ElasticPPHybridKVTransport,
+                )
+
+                transport_class = ElasticPPHybridKVTransport
+            self.elastic_pp_kv_transport = transport_class(
                 group=self.elastic_pp_migration_group,
                 model_runner=self,
                 allocator=self.token_to_kv_pool_allocator,
@@ -1172,7 +1179,7 @@ class ModelRunner:
             if finalize_profile is None:
                 raise RuntimeError(
                     "--enable-elastic-pp requires a model implementation with "
-                    "first-load weight profiling; currently Llama is supported"
+                    "first-load weight profiling; currently Llama and Qwen3.5 are supported"
                 )
             local_profile = finalize_profile()
             peer_profiles = self.pp_group.all_gather_object(local_profile)

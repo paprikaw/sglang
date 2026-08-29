@@ -7885,6 +7885,17 @@ class ServerArgs:
         self.elastic_pp_initial_partition = normalized_partition
         os.environ["SGLANG_PP_LAYER_PARTITION"] = normalized_partition
 
+        from sglang.srt.elastic_pp.hybrid_config import (
+            QWEN35_ELASTIC_ARCHITECTURES,
+            validate_qwen35_elastic_args,
+        )
+
+        if (
+            self.get_model_config().hf_config.architectures[0]
+            in QWEN35_ELASTIC_ARCHITECTURES
+        ):
+            validate_qwen35_elastic_args(self._resolved())
+
         if not self.enable_elastic_pp_autoscaling:
             if self.elastic_pp_autoscale_partitions is not None:
                 raise ValueError(
@@ -8452,7 +8463,11 @@ class ServerArgs:
         except Exception:
             return False
 
-    LANGUAGE_MODEL_ONLY_ARCHITECTURES = ("MuseGlimmerForConditionalGeneration",)
+    LANGUAGE_MODEL_ONLY_ARCHITECTURES = (
+        "MuseGlimmerForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+    )
 
     def _handle_language_model_only(self):
         if not self.language_model_only:

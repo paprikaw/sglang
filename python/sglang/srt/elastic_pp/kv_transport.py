@@ -17,6 +17,16 @@ _SLOT_IDS_KEY = "elastic_pp_kv_slot_ids"
 _TENSOR_KEY_PREFIX = "elastic_pp_kv_tensor_"
 
 
+def _transfer_layer_ids(transfer: LayerTransfer, layer_ids=None) -> set[int]:
+    interval = set(range(transfer.layer_range.start, transfer.layer_range.end))
+    if layer_ids is None:
+        return interval
+    expected = set(layer_ids)
+    if not expected <= interval:
+        raise ValueError("KV layer ids are outside the transferred model interval")
+    return expected
+
+
 def _slot_chunks(slot_ids: torch.Tensor, chunk_size: int) -> tuple[torch.Tensor, ...]:
     if chunk_size <= 0:
         raise ValueError("elastic PP KV slot chunk size must be positive")
@@ -39,8 +49,9 @@ def flatten_kv_chunk(
     total_chunks: int,
     slot_ids: torch.Tensor,
     layer_kv: dict[int, tuple[torch.Tensor, torch.Tensor]],
+    layer_ids: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
-    expected_layers = set(range(transfer.layer_range.start, transfer.layer_range.end))
+    expected_layers = _transfer_layer_ids(transfer, layer_ids)
     if set(layer_kv) != expected_layers:
         raise ValueError(
             "KV payload does not exactly cover transfer layers: "
@@ -86,6 +97,7 @@ def unflatten_kv_chunk(
     phase: KVTransferPhase,
     chunk_index: int,
     total_chunks: int,
+    layer_ids: tuple[int, ...] | None = None,
 ) -> tuple[torch.Tensor, dict[int, tuple[torch.Tensor, torch.Tensor]]]:
     manifest = payload.get(_MANIFEST_KEY)
     if not isinstance(manifest, dict):
@@ -138,7 +150,7 @@ def unflatten_kv_chunk(
         tensor_keys.add(key)
         by_layer[layer_id][kind] = tensor
 
-    expected_layers = set(range(transfer.layer_range.start, transfer.layer_range.end))
+    expected_layers = _transfer_layer_ids(transfer, layer_ids)
     if set(by_layer) != expected_layers or any(
         set(item) != {"k", "v"} for item in by_layer.values()
     ):
@@ -326,20 +338,21 @@ class ElasticPPKVTransport:
     ) -> int:
         """Send bounded chunks; run this on the migration sender thread."""
 
-        chunks = _slot_chunks(slot_ids, self.slot_chunk_size)
         sent = 0
         with self._stream_context(self._send_stream):
             if source_ready_event is not None and self._send_stream is not None:
                 self._send_stream.wait_event(source_ready_event)
             for transfer in self.outbound_transfers(transition):
+                layer_ids = self._kv_layer_ids(transfer)
+                chunks = _slot_chunks(
+                    slot_ids if layer_ids else slot_ids[:0], self.slot_chunk_size
+                )
                 for chunk_index, chunk in enumerate(chunks):
                     layer_kv = {
                         layer_id: self.pool.export_elastic_pp_kv_slots(
                             layer_id=layer_id, slot_ids=chunk
                         )
-                        for layer_id in range(
-                            transfer.layer_range.start, transfer.layer_range.end
-                        )
+                        for layer_id in layer_ids
                     }
                     payload = flatten_kv_chunk(
                         generation=transition.target.generation,
@@ -349,6 +362,7 @@ class ElasticPPKVTransport:
                         total_chunks=len(chunks),
                         slot_ids=chunk,
                         layer_kv=layer_kv,
+                        layer_ids=layer_ids,
                     )
                     works = self.group.send_tensor_dict(
                         payload, dst=transfer.dst_rank, async_send=True
@@ -454,6 +468,7 @@ class ElasticPPKVTransport:
                 phase=phase,
                 chunk_index=chunk_index,
                 total_chunks=total_chunks,
+                layer_ids=self._kv_layer_ids(transfer),
             )
             key = (
                 transition.target.generation,
@@ -469,6 +484,12 @@ class ElasticPPKVTransport:
             self._staged_chunks[key] = (slot_ids, layer_kv)
             loaded.update(layer_kv)
         return frozenset(loaded)
+
+    def _kv_layer_ids(self, transfer: LayerTransfer) -> tuple[int, ...]:
+        selector = getattr(self.pool, "elastic_pp_kv_layer_ids", None)
+        if selector is not None:
+            return selector(transfer.layer_range)
+        return tuple(range(transfer.layer_range.start, transfer.layer_range.end))
 
     def exchange_phase(
         self,
@@ -501,16 +522,16 @@ class ElasticPPKVTransport:
                     # The migrating layer owner defines the sparse KV rows for
                     # this edge.  Receiver-local live slots may legitimately
                     # differ while PP microbatches are still in flight.
-                    chunks = _slot_chunks(slot_ids, self.slot_chunk_size)
+                    layer_ids = self._kv_layer_ids(transfer)
+                    chunks = _slot_chunks(
+                        slot_ids if layer_ids else slot_ids[:0], self.slot_chunk_size
+                    )
                     for chunk_index, source_chunk in enumerate(chunks):
                         layer_kv = {
                             layer_id: self.pool.export_elastic_pp_kv_slots(
                                 layer_id=layer_id, slot_ids=source_chunk
                             )
-                            for layer_id in range(
-                                transfer.layer_range.start,
-                                transfer.layer_range.end,
-                            )
+                            for layer_id in layer_ids
                         }
                         payload = flatten_kv_chunk(
                             generation=transition.target.generation,
@@ -520,6 +541,7 @@ class ElasticPPKVTransport:
                             total_chunks=len(chunks),
                             slot_ids=source_chunk,
                             layer_kv=layer_kv,
+                            layer_ids=layer_ids,
                         )
                         works = self.group.send_tensor_dict(
                             payload,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 
+import pytest
 import torch
 
 from sglang.srt.elastic_pp.coordinator import (
@@ -155,9 +156,20 @@ def _coordinator(group=None, *, fence_step_provider=None, fence_lead_steps=0):
     return coordinator, transition, runner, kv_transport
 
 
-def test_prepare_fence_commit_and_deferred_cleanup():
+@pytest.mark.parametrize(
+    "device, expected_gpu", [("cpu", None), ("cuda", 3), ("cuda:2", 2)]
+)
+def test_prepare_fence_commit_and_deferred_cleanup(monkeypatch, device, expected_gpu):
     coordinator, transition, runner, kv_transport = _coordinator()
     installed = []
+    runner.device = device
+    runner.gpu_id = 3
+    selected_devices = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "set_device",
+        lambda index: selected_devices.append((index, threading.current_thread().name)),
+    )
 
     coordinator.begin(transition)
     ready = coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
@@ -187,6 +199,13 @@ def test_prepare_fence_commit_and_deferred_cleanup():
     assert done.prepare_seconds is not None
     assert done.fence_seconds is not None
     assert done.total_seconds is not None
+    if expected_gpu is None:
+        assert selected_devices == []
+    else:
+        assert selected_devices == [
+            (expected_gpu, "elastic-pp-prepare-g1-r0"),
+            (expected_gpu, "elastic-pp-cleanup-g1-r0"),
+        ]
 
 
 def test_prepare_arms_one_future_fence_from_the_slowest_scheduler_rank():
@@ -252,6 +271,21 @@ def test_rank_skewed_bulk_and_delta_snapshots_are_allowed():
     assert coordinator.finalize_at_fence(lambda topology: None) == transition.target
     assert coordinator.phase == ElasticPPMigrationPhase.COMMITTED
     assert runner.committed
+
+
+def test_recurrent_slot_skew_aborts_collectively_before_copy():
+    group = _Group(mismatch_stage="fence_slots")
+    coordinator, transition, runner, kv_transport = _coordinator(group)
+    kv_transport.fence_state_signature = lambda: {"slots": 5, "mapping": "abc"}
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    with pytest.raises(RuntimeError, match="recurrent slot mapping"):
+        coordinator.finalize_at_fence(lambda topology: None)
+    assert coordinator.phase == ElasticPPMigrationPhase.FAILED
+    assert coordinator.snapshot().source_usable
+    assert not runner.committed
+    assert not coordinator.layer_transport.copy_threads
+    assert runner.aborted_layers and runner.aborted_kv
 
 
 def test_peer_commit_failure_is_reported_as_nonrecoverable_partial_commit():

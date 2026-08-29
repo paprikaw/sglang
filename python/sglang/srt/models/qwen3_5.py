@@ -16,7 +16,9 @@
 
 import logging
 import os
+from contextlib import nullcontext
 from functools import lru_cache
+from threading import RLock
 from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -39,6 +41,10 @@ from sglang.srt.configs.qwen3_5 import (
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.elastic_pp.layer_residency import ElasticLayerResidency
+from sglang.srt.elastic_pp.model import ElasticPPModelMixin
+from sglang.srt.elastic_pp.model_wrapper import ElasticPPModelWrapperMixin
+from sglang.srt.elastic_pp.topology import LayerRange
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
@@ -70,7 +76,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -1300,8 +1309,34 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 )
 
 
-class Qwen3_5ForCausalLM(nn.Module):
+def _record_elastic_qwen35_weights(model, weights):
+    if getattr(model, "language_model_only", False):
+        weights = ((name, weight) for name, weight in weights if "visual." not in name)
+    profiler = getattr(model, "_elastic_pp_weight_profiler", None)
+    if profiler is not None:
+        # The MTP module has its own layers. It is not part of the target's PP
+        # partition and must not be counted as decoder layer zero.
+        weights = profiler.record_initial_stream(
+            (name, weight) for name, weight in weights if "mtp" not in name
+        )
+    return weights
+
+
+def _skip_qwen35_pp_weight(model, layer_id):
+    if layer_id is None:
+        return False
+    loading_ids = getattr(model, "_elastic_pp_loading_layer_ids", None)
+    if loading_ids is not None:
+        return layer_id not in loading_ids
+    return hasattr(model, "start_layer") and not (
+        model.start_layer <= layer_id < model.end_layer
+    )
+
+
+class Qwen3_5ForCausalLM(ElasticPPModelMixin, nn.Module):
     """Qwen3.5 Model with support for dense variant."""
+
+    elastic_pp_quantization_methods = (None, "moe_wna16")
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -1378,8 +1413,17 @@ class Qwen3_5ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        self.quant_config = quant_config
         self.hidden_size = config.hidden_size
         self.pp_group = get_pp_group()
+        self._elastic_pp_enabled = getattr(get_parallel(), "enable_elastic_pp", False)
+        self._elastic_layer_lock = RLock()
+        if self._elastic_pp_enabled and quant_config is not None:
+            if quant_config.get_name() not in self.elastic_pp_quantization_methods:
+                raise NotImplementedError(
+                    "Qwen3.5 elastic PP supports BF16/FP16 and moe_wna16; "
+                    "launch GPTQ Int4 weights with --quantization moe_wna16"
+                )
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
@@ -1418,9 +1462,21 @@ class Qwen3_5ForCausalLM(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
+        self._elastic_layer_factory = lambda idx, start_layer: get_layer(
+            idx, f"{prefix}.layers.{idx}"
+        )
+        self._elastic_layer_residency = (
+            ElasticLayerResidency(
+                num_layers=config.num_hidden_layers,
+                initial_generation=0,
+                initial_range=LayerRange(self.start_layer, self.end_layer),
+            )
+            if self._elastic_pp_enabled
+            else None
+        )
 
         # Final normalization
-        if self.pp_group.is_last_rank:
+        if self.pp_group.is_last_rank or self._elastic_pp_enabled:
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -1439,9 +1495,17 @@ class Qwen3_5ForCausalLM(nn.Module):
     def start_layer(self) -> int:
         return self._start_layer
 
+    @start_layer.setter
+    def start_layer(self, value: int) -> None:
+        self._start_layer = value
+
     @property
     def end_layer(self) -> int:
         return self._end_layer
+
+    @end_layer.setter
+    def end_layer(self, value: int) -> None:
+        self._end_layer = value
 
     @torch.no_grad()
     def forward(
@@ -1453,70 +1517,73 @@ class Qwen3_5ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
         input_deepstack_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        # Initialize hidden states
-        if self.pp_group.is_first_rank:
-            if input_embeds is None:
-                hidden_states = self.embed_tokens(input_ids)
+        lock = self._elastic_layer_lock if self._elastic_pp_enabled else nullcontext()
+        with lock:
+            # Initialize hidden states
+            if self.pp_group.is_first_rank:
+                if input_embeds is None:
+                    hidden_states = self.embed_tokens(input_ids)
+                else:
+                    hidden_states = input_embeds
+                residual = None
             else:
-                hidden_states = input_embeds
-            residual = None
-        else:
-            assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            residual = pp_proxy_tensors["residual"]
+                assert pp_proxy_tensors is not None
+                hidden_states = pp_proxy_tensors["hidden_states"]
+                residual = pp_proxy_tensors["residual"]
 
-        aux_hidden_states = []
-        # Pass through decoder layers
-        for layer_idx in range(self.start_layer, self.end_layer):
-            layer = self.layers[layer_idx]
-            with get_global_expert_distribution_recorder().with_current_layer(
-                layer_idx
-            ):
-                hidden_states, residual = layer(
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    residual=residual,
-                    forward_batch=forward_batch,
-                    captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
-                    ),
+            aux_hidden_states = []
+            # Pass through decoder layers
+            for layer_idx in range(self.start_layer, self.end_layer):
+                layer = self.layers[layer_idx]
+                with get_global_expert_distribution_recorder().with_current_layer(
+                    layer_idx
+                ):
+                    hidden_states, residual = layer(
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        forward_batch=forward_batch,
+                        captured_last_layer_outputs=(
+                            aux_hidden_states
+                            if getattr(layer, "_is_layer_to_capture", False)
+                            else None
+                        ),
+                    )
+
+                # Process deepstack embeddings if provided
+                if (
+                    input_deepstack_embeds is not None
+                    and input_deepstack_embeds.numel() > 0
+                    and layer_idx < 3
+                ):
+                    sep = self.hidden_size * layer_idx
+                    hidden_states.add_(
+                        input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                    )
+
+            # Return intermediate tensors for pipeline parallelism
+            if not self.pp_group.is_last_rank:
+                return PPProxyTensors(
+                    {
+                        "hidden_states": hidden_states,
+                        "residual": residual,
+                    }
                 )
 
-            # Process deepstack embeddings if provided
-            if (
-                input_deepstack_embeds is not None
-                and input_deepstack_embeds.numel() > 0
-                and layer_idx < 3
-            ):
-                sep = self.hidden_size * layer_idx
-                hidden_states.add_(
-                    input_deepstack_embeds[:, sep : sep + self.hidden_size]
-                )
+            # Apply final normalization
+            if hidden_states.shape[0] != 0:
+                if residual is None:
+                    hidden_states = self.norm(hidden_states)
+                else:
+                    hidden_states, _ = self.norm(hidden_states, residual)
 
-        # Return intermediate tensors for pipeline parallelism
-        if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
+            if len(aux_hidden_states) == 0:
+                return hidden_states
 
-        # Apply final normalization
-        if hidden_states.shape[0] != 0:
-            if residual is None:
-                hidden_states = self.norm(hidden_states)
-            else:
-                hidden_states, _ = self.norm(hidden_states, residual)
-
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-
-        return hidden_states, aux_hidden_states
+            return hidden_states, aux_hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = _record_elastic_qwen35_weights(self, weights)
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1546,11 +1613,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self, "start_layer")
-                and (layer_id < self.start_layer or layer_id >= self.end_layer)
-            ):
+            if _skip_qwen35_pp_weight(self, layer_id):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1606,6 +1669,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = _record_elastic_qwen35_weights(self, weights)
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1691,11 +1755,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 name = name.replace(".self_attn", "")
 
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self, "start_layer")
-                and (layer_id < self.start_layer or layer_id >= self.end_layer)
-            ):
+            if _skip_qwen35_pp_weight(self, layer_id):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1807,7 +1867,28 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
         return loaded_params
 
 
-class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
+class _Qwen3_5ElasticPPWrapperMixin(ElasticPPModelWrapperMixin):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        enabled = getattr(get_parallel(), "enable_elastic_pp", False)
+        self._init_elastic_pp_weight_profile(enabled)
+        if enabled and isinstance(self.lm_head, PPMissingLayer):
+            # Rank zero keeps the input/vision endpoint; any resident rank can
+            # become the logical output endpoint after a topology switch.
+            self.lm_head = ParallelLMHead(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                quant_config=self.quant_config,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                prefix=add_prefix(
+                    "lm_head", kwargs.get("prefix", args[2] if len(args) > 2 else "")
+                ),
+            )
+
+
+class Qwen3_5ForConditionalGeneration(
+    _Qwen3_5ElasticPPWrapperMixin, Qwen3VLForConditionalGeneration
+):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
@@ -1872,6 +1953,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = _record_elastic_qwen35_weights(self, weights)
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -1900,7 +1982,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(".self_attn", "")
             if (
                 self.config.tie_word_embeddings
-                and self.pp_group.is_last_rank
+                and (
+                    self.pp_group.is_last_rank
+                    or getattr(self.model, "_elastic_pp_enabled", False)
+                )
                 and "model.embed_tokens.weight" in name
             ):
                 if "lm_head.weight" in params_dict:
@@ -1910,11 +1995,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                     weight_loader(lm_head_param, loaded_weight)
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self, "start_layer")
-                and (layer_id < self.start_layer or layer_id >= self.end_layer)
-            ):
+            if _skip_qwen35_pp_weight(self, layer_id):
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -1968,7 +2049,9 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return loaded_params
 
 
-class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+class Qwen3_5MoeForConditionalGeneration(
+    _Qwen3_5ElasticPPWrapperMixin, Qwen3VLForConditionalGeneration
+):
     """Qwen3.5 MoE Vision-Language Model."""
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
@@ -2037,6 +2120,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             torch.cuda.synchronize()
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        weights = _record_elastic_qwen35_weights(self, weights)
         weights = QWEN3_5_KV_SCALE_MAPPER.apply(weights)
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -2157,7 +2241,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(".self_attn", "")
             if (
                 self.config.tie_word_embeddings
-                and self.pp_group.is_last_rank
+                and (
+                    self.pp_group.is_last_rank
+                    or getattr(self.model, "_elastic_pp_enabled", False)
+                )
                 and "model.embed_tokens.weight" in name
             ):
                 if "lm_head.weight" in params_dict:
@@ -2168,11 +2255,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     weight_loader(lm_head_param, loaded_weight)
 
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self, "start_layer")
-                and (layer_id < self.start_layer or layer_id >= self.end_layer)
-            ):
+            if _skip_qwen35_pp_weight(self, layer_id):
                 continue
 
             if self.enable_shared_expert_fusion:
@@ -2340,6 +2423,11 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         logger.warning(f"Parameter {name} not found in params_dict")
             loaded_params.add(name)
 
+        self._refresh_elastic_pp_moe_weights()
+
+        return loaded_params
+
+    def _refresh_elastic_pp_moe_weights(self):
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
@@ -2347,8 +2435,6 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 if isinstance(self.model.layers[layer_id].mlp, Qwen2MoeSparseMoeBlock)
             }
         )
-
-        return loaded_params
 
     @property
     def routed_experts_weights_of_layer(self):

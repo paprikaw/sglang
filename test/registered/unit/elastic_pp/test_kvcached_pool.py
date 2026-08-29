@@ -105,6 +105,38 @@ class _FakeKVCacheDPool(KVCacheDMHATokenToKVPool):
         return _FakeKVCacheDManager(size=self.size // self.page_size)
 
 
+def test_hybrid_kvcached_uses_attention_ordinals_and_shared_logical_allocator(
+    hybrid_pool_factory,
+):
+    pool = hybrid_pool_factory(
+        start_layer=0, end_layer=3, full_pool_class=_FakeKVCacheDPool
+    )
+    allocator = KVCacheDTokenToKVPoolAllocator(
+        size=8, dtype=torch.float32, device="cpu", kvcache=pool, need_sort=False
+    )
+    slots = allocator.alloc(2)
+    assert pool.kvcached_allocator is pool.full_kv_pool.kvcached_allocator
+    assert pool.full_kv_pool._kvcached_total_num_layers == 2
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(2, 4), generation=1, total_num_layers=4
+    )
+    pool.prepare_elastic_pp_kv_fence(generation=1)
+    pool.import_elastic_pp_kv_slots(
+        generation=1,
+        layer_id=3,
+        slot_ids=slots,
+        cache_k=torch.full((2, 1, 2), 31.0),
+        cache_v=torch.full((2, 1, 2), 37.0),
+    )
+    pool.mark_elastic_pp_kv_layers_loaded(generation=1, layer_ids={3})
+    pool.commit_elastic_pp_kv_layers(generation=1)
+    assert pool.full_kv_pool.start_layer == 1
+    assert torch.all(pool.get_key_buffer(3)[slots] == 31)
+    pool.cleanup_elastic_pp_kv_layers(generation=1)
+    allocator.free(slots)
+    assert allocator.available_size() == 8
+
+
 class _RecordingPhysicalKVCacheDPool(_FakeKVCacheDPool):
     def __init__(self, *args, **kwargs):
         self.mapped: list[tuple[frozenset[int], torch.Tensor]] = []

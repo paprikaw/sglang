@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from sglang.srt.elastic_pp.hybrid_kv_transport import ElasticPPHybridKVTransport
 from sglang.srt.elastic_pp.kv_transport import (
     ElasticPPKVTransport,
     flatten_kv_chunk,
@@ -297,3 +298,94 @@ def test_prepare_transition_rolls_back_before_coordinator_flags_exist():
     assert not allocator.tracking
     assert pool._elastic_pp_pending_kv == {}
     assert pool._elastic_pp_residency.pending is None
+
+
+@pytest.mark.parametrize(
+    "source_counts,target_counts", [([4, 0], [1, 3]), ([3, 1], [2, 2])]
+)
+def test_hybrid_transport_uses_request_slots_not_token_slots(
+    hybrid_pool_factory, source_counts, target_counts
+):
+    transition = DynamicPPTransition.build(
+        PPTopology.from_layer_counts(source_counts, generation=0),
+        PPTopology.from_layer_counts(target_counts, generation=1),
+    )
+    pools = [
+        hybrid_pool_factory(
+            start_layer=transition.source.layer_range(rank).start,
+            end_layer=transition.source.layer_range(rank).end,
+        )
+        for rank in range(2)
+    ]
+    source_state = pools[0].mamba_pool.mamba_cache
+    source_state.temporal[1].copy_(torch.arange(5 * 18).reshape(5, 2, 3, 3))
+    source_state.conv[0][1].fill_(23)
+    token_slots = torch.tensor([6, 7])  # Outside the five recurrent slots.
+    for layer_id in pools[0].full_attention_layer_id_mapping:
+        pools[0].get_key_buffer(layer_id)[token_slots] = 10 + layer_id
+        pools[0].get_value_buffer(layer_id)[token_slots] = 20 + layer_id
+    mailbox = _Mailbox()
+    transports = [
+        ElasticPPHybridKVTransport(
+            group=_Group(mailbox, rank),
+            model_runner=_Runner(pools[rank]),
+            allocator=_Allocator(token_slots),
+            rank=rank,
+            slot_chunk_size=1,
+            recurrent_chunk_size=2,
+        )
+        for rank in range(2)
+    ]
+    assert (
+        transports[0].fence_state_signature() == transports[1].fence_state_signature()
+    )
+    for transport in transports:
+        assert transport.prepare_transition(transition).numel() == 0
+        assert not transport.allocator.tracking
+    for phase, slots in (("bulk", token_slots), ("delta", token_slots[:0])):
+        for transport in transports:
+            transport.exchange_phase(transition, phase=phase, slot_ids=slots)
+    assert pools[1].req_to_token_pool.mamba_map == {}
+    assert not pools[1].elastic_pp_kv_ready(generation=1)
+    for transport in transports:
+        transport.apply_staged(transition)
+    pools[1].commit_elastic_pp_kv_layers(generation=1)
+    assert pools[1].req_to_token_pool.mamba_map == {2: 0}
+    assert torch.equal(
+        pools[1].mamba_pool.mamba_cache.temporal[0], source_state.temporal[1]
+    )
+    assert torch.equal(
+        pools[1].mamba_pool.mamba_cache.conv[0][0], source_state.conv[0][1]
+    )
+    for layer_id in (1, 3):
+        if (
+            layer_id in pools[0].full_attention_layer_id_mapping
+            and layer_id in pools[1].full_attention_layer_id_mapping
+        ):
+            assert torch.equal(
+                pools[1].get_key_buffer(layer_id)[token_slots],
+                pools[0].get_key_buffer(layer_id)[token_slots],
+            )
+    assert not mailbox.payloads[(0, 1)]
+
+
+def test_hybrid_codec_requires_explicit_sparse_attention_subset():
+    transfer = LayerTransfer(0, 1, LayerRange(0, 4))
+    slots = torch.tensor([7])
+    args = dict(
+        generation=1, transfer=transfer, phase="bulk", chunk_index=0, total_chunks=1
+    )
+    layer_kv = {
+        1: (torch.ones(1, 1, 2), torch.zeros(1, 1, 2)),
+        3: (torch.ones(1, 1, 2), torch.zeros(1, 1, 2)),
+    }
+    with pytest.raises(ValueError, match="exactly cover"):
+        flatten_kv_chunk(**args, slot_ids=slots, layer_kv=layer_kv)
+    payload = flatten_kv_chunk(
+        **args, slot_ids=slots, layer_kv=layer_kv, layer_ids=(1, 3)
+    )
+    with pytest.raises(ValueError, match="one K/V pair"):
+        unflatten_kv_chunk(payload, **args)
+    decoded_slots, decoded = unflatten_kv_chunk(payload, **args, layer_ids=(1, 3))
+    assert torch.equal(slots, decoded_slots)
+    assert set(decoded) == {1, 3}
