@@ -101,5 +101,47 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         follower.loading_check.assert_called_once_with(finish_count=1)
 
 
+class TestUnifiedDecodeLoadBackReadiness(unittest.TestCase):
+    def _cache(self, local_ready, global_ready):
+        cache = object.__new__(UnifiedRadixCache)
+        event = SimpleNamespace(query=MagicMock(return_value=local_ready))
+        cache.cache_controller = SimpleNamespace(
+            layer_done_counter=SimpleNamespace(
+                events=[SimpleNamespace(finish_event=event)]
+            )
+        )
+        cache._all_reduce = MagicMock(
+            side_effect=lambda ready, op: ready.fill_(int(global_ready))
+        )
+        cache.loading_check = MagicMock()
+        return cache
+
+    def test_local_not_ready_still_enters_collective(self):
+        cache = self._cache(False, False)
+        self.assertFalse(cache.is_load_back_event_done(0))
+        cache._all_reduce.assert_called_once()
+        cache.loading_check.assert_not_called()
+
+    def test_local_ready_waits_for_slower_peer(self):
+        cache = self._cache(True, False)
+        self.assertFalse(cache.is_load_back_event_done(0))
+        cache._all_reduce.assert_called_once()
+        cache.loading_check.assert_not_called()
+
+    def test_all_ranks_ready_drain_only_after_agreement(self):
+        cache = self._cache(True, True)
+        order = []
+        cache._all_reduce.side_effect = lambda ready, op: order.append("ready")
+        cache.loading_check.side_effect = lambda: order.append("drain")
+        self.assertTrue(cache.is_load_back_event_done(0))
+        self.assertEqual(order, ["ready", "drain"])
+
+    def test_no_consumer_has_no_collective(self):
+        cache = self._cache(False, False)
+        self.assertTrue(cache.is_load_back_event_done(-1))
+        cache._all_reduce.assert_not_called()
+        cache.loading_check.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

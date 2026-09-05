@@ -2677,7 +2677,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return 0
 
     def is_load_back_event_done(self, consumer_index: int) -> bool:
-        """Return True after the local load-back event is complete.
+        """Return True after every cache rank has completed the load-back event.
 
         Mirrors ``HiRadixCache`` so the disagg decode restore state machine
         (``DecodeHiCacheTransferMixin``) can gate on load-back completion; the
@@ -2691,7 +2691,12 @@ class UnifiedRadixCache(BasePrefixCache):
         finish_event = self.cache_controller.layer_done_counter.events[
             consumer_index
         ].finish_event
-        if not finish_event.query():
+        # loading_check() performs collectives. A local CUDA event must not
+        # decide whether this rank enters them: peers can finish the same DMA
+        # on different scheduler ticks, otherwise corrupting collective order.
+        ready = torch.tensor(int(finish_event.query()), dtype=torch.int32, device="cpu")
+        self._all_reduce(ready, torch.distributed.ReduceOp.MIN)
+        if not ready.item():
             return False
 
         self.loading_check()
