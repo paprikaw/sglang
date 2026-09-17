@@ -10033,9 +10033,29 @@ class ServerArgs:
         )
 
         if self.pp_size > 1:
-            assert (
-                self.disable_overlap_schedule and self.speculative_algorithm is None
-            ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
+            if envs.SGLANG_ENABLE_PP_SPEC.get():
+                assert self.disable_overlap_schedule, (
+                    "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"
+                )
+                assert self.speculative_algorithm == "EAGLE" and not self.enable_multi_layer_eagle, (
+                    "SGLANG_ENABLE_PP_SPEC supports single-layer EAGLE/MTP only"
+                )
+                assert self.disaggregation_mode == "null", (
+                    "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
+                )
+                assert not self.speculative_adaptive, (
+                    "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
+                )
+                assert not self.enable_dp_attention, (
+                    "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
+                )
+                assert not self.enable_elastic_pp, (
+                    "SGLANG_ENABLE_PP_SPEC does not support elastic PP reconfiguration"
+                )
+            else:
+                assert (
+                    self.disable_overlap_schedule and self.speculative_algorithm is None
+                ), "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
             assert self.min_free_slots_delay is None, (
                 "--min-free-slots-delay is not supported with pipeline "
                 "parallelism: allocatable slots per microbatch are bounded by "
