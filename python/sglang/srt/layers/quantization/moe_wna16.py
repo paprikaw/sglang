@@ -23,7 +23,6 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_device_capability, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -454,8 +453,21 @@ class MoeWNA16Method(FusedMoEMethodBase):
             if not layer.quant_config.has_zp and "qzeros" in weight_name:
                 return
 
+            # Packed zero points bypass the generic loader below, so apply
+            # its expert ownership mapping here while keeping global ids for
+            # weights/scales delegated to weight_loader.
+            local_expert_id = expert_id
+            if "qzeros" in weight_name and not getattr(
+                param, "_sglang_require_global_experts", False
+            ):
+                local_expert_id = layer._map_global_expert_id_to_local_expert_id(
+                    expert_id
+                )
+                if local_expert_id == -1:
+                    return
+
             device = get_tp_group().device
-            tp_rank = get_parallel().tp_rank
+            tp_rank = layer.moe_tp_rank
             loaded_weight = loaded_weight.to(device)
             shard_size = layer.intermediate_size_per_partition
 
@@ -497,11 +509,11 @@ class MoeWNA16Method(FusedMoEMethodBase):
                     layer.moe_tp_size, -1, loaded_weight.size(1)
                 )[tp_rank]
                 if shard_id == "w1":
-                    param.data[expert_id, : shard_size // 2] = tensor
+                    param.data[local_expert_id, : shard_size // 2] = tensor
                 else:
-                    param.data[expert_id, shard_size // 2 :] = tensor
+                    param.data[local_expert_id, shard_size // 2 :] = tensor
             elif "w2_qzeros" in weight_name:
-                param.data[expert_id] = loaded_weight.view(
+                param.data[local_expert_id] = loaded_weight.view(
                     loaded_weight.size(0), layer.moe_tp_size, -1
                 )[:, tp_rank]
             else:
