@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, StateType
+from sglang.srt.disaggregation.common.conn import CommonKVManager, PrefillServerInfo
 from sglang.srt.disaggregation.common.staging_handler import (
     handle_staging_req,
 )
@@ -34,6 +35,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.eagle_disaggregation import (
     build_eagle_disagg_draft_input,
@@ -175,6 +177,163 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+
+class TestMooncakeDecodePPFanout(unittest.TestCase):
+    @staticmethod
+    def _manager(pp_rank=0, tp_rank=0):
+        manager = object.__new__(MooncakeKVManager)
+        manager.attn_tp_size = 4
+        manager.attn_cp_size = manager.dcp_size = 1
+        manager.attn_cp_rank = 0
+        manager.pp_size = 2
+        manager.pp_rank = pp_rank
+        manager.is_mla_backend = manager.is_hybrid_mla_backend = False
+        manager.server_args = SimpleNamespace(
+            disaggregation_decode_enable_radix_cache=False
+        )
+        layers = list(range(pp_rank * 2, (pp_rank + 1) * 2))
+        manager.kv_args = SimpleNamespace(
+            engine_rank=pp_rank * 4 + tp_rank,
+            kv_data_ptrs=[1000, 2000, 3000, 4000],
+            kv_layer_ids=layers * 2,
+            state_types=[],
+        )
+        return manager
+
+    @staticmethod
+    def _prefill(pp_size=1):
+        return PrefillServerInfo(
+            attn_tp_size=4,
+            attn_cp_size=1,
+            dp_size=1,
+            pp_size=pp_size,
+            page_size=64,
+            kv_cache_dtype="bfloat16",
+            follow_bootstrap_room=False,
+        )
+
+    def test_tp4_sender_waits_for_both_decode_stages(self):
+        for pp_rank in range(2):
+            for tp_rank in range(4):
+                with self.subTest(pp_rank=pp_rank, tp_rank=tp_rank):
+                    manager = self._manager(pp_rank, tp_rank)
+                    info = self._prefill()
+                    manager._resolve_rank_mapping(info)
+                    self.assertEqual(info.target_tp_ranks, [tp_rank])
+                    self.assertEqual(info.target_pp_ranks, [0])
+                    self.assertEqual(info.required_dst_info_num, 2)
+                    self.assertEqual(info.required_prefill_response_num, 1)
+
+    def test_existing_pp_topologies_keep_their_counts(self):
+        for p_pp, d_pp, d_rank, targets, responses in (
+            (1, 1, 0, [0], 1),
+            (2, 1, 0, [0, 1], 2),
+            (2, 2, 1, [1], 1),
+        ):
+            with self.subTest(p_pp=p_pp, d_pp=d_pp):
+                manager = self._manager(d_rank)
+                manager.pp_size = d_pp
+                info = self._prefill(p_pp)
+                manager._resolve_rank_mapping(info)
+                self.assertEqual(info.target_pp_ranks, targets)
+                self.assertEqual(info.required_dst_info_num, 1)
+                self.assertEqual(info.required_prefill_response_num, responses)
+
+    def test_other_backends_still_reject_decode_only_pp(self):
+        with self.assertRaises(AssertionError):
+            CommonKVManager._resolve_pp_rank_mapping(self._manager(), self._prefill())
+
+    def test_unsupported_layouts_and_parallelism_fail_closed(self):
+        for change in (
+            lambda m: setattr(m, "is_mla_backend", True),
+            lambda m: setattr(m, "is_hybrid_mla_backend", True),
+            lambda m: setattr(m, "attn_tp_size", 8),
+            lambda m: setattr(m, "dcp_size", 2),
+            lambda m: setattr(
+                m.server_args, "disaggregation_decode_enable_radix_cache", True
+            ),
+            lambda m: setattr(m.kv_args, "state_types", [StateType.MAMBA]),
+            lambda m: setattr(m.kv_args, "kv_layer_ids", []),
+            lambda m: setattr(m.kv_args, "kv_layer_ids", [0, 1, 2, 3]),
+        ):
+            manager = self._manager()
+            change(manager)
+            with self.assertRaisesRegex(RuntimeError, "P PP1 -> D PP2"):
+                manager._resolve_pp_rank_mapping(self._prefill())
+
+    def test_native_pool_reports_global_k_and_v_layer_ids(self):
+        pool = SimpleNamespace(
+            start_layer=46,
+            layer_num=46,
+            get_contiguous_buf_infos=Mock(return_value=([0] * 92, [], [])),
+        )
+        self.assertEqual(
+            MHATokenToKVPool.get_kv_layer_ids(pool), list(range(46, 92)) * 2
+        )
+        pool.get_contiguous_buf_infos.return_value = ([0], [], [])
+        self.assertEqual(MHATokenToKVPool.get_kv_layer_ids(pool), [])
+
+    def test_each_stage_receives_only_its_k_and_v_entries(self):
+        manager = self._manager()
+        manager.pp_size = 1
+        manager.enable_custom_mem_pool = False
+        manager._transfer_data = Mock(return_value=0)
+        src_ptrs = [0x10000 * (i + 1) for i in range(10)]
+        item_lens = [64 + i * 8 for i in range(10)]
+        for layers in ([0, 1], [2, 3, 4]):
+            with self.subTest(layers=layers):
+                dst_ids = layers * 2
+                dst_ptrs = [0x100000 * (j + 1) for j in range(len(dst_ids))]
+                src_entries = list(layers) + [5 + i for i in layers]
+                ret = manager._send_kvcache_generic(
+                    "peer",
+                    src_ptrs,
+                    dst_ptrs,
+                    item_lens,
+                    np.array([1, 2], dtype=np.int32),
+                    np.array([3, 4], dtype=np.int32),
+                    executor=None,
+                    src_layer_ids=list(range(5)) * 2,
+                    dst_layer_ids=dst_ids,
+                )
+                self.assertEqual(ret, 0)
+                manager._transfer_data.assert_called_once_with(
+                    "peer",
+                    [
+                        (
+                            src_ptrs[i] + item_lens[i],
+                            dst_ptrs[j] + 3 * item_lens[i],
+                            2 * item_lens[i],
+                        )
+                        for j, i in enumerate(src_entries)
+                    ],
+                )
+                manager._transfer_data.reset_mock()
+
+    def test_missing_layer_metadata_never_submits_a_write(self):
+        for src_ids, dst_ids in (
+            ([], [2, 2]),
+            ([0, 1, 0, 1], []),
+            ([0, 1, 0, 1], [9, 9]),
+        ):
+            manager = self._manager()
+            manager.pp_size = 1
+            manager.enable_custom_mem_pool = False
+            manager._transfer_data = Mock()
+            with self.assertRaises(RuntimeError):
+                manager._send_kvcache_generic(
+                    "peer",
+                    [100, 200, 300, 400],
+                    [500, 600],
+                    [8] * 4,
+                    np.array([0], dtype=np.int32),
+                    np.array([0], dtype=np.int32),
+                    executor=None,
+                    src_layer_ids=src_ids,
+                    dst_layer_ids=dst_ids,
+                )
+            manager._transfer_data.assert_not_called()
 
 
 class TestMooncakePPStaging(unittest.TestCase):

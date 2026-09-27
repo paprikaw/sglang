@@ -14,7 +14,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=216, stage="base-c", runner_config="8-gpu-h20")
+register_cuda_ci(est_time=288, stage="base-c", runner_config="8-gpu-h20")
 
 
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
@@ -249,6 +249,33 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.24)
         # Wait a little bit so that the memory check happens.
         time.sleep(5)
+
+
+class TestDisaggregationDecodeOnlyPPAccuracy(TestDisaggregationDecodePPAccuracy):
+    """One prefill stage sends global-layer KV slices to two decode stages."""
+
+    @classmethod
+    def start_prefill(cls):
+        if cls.transfer_backend[-1] != "mooncake":
+            raise unittest.SkipTest(
+                "Decode-only PP fan-out currently requires Mooncake"
+            )
+        prefill_args = [
+            "--trust-remote-code",
+            "--disaggregation-mode",
+            "prefill",
+            "--disaggregation-bootstrap-port",
+            cls.bootstrap_port,
+            "--tp-size",
+            "2",
+        ]
+        prefill_args += cls.transfer_backend + cls.rdma_devices
+        cls.process_prefill = popen_launch_pd_server(
+            cls.model,
+            cls.prefill_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=prefill_args,
+        )
 
 
 if __name__ == "__main__":

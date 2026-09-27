@@ -708,15 +708,13 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
-        # PP rank mapping — decode pp size should be equal to prefill pp size or 1
-        assert self.pp_size == info.pp_size or self.pp_size == 1, (
-            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
+        # Count both destinations per sender and senders per receiver. A backend
+        # that splits a prefill stage must wait for every destination's KV.
+        target_pp_ranks, pp_dst_count, pp_response_count = (
+            self._resolve_pp_rank_mapping(info)
         )
-        if info.pp_size == self.pp_size:
-            target_pp_ranks = [self.pp_rank]
-        else:
-            target_pp_ranks = list(range(info.pp_size))
-            required_prefill_response_num *= info.pp_size // self.pp_size
+        required_dst_info_num *= pp_dst_count
+        required_prefill_response_num *= pp_response_count
 
         info.target_tp_rank = target_tp_rank
         info.target_tp_ranks = target_tp_ranks
@@ -724,6 +722,17 @@ class CommonKVManager(BaseKVManager):
         info.target_pp_ranks = target_pp_ranks
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
+
+    def _resolve_pp_rank_mapping(
+        self, info: PrefillServerInfo
+    ) -> Tuple[List[int], int, int]:
+        """Return target prefill ranks, destination fan-out, and response fan-in."""
+        assert self.pp_size == info.pp_size or self.pp_size == 1, (
+            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
+        )
+        if info.pp_size == self.pp_size:
+            return [self.pp_rank], 1, 1
+        return list(range(info.pp_size)), 1, info.pp_size
 
     def _sync_bootstrap_port_across_nodes(self, local_port: int) -> int:
         """Broadcast world-rank-0's bootstrap port to all prefill ranks.
