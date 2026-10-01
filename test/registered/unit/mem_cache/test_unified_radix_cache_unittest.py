@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
     StorageMedium,
 )
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
@@ -7400,12 +7401,20 @@ class TestHiCachePPPrefetchGroups(CustomTestCase):
         controller = self.controller(2)
         with (
             mock.patch.object(torch.distributed, "get_world_size", return_value=2),
-            mock.patch.object(torch.distributed, "get_process_group_ranks", return_value=[0, 1]),
-            mock.patch.object(torch.distributed, "new_group", return_value=mock.sentinel.prefetch) as new_group,
-            mock.patch("sglang.srt.distributed.parallel_state.create_custom_parallel_group") as global_group,
+            mock.patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+            ),
+            mock.patch.object(
+                torch.distributed, "new_group", return_value=mock.sentinel.prefetch
+            ) as new_group,
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.create_custom_parallel_group"
+            ) as global_group,
         ):
             controller._create_prefetch_sync_groups()
-        new_group.assert_called_once_with(ranks=[0, 1], backend="gloo", use_local_synchronization=True)
+        new_group.assert_called_once_with(
+            ranks=[0, 1], backend="gloo", use_local_synchronization=True
+        )
         global_group.assert_not_called()
         self.assertEqual(controller.prefetch_sync_groups, [mock.sentinel.prefetch])
 
@@ -7413,9 +7422,14 @@ class TestHiCachePPPrefetchGroups(CustomTestCase):
         controller = self.controller(1)
         with (
             mock.patch.object(torch.distributed, "get_world_size", return_value=2),
-            mock.patch.object(torch.distributed, "get_process_group_ranks", return_value=[0, 1]),
+            mock.patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+            ),
             mock.patch.object(torch.distributed, "new_group") as local_group,
-            mock.patch("sglang.srt.distributed.parallel_state.create_custom_parallel_group", return_value=mock.sentinel.prefetch) as global_group,
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
+                return_value=mock.sentinel.prefetch,
+            ) as global_group,
         ):
             controller._create_prefetch_sync_groups()
         global_group.assert_called_once_with(group_ranks=[0, 1], backend="gloo")
@@ -7424,15 +7438,119 @@ class TestHiCachePPPrefetchGroups(CustomTestCase):
 
     def test_duplicate_attention_groups_create_one_prefetch_group(self):
         controller = self.controller(2)
-        controller.attn_cp_group, controller.attn_tp_group = mock.sentinel.cp, mock.sentinel.attn_tp
+        controller.attn_cp_group, controller.attn_tp_group = (
+            mock.sentinel.cp,
+            mock.sentinel.attn_tp,
+        )
         with (
             mock.patch.object(torch.distributed, "get_world_size", return_value=2),
-            mock.patch.object(torch.distributed, "get_process_group_ranks", return_value=[0, 1]),
-            mock.patch.object(torch.distributed, "new_group", return_value=mock.sentinel.prefetch) as new_group,
+            mock.patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+            ),
+            mock.patch.object(
+                torch.distributed, "new_group", return_value=mock.sentinel.prefetch
+            ) as new_group,
         ):
             controller._create_prefetch_sync_groups()
         self.assertEqual(new_group.call_count, 1)
         self.assertEqual(controller.prefetch_sync_groups, [mock.sentinel.prefetch])
+
+
+class TestPPPrefetchAdmission(CustomTestCase):
+    def cache(self, rank=0, size=2):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.pp_rank, cache.pp_size = rank, size
+        cache.pp_group = mock.sentinel.pp if size > 1 else None
+        cache.ongoing_prefetch = {}
+        return cache
+
+    def primary_decision(self, cache, ready, request_key=None):
+        def sync(data, *, tag):
+            self.assertEqual(tag, P2PTag.HIRADIX_PP_PREFETCH_ADMISSION)
+            data[1] = int(ready)
+            if request_key is not None:
+                data[0] = request_key
+
+        return mock.patch.object(cache, "_pp_sync", side_effect=sync)
+
+    def test_primary_can_publish_pending_without_downstream_readiness(self):
+        cache = self.cache()
+        with (
+            mock.patch.object(
+                cache, "_check_prefetch_progress_local", return_value=False
+            ),
+            mock.patch.object(cache, "_pp_sync") as sync,
+        ):
+            self.assertFalse(cache.check_prefetch_progress("req"))
+        self.assertEqual(
+            sync.call_args.args[0].tolist(), [cache._pp_request_key("req"), 0]
+        )
+        self.assertEqual(
+            sync.call_args.kwargs["tag"], P2PTag.HIRADIX_PP_PREFETCH_ADMISSION
+        )
+
+    def test_downstream_finished_io_still_follows_primary_pending(self):
+        cache = self.cache(rank=1)
+        with (
+            self.primary_decision(cache, False),
+            mock.patch.object(
+                cache, "_check_prefetch_progress_local", return_value=True
+            ) as local,
+            mock.patch.object(cache, "drain_storage_control_queues") as drain,
+        ):
+            self.assertFalse(cache.check_prefetch_progress("req"))
+        local.assert_not_called()
+        drain.assert_not_called()
+
+    def test_positive_decision_waits_local_io_and_drains_query_hits(self):
+        cache = self.cache(rank=1)
+        with (
+            self.primary_decision(cache, True),
+            mock.patch.object(
+                cache,
+                "_check_prefetch_progress_local",
+                side_effect=[False, False, True],
+            ),
+            mock.patch.object(cache, "drain_storage_control_queues") as drain,
+            mock.patch("sglang.srt.mem_cache.unified_radix_cache.time.sleep"),
+        ):
+            self.assertTrue(cache.check_prefetch_progress("req"))
+        self.assertEqual(drain.call_count, 2)
+
+    def test_missing_local_prefetch_still_receives_admission_decision(self):
+        cache = self.cache(rank=1)
+        with self.primary_decision(cache, True) as sync:
+            self.assertTrue(cache.check_prefetch_progress("cached"))
+        self.assertEqual(sync.call_count, 1)
+
+    def test_request_order_mismatch_fails_before_admission(self):
+        cache = self.cache(rank=1)
+        with self.primary_decision(cache, True, cache._pp_request_key("other")):
+            with self.assertRaisesRegex(RuntimeError, "request order mismatch"):
+                cache.check_prefetch_progress("req")
+
+    def test_prefix_mismatch_is_rejected_before_proxy_compute(self):
+        cache = self.cache(rank=1)
+
+        def sync(data, *, tag):
+            self.assertEqual(tag, P2PTag.HIRADIX_PP_PREFIX_ALIGNMENT)
+            data[1] = 128
+
+        with mock.patch.object(cache, "_pp_sync", side_effect=sync):
+            with self.assertRaisesRegex(RuntimeError, "prefix mismatch"):
+                cache.check_pp_prefix_alignment("req", 64)
+
+    def test_pp1_keeps_local_readiness_without_extra_communication(self):
+        cache = self.cache(size=1)
+        with (
+            mock.patch.object(
+                cache, "_check_prefetch_progress_local", return_value=False
+            ),
+            mock.patch.object(cache, "_pp_sync") as sync,
+        ):
+            self.assertFalse(cache.check_prefetch_progress("req"))
+            cache.check_pp_prefix_alignment("req", 64)
+        sync.assert_not_called()
 
 
 if __name__ == "__main__":

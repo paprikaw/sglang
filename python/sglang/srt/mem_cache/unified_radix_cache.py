@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import logging
 import threading
 import time
@@ -312,7 +313,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._all_reduce_attn_groups(data, tp_reduce_op)
         self._pp_sync(data)
 
-    def _pp_sync(self, data: torch.Tensor) -> None:
+    def _pp_sync(self, data: torch.Tensor, tag: int = P2PTag.HIRADIX_PP_SYNC) -> None:
         """
         Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
         """
@@ -323,7 +324,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 data,
                 group_src=self.pp_rank - 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=tag,
             )
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
@@ -331,7 +332,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 copy_of_data,
                 group_dst=self.pp_rank + 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=tag,
             )
             self.work_list.append(send_work)
 
@@ -1765,6 +1766,58 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, req_id: str) -> bool:
+        if self.pp_size <= 1:
+            return self._check_prefetch_progress_local(req_id)
+
+        # A scheduler microstep cannot perform a blocking PP collective:
+        # downstream may still be receiving the previous output from PP0.
+        # Publish PP0's admission decision through the existing one-way cache
+        # channel. A downstream stage must follow a negative decision even
+        # when its own IO finished earlier; a positive decision allows it to
+        # wait for its local IO without preventing PP0's output relay.
+        assert self.pp_group is not None
+        primary_ready = (
+            self._check_prefetch_progress_local(req_id) if self.pp_rank == 0 else False
+        )
+        request_key = self._pp_request_key(req_id)
+        decision = torch.tensor([request_key, int(primary_ready)], dtype=torch.int64)
+        self._pp_sync(decision, tag=P2PTag.HIRADIX_PP_PREFETCH_ADMISSION)
+        if int(decision[0]) != request_key:
+            raise RuntimeError(
+                f"PP HiCache admission request order mismatch for {req_id}"
+            )
+        if not bool(decision[1]):
+            return False
+        if self.pp_rank > 0:
+            while not self._check_prefetch_progress_local(req_id):
+                # Query hits allocate host staging only when the scheduler
+                # drains this queue. IO threads do not need an upstream
+                # model-output receive, so this wait preserves ring progress.
+                self.drain_storage_control_queues()
+                time.sleep(0.001)
+        return True
+
+    @staticmethod
+    def _pp_request_key(req_id: str) -> int:
+        return int.from_bytes(
+            hashlib.sha256(req_id.encode()).digest()[:8], "little"
+        ) & ((1 << 63) - 1)
+
+    def check_pp_prefix_alignment(self, req_id: str, matched_tokens: int) -> None:
+        """Reject different logical KV prefixes before proxy tensor computation."""
+        if self.pp_size <= 1:
+            return
+        assert self.pp_group is not None
+        request_key = self._pp_request_key(req_id)
+        prefix = torch.tensor([request_key, matched_tokens], dtype=torch.int64)
+        self._pp_sync(prefix, tag=P2PTag.HIRADIX_PP_PREFIX_ALIGNMENT)
+        if int(prefix[0]) != request_key or int(prefix[1]) != matched_tokens:
+            raise RuntimeError(
+                f"PP HiCache prefix mismatch for {req_id}: "
+                f"PP0 matched {int(prefix[1])}, PP{self.pp_rank} matched {matched_tokens}"
+            )
+
+    def _check_prefetch_progress_local(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             return True
 
