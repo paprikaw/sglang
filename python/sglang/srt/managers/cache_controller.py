@@ -387,11 +387,26 @@ class HiCacheController:
             if group_ranks in seen_rank_sets:
                 continue
             seen_rank_sets.add(group_ranks)
-            self.prefetch_sync_groups.append(
-                create_custom_parallel_group(
+            if (
+                self.pp_group is not None
+                and torch.distributed.get_world_size(group=self.pp_group) > 1
+            ):
+                # A PP control request is handled before it is forwarded to the
+                # next stage. The custom helper gathers configurations across
+                # the entire world, so runtime attachment cannot use it here:
+                # other stages have not received the command yet. These ranks
+                # already describe a complete local CP/TP group. Create a
+                # dedicated group using member-only synchronization instead.
+                prefetch_group = torch.distributed.new_group(
+                    ranks=list(group_ranks),
+                    backend="gloo",
+                    use_local_synchronization=True,
+                )
+            else:
+                prefetch_group = create_custom_parallel_group(
                     group_ranks=list(group_ranks), backend="gloo"
                 )
-            )
+            self.prefetch_sync_groups.append(prefetch_group)
 
     def _destroy_prefetch_sync_groups(self) -> None:
         for group in self.prefetch_sync_groups:
