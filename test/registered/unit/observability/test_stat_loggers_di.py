@@ -22,6 +22,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
 
 import prometheus_client
@@ -138,6 +143,10 @@ class TestDefaultBackend(unittest.TestCase):
         self.assertIsInstance(
             collector.eviction_duration_seconds, prometheus_client.Histogram
         )
+        load_back = collector.load_back_num_tokens.labels(**labels, pool="kv")
+        self.assertEqual(load_back._value.get(), 0)
+        collector.increment_load_back_num_tokens(64, "kv")
+        self.assertEqual(load_back._value.get(), 64)
         collector.increment_hybrid_eviction(1024, 2, "mamba")
         self.assertEqual(
             collector.hybrid_evicted_tokens.labels(
@@ -151,6 +160,40 @@ class TestDefaultBackend(unittest.TestCase):
             )._value.get(),
             2,
         )
+
+    def test_loadback_zero_is_exported_by_real_multiprocess_collector(self):
+        # The multiprocess directory must be set before prometheus_client is
+        # first imported, as in serving scheduler subprocesses.
+        script = """
+import json
+from prometheus_client import CollectorRegistry, multiprocess
+from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
+
+collector = RadixCacheMetricsCollector(labels={"cache_type": "multiprocess"})
+registry = CollectorRegistry()
+multiprocess.MultiProcessCollector(registry)
+
+def values():
+    return {sample.labels["pool"]: sample.value
+            for family in registry.collect() for sample in family.samples
+            if sample.name == "sglang:load_back_tokens_total"}
+
+before = values()
+collector.increment_load_back_num_tokens(64, "kv")
+collector.increment_load_back_num_tokens(32, "swa")
+print(json.dumps({"before": before, "after": values()}))
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                env={**os.environ, "PROMETHEUS_MULTIPROC_DIR": directory},
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+        values = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(values["before"], {"kv": 0})
+        self.assertEqual(values["after"], {"kv": 64, "swa": 32})
 
 
 if __name__ == "__main__":
