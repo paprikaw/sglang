@@ -1039,6 +1039,8 @@ class Envs:
     # read by several call sites; do not use in new code.
     SGLANG_DEEPEP_BF16_DISPATCH = EnvBool(False)
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
+    # PCIe A100 nodes may have only pairwise NVLink, not an all-peer fabric.
+    SGLANG_DEEPEP_DISABLE_NVLINK_LOW_LATENCY = EnvBool(False)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_ENABLE_QWEN_DEEPEP_SHARED_OVERLAP = EnvBool(True)

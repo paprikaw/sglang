@@ -282,6 +282,12 @@ class DeepEPBuffer:
             num_qps_per_rank=num_qps_per_rank,
             allow_mnnvl=use_mnnvl_fabric,
         )
+        if (
+            not _is_npu
+            and deepep_mode.enable_low_latency()
+            and envs.SGLANG_DEEPEP_DISABLE_NVLINK_LOW_LATENCY.get()
+        ):
+            buffer_kwargs["allow_nvlink_for_low_latency_mode"] = False
         # Use CU_MEM_HANDLE_TYPE_FABRIC on hardware that advertises MNNVL fabric
         # support, so cross-pod GB200/GB300 EP groups use
         # cuMemImportFromShareableHandle instead of the intra-node-only
