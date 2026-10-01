@@ -135,6 +135,18 @@ __device__ static __forceinline__ void ibgda_post_send(nvshmemi_ibgda_device_qp_
     ibgda_lock_release(&mvars->post_send_lock);
 }
 
+__device__ static __forceinline__ void ibgda_proxy_post_send(nvshmemi_ibgda_device_qp_t* qp, uint64_t new_prod_idx) {
+    auto* prod_idx = reinterpret_cast<unsigned long long int*>(&qp->mvars.tx_wq.prod_idx);
+    auto old_prod_idx = atomicMax(prod_idx, static_cast<unsigned long long int>(new_prod_idx));
+    if (new_prod_idx > old_prod_idx) {
+        // NVSHMEM 3.4.5's CPU handler polls the proxy notification behind bf.
+        // tx_wq.prod_idx is not the producer-notification address. Updating it
+        // alone leaves the CPU proxy asleep and remote receives time out.
+        atomicMax_system(reinterpret_cast<unsigned long long int*>(qp->tx_wq.bf),
+                         static_cast<unsigned long long int>(new_prod_idx));
+    }
+}
+
 template <bool kAlwaysDoPostSend>
 __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_device_qp_t* qp,
                                                              uint64_t base_wqe_idx,
@@ -147,15 +159,16 @@ __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_devi
     // WQE writes must be finished first
     __threadfence();
 
-    unsigned long long int* ready_idx =
-        (unsigned long long int*)(state->use_async_postsend ? qp->tx_wq.prod_idx : &mvars->tx_wq.ready_head);
+    auto* ready_idx = reinterpret_cast<unsigned long long int*>(&mvars->tx_wq.ready_head);
 
     // Wait for prior WQE slots to be filled first
     while (atomicCAS(ready_idx, base_wqe_idx, new_wqe_idx) != base_wqe_idx)
         ;
 
     // Always post, not in batch
-    if (!state->use_async_postsend) {
+    if (state->use_async_postsend) {
+        ibgda_proxy_post_send(qp, new_wqe_idx);
+    } else {
         constexpr int kNumRequestInBatch = 4;
         if (kAlwaysDoPostSend or (message_idx + 1) % kNumRequestInBatch == 0)
             ibgda_post_send(qp, new_wqe_idx);
