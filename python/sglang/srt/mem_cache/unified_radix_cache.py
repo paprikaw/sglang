@@ -287,6 +287,19 @@ class UnifiedRadixCache(BasePrefixCache):
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
 
+    def _all_reduce_storage_groups(self, tensor: torch.Tensor, op):
+        """Agree on storage progress before PP stages choose a forward batch.
+
+        Storage IO completes independently on each stage. A TP-only decision
+        can admit a request downstream while the preceding stage still skips
+        it, leaving proxy receive and the next cache event round deadlocked.
+        Unlike the PP0-authoritative event broadcast, storage readiness and
+        usable prefix lengths must account for every stage's local result.
+        """
+        self._all_reduce_attn_groups(tensor, op)
+        if self.pp_size > 1 and self.pp_group is not None:
+            torch.distributed.all_reduce(tensor, op=op, group=self.pp_group)
+
     def _drain_async_work(self):
         """
         Block until all outstanding async sends are consumed, then clear.
@@ -1590,7 +1603,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
-        self._all_reduce_attn_groups(
+        self._all_reduce_storage_groups(
             storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
         )
         storage_hit_count = storage_hit_count_tensor.item()
@@ -1758,7 +1771,7 @@ class UnifiedRadixCache(BasePrefixCache):
             [1 - int(can_terminate), int(operation_terminated)],
             dtype=torch.int,
         )
-        self._all_reduce_attn_groups(states, torch.distributed.ReduceOp.MAX)
+        self._all_reduce_storage_groups(states, torch.distributed.ReduceOp.MAX)
         can_terminate = states[0].item() == 0
         operation_terminated = states[1].item() == 1
         return can_terminate or operation_terminated
@@ -1907,7 +1920,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         pool_hit_pages = [hit_pages.get(t.name, 0) for t in pool_transfers]
         packed = torch.tensor([completed_tokens, *pool_hit_pages], dtype=torch.int)
-        self._all_reduce_attn_groups(packed, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_storage_groups(packed, torch.distributed.ReduceOp.MIN)
         min_completed_tokens = int(packed[0].item())
         pool_hit_pages = list(map(int, packed[1:].tolist()))
         for transfer, count in zip(pool_transfers, pool_hit_pages):
@@ -2289,7 +2302,7 @@ class UnifiedRadixCache(BasePrefixCache):
             local_qsize_list,
             dtype=torch.int,
         )
-        self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
+        self._all_reduce_storage_groups(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
         n_storage_hit, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {

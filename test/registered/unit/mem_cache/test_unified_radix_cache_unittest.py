@@ -6949,6 +6949,53 @@ class TestReturnedValuesDrain(_InsertWalkSuite):
         cache.sanity_check()
 
 
+class TestPPStorageConsensus(CustomTestCase):
+    def _cache(self, pp_size=2):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.pp_size = pp_size
+        cache.pp_group = object()
+        cache._all_reduce_attn_groups = mock.MagicMock()
+        return cache
+
+    def test_storage_progress_reduces_across_attention_and_pipeline(self):
+        cache = self._cache()
+        progress = torch.tensor([1, 0], dtype=torch.int)
+        with mock.patch.object(torch.distributed, "all_reduce") as pp_reduce:
+            cache._all_reduce_storage_groups(progress, torch.distributed.ReduceOp.MAX)
+        cache._all_reduce_attn_groups.assert_called_once_with(
+            progress, torch.distributed.ReduceOp.MAX
+        )
+        pp_reduce.assert_called_once_with(
+            progress, op=torch.distributed.ReduceOp.MAX, group=cache.pp_group
+        )
+
+    def test_single_stage_keeps_existing_attention_consensus(self):
+        cache = self._cache(pp_size=1)
+        progress = torch.tensor([512], dtype=torch.int)
+        with mock.patch.object(torch.distributed, "all_reduce") as pp_reduce:
+            cache._all_reduce_storage_groups(progress, torch.distributed.ReduceOp.MIN)
+        cache._all_reduce_attn_groups.assert_called_once()
+        pp_reduce.assert_not_called()
+
+    def test_locally_complete_prefetch_waits_for_other_pipeline_stage(self):
+        cache = self._cache()
+        cache.prefetch_stop_policy = "wait_complete"
+        cache.page_size = 64
+        operation = mock.MagicMock()
+        operation.hash_value = ["page"]
+        operation.completed_tokens = 64
+        operation.pool_transfers = []
+        operation.is_terminated.return_value = False
+
+        def other_stage_is_pending(states, **kwargs):
+            states[0] = 1
+
+        with mock.patch.object(
+            torch.distributed, "all_reduce", side_effect=other_stage_is_pending
+        ):
+            self.assertFalse(cache.can_terminate_prefetch(operation))
+
+
 class TestPrefetchCommitOrdering(CustomTestCase):
     """The prefetch commit's action ordering (mock-based)."""
 
