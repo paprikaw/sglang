@@ -149,5 +149,44 @@ class TestMoeWNA16ExpertWeightLoader(unittest.TestCase):
         mapper.assert_not_called()
 
 
+class TestHummingAWQExpertWeightLoader(unittest.TestCase):
+    def test_packed_zero_points_follow_group_scales_and_expert_ownership(self):
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+        from sglang.srt.layers.quantization.humming import HummingConfig, HummingMoEMethod
+
+        config = HummingConfig.from_config(
+            {"quant_method": "awq", "bits": 4, "group_size": 128, "zero_point": True}
+        )
+        method = HummingMoEMethod(config.get_quant_config_for_layer("model.layers.3.mlp.experts", "moe"))
+        layer = FusedMoE.__new__(FusedMoE)
+        torch.nn.Module.__init__(layer)
+        layer.quant_method = method
+        layer.quant_config = config
+        layer.scheme = None
+        layer.moe_tp_rank = 0
+        layer.moe_tp_size = 1
+        layer.use_flashinfer_trtllm_moe = False
+        layer.use_triton_kernels = False
+        layer.use_padded_loading = False
+        layer.use_presharded_weights = False
+        layer.moe_runner_config = SimpleNamespace(is_gated=True)
+        layer._map_global_expert_id_to_local_expert_id = lambda e: e - 20 if 20 <= e < 22 else -1
+        layer._maybe_load_fp8_shared_expert_as_fp4 = lambda **kwargs: False
+        method.create_weights(layer, 2, 256, 256, torch.bfloat16, weight_loader=layer.weight_loader)
+        for param in layer.parameters():
+            param.data.zero_()
+        with patch("sglang.srt.layers.moe.fused_moe_triton.layer.get_global_expert_location_metadata", return_value=None):
+            for shard, name, value in [("w1", "w13_qzeros", 0x11111111), ("w3", "w13_qzeros", 0x22222222), ("w2", "w2_qzeros", 0x33333333)]:
+                param = getattr(layer, name)
+                raw = torch.full((2, 32), value, dtype=torch.int32)
+                with self.subTest(shard=shard):
+                    param.weight_loader(param, raw, name, shard, 21)
+                    param.weight_loader(param, raw, name, shard, 19)
+                    self.assertTrue(torch.all(param[0] == 0).item())
+            self.assertTrue(torch.all(layer.w13_qzeros[1, :, :32] == 0x11111111).item())
+            self.assertTrue(torch.all(layer.w13_qzeros[1, :, 32:] == 0x22222222).item())
+            self.assertTrue(torch.all(layer.w2_qzeros[1] == 0x33333333).item())
+
+
 if __name__ == "__main__":
     unittest.main()

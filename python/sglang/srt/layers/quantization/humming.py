@@ -776,6 +776,10 @@ class HummingMoEMethod(FusedMoEMethodBase):
                 tensor = torch.empty(attrs["shape"], dtype=attrs["dtype"])
                 param = torch.nn.Parameter(tensor, requires_grad=False)
                 extra_attrs = attrs.get("extra_attrs", {}).copy()
+                if self.weight_schema.quant_method == "awq" and name == "qzeros":
+                    # AWQ zero points share the scale grouping. Humming's AWQ
+                    # schema omits this tag, but the MoE loader requires it.
+                    extra_attrs.setdefault("scale_type", "group")
                 extra_attrs.update(extra_weight_attrs)
                 param = prepare_moe_param(tensor, name, extra_attrs)
                 setattr(layer, f"{sublayer_name}_{name}", param)
