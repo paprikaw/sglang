@@ -14,6 +14,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import (
@@ -7432,6 +7433,53 @@ class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
             all(h for h in self._hashes_by_token_ids(cache).values()),
             "every node must carry a hash chain once storage is enabled",
         )
+
+
+class TestHiCachePPPrefetchGroups(CustomTestCase):
+    def controller(self, pp_size):
+        controller = object.__new__(HiCacheController)
+        controller.tp_group = mock.sentinel.tp
+        controller.pp_group = mock.sentinel.pp if pp_size > 1 else None
+        controller.attn_cp_group = controller.attn_tp_group = None
+        return controller
+
+    def test_pp_attach_creates_group_without_other_stages(self):
+        controller = self.controller(2)
+        with (
+            mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+            mock.patch.object(torch.distributed, "get_process_group_ranks", return_value=[0, 1]),
+            mock.patch.object(torch.distributed, "new_group", return_value=mock.sentinel.prefetch) as new_group,
+            mock.patch("sglang.srt.distributed.parallel_state.create_custom_parallel_group") as global_group,
+        ):
+            controller._create_prefetch_sync_groups()
+        new_group.assert_called_once_with(ranks=[0, 1], backend="gloo", use_local_synchronization=True)
+        global_group.assert_not_called()
+        self.assertEqual(controller.prefetch_sync_groups, [mock.sentinel.prefetch])
+
+    def test_pp1_retains_existing_group_creation(self):
+        controller = self.controller(1)
+        with (
+            mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+            mock.patch.object(torch.distributed, "get_process_group_ranks", return_value=[0, 1]),
+            mock.patch.object(torch.distributed, "new_group") as local_group,
+            mock.patch("sglang.srt.distributed.parallel_state.create_custom_parallel_group", return_value=mock.sentinel.prefetch) as global_group,
+        ):
+            controller._create_prefetch_sync_groups()
+        global_group.assert_called_once_with(group_ranks=[0, 1], backend="gloo")
+        local_group.assert_not_called()
+        self.assertEqual(controller.prefetch_sync_groups, [mock.sentinel.prefetch])
+
+    def test_duplicate_attention_groups_create_one_prefetch_group(self):
+        controller = self.controller(2)
+        controller.attn_cp_group, controller.attn_tp_group = mock.sentinel.cp, mock.sentinel.attn_tp
+        with (
+            mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+            mock.patch.object(torch.distributed, "get_process_group_ranks", return_value=[0, 1]),
+            mock.patch.object(torch.distributed, "new_group", return_value=mock.sentinel.prefetch) as new_group,
+        ):
+            controller._create_prefetch_sync_groups()
+        self.assertEqual(new_group.call_count, 1)
+        self.assertEqual(controller.prefetch_sync_groups, [mock.sentinel.prefetch])
 
 
 if __name__ == "__main__":
