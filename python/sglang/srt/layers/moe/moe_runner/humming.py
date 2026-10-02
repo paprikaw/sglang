@@ -396,6 +396,21 @@ class HummingRunnerCore(MoeRunnerCore):
         else:
             raise ValueError(f"Unsupported activation: {self.activation}")
 
+    def apply_masked_activation(
+        self,
+        inputs: torch.Tensor,
+        outputs: torch.Tensor,
+        expert_num_tokens: torch.Tensor,
+    ):
+        if self.activation == "silu" and self.swiglu_limit is None:
+            from sglang.kernels.ops.moe.humming_masked_activation import (
+                masked_silu_and_mul,
+            )
+
+            masked_silu_and_mul(inputs, outputs, expert_num_tokens)
+        else:
+            self.apply_activation(inputs, outputs)
+
     def run(
         self,
         runner_input: HummingRunnerInput,
@@ -650,9 +665,10 @@ class HummingRunnerCore(MoeRunnerCore):
             sublayer_name="w13",
         )
 
-        self.apply_activation(
+        self.apply_masked_activation(
             inputs=buffers["gate_up_output"],
             outputs=buffers["activation_output"],
+            expert_num_tokens=expert_num_tokens,
         )
 
         inputs, input_scale = HummingMethod.may_quant_input(
