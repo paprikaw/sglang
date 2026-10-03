@@ -1,14 +1,18 @@
 """Unit tests for UnifiedRadixCache"""
 
+import gc
 import json
+import os
 import shutil
 import sys
 import tempfile
 import time
 import unittest
+import weakref
 from array import array
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
@@ -50,7 +54,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import alloc_mmap
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
@@ -7604,6 +7611,106 @@ class TestHiCacheHostSleepLifecycle(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "L3 storage backend"):
             cache.suspend_hicache_host_memory()
         host_pool.destroy.assert_not_called()
+
+    def _mmap_cache(self):
+        cache, _, _ = self._cache()
+        # Use the real pool/group and the controller's real bound callbacks,
+        # but skip CUDA initialization: the bug concerns CPU object ownership.
+        host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+            host_pool.kv_buffer = alloc_mmap((2, 1, 131072), torch.float32)
+        host_pool.k_data_refs = [host_pool.k_buffer[0]]
+        host_pool.v_data_refs = [host_pool.v_buffer[0]]
+        host_pool.host_kv_data_refs = host_pool.k_data_refs + host_pool.v_data_refs
+        host_pool.layout = "layer_first"
+        host_pool.page_size = 1
+        host_pool.device = "cpu"
+        host_pool.size = 131072
+        host_pool.dcp_size = 1
+        host_pool.pin_memory = False
+        host_pool.can_use_write_back_jit = False
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=host_pool,
+                    device_pool=None,
+                    layer_mapper=lambda layer: layer,
+                    is_primary_index_anchor=True,
+                )
+            ]
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_host = group
+        controller.page_get_func = controller._generic_page_get
+        controller.page_set_func = controller._generic_page_set
+        cache.cache_controller = controller
+        cache.host_pool_group = group
+        cache.full_kv_pool_host = host_pool
+        cache.components = {
+            ComponentType.FULL: SimpleNamespace(_full_kv_pool_host=host_pool)
+        }
+        refs = tuple(
+            weakref.ref(value)
+            for value in (controller, group, host_pool, host_pool.k_data_refs[0])
+        )
+        return cache, refs, host_pool.k_data_refs[0].data_ptr()
+
+    @unittest.skipUnless(os.path.exists("/proc/self/maps"), "Linux mmap accounting")
+    def test_suspend_reclaims_frozen_controller_cycle_and_anonymous_mmap(self):
+        was_frozen = gc.is_tracked(self) and not any(
+            obj is self for obj in gc.get_objects()
+        )
+        was_enabled = gc.isenabled()
+        callbacks = list(gc.callbacks)
+        cache, refs, address = self._mmap_cache()
+
+        def address_is_mapped():
+            with open("/proc/self/maps") as mappings:
+                for mapping in mappings:
+                    start, end = mapping.split()[0].split("-")
+                    if int(start, 16) <= address < int(end, 16):
+                        return True
+            return False
+
+        try:
+            gc.freeze()
+            self.assertTrue(address_is_mapped())
+            with mock.patch("torch.get_device_module", return_value=mock.Mock()):
+                cache.suspend_hicache_host_memory()
+            self.assertTrue(all(ref() is None for ref in refs))
+            self.assertFalse(address_is_mapped())
+            self.assertGreater(gc.get_freeze_count(), 0)
+            self.assertEqual(gc.isenabled(), was_enabled)
+            self.assertEqual(gc.callbacks, callbacks)
+        finally:
+            gc.unfreeze()
+            gc.collect()
+            if was_frozen:
+                gc.freeze()
+
+    def test_suspend_keeps_unfrozen_disabled_gc_state(self):
+        was_frozen = gc.is_tracked(self) and not any(
+            obj is self for obj in gc.get_objects()
+        )
+        was_enabled = gc.isenabled()
+        try:
+            gc.unfreeze()
+            gc.disable()
+            sentinel = SimpleNamespace()
+            cache, refs, _ = self._mmap_cache()
+            with mock.patch("torch.get_device_module", return_value=mock.Mock()):
+                cache.suspend_hicache_host_memory()
+            self.assertTrue(all(ref() is None for ref in refs))
+            self.assertTrue(any(obj is sentinel for obj in gc.get_objects()))
+            self.assertFalse(gc.isenabled())
+        finally:
+            if was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+            if was_frozen:
+                gc.freeze()
 
     def test_resume_rebuilds_stack_and_returns_new_counter(self):
         cache, _, _ = self._cache()

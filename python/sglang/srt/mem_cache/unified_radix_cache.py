@@ -529,6 +529,13 @@ class UnifiedRadixCache(BasePrefixCache):
         torch.get_device_module().synchronize()
         self.release_host_resources()
 
+        # A frozen, GC-tracked controller is absent from get_objects().  The
+        # permanent-generation count alone cannot identify an explicitly frozen
+        # heap: Python 3.12 also puts immortal objects in that generation.
+        controller_was_frozen = gc.is_tracked(self.cache_controller) and not any(
+            obj is self.cache_controller for obj in gc.get_objects()
+        )
+
         # Drop every strong reference to the old pools/controller.  Host pool
         # subclasses retain tensor views in addition to kv_buffer; destroying the
         # now-unreachable pool object releases those aliases as one unit.
@@ -546,7 +553,20 @@ class UnifiedRadixCache(BasePrefixCache):
         self.sidecar_pool_specs.clear()
         self._storage_attachment = None
         self._hicache_host_suspended = True
-        gc.collect()
+        # The controller stores bound methods on itself (page_get_func and
+        # page_set_func), so dropping its last external reference leaves a
+        # cycle that still owns the host pools and their tensor views.  Servers
+        # freeze the heap after warmup; ordinary collect() ignores those frozen
+        # cycles.  Temporarily thaw during this idle-only lifecycle, then restore
+        # the server's frozen-heap convention without changing GC enablement or
+        # callbacks.
+        try:
+            if controller_was_frozen:
+                gc.unfreeze()
+            gc.collect()
+        finally:
+            if controller_was_frozen:
+                gc.freeze()
 
     def resume_hicache_host_memory(self):
         """Rebuild CPU HiCache buffers released by suspend_hicache_host_memory."""

@@ -108,8 +108,23 @@ class SchedulerWeightUpdaterManager:
             )
             assert flush_cache_success, "Cache flush failed after updating weights"
 
+    def _cpu_weight_cache_online_update_error(self) -> Optional[str]:
+        model = self.tp_worker.model_runner.model
+        if hasattr(model, "_cpu_weight_cache_identity"):
+            return (
+                "Online weight updates are disabled for CPU daemon snapshots: "
+                "changing weights would invalidate the immutable cached model. "
+                "Restart without SGLANG_CPU_WEIGHT_CACHE_SOCKET to update weights."
+            )
+        return None
+
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
+        message = self._cpu_weight_cache_online_update_error()
+        if message is not None:
+            return UpdateWeightFromDiskReqOutput(
+                success=False, message=message, num_paused_requests=0
+            )
         with self._observe_weight_load("disk"):
             success, message = self.tp_worker.update_weights_from_disk(recv_req)
             tp_success = success
@@ -125,6 +140,9 @@ class SchedulerWeightUpdaterManager:
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""
+        message = self._cpu_weight_cache_online_update_error()
+        if message is not None:
+            return InitWeightsUpdateGroupReqOutput(success=False, message=message)
         success, message = self.tp_worker.init_weights_update_group(recv_req)
         return InitWeightsUpdateGroupReqOutput(success=success, message=message)
 
@@ -141,6 +159,9 @@ class SchedulerWeightUpdaterManager:
         recv_req: UpdateWeightsFromDistributedReqInput,
     ) -> Tuple[bool, str]:
         """Update the online model parameter."""
+        message = self._cpu_weight_cache_online_update_error()
+        if message is not None:
+            return UpdateWeightsFromDistributedReqOutput(success=False, message=message)
         with self._observe_weight_load("distributed"):
             success, message = self.tp_worker.update_weights_from_distributed(recv_req)
             if success:
@@ -153,6 +174,9 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
+        message = self._cpu_weight_cache_online_update_error()
+        if message is not None:
+            return UpdateWeightsFromTensorReqOutput(success=False, message=message)
         with self._observe_weight_load("tensor"):
             if recv_req.disable_draft_model:
                 worker = self.tp_worker
@@ -168,6 +192,9 @@ class SchedulerWeightUpdaterManager:
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
+        message = self._cpu_weight_cache_online_update_error()
+        if message is not None:
+            return UpdateWeightsFromIPCReqOutput(success=False, message=message)
         with self._observe_weight_load("ipc"):
             success, message = self.tp_worker.update_weights_from_ipc(recv_req)
             tp_success = success
@@ -244,9 +271,27 @@ class SchedulerWeightUpdaterManager:
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
-            self.stashed_model_static_state = _export_static_state(
-                self.tp_worker.model_runner.model
-            )
+            model = self.tp_worker.model_runner.model
+            if hasattr(model, "_cpu_weight_cache_identity"):
+                from sglang.srt.weight_cache.cpu_loader import publish_model
+
+                cache = self.scheduler.tree_cache if self.scheduler is not None else None
+                if (
+                    cache is not None
+                    and getattr(cache, "host_pool_group", None) is not None
+                ):
+                    raise RuntimeError(
+                        "Release hicache_host before publishing weights to the CPU daemon."
+                    )
+                # GLM lazily constructs this derived gate buffer outside the
+                # memory-saver weight region. It can be rebuilt from weight on
+                # the next forward; drop it so it does not pin extra GPU memory.
+                for module in model.modules():
+                    if type(module).__name__ == "Glm4MoeGate":
+                        module._weight_fp32 = None
+                publish_model(model)
+            else:
+                self.stashed_model_static_state = _export_static_state(model)
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
 
@@ -273,11 +318,14 @@ class SchedulerWeightUpdaterManager:
             self._assert_weight_cache_inactive("resume_memory_occupation")
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_WEIGHTS)
             torch.distributed.barrier(self.tp_cpu_group)
-            _import_static_state(
-                self.tp_worker.model_runner.model,
-                self.stashed_model_static_state,
-            )
-            del self.stashed_model_static_state
+            model = self.tp_worker.model_runner.model
+            if hasattr(model, "_cpu_weight_cache_identity"):
+                from sglang.srt.weight_cache.cpu_loader import resume_model
+
+                resume_model(model)
+            else:
+                _import_static_state(model, self.stashed_model_static_state)
+                del self.stashed_model_static_state
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
