@@ -360,6 +360,201 @@ class TestCpuModelSnapshots(unittest.TestCase):
                 adapter._identity(config, load_config)
 
 
+class TestCanonicalPreparedOperations(unittest.TestCase):
+    def test_canonical_prefetch_suppression_keeps_iterator_policy_and_restores_state(
+        self,
+    ):
+        from safetensors.torch import save_file
+
+        loader_module = importlib.import_module("sglang.srt.model_loader.loader")
+        runtime = importlib.import_module("sglang.srt.runtime_context")
+        weights_module = importlib.import_module("sglang.srt.model_loader.weight_utils")
+        canonical = importlib.import_module(
+            "sglang.srt.weight_cache.cpu_canonical_loader"
+        )
+        flags = runtime._ConfigBag("model")
+        for name, value in {
+            "weight_loader_disable_mmap": False,
+            "weight_loader_prefetch_checkpoints": True,
+            "weight_loader_prefetch_num_threads": 1,
+            "weight_loader_drop_cache_after_load": True,
+        }.items():
+            flags._set(name, value)
+        with tempfile.TemporaryDirectory() as directory:
+            save_file(
+                {"weight": torch.arange(4, dtype=torch.uint8)},
+                str(Path(directory) / "model.safetensors"),
+            )
+            # Real DefaultModelLoader + real safetensors iterator: only CUDA
+            # model construction and the already-tested daemon view are replaced.
+            for prefetch, extra, single_thread, fail in (
+                (True, {}, True, False),
+                (True, {}, True, True),
+                (True, {"enable_multithread_load": True}, False, False),
+                (True, {"num_threads": 1}, False, False),
+                (True, {"enable_multithread_load": False}, True, False),
+                (False, {}, False, False),
+            ):
+                with self.subTest(prefetch=prefetch, extra=extra, exception=fail):
+                    flags._set("weight_loader_prefetch_checkpoints", prefetch)
+                    config = types.SimpleNamespace(
+                        load_format=loader_module.LoadFormat.SAFETENSORS,
+                        model_loader_extra_config=extra,
+                        draft_model_idx=None,
+                    )
+                    fallback = loader_module.DefaultModelLoader(config)
+                    model_config = types.SimpleNamespace(model_path="/original/model")
+
+                    def consume(*, model_config, device_config):
+                        self.assertFalse(flags.weight_loader_prefetch_checkpoints)
+                        self.assertTrue(flags.weight_loader_drop_cache_after_load)
+                        self.assertIsNot(config.model_loader_extra_config, extra)
+                        source = loader_module.DefaultModelLoader.Source(
+                            model_config.model_path, None
+                        )
+                        tensors = dict(fallback._get_weights_iterator(source))
+                        self.assertTrue(
+                            torch.equal(
+                                tensors["weight"], torch.arange(4, dtype=torch.uint8)
+                            )
+                        )
+                        if fail:
+                            raise RuntimeError("load interrupted")
+                        return nn.Module()
+
+                    with (
+                        patch.dict(
+                            os.environ,
+                            {
+                                "SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET": "/private/cache.sock"
+                            },
+                            clear=True,
+                        ),
+                        patch.object(runtime, "get_model", return_value=flags),
+                        patch.object(loader_module, "get_model", return_value=flags),
+                        patch.object(
+                            loader_module, "get_server_args", return_value=None
+                        ),
+                        patch.object(
+                            loader_module.envs.SGLANG_SORT_WEIGHT_FILES,
+                            "get",
+                            return_value=-1,
+                        ),
+                        patch.object(
+                            canonical,
+                            "model_view",
+                            return_value=nullcontext(
+                                (directory, {"group_key": "a" * 64})
+                            ),
+                        ),
+                        patch.object(fallback, "load_model", side_effect=consume),
+                        patch.object(
+                            loader_module,
+                            "safetensors_weights_iterator",
+                            wraps=loader_module.safetensors_weights_iterator,
+                        ) as single,
+                        patch.object(
+                            loader_module,
+                            "buffered_multi_thread_safetensors_weights_iterator",
+                            wraps=loader_module.buffered_multi_thread_safetensors_weights_iterator,
+                        ) as multi,
+                        patch.object(
+                            weights_module,
+                            "_prefetch_all_checkpoints",
+                            side_effect=AssertionError(
+                                "background prefetch must not start"
+                            ),
+                        ) as background,
+                        patch.object(
+                            weights_module,
+                            "_drop_file_cache_after_load",
+                            wraps=weights_module._drop_file_cache_after_load,
+                        ) as drop,
+                    ):
+                        selected = canonical.CanonicalCpuModelLoader(config, fallback)
+                        if fail:
+                            with self.assertRaisesRegex(
+                                RuntimeError, "load interrupted"
+                            ):
+                                selected.load_model(
+                                    model_config=model_config, device_config=None
+                                )
+                        else:
+                            selected.load_model(
+                                model_config=model_config, device_config=None
+                            )
+                        self.assertEqual(single.call_count, int(single_thread))
+                        self.assertEqual(multi.call_count, int(not single_thread))
+                        background.assert_not_called()
+                        drop.assert_called_once()
+                    self.assertEqual(flags.weight_loader_prefetch_checkpoints, prefetch)
+                    self.assertTrue(flags.weight_loader_drop_cache_after_load)
+                    self.assertIs(config.model_loader_extra_config, extra)
+                    self.assertFalse(hasattr(config, "_canonical_weight_cache_view"))
+                    self.assertEqual(model_config.model_path, "/original/model")
+
+    def test_actual_loader_entrypoint_and_weight_source_guard_fail_closed(self):
+        loader_module = importlib.import_module("sglang.srt.model_loader.loader")
+        config = types.SimpleNamespace(
+            load_format=loader_module.LoadFormat.SAFETENSORS,
+            model_loader_extra_config={},
+        )
+        with patch.dict(
+            os.environ,
+            {"SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET": "/private/cache.sock"},
+            clear=True,
+        ):
+            selected = loader_module.get_model_loader(config)
+            self.assertEqual(type(selected).__name__, "CanonicalCpuModelLoader")
+            with self.assertRaisesRegex(ValueError, "forbids external/disk"):
+                selected.fallback._prepare_weights("/disk/model", None, False)
+            config._canonical_weight_cache_view = "/private/view"
+            with self.assertRaisesRegex(ValueError, "forbids external/disk"):
+                selected.fallback._prepare_weights("/disk/secondary", None, False)
+            with patch.object(
+                selected.fallback,
+                "_maybe_download_from_modelscope",
+                side_effect=RuntimeError("view accepted"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "view accepted"):
+                    selected.fallback._prepare_weights("/private/view", None, False)
+            with patch.dict(
+                os.environ, {"SGLANG_CPU_WEIGHT_CACHE_SOCKET": "/prepared.sock"}
+            ):
+                with self.assertRaisesRegex(ValueError, "cannot be mixed"):
+                    loader_module.get_model_loader(config)
+
+    def test_canonical_models_reject_prepared_publish_and_resume_without_socket_io(
+        self,
+    ):
+        package = types.ModuleType("canonical_prepared_rejection_test")
+        package.__path__ = [str(SOURCE)]
+        sys.modules[package.__name__] = package
+        adapter = importlib.import_module(package.__name__ + ".cpu_loader")
+        for env_enabled in (False, True):
+            model = nn.Module()
+            if not env_enabled:
+                model._canonical_cpu_weight_cache_key = "a" * 64
+            environment = (
+                {"SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET": "/not-opened.sock"}
+                if env_enabled
+                else {}
+            )
+            with (
+                patch.dict(os.environ, environment, clear=True),
+                patch.object(adapter, "_client") as client,
+            ):
+                for operation in (adapter.publish_model, adapter.resume_model):
+                    with self.subTest(
+                        environment=env_enabled, operation=operation.__name__
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "canonical CPU banks"
+                        ):
+                            operation(model)
+                client.assert_not_called()
+
+
 class TestCpuDaemonOnlineUpdates(unittest.TestCase):
     operations = {
         "update_weights_from_disk": "UpdateWeightFromDiskReqOutput",

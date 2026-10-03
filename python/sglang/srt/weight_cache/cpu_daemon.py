@@ -129,6 +129,7 @@ class CpuWeightCacheDaemon:
         self.source_commit = source_commit
         self.headroom_bytes = headroom_bytes
         self.entries: dict[str, Entry] = {}
+        self.group_readers: dict[str, tuple[str, tuple[str, ...]]] = {}
         self.condition = threading.Condition(threading.RLock())
         self.stop_event = threading.Event()
         self.connections: set[socket.socket] = set()
@@ -192,6 +193,7 @@ class CpuWeightCacheDaemon:
                     "source_commit": self.source_commit,
                     "max_bytes": self.max_bytes,
                     "headroom_bytes": self.headroom_bytes,
+                    "features": ["canonical_groups_v1"],
                     "used_bytes": used,
                     "reserved_bytes": reserved,
                     "current_bytes": used + reserved,
@@ -206,6 +208,59 @@ class CpuWeightCacheDaemon:
                         }
                         for e in self.entries.values()
                     ],
+                }, None
+            if op == "get_group":
+                items = request.get("items")
+                if (
+                    not isinstance(items, list)
+                    or not items
+                    or len(items) > 4096
+                    or not all(isinstance(item, dict) for item in items)
+                ):
+                    raise CacheFailure("group", "nonempty bounded shard list required")
+                identities = [self._identity(item) for item in items]
+                if len({key for key, _ in identities}) != len(identities):
+                    raise CacheFailure("group", "duplicate group member")
+                wait_s = min(max(float(request.get("wait_s", 0)), 0), 3600)
+                deadline = time.monotonic() + wait_s
+                while True:
+                    unavailable = []
+                    for key, fingerprint in identities:
+                        entry = self.entries.get(key)
+                        if entry and entry.fingerprint != fingerprint:
+                            raise CacheFailure(
+                                "fingerprint", "stored fingerprint differs"
+                            )
+                        if not entry or entry.state != "ready" or entry.evict_pending:
+                            unavailable.append(key)
+                    if not unavailable:
+                        break
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return {"state": "missing", "missing_keys": unavailable}, None
+                    self.condition.wait(min(remaining, 0.25))
+                    if self.stop_event.is_set():
+                        raise CacheFailure("shutdown", "daemon is stopping")
+                token = secrets.token_hex(24)
+                keys = tuple(key for key, _ in identities)
+                self.group_readers[token] = (owner, keys)
+                members = []
+                for key in keys:
+                    entry = self.entries[key]
+                    entry.readers[token] = owner
+                    entry.last_access = time.monotonic()
+                    members.append(
+                        {
+                            "key": key,
+                            "size": entry.size,
+                            "manifest": entry.manifest,
+                            "path": f"/proc/{os.getpid()}/fd/{entry.fd}",
+                        }
+                    )
+                return {
+                    "state": "ready",
+                    "reader_token": token,
+                    "entries": members,
                 }, None
             if op in ("acquire", "get"):
                 key, fingerprint = self._identity(request)
@@ -337,9 +392,22 @@ class CpuWeightCacheDaemon:
                 entry.state, entry.owner, entry.build_token = "ready", None, None
                 entry.last_access = time.monotonic()
                 self.condition.notify_all()
+                if request.get("pin_after_publish"):
+                    return self._read(entry, owner)
                 return {"state": "ready", "key": key, "size": size}, None
             if op == "release":
                 token = request.get("token")
+                group = self.group_readers.get(token)
+                if group and group[0] == owner:
+                    del self.group_readers[token]
+                    for key in group[1]:
+                        entry = self.entries[key]
+                        del entry.readers[token]
+                        entry.evict_pending |= bool(request.get("evict"))
+                        if entry.evict_pending and not entry.readers:
+                            self._remove(entry)
+                    self.condition.notify_all()
+                    return {"state": "released", "shard_count": len(group[1])}, None
                 for entry in list(self.entries.values()):
                     if entry.build_token == token and entry.owner == owner:
                         self._remove(entry)
@@ -404,6 +472,11 @@ class CpuWeightCacheDaemon:
             pass
         finally:
             with self.condition:
+                self.group_readers = {
+                    token: group
+                    for token, group in self.group_readers.items()
+                    if group[0] != owner
+                }
                 for entry in list(self.entries.values()):
                     if entry.state == "building" and entry.owner == owner:
                         self._remove(entry)

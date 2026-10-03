@@ -190,6 +190,14 @@ class CpuWeightCacheClient:
 
     fetch = get
 
+    def get_group(self, items: list[dict], wait_s: float = 0) -> dict:
+        """Atomically pin an entire canonical bank, or pin nothing.
+
+        The returned proc-FD paths are only valid while this connection owns
+        the returned reader_token. No weight bytes travel over the socket.
+        """
+        return self._request("get_group", items=items, wait_s=wait_s)
+
     def publish(
         self,
         key: str,
@@ -197,6 +205,7 @@ class CpuWeightCacheClient:
         fingerprint: Any,
         manifest: Any,
         used_bytes: int | None = None,
+        pin_after_publish: bool = False,
     ) -> dict:
         fd = self._fds.get(token)
         if fd is None:
@@ -213,6 +222,7 @@ class CpuWeightCacheClient:
             fingerprint=fingerprint,
             manifest=manifest,
             used_bytes=os.fstat(fd).st_size,
+            pin_after_publish=pin_after_publish,
         )
         os.close(self._fds.pop(token))
         return result

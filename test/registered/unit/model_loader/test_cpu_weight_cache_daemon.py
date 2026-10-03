@@ -152,6 +152,46 @@ assert 'torch' not in sys.modules
         self.assertEqual(self.client.status()["used_bytes"], 128)
         another.release(fetched["reader_token"])
 
+    def test_group_pin_is_atomic_and_disconnect_releases_all_members(self):
+        first = self.publish(self.client, "group-one", size=64)
+        missing = self.identity("group-two")
+        items = [{"key": key, "fingerprint": fp} for key, fp in (first, missing)]
+        fetched = self.client.get_group(items)
+        self.assertEqual(fetched["state"], "missing")
+        self.assertTrue(all(e["readers"] == 0 for e in self.client.status()["entries"]))
+        self.publish(self.client, "group-two", size=64)
+        other = self.new_client()
+        fetched = other.get_group(items)
+        self.assertEqual(fetched["state"], "ready")
+        for member in fetched["entries"]:
+            self.assertEqual(Path(member["path"]).read_bytes()[:7], b"correct")
+            with self.assertRaises(OSError):
+                with open(member["path"], "r+b") as backing:
+                    backing.write(b"X")
+            with self.assertRaises(CpuWeightCacheError) as caught:
+                self.client.evict(member["key"])
+            self.assertEqual(caught.exception.code, "busy")
+        other.close()
+        for _ in range(100):
+            if all(e["readers"] == 0 for e in self.client.status()["entries"]):
+                break
+            time.sleep(0.01)
+        self.assertTrue(all(e["readers"] == 0 for e in self.client.status()["entries"]))
+        for item in items:
+            self.assertEqual(self.client.evict(item["key"])["state"], "evicted")
+
+    def test_publish_pin_protects_ready_shard_until_group_complete(self):
+        key, fp = self.identity("group-one")
+        build = self.client.acquire(key, 128, fp)
+        os.pwrite(build["fd"], b"complete", 0)
+        ready = self.client.publish(key, build["token"], fp, {}, pin_after_publish=True)
+        self.assertEqual(os.pread(ready["fd"], 8, 0), b"complete")
+        other = self.new_client()
+        with self.assertRaises(CpuWeightCacheError):
+            other.evict(key)
+        self.client.release(ready["reader_token"])
+        self.assertEqual(other.evict(key)["state"], "evicted")
+
     def test_byte_limit_counts_builds_and_recovers_disconnect(self):
         key1, fingerprint1 = self.identity("one")
         key2, fingerprint2 = self.identity("two")

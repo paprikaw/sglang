@@ -239,6 +239,12 @@ class CpuDaemonModelLoader:
 
 def publish_model(model):
     """Transfer the idle prepared model to the node daemon before GPU release."""
+    if os.environ.get("SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET") or hasattr(
+        model, "_canonical_cpu_weight_cache_key"
+    ):
+        raise RuntimeError(
+            "canonical CPU banks do not accept prepared snapshot publication"
+        )
     identity = model._cpu_weight_cache_identity
     key = model._cpu_weight_cache_key
     started = time.perf_counter()
@@ -269,6 +275,12 @@ def publish_model(model):
 
 def resume_model(model):
     """Fill memory-saver's resumed allocations without reconstructing a model."""
+    if os.environ.get("SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET") or hasattr(
+        model, "_canonical_cpu_weight_cache_key"
+    ):
+        raise RuntimeError(
+            "canonical CPU banks require a new normal-loader model process"
+        )
     identity = model._cpu_weight_cache_identity
     key = model._cpu_weight_cache_key
     with _client() as client:
