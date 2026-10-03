@@ -478,6 +478,14 @@ class DefaultModelLoader(BaseModelLoader):
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
+        if os.environ.get("SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET"):
+            view = getattr(self.load_config, "_canonical_weight_cache_view", None)
+            if not view or os.path.realpath(model_name_or_path) != os.path.realpath(
+                view
+            ):
+                raise ValueError(
+                    "canonical CPU bank forbids external/disk weight sources"
+                )
         model_name_or_path = self._maybe_download_from_modelscope(
             model_name_or_path, revision
         )
@@ -4274,6 +4282,15 @@ def get_model_loader(
     load_config: LoadConfig, model_config: Optional[ModelConfig] = None
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
+
+    if os.environ.get("SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET"):
+        from sglang.srt.weight_cache.cpu_canonical_loader import CanonicalCpuModelLoader
+
+        if os.environ.get("SGLANG_CPU_WEIGHT_CACHE_SOCKET"):
+            raise ValueError("canonical and prepared CPU weight caches cannot be mixed")
+        if load_config.load_format not in (LoadFormat.AUTO, LoadFormat.SAFETENSORS):
+            raise ValueError("canonical RAM bank requires normal safetensors loading")
+        return CanonicalCpuModelLoader(load_config, DefaultModelLoader(load_config))
 
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
