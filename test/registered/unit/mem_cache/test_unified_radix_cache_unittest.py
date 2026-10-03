@@ -7553,5 +7553,74 @@ class TestPPPrefetchAdmission(CustomTestCase):
         sync.assert_not_called()
 
 
+class TestHiCacheHostSleepLifecycle(unittest.TestCase):
+    def _cache(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        host_pool = mock.Mock()
+        controller = mock.Mock()
+        component = mock.Mock()
+        component._full_kv_pool_host = host_pool
+        cache._hicache_host_suspended = False
+        cache._hicache_init_server_args = object()
+        cache._hicache_init_params = object()
+        cache.cache_controller = controller
+        cache.host_pool_group = host_pool
+        cache.tree_core = mock.Mock()
+        cache.enable_storage = False
+        cache.components = {ComponentType.FULL: component}
+        cache.full_kv_pool_host = host_pool
+        cache.buffer_pipeline = object()
+        cache.sidecar_pool_specs = [object()]
+        cache._storage_attachment = object()
+        cache._drain_async_work = mock.Mock()
+        cache._reset_full = mock.Mock()
+        return cache, host_pool, component
+
+    def test_suspend_drops_every_host_stack_reference(self):
+        cache, host_pool, component = self._cache()
+        device_module = mock.Mock()
+        with (
+            mock.patch("torch.get_device_module", return_value=device_module),
+            mock.patch(
+                "sglang.srt.mem_cache.unified_radix_cache.gc.collect"
+            ) as collect,
+        ):
+            cache.suspend_hicache_host_memory()
+
+        cache._drain_async_work.assert_called_once_with()
+        cache._reset_full.assert_called_once_with()
+        device_module.synchronize.assert_called_once_with()
+        host_pool.destroy.assert_called_once_with()
+        self.assertIsNone(cache.cache_controller)
+        self.assertIsNone(cache.host_pool_group)
+        self.assertIsNone(cache.full_kv_pool_host)
+        self.assertIsNone(component._full_kv_pool_host)
+        self.assertTrue(cache._hicache_host_suspended)
+        collect.assert_called_once_with()
+
+    def test_suspend_rejects_attached_storage(self):
+        cache, host_pool, _ = self._cache()
+        cache.enable_storage = True
+        with self.assertRaisesRegex(RuntimeError, "L3 storage backend"):
+            cache.suspend_hicache_host_memory()
+        host_pool.destroy.assert_not_called()
+
+    def test_resume_rebuilds_stack_and_returns_new_counter(self):
+        cache, _, _ = self._cache()
+        cache._hicache_host_suspended = True
+        counter = object()
+
+        def rebuild(server_args, params):
+            cache.cache_controller = mock.Mock(layer_done_counter=counter)
+            cache.host_pool_group = object()
+
+        cache.init_hicache = mock.Mock(side_effect=rebuild)
+        self.assertIs(cache.resume_hicache_host_memory(), counter)
+        cache.init_hicache.assert_called_once_with(
+            cache._hicache_init_server_args, cache._hicache_init_params
+        )
+        self.assertFalse(cache._hicache_host_suspended)
+
+
 if __name__ == "__main__":
     unittest.main()

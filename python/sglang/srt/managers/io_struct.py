@@ -1936,7 +1936,8 @@ class GetWeightsByNameReqOutput(BaseReq, kw_only=True):
 
 class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Optional tags to identify the memory region, which is primarily used for RL
-    # Currently we only support `weights` and `kv_cache`
+    # `hicache_host` explicitly releases the CPU-resident HiCache pool for a
+    # sleeping model process; it is not included when tags is omitted.
     tags: Optional[List[str]] = None
 
 
@@ -1946,7 +1947,8 @@ class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Optional tags to identify the memory region, which is primarily used for RL
-    # Currently we only support `weights` and `kv_cache`
+    # `hicache_host` explicitly rebuilds the CPU-resident HiCache pool after the
+    # GPU weights and KV allocation have been restored.
     tags: Optional[List[str]] = None
 
 

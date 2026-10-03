@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import atexit
+import gc
 import hashlib
 import logging
 import threading
@@ -232,6 +233,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
+        self._hicache_init_server_args: Optional[ServerArgs] = None
+        self._hicache_init_params: Optional[CacheInitParams] = None
+        self._hicache_host_suspended = False
+        self._hicache_shutdown_registered = False
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.prefetch_stop_policy = "best_effort"
@@ -364,6 +369,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        self._hicache_init_server_args = server_args
+        self._hicache_init_params = params
         self.host_memory_mode = server_args.hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             # FULL and FULL+SWA only: Mamba has no state-handoff channel on
@@ -463,7 +470,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         self._storage_attachment = StorageAttachment(self)
-        atexit.register(self.shutdown)
+        if not self._hicache_shutdown_registered:
+            atexit.register(self.shutdown)
+            self._hicache_shutdown_registered = True
 
         if storage_backend is not None:
             self._storage_attachment.apply_runtime_config(
@@ -492,6 +501,67 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_host_resources(self) -> None:
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
+
+    def suspend_hicache_host_memory(self) -> None:
+        """Release an idle server's CPU HiCache buffers without exiting.
+
+        This lifecycle is intentionally limited to the L2-only configuration.
+        Runtime-attached L3 backends own worker threads and registrations whose
+        reconstruction needs backend-specific recovery; refusing that case is
+        safer than leaving stale host pointers behind.
+        """
+        if self._hicache_host_suspended:
+            return
+        if self.cache_controller is None or self.host_pool_group is None:
+            raise RuntimeError("HiCache host memory is not initialized.")
+        if self.enable_storage:
+            raise RuntimeError(
+                "Cannot suspend HiCache host memory while an L3 storage backend "
+                "is attached; detach it first."
+            )
+        if self._hicache_init_server_args is None or self._hicache_init_params is None:
+            raise RuntimeError("HiCache reconstruction parameters are unavailable.")
+
+        # The scheduler has already established idleness.  Resetting here drains
+        # logical host ownership before any backing tensor is unregistered.
+        self._drain_async_work()
+        self._reset_full()
+        torch.get_device_module().synchronize()
+        self.release_host_resources()
+
+        # Drop every strong reference to the old pools/controller.  Host pool
+        # subclasses retain tensor views in addition to kv_buffer; destroying the
+        # now-unreachable pool object releases those aliases as one unit.
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            _COMPONENT_HOST_ATTR,
+        )
+
+        for component_type, (cache_attr, component_attr) in _COMPONENT_HOST_ATTR.items():
+            if component_type in self.components:
+                setattr(self, cache_attr, None)
+                setattr(self.components[component_type], component_attr, None)
+        self.cache_controller = None
+        self.host_pool_group = None
+        self.buffer_pipeline = None
+        self.sidecar_pool_specs.clear()
+        self._storage_attachment = None
+        self._hicache_host_suspended = True
+        gc.collect()
+
+    def resume_hicache_host_memory(self):
+        """Rebuild CPU HiCache buffers released by suspend_hicache_host_memory."""
+        if not self._hicache_host_suspended:
+            if self.cache_controller is None:
+                raise RuntimeError("HiCache host memory is not initialized.")
+            return self.cache_controller.layer_done_counter
+        if self._hicache_init_server_args is None or self._hicache_init_params is None:
+            raise RuntimeError("HiCache reconstruction parameters are unavailable.")
+
+        self.init_hicache(self._hicache_init_server_args, self._hicache_init_params)
+        if self.cache_controller is None or self.host_pool_group is None:
+            raise RuntimeError("HiCache host-memory reconstruction failed.")
+        self._hicache_host_suspended = False
+        return self.cache_controller.layer_done_counter
 
     @rank_consensus(
         same_params=["params"],

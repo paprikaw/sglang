@@ -14,6 +14,7 @@ import torch
 from sglang.srt.constants import (
     GPU_MEMORY_ALL_TYPES,
     GPU_MEMORY_TYPE_CUDA_GRAPH,
+    GPU_MEMORY_TYPE_HICACHE_HOST,
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
@@ -212,6 +213,17 @@ class SchedulerWeightUpdaterManager:
         for tag in tags:
             self.offload_tags.add(tag)
 
+        if GPU_MEMORY_TYPE_HICACHE_HOST in tags:
+            if self.scheduler is None or not hasattr(
+                self.scheduler.tree_cache, "suspend_hicache_host_memory"
+            ):
+                raise RuntimeError(
+                    "Current scheduler cache does not support HiCache host suspension."
+                )
+            if not self.flush_cache(empty_cache=False):
+                raise RuntimeError("Cache flush failed before HiCache host suspension.")
+            self.scheduler.tree_cache.suspend_hicache_host_memory()
+
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             scheduler = self.scheduler
             if scheduler is not None:
@@ -283,6 +295,16 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.resume_memory_occupation()
+
+        if GPU_MEMORY_TYPE_HICACHE_HOST in tags:
+            if self.scheduler is None or not hasattr(
+                self.scheduler.tree_cache, "resume_hicache_host_memory"
+            ):
+                raise RuntimeError(
+                    "Current scheduler cache does not support HiCache host resume."
+                )
+            counter = self.scheduler.tree_cache.resume_hicache_host_memory()
+            self.tp_worker.register_hicache_layer_transfer_counter(counter)
 
         return ResumeMemoryOccupationReqOutput()
 

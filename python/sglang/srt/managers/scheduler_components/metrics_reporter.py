@@ -1093,7 +1093,13 @@ class SchedulerMetricsReporter:
         host_pool = getattr(
             self.scheduler.tree_cache, "token_to_kv_pool_host", None
         ) or getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
-        assert host_pool is not None, "Host pool not found"
+        if host_pool is None:
+            # A registered sleeping model can temporarily release the entire
+            # CPU host tier.  Publish zeroes instead of retaining the last live
+            # gauge value or crashing the idle scheduler's stats cycle.
+            self.stats.hicache_host_used_tokens = 0
+            self.stats.hicache_host_total_tokens = 0
+            return
         host_total = host_pool.logical_size
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
