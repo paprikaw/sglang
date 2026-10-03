@@ -157,7 +157,7 @@ Buffer::Buffer(int rank,
     }
     // The opt-in experiment must verify its rank-to-GPU NVLink pairing before
     // Buffer construction. This flag does not discover general topologies.
-    EP_HOST_ASSERT(not low_latency_nvlink_pair_only or (low_latency_mode and num_ranks == 8));
+    EP_HOST_ASSERT(not low_latency_nvlink_pair_only or (low_latency_mode and (num_ranks == 8 or num_ranks == 16)));
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
