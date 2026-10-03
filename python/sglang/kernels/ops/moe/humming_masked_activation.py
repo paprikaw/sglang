@@ -33,13 +33,16 @@ def _masked_silu_and_mul_kernel(
     for start_row in range(first_row, count, step):
         rows = start_row + row_offsets
         mask = (rows[:, None] < count) & (columns[None, :] < N)
-        in_offsets = (expert * CAPACITY + rows[:, None]) * (2 * N) + columns[None, :]
+        # Cast before multiplying strides: large expert buffers can contain
+        # more than 2**31 elements even when their row count fits in int32.
+        row_base = expert.to(tl.int64) * CAPACITY + rows[:, None]
+        in_offsets = row_base * (2 * N) + columns[None, :]
         gate = tl.load(inputs + in_offsets, mask=mask, other=0).to(tl.float32)
         up = tl.load(inputs + in_offsets + N, mask=mask, other=0).to(tl.float32)
         # sgl_kernel.silu_and_mul evaluates both activation and multiplication
         # in float32 before the final output cast.
         result = (gate / (1.0 + tl.exp(-gate))) * up
-        out_offsets = (expert * CAPACITY + rows[:, None]) * N + columns[None, :]
+        out_offsets = row_base * N + columns[None, :]
         tl.store(outputs + out_offsets, result, mask=mask)
 
 
@@ -48,7 +51,7 @@ def masked_silu_and_mul(
     outputs: torch.Tensor,
     expert_num_tokens: torch.Tensor,
     *,
-    programs_per_expert: int = 16,
+    programs_per_expert: int = 128,
     rows_per_program: int = 4,
 ) -> None:
     """Write valid rows of contiguous ``[E * capacity, 2N]`` input.
