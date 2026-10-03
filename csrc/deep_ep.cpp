@@ -7,7 +7,9 @@
 #include <torch/python.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <memory>
+#include <string>
 
 #include "kernels/api.cuh"
 #include "kernels/configs.cuh"
@@ -142,6 +144,14 @@ Buffer::Buffer(int rank,
       explicitly_destroy(explicitly_destroy),
       comm_stream(at::cuda::getStreamFromPool(true)),
       shared_memory_allocator(use_fabric) {
+    if (const char* value = std::getenv("DEEPEP_LL_NVLINK_PAIR_ONLY")) {
+        const std::string option(value);
+        EP_HOST_ASSERT(option == "0" or option == "1");
+        low_latency_nvlink_pair_only = option == "1";
+    }
+    // The opt-in experiment must verify its rank-to-GPU NVLink pairing before
+    // Buffer construction. This flag does not discover general topologies.
+    EP_HOST_ASSERT(not low_latency_nvlink_pair_only or (low_latency_mode and num_ranks == 8));
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
@@ -1518,7 +1528,8 @@ void Buffer::clean_low_latency_buffer(int num_max_dispatch_tokens_per_rank, int 
                                            num_ranks,
                                            mask_buffer_ptr,
                                            sync_buffer_ptr,
-                                           at::cuda::getCurrentCUDAStream());
+                                           at::cuda::getCurrentCUDAStream(),
+                                           low_latency_nvlink_pair_only);
 #else
     EP_HOST_ASSERT(false and "NVSHMEM is disabled during compilation");
 #endif
@@ -1644,7 +1655,8 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
             workspace,
             num_device_sms,
             launch_stream,
-            phases);
+            phases,
+            low_latency_nvlink_pair_only);
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
@@ -1768,7 +1780,8 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
                               num_device_sms,
                               launch_stream,
                               phases,
-                              zero_copy);
+                              zero_copy,
+                              low_latency_nvlink_pair_only);
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
@@ -1864,6 +1877,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     pybind11::class_<deep_ep::Buffer>(m, "Buffer")
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
+        .def("get_low_latency_nvlink_pair_only", &deep_ep::Buffer::get_low_latency_nvlink_pair_only)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
         .def("get_root_rdma_rank", &deep_ep::Buffer::get_root_rdma_rank)

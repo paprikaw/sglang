@@ -280,7 +280,8 @@ void clean_low_latency_buffer(int* clean_0,
                               int num_ranks,
                               int* mask_buffer,
                               int* sync_buffer,
-                              cudaStream_t stream);
+                              cudaStream_t stream,
+                              bool nvlink_pair_only);
 
 void dispatch(void* packed_recv_x,
               void* packed_recv_x_scales,
@@ -310,7 +311,8 @@ void dispatch(void* packed_recv_x,
               void* workspace,
               int num_device_sms,
               cudaStream_t stream,
-              int phases);
+              int phases,
+              bool nvlink_pair_only);
 
 void combine(void* combined_x,
              void* rdma_recv_x,
@@ -337,7 +339,8 @@ void combine(void* combined_x,
              int num_device_sms,
              cudaStream_t stream,
              int phases,
-             bool zero_copy);
+             bool zero_copy,
+             bool nvlink_pair_only);
 
 void query_mask_buffer(int* mask_buffer_ptr, int num_ranks, int* output_mask_tensor, cudaStream_t stream);
 

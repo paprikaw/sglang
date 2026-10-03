@@ -453,10 +453,15 @@ __device__ __forceinline__ void nvshmemi_ibgda_amo_nonfetch_add(
     }
 }
 
-__device__ __forceinline__ uint64_t nvshmemi_get_p2p_ptr(const uint64_t& ptr, const int& rank, const int& dst_rank) {
+__device__ __forceinline__ uint64_t nvshmemi_get_p2p_ptr(const uint64_t& ptr, const int& rank, const int& dst_rank,
+                                                       bool nvlink_pair_only = false) {
     // Local rank, no need for mapping
     if (rank == dst_rank)
         return ptr;
+    // Exact EP8 experiment only. A zero pointer selects the existing IBGDA
+    // fallback for both payload and synchronization metadata.
+    if (nvlink_pair_only and (rank ^ 1) != dst_rank)
+        return 0;
     auto peer_base = __ldg(reinterpret_cast<uint64_t*>(nvshmemi_device_state_d.peer_heap_base_p2p) + dst_rank);
 
     // RDMA connected

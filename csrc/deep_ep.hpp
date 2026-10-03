@@ -58,6 +58,9 @@ private:
     // Low-latency mode buffer
     int low_latency_buffer_idx = 0;
     bool low_latency_mode = false;
+    // Experimental only: exact two-node EP8 rank layout with NVLink pairs
+    // (0,1), (2,3), (4,5), (6,7). Defaults to existing unrestricted P2P.
+    bool low_latency_nvlink_pair_only = false;
 
     // NVLink Buffer
     int64_t num_nvl_bytes;
@@ -125,6 +128,8 @@ public:
     ~Buffer() noexcept(false);
 
     bool is_available() const;
+
+    bool get_low_latency_nvlink_pair_only() const { return low_latency_nvlink_pair_only; }
 
     bool is_internode_available() const;
 

@@ -20,7 +20,8 @@ __forceinline__ __device__ bool is_rank_masked(int* mask_buffer_ptr, int rank) {
 }
 
 template <int kNumThreads>
-__forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, int* mask_buffer_ptr, int* sync_buffer_ptr) {
+__forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, int* mask_buffer_ptr, int* sync_buffer_ptr,
+                                      bool nvlink_pair_only) {
     EP_DEVICE_ASSERT(kNumThreads >= num_ranks);
 
     // Quiet all QPs
@@ -42,7 +43,7 @@ __forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, 
     if (thread_id < num_ranks && thread_id != rank) {
         const auto dst_rank = thread_id;
         const auto dst_ptr = reinterpret_cast<uint64_t>(sync_buffer_ptr + rank);
-        const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+        const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
 
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             if (dst_p2p_ptr == 0) {
@@ -77,14 +78,15 @@ __launch_bounds__(kNumThreads, 1) __global__ void clean_low_latency_buffer(int* 
                                                                            int rank,
                                                                            int num_ranks,
                                                                            int* mask_buffer_ptr,
-                                                                           int* sync_buffer_ptr) {
+                                                                           int* sync_buffer_ptr,
+                                                                           bool nvlink_pair_only) {
     auto thread_id = static_cast<int>(threadIdx.x);
 
     // Barrier before cleaning (in case of unfinished chunked EP)
     if (sync_buffer_ptr == nullptr)
         nvshmemx_barrier_all_block();
     else
-        barrier<kNumThreads>(thread_id, rank, num_ranks, mask_buffer_ptr, sync_buffer_ptr);
+        barrier<kNumThreads>(thread_id, rank, num_ranks, mask_buffer_ptr, sync_buffer_ptr, nvlink_pair_only);
 
     // Clean
     #pragma unroll
@@ -98,7 +100,7 @@ __launch_bounds__(kNumThreads, 1) __global__ void clean_low_latency_buffer(int* 
     if (sync_buffer_ptr == nullptr)
         nvshmemx_barrier_all_block();
     else
-        barrier<kNumThreads>(thread_id, rank, num_ranks, mask_buffer_ptr, sync_buffer_ptr);
+        barrier<kNumThreads>(thread_id, rank, num_ranks, mask_buffer_ptr, sync_buffer_ptr, nvlink_pair_only);
 }
 
 void clean_low_latency_buffer(int* clean_0,
@@ -109,7 +111,8 @@ void clean_low_latency_buffer(int* clean_0,
                               int num_ranks,
                               int* mask_buffer_ptr,
                               int* sync_buffer_ptr,
-                              cudaStream_t stream) {
+                              cudaStream_t stream,
+                              bool nvlink_pair_only) {
     constexpr int kNumThreads = 256;
 
     SETUP_LAUNCH_CONFIG(1, kNumThreads, stream);
@@ -123,7 +126,8 @@ void clean_low_latency_buffer(int* clean_0,
                   rank,
                   num_ranks,
                   mask_buffer_ptr,
-                  sync_buffer_ptr);
+                  sync_buffer_ptr,
+                  nvlink_pair_only);
 }
 
 template <bool kUseFP8, bool kUseUE8M0, int kHidden>
@@ -153,7 +157,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     int num_warp_groups,
                                                     int num_warps_per_group,
                                                     bool round_scale,
-                                                    int phases) {
+                                                    int phases,
+                                                    bool nvlink_pair_only) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
@@ -261,7 +266,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                     rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg + slot_idx * num_bytes_per_msg;
-                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
                 if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
                     if (dst_p2p_ptr == 0) {
                         nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
@@ -331,7 +336,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2)
             ;
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
-        auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+        auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             if (dst_p2p_ptr == 0) {
                 nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
@@ -490,7 +495,8 @@ void dispatch(void* packed_recv_x,
               void* workspace,
               int num_device_sms,
               cudaStream_t stream,
-              int phases) {
+              int phases,
+              bool nvlink_pair_only) {
     constexpr int kNumMaxTopK = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
@@ -545,7 +551,8 @@ void dispatch(void* packed_recv_x,
                       num_warp_groups,                       \
                       num_warps_per_group,                   \
                       round_scale,                           \
-                      phases);                               \
+                      phases,                                \
+                      nvlink_pair_only);                     \
     }                                                        \
     break
 
@@ -739,7 +746,8 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                                                    int num_warp_groups,
                                                    int num_warps_per_group,
                                                    int phases,
-                                                   bool zero_copy) {
+                                                   bool zero_copy,
+                                                   bool nvlink_pair_only) {
     const auto sm_id = __shfl_sync(0xffffffff, static_cast<int>(blockIdx.x), 0);
     const auto num_sms = __shfl_sync(0xffffffff, static_cast<int>(gridDim.x), 0);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -847,7 +855,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                 const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
-                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
                 int num_send_bytes = hidden * sizeof(nv_bfloat16);
 
                 if (not zero_copy or dst_p2p_ptr != 0) {
@@ -993,7 +1001,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
             while (ld_acquire_global(atomic_clean_flag) == 0)
                 ;
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
-            auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank);
+            auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
                 if (dst_p2p_ptr == 0) {
                     nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
@@ -1278,7 +1286,8 @@ void combine(void* combined_x,
              int num_device_sms,
              cudaStream_t stream,
              int phases,
-             bool zero_copy) {
+             bool zero_copy,
+             bool nvlink_pair_only) {
     constexpr int kNumMaxTopk = 11;
     const int num_warp_groups = ceil_div(num_experts, num_device_sms);
     const int num_warps_per_group = 32 / num_warp_groups;
@@ -1344,7 +1353,8 @@ void combine(void* combined_x,
                       num_warp_groups,                                                                                             \
                       num_warps_per_group,                                                                                         \
                       phases,                                                                                                      \
-                      zero_copy);                                                                                                  \
+                      zero_copy,                                                                                                   \
+                      nvlink_pair_only);                                                                                           \
     }                                                                                                                              \
     break
 
