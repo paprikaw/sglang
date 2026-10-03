@@ -61,6 +61,9 @@ private:
     // Experimental only: exact two-node EP8 rank layout with NVLink pairs
     // (0,1), (2,3), (4,5), (6,7). Defaults to existing unrestricted P2P.
     bool low_latency_nvlink_pair_only = false;
+    // A positive threshold allows PCIe P2P for small per-rank calls. Zero
+    // preserves the always-pair-only experiment, including empty ranks.
+    int low_latency_pcie_p2p_max_tokens = 0;
 
     // NVLink Buffer
     int64_t num_nvl_bytes;
@@ -130,6 +133,8 @@ public:
     bool is_available() const;
 
     bool get_low_latency_nvlink_pair_only() const { return low_latency_nvlink_pair_only; }
+
+    int get_low_latency_pcie_p2p_max_tokens() const { return low_latency_pcie_p2p_max_tokens; }
 
     bool is_internode_available() const;
 

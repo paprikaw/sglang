@@ -149,6 +149,12 @@ Buffer::Buffer(int rank,
         EP_HOST_ASSERT(option == "0" or option == "1");
         low_latency_nvlink_pair_only = option == "1";
     }
+    if (const char* value = std::getenv("DEEPEP_LL_PCIE_P2P_MAX_TOKENS")) {
+        char* end = nullptr;
+        const long threshold = std::strtol(value, &end, 10);
+        EP_HOST_ASSERT(end != value and *end == '\0' and threshold >= 0 and threshold <= 1024);
+        low_latency_pcie_p2p_max_tokens = static_cast<int>(threshold);
+    }
     // The opt-in experiment must verify its rank-to-GPU NVLink pairing before
     // Buffer construction. This flag does not discover general topologies.
     EP_HOST_ASSERT(not low_latency_nvlink_pair_only or (low_latency_mode and num_ranks == 8));
@@ -1580,6 +1586,10 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     auto num_tokens = static_cast<int>(x.size(0)), hidden = static_cast<int>(x.size(1));
     auto num_topk = static_cast<int>(topk_idx.size(1));
     auto num_local_experts = num_experts / num_ranks;
+    // Capture this per-call decision by value in launcher and its recv hook.
+    // Payload and synchronization metadata must use the same transport.
+    const bool nvlink_pair_only_for_call = low_latency_nvlink_pair_only and
+        not(low_latency_pcie_p2p_max_tokens > 0 and num_tokens <= low_latency_pcie_p2p_max_tokens);
 
     // Buffer control
     LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
@@ -1656,7 +1666,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
             num_device_sms,
             launch_stream,
             phases,
-            low_latency_nvlink_pair_only);
+            nvlink_pair_only_for_call);
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
@@ -1725,7 +1735,11 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
 
     auto hidden = static_cast<int>(x.size(2));
     auto num_topk = static_cast<int>(topk_weights.size(1));
-    auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
+    auto num_combined_tokens = static_cast<int>(topk_idx.size(0));
+    // Use the original local input-token count, not the padded received
+    // expert-buffer shape. A receiver can contain tokens from other ranks.
+    const bool nvlink_pair_only_for_call = low_latency_nvlink_pair_only and
+        not(low_latency_pcie_p2p_max_tokens > 0 and num_combined_tokens <= low_latency_pcie_p2p_max_tokens);
 
     // Buffer control
     LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
@@ -1781,7 +1795,7 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
                               launch_stream,
                               phases,
                               zero_copy,
-                              low_latency_nvlink_pair_only);
+                              nvlink_pair_only_for_call);
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
 
@@ -1878,6 +1892,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_low_latency_nvlink_pair_only", &deep_ep::Buffer::get_low_latency_nvlink_pair_only)
+        .def("get_low_latency_pcie_p2p_max_tokens", &deep_ep::Buffer::get_low_latency_pcie_p2p_max_tokens)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)
         .def("get_root_rdma_rank", &deep_ep::Buffer::get_root_rdma_rank)
