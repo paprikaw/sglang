@@ -157,7 +157,11 @@ Buffer::Buffer(int rank,
     }
     // The opt-in experiment must verify its rank-to-GPU NVLink pairing before
     // Buffer construction. This flag does not discover general topologies.
-    EP_HOST_ASSERT(not low_latency_nvlink_pair_only or (low_latency_mode and (num_ranks == 4 or num_ranks == 8 or num_ranks == 16)));
+    EP_HOST_ASSERT(not low_latency_nvlink_pair_only or
+                   (low_latency_mode and (num_ranks == 4 or num_ranks == 8 or num_ranks == 12 or num_ranks == 16)));
+    // Twelve ranks are supported only by the dedicated low-latency kernels.
+    // Normal-mode IPC teams assume complete groups of eight ranks.
+    EP_HOST_ASSERT(num_ranks != 12 or (low_latency_mode and num_nvl_bytes == 0));
     // Metadata memory
     int64_t barrier_signal_bytes = NUM_MAX_NVL_PEERS * sizeof(int);
     int64_t buffer_ptr_bytes = NUM_MAX_NVL_PEERS * sizeof(void*);
@@ -172,7 +176,8 @@ Buffer::Buffer(int rank,
     EP_HOST_ASSERT(num_nvl_bytes / sizeof(int4) < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(num_rdma_bytes / sizeof(int4) < std::numeric_limits<int>::max());
     EP_HOST_ASSERT(0 <= rank and rank < num_ranks and (num_ranks <= NUM_MAX_NVL_PEERS * NUM_MAX_RDMA_PEERS or low_latency_mode));
-    EP_HOST_ASSERT(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0);
+    EP_HOST_ASSERT(num_ranks < NUM_MAX_NVL_PEERS or num_ranks % NUM_MAX_NVL_PEERS == 0 or
+                   (num_ranks == 12 and low_latency_mode and num_nvl_bytes == 0));
     if (num_rdma_bytes > 0)
         EP_HOST_ASSERT(num_ranks > NUM_MAX_NVL_PEERS or low_latency_mode);
 
@@ -409,6 +414,7 @@ void Buffer::sync(const std::vector<int>& device_ids,
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
 Buffer::get_dispatch_layout(
     const torch::Tensor& topk_idx, int num_experts, std::optional<EventHandle>& previous_event, bool async, bool allocate_on_comm_stream) {
+    EP_HOST_ASSERT(num_ranks != 12 and "EP12 supports only dedicated low-latency communication");
     EP_HOST_ASSERT(topk_idx.dim() == 2);
     EP_HOST_ASSERT(topk_idx.is_contiguous());
     EP_HOST_ASSERT(num_experts > 0);
@@ -499,6 +505,7 @@ Buffer::intranode_dispatch(const torch::Tensor& x,
                            std::optional<EventHandle>& previous_event,
                            bool async,
                            bool allocate_on_comm_stream) {
+    EP_HOST_ASSERT(num_ranks != 12 and "EP12 supports only dedicated low-latency communication");
     bool cached_mode = cached_rank_prefix_matrix.has_value();
 
     // One channel use two blocks, even-numbered blocks for sending, odd-numbered blocks for receiving.
@@ -798,6 +805,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     std::optional<EventHandle>& previous_event,
     bool async,
     bool allocate_on_comm_stream) {
+    EP_HOST_ASSERT(num_ranks != 12 and "EP12 supports only dedicated low-latency communication");
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous());
     EP_HOST_ASSERT(src_idx.dim() == 1 and src_idx.is_contiguous() and src_idx.scalar_type() == torch::kInt32);
     EP_HOST_ASSERT(send_head.dim() == 2 and send_head.is_contiguous() and send_head.scalar_type() == torch::kInt32);
@@ -961,6 +969,7 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                            std::optional<EventHandle>& previous_event,
                            bool async,
                            bool allocate_on_comm_stream) {
+    EP_HOST_ASSERT(num_ranks != 12 and "EP12 supports only dedicated low-latency communication");
 #ifndef DISABLE_NVSHMEM
     // In dispatch, CPU will busy-wait until GPU receive tensor size metadata from other ranks, which can be quite long.
     // If users of DeepEP need to execute other Python code on other threads, such as KV transfer, their code will get stuck due to GIL
@@ -1339,6 +1348,7 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
     std::optional<EventHandle>& previous_event,
     bool async,
     bool allocate_on_comm_stream) {
+    EP_HOST_ASSERT(num_ranks != 12 and "EP12 supports only dedicated low-latency communication");
 #ifndef DISABLE_NVSHMEM
     const int num_channels = config.num_sms / 2;
     EP_HOST_ASSERT(config.num_sms % 2 == 0);
