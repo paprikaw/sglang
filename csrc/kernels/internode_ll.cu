@@ -917,6 +917,14 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                     __syncwarp();
 #else
                     constexpr int kNumUnrolls = 4;
+                    // Keep the existing warp/SM budget and four-vector register
+                    // pipeline. Only ordinary BF16 writes to a remote mapped
+                    // GPU use lane-contiguous vectors, as dispatch already does.
+                    // Local/RDMA staging and LogFMT retain their original path.
+                    if (not kUseLogFMT and dst_p2p_ptr != 0 and dst_rank != rank) {
+                        UNROLLED_WARP_COPY(kNumUnrolls, lane_id, hidden_bf16_int4,
+                                           cpy_dst_int4_ptr, cpy_src_int4_ptr, ld_nc_global, st_na_global);
+                    } else {
                     constexpr int hidden_bf16_int4_pad = align_up(static_cast<int>(hidden_bf16_int4), 32 * kNumUnrolls);
                     #pragma unroll
                     for (int i = lane_id * kNumUnrolls; i < hidden_bf16_int4_pad; i += 32 * kNumUnrolls) {
@@ -983,6 +991,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                             for (int k = 0; k < kNumUnrolls; ++k)
                                 st_na_global(cpy_dst_int4_ptr + i + k, int4_values[k]);
                         }
+                    }
                     }
 #endif
                 }
