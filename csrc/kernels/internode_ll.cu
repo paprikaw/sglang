@@ -380,7 +380,14 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         auto dst_p2p_ptr = control_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             if (dst_p2p_ptr == 0) {
+#ifdef DISABLE_SM90_FEATURES
+                // Exactly one owner writes [local_expert, source_rank] each
+                // round, to an already-cleaned slot: equivalent to the P2P
+                // release-store, without an unnecessary NIC read/modify/write.
+                nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
+#else
                 nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
+#endif
             } else {
                 st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), -num_tokens_sent - 1);
             }
@@ -1082,7 +1089,13 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
             auto dst_p2p_ptr = control_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
                 if (dst_p2p_ptr == 0) {
+#ifdef DISABLE_SM90_FEATURES
+                    // One owner of global_expert_idx sends one completion to
+                    // each destination. P2P already uses a direct store of 1.
+                    nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
+#else
                     nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
+#endif
                 } else {
                     st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), 1);
                 }
