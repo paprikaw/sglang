@@ -3,6 +3,8 @@
 #define DEEPEP_LL_CPU_POST_BATCH 8
 #include "ibgda_device.cuh"
 #include "launch.cuh"
+#include <cstdlib>
+#include <cstdio>
 
 namespace deep_ep {
 
@@ -15,7 +17,7 @@ constexpr int kRDMAFirstPayloadPhase = 4;
 // filling these QPs. Flush every ready tail (including batches shorter than
 // eight), then poll precisely that completion index. The existing quiet helper
 // can see only the CPU proxy's already posted index, which is insufficient here.
-__global__ __launch_bounds__(32, 1) void drain_rdma_before_pcie(int rank, int num_ranks) {
+__global__ __launch_bounds__(32, 1) void drain_rdma_before_pcie(int rank, int num_ranks, int mode) {
     const auto state = ibgda_get_state();
     const auto qps_per_rank = state->num_rc_per_pe * state->num_devices_initialized;
     for (int i = threadIdx.x; i < qps_per_rank * (num_ranks - 1); i += blockDim.x) {
@@ -27,17 +29,34 @@ __global__ __launch_bounds__(32, 1) void drain_rdma_before_pcie(int rank, int nu
             ibgda_proxy_post_send(qp, ready);
         else
             ibgda_post_send(qp, ready);
-        ibgda_poll_cq(qp->tx_wq.cq, ready);
+        if (mode >= 1)
+            ibgda_poll_cq(qp->tx_wq.cq, ready);
     }
     __syncthreads();
     // All ranks must drain before any rank starts its local PCIe writes;
     // per-rank completion alone still permits another rank's NIC/PCIe overlap.
-    nvshmemx_barrier_all_block();
+    if (mode == 2)
+        nvshmemx_barrier_all_block();
 }
 
 void launch_drain_rdma_before_pcie(int rank, int num_ranks, cudaStream_t stream) {
+    // Experimental ablation: 0=tail publish only, 1=publish plus local CQ
+    // completion, 2=completion plus global barrier (previous candidate).
+    int mode = 2;
+    if (const auto text = std::getenv("DEEPEP_LL_PCIE_DRAIN_MODE")) {
+        char* end = nullptr;
+        const auto value = std::strtol(text, &end, 10);
+        EP_HOST_ASSERT(end != text and *end == '\0' and value >= 0 and value <= 2);
+        mode = static_cast<int>(value);
+    }
+    static bool reported[3] = {false, false, false};
+    if (not reported[mode]) {
+        reported[mode] = true;
+        printf("DEEPEP_PCIE_DRAIN_ACTUAL rank=%d mode=%d\n", rank, mode);
+        fflush(stdout);  // first untimed correctness call, never a formal sample
+    }
     SETUP_LAUNCH_CONFIG(1, 32, stream);
-    LAUNCH_KERNEL(&cfg, drain_rdma_before_pcie, rank, num_ranks);
+    LAUNCH_KERNEL(&cfg, drain_rdma_before_pcie, rank, num_ranks, mode);
 }
 
 __forceinline__ __device__ bool is_cross_pair_pcie(uint64_t ptr, int rank, int dst_rank,
