@@ -3,6 +3,7 @@
 #define DEEPEP_LL_CPU_POST_BATCH 8
 #include "ibgda_device.cuh"
 #include "launch.cuh"
+#include <cstdlib>
 
 namespace deep_ep {
 
@@ -10,6 +11,31 @@ namespace internode_ll {
 
 // Internal SM80-only launch phase. No public ABI or SM90 behavior changes.
 constexpr int kRDMAFirstPayloadPhase = 4;
+
+// Benchmark-only opt-in; the default and pair-only RDMA retain the original
+// template specialization and launch geometry. No public Buffer ABI changes.
+bool balanced_pcie_requested(int rank, bool pair_only) {
+#ifdef DISABLE_SM90_FEATURES
+    if (pair_only)
+        return false;
+    int enabled = 0;
+    if (const auto text = std::getenv("DEEPEP_LL_PCIE_BALANCED_WARPS")) {
+        char* end = nullptr;
+        const auto value = std::strtol(text, &end, 10);
+        EP_HOST_ASSERT(end != text and *end == '\0' and value >= 0 and value <= 1);
+        enabled = static_cast<int>(value);
+    }
+    static bool reported[2] = {false, false};
+    if (not reported[enabled]) {
+        reported[enabled] = true;
+        printf("DEEPEP_PCIE_BALANCE_ACTUAL rank=%d enabled=%d\n", rank, enabled);
+        fflush(stdout);  // one activation line during untimed correctness
+    }
+    return enabled != 0;
+#else
+    return false;
+#endif
+}
 
 // A preceding send kernel has exited, so no GPU writer is still reserving or
 // filling these QPs. Flush every ready tail (including batches shorter than
@@ -181,7 +207,7 @@ void clean_low_latency_buffer(int* clean_0,
                   nvlink_pair_only);
 }
 
-template <bool kUseFP8, bool kUseUE8M0, int kHidden>
+template <bool kUseFP8, bool kUseUE8M0, int kHidden, bool kBalancePCIe = false>
 __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     void* packed_recv_x_scales,
                                                     int* packed_recv_src_info,
@@ -262,6 +288,37 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         const auto num_threads = (num_warps - 1) * 32;
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
 
+        if (kBalancePCIe and split_rdma_first and not early_rdma_payload_only) {
+            // The early launch already packed every token. Spread independent
+            // (token, top-k slot) writes over the existing writer warps instead
+            // of serializing all tokens of a block through only top-k warps.
+            const auto copy_warps = num_sms * (num_warps - 1);
+            for (int job = warp_id * num_sms + sm_id; job < num_tokens * num_topk; job += copy_warps) {
+                const auto token_idx = job / num_topk;
+                const auto dst_expert_idx = static_cast<int>(__ldg(topk_idx + job));
+                if (dst_expert_idx < 0)
+                    continue;
+                const auto dst_rank = dst_expert_idx / num_local_experts;
+                if (not is_cross_pair_pcie(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank,
+                                           nvlink_pair_only))
+                    continue;
+                const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
+                int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
+                slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
+                const auto src_ptr = reinterpret_cast<uint64_t>(rdma_x) + token_idx * num_bytes_per_msg;
+                const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
+                    (dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank +
+                     rank * num_max_dispatch_tokens_per_rank + slot_idx) * num_bytes_per_msg;
+                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
+                if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
+                    const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
+                    auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
+                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
+                }
+                __syncwarp();
+                lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
+            }
+        } else {
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
             const auto x_int4 = static_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
             const auto rdma_x_src_idx = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_x) + token_idx * num_bytes_per_msg);
@@ -350,6 +407,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 __syncwarp();
                 lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
             }
+        }
         }
         // Each writer flushes once after its selected payloads. The early
         // launch completes before the late one; late writers globally synchronize
@@ -600,6 +658,8 @@ void dispatch(void* packed_recv_x,
 #define DISPATCH_LAUNCH_CASE(hidden)                         \
     {                                                        \
         auto dispatch_func = dispatch<false, false, hidden>; \
+        if (balanced_pcie and not use_fp8)                  \
+            dispatch_func = dispatch<false, false, hidden, true>; \
         if (use_fp8 and not use_ue8m0)                       \
             dispatch_func = dispatch<true, false, hidden>;   \
         if (use_fp8 and use_ue8m0)                           \
@@ -650,6 +710,7 @@ void dispatch(void* packed_recv_x,
 #else
     constexpr bool split_rdma_first = false;
 #endif
+    const bool balanced_pcie = balanced_pcie_requested(rank, nvlink_pair_only);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
@@ -814,7 +875,7 @@ __forceinline__ __device__ void decode_and_accumulate(
     }
 }
 
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
+template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, bool kBalancePCIe = false>
 __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                                                    void* rdma_recv_x,
                                                    int* rdma_recv_flag,
@@ -857,6 +918,8 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
     constexpr bool split_rdma_first = false, early_rdma_payload_only = false;
 #endif
 
+    const bool balanced_late_pcie = kBalancePCIe and not kUseLogFMT and split_rdma_first and not early_rdma_payload_only;
+
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
     // Data type staffs
@@ -893,6 +956,45 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
         __syncwarp();
         if (lane_id == 0)
             atomic_add_release_global(atomic_clean_flag, num_experts);
+    }
+
+    if (balanced_late_pcie) {
+        // Transpose the warp-to-job mapping across blocks. Every destination /
+        // local-expert segment gets a disjoint set of row-striding warps across
+        // the already allocated grid, rather than one responsible warp group.
+        const auto copy_warp = warp_id * num_sms + sm_id;
+        const auto copy_warps = num_sms * (num_threads / 32);
+        const auto copy_group = copy_warp % num_experts;
+        const auto dst_rank = copy_group / num_local_experts;
+        const auto local_expert_idx = copy_group % num_local_experts;
+        if (is_cross_pair_pcie(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank, nvlink_pair_only) and
+            not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
+            const auto layout = __ldg(layout_range + local_expert_idx * num_ranks + dst_rank);
+            int offset, num_tokens_to_send;
+            unpack2(layout, num_tokens_to_send, offset);
+            const auto row_step = ceil_div(copy_warps - copy_group, num_experts);
+            const auto local_x = static_cast<const int4*>(x) +
+                local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * hidden_bf16_int4;
+            const auto local_src_info = src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
+            const auto send_base = static_cast<const uint8_t*>(rdma_send_x) +
+                local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_slot;
+            const auto global_expert_idx = rank * num_local_experts + local_expert_idx;
+            for (int token_idx = offset + copy_warp / num_experts; token_idx < offset + num_tokens_to_send;
+                 token_idx += row_step) {
+                const auto src_idx = __shfl_sync(0xffffffff, __ldg(local_src_info + token_idx), 0);
+                const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
+                    (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
+                auto* dst_vec = reinterpret_cast<int4*>(nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only));
+                const auto* src_vec = zero_copy ? reinterpret_cast<const int4*>(send_base + token_idx * num_bytes_per_slot)
+                                               : local_x + token_idx * hidden_bf16_int4;
+                UNROLLED_WARP_COPY(4, lane_id, hidden_bf16_int4, dst_vec, src_vec, ld_nc_global, st_na_global);
+            }
+            __threadfence_system();
+        }
+        // Payload writers are no longer confined to the flag issuer's block.
+        // Every writer fences before this cooperative grid barrier; only then
+        // may the original per-expert issuer publish completion.
+        cg::this_grid().sync();
     }
 
     // Issue IBGDA sends
@@ -943,7 +1045,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
 #endif
 
         // Issue IBGDA send
-        if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank) and
+        if (not balanced_late_pcie and not is_rank_masked<true>(mask_buffer_ptr, dst_rank) and
             (not split_rdma_first or
              is_cross_pair_pcie(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank,
                                 nvlink_pair_only) != early_rdma_payload_only)) {
@@ -1109,7 +1211,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
         // the warp-group barrier and the separate RDMA finishing-flag issuer.
         // A fence in only the issuer would not cover other writers' P2P stores.
 #ifdef DISABLE_SM90_FEATURES
-        if (split_rdma_first and dst_rank != rank and
+        if (not balanced_late_pcie and split_rdma_first and dst_rank != rank and
             nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank, nvlink_pair_only) != 0)
             __threadfence_system();
 #endif
@@ -1450,6 +1552,8 @@ void combine(void* combined_x,
     {                                                                                                                              \
         auto combine_func =                                                                                                        \
             use_logfmt ? combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls> : combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
+        if (balanced_pcie and not use_logfmt)                                                                                      \
+            combine_func = combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls, true>;                                                 \
         SET_SHARED_MEMORY_FOR_TMA(combine_func);                                                                                   \
         auto launch_combine_phase = [&](int launch_phases) {                                                                        \
         LAUNCH_KERNEL(&cfg,                                                                                                        \
@@ -1495,6 +1599,7 @@ void combine(void* combined_x,
 #else
     constexpr bool split_rdma_first = false;
 #endif
+    const bool balanced_pcie = balanced_pcie_requested(rank, nvlink_pair_only);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 }
