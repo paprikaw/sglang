@@ -1902,6 +1902,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool>())
         .def("is_available", &deep_ep::Buffer::is_available)
         .def("get_low_latency_nvlink_pair_only", &deep_ep::Buffer::get_low_latency_nvlink_pair_only)
+        .def("set_low_latency_nvlink_pair_only_for_benchmark", &deep_ep::Buffer::set_low_latency_nvlink_pair_only_for_benchmark)
         .def("get_low_latency_pcie_p2p_max_tokens", &deep_ep::Buffer::get_low_latency_pcie_p2p_max_tokens)
         .def("get_num_rdma_ranks", &deep_ep::Buffer::get_num_rdma_ranks)
         .def("get_rdma_rank", &deep_ep::Buffer::get_rdma_rank)

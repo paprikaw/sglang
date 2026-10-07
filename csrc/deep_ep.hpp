@@ -134,6 +134,14 @@ public:
 
     bool get_low_latency_nvlink_pair_only() const { return low_latency_nvlink_pair_only; }
 
+    // Experimental benchmark control only. The caller must synchronize all
+    // outstanding communication before switching. This changes the per-call
+    // payload selector, not NVSHMEM state, QPs, buffers or device kernels.
+    void set_low_latency_nvlink_pair_only_for_benchmark(bool value) {
+        EP_HOST_ASSERT(low_latency_mode and is_available());
+        low_latency_nvlink_pair_only = value;
+    }
+
     int get_low_latency_pcie_p2p_max_tokens() const { return low_latency_pcie_p2p_max_tokens; }
 
     bool is_internode_available() const;
