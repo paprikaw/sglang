@@ -71,7 +71,7 @@ __forceinline__ __device__ uint64_t control_p2p_ptr(const uint64_t& ptr, const i
 }
 
 
-// Experimental BF16 EP8 backend. Routing/slot allocation stay in the original
+// Experimental BF16 EP4/EP8 backend. Routing/slot allocation stay in the original
 // kernels. Only the late cross-pair writes become local dynamically packed
 // frames. Neither routes nor transfer lengths are provided by the benchmark.
 struct CEDevice {
@@ -79,7 +79,7 @@ struct CEDevice {
     int* counts;
     int* notifications;
     uint64_t frame_bytes, ready_offset, ack_offset;
-    int capacity, rank;
+    int capacity, rank, world, local_experts;
 };
 __device__ __constant__ CEDevice ce_device;
 static CEDevice ce_host{};
@@ -92,14 +92,16 @@ static uint64_t ce_metrics[6]{};
 extern "C" __attribute__((visibility("default"))) int deepep_ce_configure(
     uint64_t send, uint64_t recv, const uint64_t* peers, int* counts,
     int* notifications, int* host_counts, int capacity, int rank) {
-    if (ce_configured or capacity != 768 or rank < 0 or rank >= 8)
+    const int world = capacity == 768 ? 8 : capacity == 1536 ? 4 : 0;
+    if (ce_configured or world == 0 or rank < 0 or rank >= world)
         return static_cast<int>(cudaErrorInvalidValue);
     ce_host.send=send; ce_host.recv=recv; ce_host.counts=counts;
     ce_host.notifications=notifications; ce_host.capacity=capacity; ce_host.rank=rank;
+    ce_host.world=world; ce_host.local_experts=24/world;
     ce_host.frame_bytes=16ull + capacity * (16ull + 16 + 5120 * 2);
-    ce_host.ready_offset=ce_host.frame_bytes * 8;
-    ce_host.ack_offset=ce_host.ready_offset + 8 * 128;
-    for (int i=0; i<8; ++i) ce_host.peers[i]=peers[i];
+    ce_host.ready_offset=ce_host.frame_bytes * world;
+    ce_host.ack_offset=ce_host.ready_offset + world * 128;
+    for (int i=0; i<world; ++i) ce_host.peers[i]=peers[i];
     ce_host_counts=host_counts;
     auto status=cudaMemcpyToSymbol(ce_device, &ce_host, sizeof(ce_host));
     ce_configured=status==cudaSuccess;
@@ -126,7 +128,7 @@ __forceinline__ __device__ uint64_t ce_allocate(int peer, uint64_t offset, int b
 
 __global__ __launch_bounds__(32,1) void ce_finalize_frames(int payload_bytes) {
     const int peer=threadIdx.x;
-    if (peer<8) {
+    if (peer<ce_device.world) {
         auto header=reinterpret_cast<int4*>(ce_device.send+peer*ce_device.frame_bytes);
         *header=make_int4(ce_device.counts[peer],payload_bytes+16,0,0);
     }
@@ -135,7 +137,7 @@ __global__ __launch_bounds__(32,1) void ce_finalize_frames(int payload_bytes) {
 template <bool kAck>
 __global__ __launch_bounds__(32,1) void ce_exchange_completion(int epoch) {
     int peer=threadIdx.x;
-    const bool eligible=peer<8 and ce_device.peers[peer]!=0 and
+    const bool eligible=peer<ce_device.world and ce_device.peers[peer]!=0 and
                         peer!=ce_device.rank and peer!=(ce_device.rank^1);
     const auto flags=kAck ? ce_device.ack_offset : ce_device.ready_offset;
     if (eligible)
@@ -155,7 +157,7 @@ __global__ __launch_bounds__(32,1) void ce_exchange_completion(int epoch) {
 
 __global__ __launch_bounds__(1024,1) void ce_unpack(void* output, uint64_t output_bytes) {
     const int warp=blockIdx.x*32+threadIdx.x/32;
-    for (int peer=0; peer<8; ++peer) {
+    for (int peer=0; peer<ce_device.world; ++peer) {
         if (ce_device.peers[peer]==0 or peer==ce_device.rank or peer==(ce_device.rank^1)) continue;
         const auto frame=ce_device.recv+peer*ce_device.frame_bytes;
         const auto header=*reinterpret_cast<const int4*>(frame);
@@ -175,8 +177,9 @@ __global__ __launch_bounds__(1024,1) void ce_unpack(void* output, uint64_t outpu
 __global__ __launch_bounds__(32,1) void ce_notify(bool dispatch_mode, int* flags, int* mask) {
     const int i=threadIdx.x;
     if (i>=24) return;
-    const int dst=i/3, local_expert=i%3, rank=ce_device.rank;
-    const auto ptr=reinterpret_cast<uint64_t>(flags+(dispatch_mode ? local_expert*8+rank : rank*3+local_expert));
+    const int nlocal=ce_device.local_experts;
+    const int dst=i/nlocal, local_expert=i%nlocal, rank=ce_device.rank;
+    const auto ptr=reinterpret_cast<uint64_t>(flags+(dispatch_mode ? local_expert*ce_device.world+rank : rank*nlocal+local_expert));
     const auto p2p=control_p2p_ptr(ptr,rank,dst,false);
     const int value=dispatch_mode ? ce_device.notifications[i] : 1;
     if (not is_rank_masked(mask,dst)) {
@@ -186,21 +189,21 @@ __global__ __launch_bounds__(32,1) void ce_notify(bool dispatch_mode, int* flags
 }
 
 void ce_begin(int rank, int world, int hidden, int experts, int capacity, cudaStream_t stream) {
-    EP_HOST_ASSERT(ce_configured and rank==ce_host.rank and world==8 and hidden==5120 and experts==24 and capacity==256);
+    EP_HOST_ASSERT(ce_configured and rank==ce_host.rank and world==ce_host.world and hidden==5120 and experts==24 and capacity==256);
     cudaStreamCaptureStatus capture;
     EP_HOST_ASSERT(cudaStreamIsCapturing(stream,&capture)==cudaSuccess and capture==cudaStreamCaptureStatusNone);
-    EP_HOST_ASSERT(cudaMemsetAsync(ce_host.counts,0,8*sizeof(int),stream)==cudaSuccess);
+    EP_HOST_ASSERT(cudaMemsetAsync(ce_host.counts,0,ce_host.world*sizeof(int),stream)==cudaSuccess);
 }
 
 void ce_finish(bool dispatch_mode, void* recv, int* flags, int* mask, cudaStream_t stream) {
     const int payload_bytes=5120*2+(dispatch_mode ? 16 : 0);
-    const uint64_t output_bytes=dispatch_mode ? 3ull*8*256*payload_bytes : 24ull*256*(5120*2+160);
+    const uint64_t output_bytes=dispatch_mode ? 24ull*256*payload_bytes : 24ull*256*(5120*2+160);
     ce_finalize_frames<<<1,32,0,stream>>>(payload_bytes);
     // Dynamic GPU counts become CPU memcpy sizes. This synchronization is
     // deliberately included in the real dispatch/combine timing.
-    EP_HOST_ASSERT(cudaMemcpyAsync(ce_host_counts,ce_host.counts,8*sizeof(int),cudaMemcpyDeviceToHost,stream)==cudaSuccess);
+    EP_HOST_ASSERT(cudaMemcpyAsync(ce_host_counts,ce_host.counts,ce_host.world*sizeof(int),cudaMemcpyDeviceToHost,stream)==cudaSuccess);
     EP_HOST_ASSERT(cudaStreamSynchronize(stream)==cudaSuccess);
-    for (int peer=0; peer<8; ++peer) {
+    for (int peer=0; peer<ce_host.world; ++peer) {
         const bool eligible=ce_host.peers[peer]!=0 and peer!=ce_host.rank and peer!=(ce_host.rank^1);
         const int count=ce_host_counts[peer];
         EP_HOST_ASSERT(count>=0 and count<=ce_host.capacity and (eligible or count==0));
