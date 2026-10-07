@@ -89,16 +89,17 @@ static int ce_epoch = 0;
 // calls, memcpy calls, wire bytes, payload copies, dispatch calls, combine calls
 static uint64_t ce_metrics[6]{};
 
-extern "C" __attribute__((visibility("default"))) int deepep_ce_configure(
+extern "C" __attribute__((visibility("default"))) int deepep_ce_configure_v2(
     uint64_t send, uint64_t recv, const uint64_t* peers, int* counts,
-    int* notifications, int* host_counts, int capacity, int rank) {
-    const int world = capacity == 768 ? 8 : capacity == 1536 ? 4 : capacity == 4096 ? 3 : 0;
-    if (ce_configured or world == 0 or rank < 0 or rank >= world)
+    int* notifications, int* host_counts, int capacity, int rank, int world, int token_capacity) {
+    if (ce_configured or (world != 3 and world != 4 and world != 8) or
+        token_capacity <= 0 or token_capacity > 2048 or
+        capacity != token_capacity * (24/world) or rank < 0 or rank >= world)
         return static_cast<int>(cudaErrorInvalidValue);
     ce_host.send=send; ce_host.recv=recv; ce_host.counts=counts;
     ce_host.notifications=notifications; ce_host.capacity=capacity; ce_host.rank=rank;
     ce_host.world=world; ce_host.local_experts=24/world;
-    ce_host.token_capacity=capacity/ce_host.local_experts;
+    ce_host.token_capacity=token_capacity;
     ce_host.frame_bytes=16ull + capacity * (16ull + 16 + 5120 * 2);
     ce_host.ready_offset=ce_host.frame_bytes * world;
     ce_host.ack_offset=ce_host.ready_offset + world * 128;
