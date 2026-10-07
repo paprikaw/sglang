@@ -20,6 +20,14 @@
 #define LOW_LATENCY_SEND_PHASE 1
 #define LOW_LATENCY_RECV_PHASE 2
 
+// Isolate concurrent SM80 PCIe/NIC producers' 4-byte completion cells.
+// This protocol stride must agree between host layout and device indexing.
+#ifdef DISABLE_SM90_FEATURES
+#define LOW_LATENCY_SIGNAL_STRIDE_INTS 32
+#else
+#define LOW_LATENCY_SIGNAL_STRIDE_INTS 1
+#endif
+
 // Make CLion CUDA indexing work
 #ifdef __CLION_IDE__
 #define __CUDA_ARCH__ 900  // NOLINT(*-reserved-identifier)

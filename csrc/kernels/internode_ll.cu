@@ -20,16 +20,12 @@ __forceinline__ __device__ bool is_rank_masked(int* mask_buffer_ptr, int rank) {
     }
 }
 
-// Experimental SM80 transport split: payload keeps its configured P2P
-// eligibility, but cross-pair completion/control messages use IBGDA.
-// Self and rank^1 NVLink notifications retain their original fast path.
+// Control follows the same configured P2P eligibility as the payload. SM80
+// count/flag cells are isolated in the symmetric layout and use single-writer
+// release stores locally; remote flags retain ordered inline IBGDA writes.
 __forceinline__ __device__ uint64_t control_p2p_ptr(const uint64_t& ptr, const int& rank,
                                                   const int& dst_rank, bool nvlink_pair_only) {
-#ifdef DISABLE_SM90_FEATURES
-    return nvshmemi_get_p2p_ptr(ptr, rank, dst_rank, true);
-#else
     return nvshmemi_get_p2p_ptr(ptr, rank, dst_rank, nvlink_pair_only);
-#endif
 }
 
 template <int kNumThreads>
@@ -355,7 +351,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         // Wait local sends issued and send expert counts
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2)
             ;
-        auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
+        auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count +
+            (dst_expert_local_idx * num_ranks + rank) * LOW_LATENCY_SIGNAL_STRIDE_INTS);
         auto dst_p2p_ptr = control_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             if (dst_p2p_ptr == 0) {
@@ -414,7 +411,8 @@ LOW_LATENCY_DISPATCH_RECV:
             auto start_time = clock64();
             uint64_t wait_recv_cost = 0;
             if (not is_rank_masked(mask_buffer_ptr, src_rank)) {
-                while ((num_recv_tokens = ld_acquire_sys_global(rdma_recv_count + local_expert_idx * num_ranks + src_rank)) ==
+                while ((num_recv_tokens = ld_acquire_sys_global(rdma_recv_count +
+                             (local_expert_idx * num_ranks + src_rank) * LOW_LATENCY_SIGNAL_STRIDE_INTS)) ==
                            0                                                               // data not arrived
                        && (wait_recv_cost = clock64() - start_time) <= NUM_TIMEOUT_CYCLES  // not timeout
                 )
@@ -1042,7 +1040,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
         if (sub_warp_id == 1 and lane_id == 0) {
             while (ld_acquire_global(atomic_clean_flag) == 0)
                 ;
-            auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
+            auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx * LOW_LATENCY_SIGNAL_STRIDE_INTS);
             auto dst_p2p_ptr = control_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
                 if (dst_p2p_ptr == 0) {
@@ -1081,7 +1079,7 @@ LOW_LATENCY_COMBINE_RECV:
             auto start_time = clock64();
             uint64_t wait_recv_cost = 0;
             if (not is_rank_masked(mask_buffer_ptr, src_rank)) {
-                while (ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx) == 0  // recv not ready
+                while (ld_acquire_sys_global(rdma_recv_flag + responsible_expert_idx * LOW_LATENCY_SIGNAL_STRIDE_INTS) == 0  // recv not ready
                        && (wait_recv_cost = clock64() - start_time) <= NUM_TIMEOUT_CYCLES   // not timeout
                 )
                     ;
