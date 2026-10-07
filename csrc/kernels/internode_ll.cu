@@ -8,6 +8,44 @@ namespace deep_ep {
 
 namespace internode_ll {
 
+// Internal SM80-only launch phase. No public ABI or SM90 behavior changes.
+constexpr int kRDMAFirstPayloadPhase = 4;
+
+// A preceding send kernel has exited, so no GPU writer is still reserving or
+// filling these QPs. Flush every ready tail (including batches shorter than
+// eight), then poll precisely that completion index. The existing quiet helper
+// can see only the CPU proxy's already posted index, which is insufficient here.
+__global__ __launch_bounds__(32, 1) void drain_rdma_before_pcie(int rank, int num_ranks) {
+    const auto state = ibgda_get_state();
+    const auto qps_per_rank = state->num_rc_per_pe * state->num_devices_initialized;
+    for (int i = threadIdx.x; i < qps_per_rank * (num_ranks - 1); i += blockDim.x) {
+        const auto dst_rank = (rank + 1 + i / qps_per_rank) % num_ranks;
+        const auto qp_id = i % qps_per_rank;
+        auto qp = ibgda_get_rc(dst_rank, qp_id);
+        const auto ready = ld_na_relaxed(&qp->mvars.tx_wq.ready_head);
+        if (state->use_async_postsend)
+            ibgda_proxy_post_send(qp, ready);
+        else
+            ibgda_post_send(qp, ready);
+        ibgda_poll_cq(qp->tx_wq.cq, ready);
+    }
+    __syncthreads();
+    // All ranks must drain before any rank starts its local PCIe writes;
+    // per-rank completion alone still permits another rank's NIC/PCIe overlap.
+    nvshmemx_barrier_all_block();
+}
+
+void launch_drain_rdma_before_pcie(int rank, int num_ranks, cudaStream_t stream) {
+    SETUP_LAUNCH_CONFIG(1, 32, stream);
+    LAUNCH_KERNEL(&cfg, drain_rdma_before_pcie, rank, num_ranks);
+}
+
+__forceinline__ __device__ bool is_cross_pair_pcie(uint64_t ptr, int rank, int dst_rank,
+                                                bool nvlink_pair_only) {
+    return dst_rank != rank and dst_rank != (rank ^ 1) and
+           nvshmemi_get_p2p_ptr(ptr, rank, dst_rank, nvlink_pair_only) != 0;
+}
+
 template <bool use_warp_sync = false>
 __forceinline__ __device__ bool is_rank_masked(int* mask_buffer_ptr, int rank) {
     if (mask_buffer_ptr == nullptr) {
@@ -181,6 +219,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     const auto warp_group_id = warp_id / num_warps_per_group;
     const auto sub_warp_id = warp_id % num_warps_per_group;
     const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
+#ifdef DISABLE_SM90_FEATURES
+    const bool split_rdma_first = not nvlink_pair_only;
+    const bool early_rdma_payload_only = (phases & kRDMAFirstPayloadPhase) != 0;
+#else
+    constexpr bool split_rdma_first = false, early_rdma_payload_only = false;
+#endif
 
     // May extract UE8M0 from the scales
     using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
@@ -226,55 +270,66 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
 
             // Overlap top-k index read and source token index writes
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
-            thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
+            // Preserve RDMA source storage while the NIC drains the early
+            // submissions. The late PCIe stage only reads the prepared payload.
+            if (not split_rdma_first or early_rdma_payload_only) {
+                thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
 
-            // FP8 cast
-            EP_STATIC_ASSERT(hidden_bf16_int4 % 32 == 0, "Must use the full warp to reduce");
-            #pragma unroll
-            for (int i = thread_id; i < hidden_bf16_int4; i += num_threads) {
-                // Read
-                auto int4_value = __ldg(x_int4 + i);
+                // FP8 cast
+                EP_STATIC_ASSERT(hidden_bf16_int4 % 32 == 0, "Must use the full warp to reduce");
+                #pragma unroll
+                for (int i = thread_id; i < hidden_bf16_int4; i += num_threads) {
+                    // Read
+                    auto int4_value = __ldg(x_int4 + i);
 
-                if constexpr (kUseFP8) {
-                    // Calculate local amax
-                    auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
-                    float fp32_values[kNumElemsPerRead];
-                    float amax = kFP8Margin, scale, scale_inv;
-                    #pragma unroll
-                    for (int j = 0; j < kNumElemsPerRead; ++j) {
-                        fp32_values[j] = static_cast<float>(bf16_values[j]);
-                        amax = fmaxf(amax, fabsf(fp32_values[j]));
+                    if constexpr (kUseFP8) {
+                        // Calculate local amax
+                        auto bf16_values = reinterpret_cast<nv_bfloat16*>(&int4_value);
+                        float fp32_values[kNumElemsPerRead];
+                        float amax = kFP8Margin, scale, scale_inv;
+                        #pragma unroll
+                        for (int j = 0; j < kNumElemsPerRead; ++j) {
+                            fp32_values[j] = static_cast<float>(bf16_values[j]);
+                            amax = fmaxf(amax, fabsf(fp32_values[j]));
+                        }
+
+                        // Reduce amax and scale
+                        EP_STATIC_ASSERT(kNumElemsPerRead * 32 / kNumPerChannels == 2, "Invalid vectorization");
+                        amax = warp_reduce_max<16>(amax);
+                        calculate_fp8_scales(amax, scale, scale_inv, round_scale);
+                        if (lane_id == 0 or lane_id == 16)
+                            rdma_x_scales[i * kNumElemsPerRead / 128] = scale_inv;
+
+                        // Cast into send buffer
+                        vec_t int2_value;
+                        auto fp8x2_values = reinterpret_cast<__nv_fp8x2_storage_t*>(&int2_value);
+                        #pragma unroll
+                        for (int j = 0; j < kNumElemsPerRead; j += 2) {
+                            float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
+                            fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
+                        }
+                        rdma_x_vec[i] = int2_value;
+                    } else {
+                        // Reinterpret-cast is for C++14 compatibility
+                        rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&int4_value);
                     }
-
-                    // Reduce amax and scale
-                    EP_STATIC_ASSERT(kNumElemsPerRead * 32 / kNumPerChannels == 2, "Invalid vectorization");
-                    amax = warp_reduce_max<16>(amax);
-                    calculate_fp8_scales(amax, scale, scale_inv, round_scale);
-                    if (lane_id == 0 or lane_id == 16)
-                        rdma_x_scales[i * kNumElemsPerRead / 128] = scale_inv;
-
-                    // Cast into send buffer
-                    vec_t int2_value;
-                    auto fp8x2_values = reinterpret_cast<__nv_fp8x2_storage_t*>(&int2_value);
-                    #pragma unroll
-                    for (int j = 0; j < kNumElemsPerRead; j += 2) {
-                        float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
-                        fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
-                    }
-                    rdma_x_vec[i] = int2_value;
-                } else {
-                    // Reinterpret-cast is for C++14 compatibility
-                    rdma_x_vec[i] = *reinterpret_cast<vec_t*>(&int4_value);
                 }
             }
             asm volatile("bar.sync 1, %0;" ::"r"(num_threads));
 
             // Issue IBGDA sends
             if (dst_expert_idx >= 0) {
-                int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
-                slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
                 const auto dst_rank = dst_expert_idx / num_local_experts;
                 const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
+                // Allocate each destination slot exactly once across the two
+                // launches. Phase 4 prepares the source once and sends self/NVLink/RDMA;
+                // the ordinary send copies PCIe and publishes all notifications.
+                if (split_rdma_first and
+                    is_cross_pair_pcie(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank,
+                                       nvlink_pair_only) == early_rdma_payload_only)
+                    continue;
+                int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
+                slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
                 const auto src_ptr = reinterpret_cast<uint64_t>(rdma_x_src_idx);
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
@@ -288,13 +343,6 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                         const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                         const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
                         UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
-#ifdef DISABLE_SM90_FEATURES
-                        // Each writer flushes its cross-pair P2P payload before
-                        // publishing the local completion counter used by the
-                        // separate warp that issues the RDMA count notification.
-                        if (dst_rank != rank and dst_rank != (rank ^ 1))
-                            __threadfence_system();
-#endif
                     }
                 }
 
@@ -303,7 +351,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
             }
         }
-    } else if (warp_id == num_warps - 1) {
+        // Each writer flushes once after its selected payloads. The early
+        // launch completes before the late one; late writers globally synchronize
+        // before any completion count can be issued by another block.
+        if (split_rdma_first)
+            __threadfence_system();
+    } else if (warp_id == num_warps - 1 and not early_rdma_payload_only) {
         EP_DEVICE_ASSERT(num_sms > 1);
         if (sm_id == 0) {
             // The first SM is also responsible for checking QPs
@@ -345,6 +398,10 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         }
     }
     __syncthreads();
+    if (early_rdma_payload_only)
+        return;
+    if (split_rdma_first)
+        cg::this_grid().sync();
 
     // Issue count sends
     if (responsible_expert_idx < num_experts and sub_warp_id == 0 and lane_id == 0) {
@@ -547,6 +604,7 @@ void dispatch(void* packed_recv_x,
             dispatch_func = dispatch<true, false, hidden>;   \
         if (use_fp8 and use_ue8m0)                           \
             dispatch_func = dispatch<true, true, hidden>;    \
+        auto launch_dispatch_phase = [&](int launch_phases) { \
         LAUNCH_KERNEL(&cfg,                                  \
                       dispatch_func,                         \
                       packed_recv_x,                         \
@@ -575,12 +633,23 @@ void dispatch(void* packed_recv_x,
                       num_warp_groups,                       \
                       num_warps_per_group,                   \
                       round_scale,                           \
-                      phases,                                \
+                      launch_phases,                         \
                       nvlink_pair_only);                     \
+        };                                                   \
+        if (split_rdma_first and (phases & LOW_LATENCY_SEND_PHASE)) { \
+            launch_dispatch_phase(LOW_LATENCY_SEND_PHASE | kRDMAFirstPayloadPhase); \
+            launch_drain_rdma_before_pcie(rank, num_ranks, stream); \
+        }                                                    \
+        launch_dispatch_phase(phases);                       \
     }                                                        \
     break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+#ifdef DISABLE_SM90_FEATURES
+    const bool split_rdma_first = not nvlink_pair_only;
+#else
+    constexpr bool split_rdma_first = false;
+#endif
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
@@ -781,6 +850,12 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
     const auto warp_group_id = warp_id / num_warps_per_group;
     const auto sub_warp_id = warp_id % num_warps_per_group;
     const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
+#ifdef DISABLE_SM90_FEATURES
+    const bool split_rdma_first = not nvlink_pair_only;
+    const bool early_rdma_payload_only = (phases & kRDMAFirstPayloadPhase) != 0;
+#else
+    constexpr bool split_rdma_first = false, early_rdma_payload_only = false;
+#endif
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
@@ -809,7 +884,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
         goto LOW_LATENCY_COMBINE_RECV;
 
     // Clean up next buffer
-    if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
+    if (not early_rdma_payload_only and sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
         #pragma unroll
         for (int i = lane_id; i < num_next_clean_int; i += 32)
             next_clean[i] = 0;
@@ -868,7 +943,10 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
 #endif
 
         // Issue IBGDA send
-        if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
+        if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank) and
+            (not split_rdma_first or
+             is_cross_pair_pcie(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank,
+                                nvlink_pair_only) != early_rdma_payload_only)) {
             for (int token_idx = offset + sub_warp_id; token_idx < offset + num_tokens_to_send; token_idx += num_warps_per_group) {
                 const auto x_int4 = local_x + token_idx * hidden_bf16_int4;
                 const auto rdma_send_type_row = reinterpret_cast<int*>(rdma_send_x_vec + token_idx * num_bytes_per_slot);
@@ -1031,7 +1109,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
         // the warp-group barrier and the separate RDMA finishing-flag issuer.
         // A fence in only the issuer would not cover other writers' P2P stores.
 #ifdef DISABLE_SM90_FEATURES
-        if (dst_rank != rank and dst_rank != (rank ^ 1) and
+        if (split_rdma_first and dst_rank != rank and
             nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank, nvlink_pair_only) != 0)
             __threadfence_system();
 #endif
@@ -1039,7 +1117,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
         // Put the finishing flag
         EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 16);
         asm volatile("bar.sync %0, %1;" ::"r"(warp_group_id + 1), "r"(num_warps_per_group * 32));
-        if (sub_warp_id == 1 and lane_id == 0) {
+        if (not early_rdma_payload_only and sub_warp_id == 1 and lane_id == 0) {
             while (ld_acquire_global(atomic_clean_flag) == 0)
                 ;
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
@@ -1373,6 +1451,7 @@ void combine(void* combined_x,
         auto combine_func =                                                                                                        \
             use_logfmt ? combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls> : combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
         SET_SHARED_MEMORY_FOR_TMA(combine_func);                                                                                   \
+        auto launch_combine_phase = [&](int launch_phases) {                                                                        \
         LAUNCH_KERNEL(&cfg,                                                                                                        \
                       combine_func,                                                                                                \
                       combined_x,                                                                                                  \
@@ -1398,13 +1477,24 @@ void combine(void* combined_x,
                       num_ranks,                                                                                                   \
                       num_warp_groups,                                                                                             \
                       num_warps_per_group,                                                                                         \
-                      phases,                                                                                                      \
+                      launch_phases,                                                                                               \
                       zero_copy,                                                                                                   \
                       nvlink_pair_only);                                                                                           \
+        };                                                                                                                         \
+        if (split_rdma_first and (phases & LOW_LATENCY_SEND_PHASE)) {                                                               \
+            launch_combine_phase(LOW_LATENCY_SEND_PHASE | kRDMAFirstPayloadPhase);                                                   \
+            launch_drain_rdma_before_pcie(rank, num_ranks, stream);                                                                \
+        }                                                                                                                        \
+        launch_combine_phase(phases);                                                                                              \
     }                                                                                                                              \
     break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+#ifdef DISABLE_SM90_FEATURES
+    const bool split_rdma_first = not nvlink_pair_only;
+#else
+    constexpr bool split_rdma_first = false;
+#endif
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 }
