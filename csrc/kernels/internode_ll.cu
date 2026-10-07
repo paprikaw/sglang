@@ -71,7 +71,7 @@ __forceinline__ __device__ uint64_t control_p2p_ptr(const uint64_t& ptr, const i
 }
 
 
-// Experimental BF16 EP4/EP8 backend. Routing/slot allocation stay in the original
+// Experimental BF16 EP3/EP4/EP8 backend. Routing/slot allocation stay in the original
 // kernels. Only the late cross-pair writes become local dynamically packed
 // frames. Neither routes nor transfer lengths are provided by the benchmark.
 struct CEDevice {
@@ -79,7 +79,7 @@ struct CEDevice {
     int* counts;
     int* notifications;
     uint64_t frame_bytes, ready_offset, ack_offset;
-    int capacity, rank, world, local_experts;
+    int capacity, rank, world, local_experts, token_capacity;
 };
 __device__ __constant__ CEDevice ce_device;
 static CEDevice ce_host{};
@@ -92,12 +92,13 @@ static uint64_t ce_metrics[6]{};
 extern "C" __attribute__((visibility("default"))) int deepep_ce_configure(
     uint64_t send, uint64_t recv, const uint64_t* peers, int* counts,
     int* notifications, int* host_counts, int capacity, int rank) {
-    const int world = capacity == 768 ? 8 : capacity == 1536 ? 4 : 0;
+    const int world = capacity == 768 ? 8 : capacity == 1536 ? 4 : capacity == 4096 ? 3 : 0;
     if (ce_configured or world == 0 or rank < 0 or rank >= world)
         return static_cast<int>(cudaErrorInvalidValue);
     ce_host.send=send; ce_host.recv=recv; ce_host.counts=counts;
     ce_host.notifications=notifications; ce_host.capacity=capacity; ce_host.rank=rank;
     ce_host.world=world; ce_host.local_experts=24/world;
+    ce_host.token_capacity=capacity/ce_host.local_experts;
     ce_host.frame_bytes=16ull + capacity * (16ull + 16 + 5120 * 2);
     ce_host.ready_offset=ce_host.frame_bytes * world;
     ce_host.ack_offset=ce_host.ready_offset + world * 128;
@@ -189,7 +190,7 @@ __global__ __launch_bounds__(32,1) void ce_notify(bool dispatch_mode, int* flags
 }
 
 void ce_begin(int rank, int world, int hidden, int experts, int capacity, cudaStream_t stream) {
-    EP_HOST_ASSERT(ce_configured and rank==ce_host.rank and world==ce_host.world and hidden==5120 and experts==24 and capacity==256);
+    EP_HOST_ASSERT(ce_configured and rank==ce_host.rank and world==ce_host.world and hidden==5120 and experts==24 and capacity==ce_host.token_capacity);
     cudaStreamCaptureStatus capture;
     EP_HOST_ASSERT(cudaStreamIsCapturing(stream,&capture)==cudaSuccess and capture==cudaStreamCaptureStatusNone);
     EP_HOST_ASSERT(cudaMemsetAsync(ce_host.counts,0,ce_host.world*sizeof(int),stream)==cudaSuccess);
@@ -197,7 +198,7 @@ void ce_begin(int rank, int world, int hidden, int experts, int capacity, cudaSt
 
 void ce_finish(bool dispatch_mode, void* recv, int* flags, int* mask, cudaStream_t stream) {
     const int payload_bytes=5120*2+(dispatch_mode ? 16 : 0);
-    const uint64_t output_bytes=dispatch_mode ? 24ull*256*payload_bytes : 24ull*256*(5120*2+160);
+    const uint64_t output_bytes=dispatch_mode ? 24ull*ce_host.token_capacity*payload_bytes : 24ull*ce_host.token_capacity*(5120*2+160);
     ce_finalize_frames<<<1,32,0,stream>>>(payload_bytes);
     // Dynamic GPU counts become CPU memcpy sizes. This synchronization is
     // deliberately included in the real dispatch/combine timing.
