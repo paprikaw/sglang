@@ -19,6 +19,18 @@ __forceinline__ __device__ bool is_rank_masked(int* mask_buffer_ptr, int rank) {
     }
 }
 
+// Experimental SM80 transport split: payload keeps its configured P2P
+// eligibility, but cross-pair completion/control messages use IBGDA.
+// Self and rank^1 NVLink notifications retain their original fast path.
+__forceinline__ __device__ uint64_t control_p2p_ptr(const uint64_t& ptr, const int& rank,
+                                                  const int& dst_rank, bool nvlink_pair_only) {
+#ifdef DISABLE_SM90_FEATURES
+    return nvshmemi_get_p2p_ptr(ptr, rank, dst_rank, true);
+#else
+    return nvshmemi_get_p2p_ptr(ptr, rank, dst_rank, nvlink_pair_only);
+#endif
+}
+
 template <int kNumThreads>
 __forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, int* mask_buffer_ptr, int* sync_buffer_ptr,
                                       bool nvlink_pair_only) {
@@ -43,7 +55,7 @@ __forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, 
     if (thread_id < num_ranks && thread_id != rank) {
         const auto dst_rank = thread_id;
         const auto dst_ptr = reinterpret_cast<uint64_t>(sync_buffer_ptr + rank);
-        const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
+        const auto dst_p2p_ptr = control_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
 
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             if (dst_p2p_ptr == 0) {
@@ -275,6 +287,13 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                         const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                         const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
                         UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
+#ifdef DISABLE_SM90_FEATURES
+                        // Each writer flushes its cross-pair P2P payload before
+                        // publishing the local completion counter used by the
+                        // separate warp that issues the RDMA count notification.
+                        if (dst_rank != rank and dst_rank != (rank ^ 1))
+                            __threadfence_system();
+#endif
                     }
                 }
 
@@ -336,7 +355,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2)
             ;
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
-        auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
+        auto dst_p2p_ptr = control_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
         if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             if (dst_p2p_ptr == 0) {
                 nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
@@ -1003,6 +1022,15 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
             }
         }
 
+        // One system fence per sending writer (after its token loop), before
+        // the warp-group barrier and the separate RDMA finishing-flag issuer.
+        // A fence in only the issuer would not cover other writers' P2P stores.
+#ifdef DISABLE_SM90_FEATURES
+        if (dst_rank != rank and dst_rank != (rank ^ 1) and
+            nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank, nvlink_pair_only) != 0)
+            __threadfence_system();
+#endif
+
         // Put the finishing flag
         EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 16);
         asm volatile("bar.sync %0, %1;" ::"r"(warp_group_id + 1), "r"(num_warps_per_group * 32));
@@ -1010,7 +1038,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
             while (ld_acquire_global(atomic_clean_flag) == 0)
                 ;
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
-            auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
+            auto dst_p2p_ptr = control_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
             if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
                 if (dst_p2p_ptr == 0) {
                     nvshmemi_ibgda_amo_nonfetch_add(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
