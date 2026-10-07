@@ -165,9 +165,19 @@ __device__ static __forceinline__ void ibgda_submit_requests(nvshmemi_ibgda_devi
     while (atomicCAS(ready_idx, base_wqe_idx, new_wqe_idx) != base_wqe_idx)
         ;
 
-    // Always post, not in batch
     if (state->use_async_postsend) {
+#if defined(DISABLE_SM90_FEATURES) && defined(DEEPEP_LL_CPU_POST_BATCH)
+        // Payload WQEs become visible in ready-head order. Notify the CPU
+        // proxy at queue-index boundaries rather than for every token.
+        // A final control/count WQE always forces a post, including a tail
+        // shorter than one batch; do not suppress its system-scope update.
+        constexpr uint64_t kCPUPostBatch = DEEPEP_LL_CPU_POST_BATCH;
+        static_assert(kCPUPostBatch > 0, "CPU post batch must be nonzero");
+        if (kAlwaysDoPostSend or base_wqe_idx / kCPUPostBatch != new_wqe_idx / kCPUPostBatch)
+            ibgda_proxy_post_send(qp, new_wqe_idx);
+#else
         ibgda_proxy_post_send(qp, new_wqe_idx);
+#endif
     } else {
         constexpr int kNumRequestInBatch = 4;
         if (kAlwaysDoPostSend or (message_idx + 1) % kNumRequestInBatch == 0)
