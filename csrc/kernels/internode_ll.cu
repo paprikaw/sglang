@@ -293,7 +293,10 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
             // (token, top-k slot) writes over the existing writer warps instead
             // of serializing all tokens of a block through only top-k warps.
             const auto copy_warps = num_sms * (num_warps - 1);
-            for (int job = warp_id * num_sms + sm_id; job < num_tokens * num_topk; job += copy_warps) {
+            // Rotate the block within each warp row. This is still a bijection,
+            // but avoids pinning periodic routing choices to the same block.
+            for (int job = warp_id * num_sms + (sm_id + warp_id) % num_sms;
+                 job < num_tokens * num_topk; job += copy_warps) {
                 const auto token_idx = job / num_topk;
                 const auto dst_expert_idx = static_cast<int>(__ldg(topk_idx + job));
                 if (dst_expert_idx < 0)
@@ -962,7 +965,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
         // Transpose the warp-to-job mapping across blocks. Every destination /
         // local-expert segment gets a disjoint set of row-striding warps across
         // the already allocated grid, rather than one responsible warp group.
-        const auto copy_warp = warp_id * num_sms + sm_id;
+        const auto copy_warp = warp_id * num_sms + (sm_id + warp_id) % num_sms;
         const auto copy_warps = num_sms * (num_threads / 32);
         const auto copy_group = copy_warp % num_experts;
         const auto dst_rank = copy_group / num_local_experts;
