@@ -3,6 +3,7 @@
 #define DEEPEP_LL_CPU_POST_BATCH 8
 #include "ibgda_device.cuh"
 #include "launch.cuh"
+#include <algorithm>
 
 namespace deep_ep {
 
@@ -1551,3 +1552,105 @@ void clean_mask_buffer(int* mask_buffer_ptr, int num_ranks, cudaStream_t stream)
 }  // namespace internode_ll
 
 }  // namespace deep_ep
+
+// Diagnostic-only PCIe copy backend comparison. Existing DeepEP entrypoints
+// above are unchanged. Addresses are prepared outside timing for BOTH modes;
+// these probes are not a drop-in dynamic-routing optimization.
+namespace deep_ep { namespace pcie_probe {
+struct Job { uint64_t src, dst, bytes; };
+static_assert(sizeof(Job) == 24);
+
+template <int kUnroll>
+__forceinline__ __device__ void copy_job(const Job& job) {
+    if (job.bytes) {
+        const auto* src = reinterpret_cast<const int4*>(job.src);
+        const auto* dst = reinterpret_cast<const int4*>(job.dst);
+        const int count = static_cast<int>(job.bytes / sizeof(int4));
+        UNROLLED_WARP_COPY(kUnroll, get_lane_id(), count, dst, src, ld_nc_global, st_na_global);
+    }
+}
+
+template <int kOperation>
+__global__ __launch_bounds__(1024, 1) void sm_copy(const Job* jobs, const int* counts, int capacity) {
+    const int warp = threadIdx.x / 32;
+    if constexpr (kOperation == 0) {
+        // Match dispatch's token/block and top-k/warp ownership: 24 blocks,
+        // eight payload warps per token. Other original bookkeeping is absent.
+        if (warp < 8) {
+            for (int token = blockIdx.x; token < 128; token += gridDim.x)
+                copy_job<8>(jobs[token * 8 + warp]);
+            __threadfence_system();
+        }
+    } else {
+        // Match combine's expert/destination groups: 24 active groups in a
+        // 64-block grid. Only the six cross-pair groups carry PCIe payload.
+        if (blockIdx.x < 24) {
+            for (int row = warp; row < counts[blockIdx.x]; row += 32)
+                copy_job<4>(jobs[blockIdx.x * capacity + row]);
+            __threadfence_system();
+        }
+    }
+}
+
+__global__ __launch_bounds__(1024, 1) void local_copy(const Job* jobs, int count) {
+    const int warp = blockIdx.x * 32 + threadIdx.x / 32;
+    for (int job = warp; job < count; job += gridDim.x * 32)
+        copy_job<4>(jobs[job]);
+    // These are local GPU pack/unpack stores. Stream ordering supplies the
+    // dependency with cudaMemcpyAsync; no remote-system fence is substituted.
+}
+
+__global__ __launch_bounds__(32, 1) void complete_pair(const uint64_t* peer_bases, uint64_t local_base,
+                                                     uint64_t flag_offset, int rank, int epoch) {
+    const int peer = threadIdx.x;
+    const bool eligible = peer < 8 and peer_bases[peer] != 0 and peer != rank and peer != (rank ^ 1);
+    if (eligible)
+        st_release_sys_global(reinterpret_cast<int*>(peer_bases[peer] + flag_offset + rank * 128), epoch);
+    __syncwarp();
+    if (eligible) {
+        const auto* flag = reinterpret_cast<const int*>(local_base + flag_offset + peer * 128);
+        const auto begin = clock64();
+        while (ld_acquire_sys_global(flag) != epoch) {
+            if (clock64() - begin > 10000000000ull) {
+                printf("PCIE_PROBE_TIMEOUT rank=%d peer=%d epoch=%d\n", rank, peer, epoch);
+                __trap();
+            }
+        }
+    }
+}
+}}  // namespace deep_ep::pcie_probe
+
+extern "C" __attribute__((visibility("default"))) int deepep_pcie_copy_probe(
+    int operation, int mode, const void* jobs, const int* counts, int capacity,
+    const void* pack_jobs, int pack_count, const void* unpack_jobs, int unpack_count,
+    const uint64_t* peer_bases, uint64_t local_base, uint64_t flag_offset,
+    const uint64_t* ce_sources, const uint64_t* ce_destinations, const uint64_t* ce_bytes, int ce_count,
+    int rank, int epoch, uint64_t stream_address) {
+    using namespace deep_ep::pcie_probe;
+    if (operation < 0 or operation > 1 or mode < 0 or mode > 1 or capacity != 256 or
+        ce_count != 2 or pack_count <= 0 or unpack_count <= 0)
+        return static_cast<int>(cudaErrorInvalidValue);
+    auto stream = reinterpret_cast<cudaStream_t>(stream_address);
+    if (mode == 0) {
+        if (operation == 0)
+            sm_copy<0><<<24, 1024, 0, stream>>>(static_cast<const Job*>(jobs), counts, capacity);
+        else
+            sm_copy<1><<<64, 1024, 0, stream>>>(static_cast<const Job*>(jobs), counts, capacity);
+    } else {
+        local_copy<<<std::min(24, (pack_count + 31) / 32), 1024, 0, stream>>>(static_cast<const Job*>(pack_jobs), pack_count);
+        auto status = cudaGetLastError();
+        if (status != cudaSuccess) return static_cast<int>(status);
+        for (int i = 0; i < ce_count; ++i) {
+            status = cudaMemcpyAsync(reinterpret_cast<void*>(ce_destinations[i]),
+                                     reinterpret_cast<const void*>(ce_sources[i]),
+                                     ce_bytes[i], cudaMemcpyDeviceToDevice, stream);
+            if (status != cudaSuccess) return static_cast<int>(status);
+        }
+    }
+    auto status = cudaGetLastError();
+    if (status != cudaSuccess) return static_cast<int>(status);
+    complete_pair<<<1, 32, 0, stream>>>(peer_bases, local_base, flag_offset, rank, epoch);
+    if (mode == 1)
+        local_copy<<<std::min(24, (unpack_count + 31) / 32), 1024, 0, stream>>>(static_cast<const Job*>(unpack_jobs), unpack_count);
+    return static_cast<int>(cudaGetLastError());
+}
