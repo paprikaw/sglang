@@ -1,5 +1,8 @@
 #include "configs.cuh"
 #include "exception.cuh"
+// Restrict CPU doorbell coalescing to this SM80 LL translation unit.
+// Normal/high-throughput kernels and SM90 retain their existing policy.
+#define DEEPEP_LL_CPU_POST_BATCH 8
 #include "ibgda_device.cuh"
 #include "launch.cuh"
 
