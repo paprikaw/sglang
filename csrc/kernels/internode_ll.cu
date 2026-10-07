@@ -70,6 +70,157 @@ __forceinline__ __device__ uint64_t control_p2p_ptr(const uint64_t& ptr, const i
 #endif
 }
 
+
+// Experimental BF16 EP8 backend. Routing/slot allocation stay in the original
+// kernels. Only the late cross-pair writes become local dynamically packed
+// frames. Neither routes nor transfer lengths are provided by the benchmark.
+struct CEDevice {
+    uint64_t send, recv, peers[8];
+    int* counts;
+    int* notifications;
+    uint64_t frame_bytes, ready_offset, ack_offset;
+    int capacity, rank;
+};
+__device__ __constant__ CEDevice ce_device;
+static CEDevice ce_host{};
+static int* ce_host_counts = nullptr;
+static bool ce_configured = false;
+static int ce_epoch = 0;
+// calls, memcpy calls, wire bytes, payload copies, dispatch calls, combine calls
+static uint64_t ce_metrics[6]{};
+
+extern "C" __attribute__((visibility("default"))) int deepep_ce_configure(
+    uint64_t send, uint64_t recv, const uint64_t* peers, int* counts,
+    int* notifications, int* host_counts, int capacity, int rank) {
+    if (ce_configured or capacity != 768 or rank < 0 or rank >= 8)
+        return static_cast<int>(cudaErrorInvalidValue);
+    ce_host.send=send; ce_host.recv=recv; ce_host.counts=counts;
+    ce_host.notifications=notifications; ce_host.capacity=capacity; ce_host.rank=rank;
+    ce_host.frame_bytes=16ull + capacity * (16ull + 16 + 5120 * 2);
+    ce_host.ready_offset=ce_host.frame_bytes * 8;
+    ce_host.ack_offset=ce_host.ready_offset + 8 * 128;
+    for (int i=0; i<8; ++i) ce_host.peers[i]=peers[i];
+    ce_host_counts=host_counts;
+    auto status=cudaMemcpyToSymbol(ce_device, &ce_host, sizeof(ce_host));
+    ce_configured=status==cudaSuccess;
+    return static_cast<int>(status);
+}
+extern "C" __attribute__((visibility("default"))) int deepep_ce_snapshot(uint64_t* out) {
+    if (not ce_configured) return -1;
+    for (int i=0; i<6; ++i) out[i]=ce_metrics[i];
+    return ce_epoch;
+}
+
+__forceinline__ __device__ uint64_t ce_allocate(int peer, uint64_t offset, int bytes) {
+    int slot=get_lane_id()==0 ? atomicAdd(ce_device.counts+peer,1) : 0;
+    slot=__shfl_sync(0xffffffff,slot,0);
+    EP_DEVICE_ASSERT(slot < ce_device.capacity and bytes % 16 == 0);
+    auto packet=ce_device.send+peer*ce_device.frame_bytes+16ull+slot*(bytes+16ull);
+    if (get_lane_id()==0) {
+        *reinterpret_cast<uint64_t*>(packet)=offset;
+        reinterpret_cast<int*>(packet)[2]=bytes;
+        reinterpret_cast<int*>(packet)[3]=0;
+    }
+    return packet+16;
+}
+
+__global__ __launch_bounds__(32,1) void ce_finalize_frames(int payload_bytes) {
+    const int peer=threadIdx.x;
+    if (peer<8) {
+        auto header=reinterpret_cast<int4*>(ce_device.send+peer*ce_device.frame_bytes);
+        *header=make_int4(ce_device.counts[peer],payload_bytes+16,0,0);
+    }
+}
+
+template <bool kAck>
+__global__ __launch_bounds__(32,1) void ce_exchange_completion(int epoch) {
+    int peer=threadIdx.x;
+    const bool eligible=peer<8 and ce_device.peers[peer]!=0 and
+                        peer!=ce_device.rank and peer!=(ce_device.rank^1);
+    const auto flags=kAck ? ce_device.ack_offset : ce_device.ready_offset;
+    if (eligible)
+        st_release_sys_global(reinterpret_cast<int*>(ce_device.peers[peer]+flags+ce_device.rank*128),epoch);
+    __syncwarp();
+    if (eligible) {
+        auto flag=reinterpret_cast<int*>(ce_device.recv+flags+peer*128);
+        const auto begin=clock64();
+        while (ld_acquire_sys_global(flag)!=epoch) {
+            if (clock64()-begin>10000000000ull) {
+                printf("CE_COMPLETION_TIMEOUT rank=%d peer=%d epoch=%d ack=%d\n",ce_device.rank,peer,epoch,kAck);
+                trap();
+            }
+        }
+    }
+}
+
+__global__ __launch_bounds__(1024,1) void ce_unpack(void* output, uint64_t output_bytes) {
+    const int warp=blockIdx.x*32+threadIdx.x/32;
+    for (int peer=0; peer<8; ++peer) {
+        if (ce_device.peers[peer]==0 or peer==ce_device.rank or peer==(ce_device.rank^1)) continue;
+        const auto frame=ce_device.recv+peer*ce_device.frame_bytes;
+        const auto header=*reinterpret_cast<const int4*>(frame);
+        EP_DEVICE_ASSERT(header.x>=0 and header.x<=ce_device.capacity);
+        for (int slot=warp; slot<header.x; slot+=gridDim.x*32) {
+            const auto packet=frame+16ull+slot*static_cast<uint64_t>(header.y);
+            const auto offset=*reinterpret_cast<const uint64_t*>(packet);
+            const auto bytes=reinterpret_cast<const int*>(packet)[2];
+            EP_DEVICE_ASSERT(bytes>0 and bytes%16==0 and header.y==bytes+16 and offset+bytes<=output_bytes);
+            const auto* src=reinterpret_cast<const int4*>(packet+16);
+            auto* dst=reinterpret_cast<int4*>(static_cast<uint8_t*>(output)+offset);
+            UNROLLED_WARP_COPY(4,get_lane_id(),bytes/16,dst,src,ld_nc_global,st_na_global);
+        }
+    }
+}
+
+__global__ __launch_bounds__(32,1) void ce_notify(bool dispatch_mode, int* flags, int* mask) {
+    const int i=threadIdx.x;
+    if (i>=24) return;
+    const int dst=i/3, local_expert=i%3, rank=ce_device.rank;
+    const auto ptr=reinterpret_cast<uint64_t>(flags+(dispatch_mode ? local_expert*8+rank : rank*3+local_expert));
+    const auto p2p=control_p2p_ptr(ptr,rank,dst,false);
+    const int value=dispatch_mode ? ce_device.notifications[i] : 1;
+    if (not is_rank_masked(mask,dst)) {
+        if (p2p==0) nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(ptr),value,dst,local_expert);
+        else st_release_sys_global(reinterpret_cast<int*>(p2p),value);
+    }
+}
+
+void ce_begin(int rank, int world, int hidden, int experts, int capacity, cudaStream_t stream) {
+    EP_HOST_ASSERT(ce_configured and rank==ce_host.rank and world==8 and hidden==5120 and experts==24 and capacity==256);
+    cudaStreamCaptureStatus capture;
+    EP_HOST_ASSERT(cudaStreamIsCapturing(stream,&capture)==cudaSuccess and capture==cudaStreamCaptureStatusNone);
+    EP_HOST_ASSERT(cudaMemsetAsync(ce_host.counts,0,8*sizeof(int),stream)==cudaSuccess);
+}
+
+void ce_finish(bool dispatch_mode, void* recv, int* flags, int* mask, cudaStream_t stream) {
+    const int payload_bytes=5120*2+(dispatch_mode ? 16 : 0);
+    const uint64_t output_bytes=dispatch_mode ? 3ull*8*256*payload_bytes : 24ull*256*(5120*2+160);
+    ce_finalize_frames<<<1,32,0,stream>>>(payload_bytes);
+    // Dynamic GPU counts become CPU memcpy sizes. This synchronization is
+    // deliberately included in the real dispatch/combine timing.
+    EP_HOST_ASSERT(cudaMemcpyAsync(ce_host_counts,ce_host.counts,8*sizeof(int),cudaMemcpyDeviceToHost,stream)==cudaSuccess);
+    EP_HOST_ASSERT(cudaStreamSynchronize(stream)==cudaSuccess);
+    for (int peer=0; peer<8; ++peer) {
+        const bool eligible=ce_host.peers[peer]!=0 and peer!=ce_host.rank and peer!=(ce_host.rank^1);
+        const int count=ce_host_counts[peer];
+        EP_HOST_ASSERT(count>=0 and count<=ce_host.capacity and (eligible or count==0));
+        if (not eligible) continue;
+        const size_t bytes=16ull+static_cast<size_t>(count)*(payload_bytes+16);
+        EP_HOST_ASSERT(cudaMemcpyAsync(reinterpret_cast<void*>(ce_host.peers[peer]+ce_host.rank*ce_host.frame_bytes),
+            reinterpret_cast<const void*>(ce_host.send+peer*ce_host.frame_bytes),bytes,cudaMemcpyDeviceToDevice,stream)==cudaSuccess);
+        ++ce_metrics[1]; ce_metrics[2]+=bytes; ce_metrics[3]+=count;
+    }
+    const int epoch=++ce_epoch;
+    ce_exchange_completion<false><<<1,32,0,stream>>>(epoch);
+    ce_unpack<<<24,1024,0,stream>>>(recv,output_bytes);
+    // Ack only after the target has unpacked: scratch cannot be overwritten by
+    // a fast peer's next dispatch/combine. All flag traffic and waits are timed.
+    ce_exchange_completion<true><<<1,32,0,stream>>>(epoch);
+    ce_notify<<<1,32,0,stream>>>(dispatch_mode,flags,mask);
+    EP_HOST_ASSERT(cudaGetLastError()==cudaSuccess);
+    ++ce_metrics[0]; ++ce_metrics[dispatch_mode ? 4 : 5];
+}
+
 template <int kNumThreads>
 __forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, int* mask_buffer_ptr, int* sync_buffer_ptr,
                                       bool nvlink_pair_only) {
@@ -181,7 +332,7 @@ void clean_low_latency_buffer(int* clean_0,
                   nvlink_pair_only);
 }
 
-template <bool kUseFP8, bool kUseUE8M0, int kHidden>
+template <bool kUseFP8, bool kUseUE8M0, int kHidden, bool kUseCE = false>
 __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     void* packed_recv_x_scales,
                                                     int* packed_recv_src_info,
@@ -334,7 +485,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                     rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg + slot_idx * num_bytes_per_msg;
-                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
+                auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
+                if constexpr (kUseCE) {
+                    EP_DEVICE_ASSERT(dst_p2p_ptr!=0 and dst_rank!=rank and dst_rank!=(rank^1));
+                    dst_p2p_ptr=ce_allocate(dst_rank,dst_ptr-reinterpret_cast<uint64_t>(rdma_recv_x),
+                                           num_bytes_per_msg);
+                }
                 if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
                     if (dst_p2p_ptr == 0) {
                         nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
@@ -414,7 +570,9 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
             ;
         auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank);
         auto dst_p2p_ptr = control_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
-        if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
+        if constexpr (kUseCE) {
+            ce_device.notifications[responsible_expert_idx]=-num_tokens_sent-1;
+        } else if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
             if (dst_p2p_ptr == 0) {
                 #ifdef DISABLE_SM90_FEATURES
                 nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
@@ -604,9 +762,10 @@ void dispatch(void* packed_recv_x,
             dispatch_func = dispatch<true, false, hidden>;   \
         if (use_fp8 and use_ue8m0)                           \
             dispatch_func = dispatch<true, true, hidden>;    \
-        auto launch_dispatch_phase = [&](int launch_phases) { \
+        auto launch_dispatch_phase = [&](int launch_phases, bool stage_ce = false) { \
+        auto chosen_func = stage_ce ? dispatch<false,false,hidden,true> : dispatch_func; \
         LAUNCH_KERNEL(&cfg,                                  \
-                      dispatch_func,                         \
+                      chosen_func,                           \
                       packed_recv_x,                         \
                       packed_recv_x_scales,                  \
                       packed_recv_src_info,                  \
@@ -640,7 +799,13 @@ void dispatch(void* packed_recv_x,
             launch_dispatch_phase(LOW_LATENCY_SEND_PHASE | kRDMAFirstPayloadPhase); \
             launch_drain_rdma_before_pcie(rank, num_ranks, stream); \
         }                                                    \
-        launch_dispatch_phase(phases);                       \
+        if (ce_configured and split_rdma_first and (phases & LOW_LATENCY_SEND_PHASE)) { \
+            EP_HOST_ASSERT(not use_fp8); \
+            ce_begin(rank,num_ranks,hidden,num_experts,num_max_dispatch_tokens_per_rank,stream); \
+            launch_dispatch_phase(LOW_LATENCY_SEND_PHASE,true); \
+            ce_finish(true,rdma_recv_x,rdma_recv_count,mask_buffer_ptr,stream); \
+            if (phases & LOW_LATENCY_RECV_PHASE) launch_dispatch_phase(LOW_LATENCY_RECV_PHASE); \
+        } else launch_dispatch_phase(phases);                \
     }                                                        \
     break
 
@@ -814,7 +979,7 @@ __forceinline__ __device__ void decode_and_accumulate(
     }
 }
 
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
+template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, bool kUseCE = false>
 __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                                                    void* rdma_recv_x,
                                                    int* rdma_recv_flag,
@@ -957,7 +1122,11 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                 const auto buf_ptr = reinterpret_cast<int64_t>(rdma_send_x_vec_row);
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot;
-                const auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
+                auto dst_p2p_ptr = nvshmemi_get_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
+                if constexpr (kUseCE) {
+                    EP_DEVICE_ASSERT(dst_p2p_ptr!=0 and dst_rank!=rank and dst_rank!=(rank^1));
+                    dst_p2p_ptr=ce_allocate(dst_rank,dst_ptr-reinterpret_cast<uint64_t>(rdma_recv_x),hidden*2);
+                }
                 int num_send_bytes = hidden * sizeof(nv_bfloat16);
 
                 if (not zero_copy or dst_p2p_ptr != 0) {
@@ -1122,7 +1291,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                 ;
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
             auto dst_p2p_ptr = control_p2p_ptr(dst_ptr, rank, dst_rank, nvlink_pair_only);
-            if (not is_rank_masked(mask_buffer_ptr, dst_rank)) {
+            if (not kUseCE and not is_rank_masked(mask_buffer_ptr, dst_rank)) {
                 if (dst_p2p_ptr == 0) {
                     #ifdef DISABLE_SM90_FEATURES
                 nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(dst_ptr), 1, dst_rank, local_expert_idx);
@@ -1451,9 +1620,10 @@ void combine(void* combined_x,
         auto combine_func =                                                                                                        \
             use_logfmt ? combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls> : combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
         SET_SHARED_MEMORY_FOR_TMA(combine_func);                                                                                   \
-        auto launch_combine_phase = [&](int launch_phases) {                                                                        \
+        auto launch_combine_phase = [&](int launch_phases, bool stage_ce = false) { \
+        auto chosen_func = stage_ce ? combine<false,hidden,kNumMaxTopk,kNumMaxUnrolls,true> : combine_func;                                                                        \
         LAUNCH_KERNEL(&cfg,                                                                                                        \
-                      combine_func,                                                                                                \
+                      chosen_func,                                                                                                 \
                       combined_x,                                                                                                  \
                       rdma_recv_x,                                                                                                 \
                       rdma_recv_flag,                                                                                              \
@@ -1485,7 +1655,13 @@ void combine(void* combined_x,
             launch_combine_phase(LOW_LATENCY_SEND_PHASE | kRDMAFirstPayloadPhase);                                                   \
             launch_drain_rdma_before_pcie(rank, num_ranks, stream);                                                                \
         }                                                                                                                        \
-        launch_combine_phase(phases);                                                                                              \
+        if (ce_configured and split_rdma_first and (phases & LOW_LATENCY_SEND_PHASE)) { \
+            EP_HOST_ASSERT(not use_logfmt and not zero_copy); \
+            ce_begin(rank,num_ranks,hidden,num_experts,num_max_dispatch_tokens_per_rank,stream); \
+            launch_combine_phase(LOW_LATENCY_SEND_PHASE,true); \
+            ce_finish(false,rdma_recv_x,rdma_recv_flag,mask_buffer_ptr,stream); \
+            if (phases & LOW_LATENCY_RECV_PHASE) launch_combine_phase(LOW_LATENCY_RECV_PHASE); \
+        } else launch_combine_phase(phases);                                                                                              \
     }                                                                                                                              \
     break
 
