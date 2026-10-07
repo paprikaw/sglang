@@ -3,6 +3,7 @@
 #define DEEPEP_LL_CPU_POST_BATCH 8
 #include "ibgda_device.cuh"
 #include "launch.cuh"
+#include <cstdlib>
 
 namespace deep_ep {
 
@@ -10,6 +11,53 @@ namespace internode_ll {
 
 // Internal SM80-only launch phase. No public ABI or SM90 behavior changes.
 constexpr int kRDMAFirstPayloadPhase = 4;
+
+// Diagnostic-only specialization. The ordinary specialization has no stores
+// or shared scratch for these probes; no public Buffer ABI is changed.
+bool late_trace_requested(int rank, bool pair_only, int num_ranks, int64_t* stats) {
+#ifdef DISABLE_SM90_FEATURES
+    if (pair_only)
+        return false;
+    int enabled = 0;
+    if (const auto text = std::getenv("DEEPEP_LL_TRACE_LATE_STAGES")) {
+        char* end = nullptr;
+        const auto value = std::strtol(text, &end, 10);
+        EP_HOST_ASSERT(end != text and *end == '\0' and value >= 0 and value <= 1);
+        enabled = static_cast<int>(value);
+    }
+    EP_HOST_ASSERT(not enabled or (num_ranks >= 8 and stats != nullptr));
+    static bool reported[2] = {false, false};
+    if (not reported[enabled]) {
+        reported[enabled] = true;
+        printf("DEEPEP_LATE_TRACE_ACTUAL rank=%d enabled=%d\n", rank, enabled);
+        fflush(stdout);
+    }
+    return enabled != 0;
+#else
+    return false;
+#endif
+}
+
+__forceinline__ __device__ unsigned long long late_trace_clock() {
+    unsigned long long value;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(value) :: "memory");
+    return value;
+}
+
+// stats[0] is initialized to INT64_MAX by the diagnostic caller, others to 0.
+// Slots: earliest start, latest copy-loop end, latest writer-fence end,
+// latest existing synchronization exit, latest notification submission,
+// latest issuer completion, participating units, schema marker.
+__forceinline__ __device__ void late_trace_start(int64_t* stats, unsigned long long marker) {
+    auto out = reinterpret_cast<unsigned long long*>(stats);
+    atomicMin(out, late_trace_clock());
+    atomicAdd(out + 6, 1ull);
+    atomicExch(out + 7, marker);
+}
+
+__forceinline__ __device__ void late_trace_max(int64_t* stats, int slot, unsigned long long value) {
+    atomicMax(reinterpret_cast<unsigned long long*>(stats) + slot, value);
+}
 
 // A preceding send kernel has exited, so no GPU writer is still reserving or
 // filling these QPs. Flush every ready tail (including batches shorter than
@@ -181,7 +229,7 @@ void clean_low_latency_buffer(int* clean_0,
                   nvlink_pair_only);
 }
 
-template <bool kUseFP8, bool kUseUE8M0, int kHidden>
+template <bool kUseFP8, bool kUseUE8M0, int kHidden, bool kTraceLate = false>
 __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     void* packed_recv_x_scales,
                                                     int* packed_recv_src_info,
@@ -225,6 +273,9 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
 #else
     constexpr bool split_rdma_first = false, early_rdma_payload_only = false;
 #endif
+    const bool trace_late = kTraceLate and split_rdma_first and not early_rdma_payload_only;
+    __shared__ unsigned long long trace_copy_done[kTraceLate ? 32 : 1];
+    __shared__ unsigned long long trace_fence_done[kTraceLate ? 32 : 1];
 
     // May extract UE8M0 from the scales
     using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
@@ -251,6 +302,10 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
         goto LOW_LATENCY_DISPATCH_RECV;
+    if constexpr (kTraceLate) {
+        if (trace_late and thread_id == 0)
+            late_trace_start(dispatch_wait_recv_cost_stats, 1001);
+    }
 
     // There are 2 kinds of warps in this part:
     // 1. The first-kind warps for FP8 cast and sending top-k tokens
@@ -354,8 +409,22 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         // Each writer flushes once after its selected payloads. The early
         // launch completes before the late one; late writers globally synchronize
         // before any completion count can be issued by another block.
+        if constexpr (kTraceLate) {
+            if (trace_late) {
+                __syncwarp();
+                if (lane_id == 0)
+                    trace_copy_done[warp_id] = late_trace_clock();
+            }
+        }
         if (split_rdma_first)
             __threadfence_system();
+        if constexpr (kTraceLate) {
+            if (trace_late) {
+                __syncwarp();
+                if (lane_id == 0)
+                    trace_fence_done[warp_id] = late_trace_clock();
+            }
+        }
     } else if (warp_id == num_warps - 1 and not early_rdma_payload_only) {
         EP_DEVICE_ASSERT(num_sms > 1);
         if (sm_id == 0) {
@@ -400,8 +469,23 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     __syncthreads();
     if (early_rdma_payload_only)
         return;
+    if constexpr (kTraceLate) {
+        if (trace_late and thread_id == 0) {
+            unsigned long long copy_end = 0, fence_end = 0;
+            for (int w = 0; w < num_warps - 1; ++w) {
+                copy_end = max(copy_end, trace_copy_done[w]);
+                fence_end = max(fence_end, trace_fence_done[w]);
+            }
+            late_trace_max(dispatch_wait_recv_cost_stats, 1, copy_end);
+            late_trace_max(dispatch_wait_recv_cost_stats, 2, fence_end);
+        }
+    }
     if (split_rdma_first)
         cg::this_grid().sync();
+    if constexpr (kTraceLate) {
+        if (trace_late and thread_id == 0)
+            late_trace_max(dispatch_wait_recv_cost_stats, 3, late_trace_clock());
+    }
 
     // Issue count sends
     if (responsible_expert_idx < num_experts and sub_warp_id == 0 and lane_id == 0) {
@@ -426,6 +510,11 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
             }
         }
 
+        if constexpr (kTraceLate) {
+            if (trace_late)
+                late_trace_max(dispatch_wait_recv_cost_stats, 4, late_trace_clock());
+        }
+
         // Clean workspace for next use
         atomic_counter_per_expert[responsible_expert_idx] = 0;
         atomic_finish_counter_per_expert[responsible_expert_idx] = 0;
@@ -433,6 +522,10 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         // Clean `packed_recv_count`
         if (dst_rank == 0)
             packed_recv_count[dst_expert_local_idx] = 0;
+        if constexpr (kTraceLate) {
+            if (trace_late)
+                late_trace_max(dispatch_wait_recv_cost_stats, 5, late_trace_clock());
+        }
     }
     __syncwarp();
 
@@ -500,7 +593,7 @@ LOW_LATENCY_DISPATCH_RECV:
             // Add stats for diagnosis
             if (cumulative_local_expert_recv_stats != nullptr)
                 atomicAdd(cumulative_local_expert_recv_stats + local_expert_idx, num_recv_tokens);
-            if (dispatch_wait_recv_cost_stats != nullptr)
+            if (not kTraceLate and dispatch_wait_recv_cost_stats != nullptr)
                 atomicAdd(reinterpret_cast<unsigned long long*>(dispatch_wait_recv_cost_stats + src_rank), wait_recv_cost);
         }
         asm volatile("bar.sync %0, %1;" ::"r"(warp_group_id + 2), "r"(num_warps_per_group * 32));
@@ -600,6 +693,8 @@ void dispatch(void* packed_recv_x,
 #define DISPATCH_LAUNCH_CASE(hidden)                         \
     {                                                        \
         auto dispatch_func = dispatch<false, false, hidden>; \
+        if (trace_requested)                                \
+            dispatch_func = dispatch<false, false, hidden, true>; \
         if (use_fp8 and not use_ue8m0)                       \
             dispatch_func = dispatch<true, false, hidden>;   \
         if (use_fp8 and use_ue8m0)                           \
@@ -650,6 +745,8 @@ void dispatch(void* packed_recv_x,
 #else
     constexpr bool split_rdma_first = false;
 #endif
+    const bool trace_requested = late_trace_requested(rank, nvlink_pair_only, num_ranks, dispatch_wait_recv_cost_stats);
+    EP_HOST_ASSERT(not trace_requested or not use_fp8);
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
@@ -814,7 +911,7 @@ __forceinline__ __device__ void decode_and_accumulate(
     }
 }
 
-template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls>
+template <bool kUseLogFMT, int kHidden, int kNumMaxTopk, int kNumMaxUnrolls, bool kTraceLate = false>
 __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                                                    void* rdma_recv_x,
                                                    int* rdma_recv_flag,
@@ -856,6 +953,9 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
 #else
     constexpr bool split_rdma_first = false, early_rdma_payload_only = false;
 #endif
+    const bool trace_late = kTraceLate and split_rdma_first and not early_rdma_payload_only;
+    __shared__ unsigned long long trace_copy_done[kTraceLate ? 32 : 1];
+    __shared__ unsigned long long trace_fence_done[kTraceLate ? 32 : 1];
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
@@ -882,6 +982,10 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
         goto LOW_LATENCY_COMBINE_RECV;
+    if constexpr (kTraceLate) {
+        if (trace_late and responsible_expert_idx < num_experts and sub_warp_id == 0 and lane_id == 0)
+            late_trace_start(combine_wait_recv_cost_stats, 1002);
+    }
 
     // Clean up next buffer
     if (not early_rdma_payload_only and sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
@@ -1109,15 +1213,42 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
         // the warp-group barrier and the separate RDMA finishing-flag issuer.
         // A fence in only the issuer would not cover other writers' P2P stores.
 #ifdef DISABLE_SM90_FEATURES
+        if constexpr (kTraceLate) {
+            if (trace_late) {
+                __syncwarp();
+                if (lane_id == 0)
+                    trace_copy_done[warp_id] = late_trace_clock();
+            }
+        }
         if (split_rdma_first and dst_rank != rank and
             nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank, nvlink_pair_only) != 0)
             __threadfence_system();
+        if constexpr (kTraceLate) {
+            if (trace_late) {
+                __syncwarp();
+                if (lane_id == 0)
+                    trace_fence_done[warp_id] = late_trace_clock();
+            }
+        }
 #endif
 
         // Put the finishing flag
         EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 16);
         asm volatile("bar.sync %0, %1;" ::"r"(warp_group_id + 1), "r"(num_warps_per_group * 32));
         if (not early_rdma_payload_only and sub_warp_id == 1 and lane_id == 0) {
+            if constexpr (kTraceLate) {
+                if (trace_late) {
+                    const auto sync_end = late_trace_clock();
+                    unsigned long long copy_end = 0, fence_end = 0;
+                    for (int w = warp_group_id * num_warps_per_group; w < (warp_group_id + 1) * num_warps_per_group; ++w) {
+                        copy_end = max(copy_end, trace_copy_done[w]);
+                        fence_end = max(fence_end, trace_fence_done[w]);
+                    }
+                    late_trace_max(combine_wait_recv_cost_stats, 1, copy_end);
+                    late_trace_max(combine_wait_recv_cost_stats, 2, fence_end);
+                    late_trace_max(combine_wait_recv_cost_stats, 3, sync_end);
+                }
+            }
             while (ld_acquire_global(atomic_clean_flag) == 0)
                 ;
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
@@ -1133,7 +1264,15 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
                     st_release_sys_global(reinterpret_cast<int*>(dst_p2p_ptr), 1);
                 }
             }
+            if constexpr (kTraceLate) {
+                if (trace_late)
+                    late_trace_max(combine_wait_recv_cost_stats, 4, late_trace_clock());
+            }
             atomic_add_release_global(atomic_clean_flag, -1);
+            if constexpr (kTraceLate) {
+                if (trace_late)
+                    late_trace_max(combine_wait_recv_cost_stats, 5, late_trace_clock());
+            }
         }
         __syncwarp();
 #ifndef DISABLE_SM90_FEATURES
@@ -1175,7 +1314,7 @@ LOW_LATENCY_COMBINE_RECV:
                 atomicExch(mask_buffer_ptr + src_rank, 1);
             }
 
-            if (combine_wait_recv_cost_stats != nullptr) {
+            if (not kTraceLate and combine_wait_recv_cost_stats != nullptr) {
                 atomicAdd(reinterpret_cast<unsigned long long*>(combine_wait_recv_cost_stats + src_rank), wait_recv_cost);
             }
         }
@@ -1450,6 +1589,7 @@ void combine(void* combined_x,
     {                                                                                                                              \
         auto combine_func =                                                                                                        \
             use_logfmt ? combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls> : combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
+        if (trace_requested) combine_func = combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls, true>;                                \
         SET_SHARED_MEMORY_FOR_TMA(combine_func);                                                                                   \
         auto launch_combine_phase = [&](int launch_phases) {                                                                        \
         LAUNCH_KERNEL(&cfg,                                                                                                        \
@@ -1495,6 +1635,8 @@ void combine(void* combined_x,
 #else
     constexpr bool split_rdma_first = false;
 #endif
+    const bool trace_requested = late_trace_requested(rank, nvlink_pair_only, num_ranks, combine_wait_recv_cost_stats);
+    EP_HOST_ASSERT(not trace_requested or not use_logfmt);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 }
