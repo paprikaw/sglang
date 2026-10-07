@@ -7,6 +7,15 @@ namespace deep_ep {
 
 namespace internode_ll {
 
+// Internal SM80-only launch phase. No public ABI or SM90 behavior changes.
+constexpr int kPCIePayloadPhase = 4;
+
+__forceinline__ __device__ bool is_cross_pair_pcie(uint64_t ptr, int rank, int dst_rank,
+                                                bool nvlink_pair_only) {
+    return dst_rank != rank and dst_rank != (rank ^ 1) and
+           nvshmemi_get_p2p_ptr(ptr, rank, dst_rank, nvlink_pair_only) != 0;
+}
+
 template <bool use_warp_sync = false>
 __forceinline__ __device__ bool is_rank_masked(int* mask_buffer_ptr, int rank) {
     if (mask_buffer_ptr == nullptr) {
@@ -180,6 +189,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     const auto warp_group_id = warp_id / num_warps_per_group;
     const auto sub_warp_id = warp_id % num_warps_per_group;
     const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
+#ifdef DISABLE_SM90_FEATURES
+    const bool split_pcie_payload = not nvlink_pair_only;
+    const bool pcie_payload_only = (phases & kPCIePayloadPhase) != 0;
+#else
+    constexpr bool split_pcie_payload = false, pcie_payload_only = false;
+#endif
 
     // May extract UE8M0 from the scales
     using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
@@ -270,10 +285,17 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
 
             // Issue IBGDA sends
             if (dst_expert_idx >= 0) {
-                int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
-                slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
                 const auto dst_rank = dst_expert_idx / num_local_experts;
                 const auto dst_expert_local_idx = dst_expert_idx % num_local_experts;
+                // Allocate each destination slot exactly once across the two
+                // launches. Phase 4 handles PCIe; the ordinary send handles
+                // self/NVLink/RDMA and all completion notifications.
+                if (split_pcie_payload and
+                    is_cross_pair_pcie(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank,
+                                       nvlink_pair_only) != pcie_payload_only)
+                    continue;
+                int slot_idx = lane_id == 0 ? atomicAdd(atomic_counter_per_expert + dst_expert_idx, 1) : 0;
+                slot_idx = __shfl_sync(0xffffffff, slot_idx, 0);
                 const auto src_ptr = reinterpret_cast<uint64_t>(rdma_x_src_idx);
                 const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) +
                     dst_expert_local_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
@@ -287,13 +309,6 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                         const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                         const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_p2p_ptr);
                         UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
-#ifdef DISABLE_SM90_FEATURES
-                        // Each writer flushes its cross-pair P2P payload before
-                        // publishing the local completion counter used by the
-                        // separate warp that issues the RDMA count notification.
-                        if (dst_rank != rank and dst_rank != (rank ^ 1))
-                            __threadfence_system();
-#endif
                     }
                 }
 
@@ -302,7 +317,12 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 lane_id == 0 ? atomic_add_release_global(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
             }
         }
-    } else if (warp_id == num_warps - 1) {
+        // One fence per writer after all PCIe tokens, instead of a fence per
+        // token. No completion flags are issued until this kernel has returned
+        // and the next launch on the same stream reaches its notification code.
+        if (pcie_payload_only)
+            __threadfence_system();
+    } else if (warp_id == num_warps - 1 and not pcie_payload_only) {
         EP_DEVICE_ASSERT(num_sms > 1);
         if (sm_id == 0) {
             // The first SM is also responsible for checking QPs
@@ -344,6 +364,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         }
     }
     __syncthreads();
+    if (pcie_payload_only)
+        return;
 
     // Issue count sends
     if (responsible_expert_idx < num_experts and sub_warp_id == 0 and lane_id == 0) {
@@ -542,6 +564,7 @@ void dispatch(void* packed_recv_x,
             dispatch_func = dispatch<true, false, hidden>;   \
         if (use_fp8 and use_ue8m0)                           \
             dispatch_func = dispatch<true, true, hidden>;    \
+        auto launch_dispatch_phase = [&](int launch_phases) { \
         LAUNCH_KERNEL(&cfg,                                  \
                       dispatch_func,                         \
                       packed_recv_x,                         \
@@ -570,12 +593,21 @@ void dispatch(void* packed_recv_x,
                       num_warp_groups,                       \
                       num_warps_per_group,                   \
                       round_scale,                           \
-                      phases,                                \
+                      launch_phases,                         \
                       nvlink_pair_only);                     \
+        };                                                   \
+        if (split_pcie_payload and (phases & LOW_LATENCY_SEND_PHASE)) \
+            launch_dispatch_phase(LOW_LATENCY_SEND_PHASE | kPCIePayloadPhase); \
+        launch_dispatch_phase(phases);                       \
     }                                                        \
     break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+#ifdef DISABLE_SM90_FEATURES
+    const bool split_pcie_payload = not nvlink_pair_only;
+#else
+    constexpr bool split_pcie_payload = false;
+#endif
     SWITCH_HIDDEN(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
@@ -776,6 +808,12 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
     const auto warp_group_id = warp_id / num_warps_per_group;
     const auto sub_warp_id = warp_id % num_warps_per_group;
     const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
+#ifdef DISABLE_SM90_FEATURES
+    const bool split_pcie_payload = not nvlink_pair_only;
+    const bool pcie_payload_only = (phases & kPCIePayloadPhase) != 0;
+#else
+    constexpr bool split_pcie_payload = false, pcie_payload_only = false;
+#endif
 
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
 
@@ -804,7 +842,7 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
         goto LOW_LATENCY_COMBINE_RECV;
 
     // Clean up next buffer
-    if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
+    if (not pcie_payload_only and sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
         #pragma unroll
         for (int i = lane_id; i < num_next_clean_int; i += 32)
             next_clean[i] = 0;
@@ -863,7 +901,10 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
 #endif
 
         // Issue IBGDA send
-        if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank)) {
+        if (not is_rank_masked<true>(mask_buffer_ptr, dst_rank) and
+            (not split_pcie_payload or
+             is_cross_pair_pcie(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank,
+                                nvlink_pair_only) == pcie_payload_only)) {
             for (int token_idx = offset + sub_warp_id; token_idx < offset + num_tokens_to_send; token_idx += num_warps_per_group) {
                 const auto x_int4 = local_x + token_idx * hidden_bf16_int4;
                 const auto rdma_send_type_row = reinterpret_cast<int*>(rdma_send_x_vec + token_idx * num_bytes_per_slot);
@@ -1026,15 +1067,15 @@ __global__ __launch_bounds__(1024, 1) void combine(void* combined_x,
         // the warp-group barrier and the separate RDMA finishing-flag issuer.
         // A fence in only the issuer would not cover other writers' P2P stores.
 #ifdef DISABLE_SM90_FEATURES
-        if (dst_rank != rank and dst_rank != (rank ^ 1) and
-            nvshmemi_get_p2p_ptr(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank, nvlink_pair_only) != 0)
+        if (pcie_payload_only and
+            is_cross_pair_pcie(reinterpret_cast<uint64_t>(rdma_recv_x), rank, dst_rank, nvlink_pair_only))
             __threadfence_system();
 #endif
 
         // Put the finishing flag
         EP_DEVICE_ASSERT(num_warps_per_group > 1 and num_warp_groups < 16);
         asm volatile("bar.sync %0, %1;" ::"r"(warp_group_id + 1), "r"(num_warps_per_group * 32));
-        if (sub_warp_id == 1 and lane_id == 0) {
+        if (not pcie_payload_only and sub_warp_id == 1 and lane_id == 0) {
             while (ld_acquire_global(atomic_clean_flag) == 0)
                 ;
             auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_flag + global_expert_idx);
@@ -1364,6 +1405,7 @@ void combine(void* combined_x,
         auto combine_func =                                                                                                        \
             use_logfmt ? combine<true, hidden, kNumMaxTopk, kNumMaxUnrolls> : combine<false, hidden, kNumMaxTopk, kNumMaxUnrolls>; \
         SET_SHARED_MEMORY_FOR_TMA(combine_func);                                                                                   \
+        auto launch_combine_phase = [&](int launch_phases) {                                                                        \
         LAUNCH_KERNEL(&cfg,                                                                                                        \
                       combine_func,                                                                                                \
                       combined_x,                                                                                                  \
@@ -1389,13 +1431,22 @@ void combine(void* combined_x,
                       num_ranks,                                                                                                   \
                       num_warp_groups,                                                                                             \
                       num_warps_per_group,                                                                                         \
-                      phases,                                                                                                      \
+                      launch_phases,                                                                                               \
                       zero_copy,                                                                                                   \
                       nvlink_pair_only);                                                                                           \
+        };                                                                                                                         \
+        if (split_pcie_payload and (phases & LOW_LATENCY_SEND_PHASE))                                                                 \
+            launch_combine_phase(LOW_LATENCY_SEND_PHASE | kPCIePayloadPhase);                                                        \
+        launch_combine_phase(phases);                                                                                              \
     }                                                                                                                              \
     break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
+#ifdef DISABLE_SM90_FEATURES
+    const bool split_pcie_payload = not nvlink_pair_only;
+#else
+    constexpr bool split_pcie_payload = false;
+#endif
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 }
