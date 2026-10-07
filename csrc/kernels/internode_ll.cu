@@ -80,6 +80,7 @@ struct CEDevice {
     int* notifications;
     uint64_t frame_bytes, ready_offset, ack_offset;
     int capacity, rank, world, local_experts, token_capacity;
+    int dispatch_dedup;
 };
 __device__ __constant__ CEDevice ce_device;
 static CEDevice ce_host{};
@@ -115,6 +116,28 @@ extern "C" __attribute__((visibility("default"))) int deepep_ce_snapshot(uint64_
     return ce_epoch;
 }
 
+// Experimental runtime switch; caller changes it only between completed pairs.
+// Kept off by default. The initial validation scope is BF16 EP4/top-k <= 8.
+extern "C" __attribute__((visibility("default"))) int deepep_ce_set_dispatch_dedup(int enabled) {
+    if (not ce_configured or ce_host.world != 4 or (enabled != 0 and enabled != 1))
+        return static_cast<int>(cudaErrorInvalidValue);
+    auto status=cudaDeviceSynchronize();
+    if (status!=cudaSuccess) return static_cast<int>(status);
+    ce_host.dispatch_dedup=enabled;
+    return static_cast<int>(cudaMemcpyToSymbol(ce_device,&ce_host,sizeof(ce_host)));
+}
+
+// Header (16), eight destination offsets (64), then one source-token payload.
+// Every route still gets its original expert slot. Only PCIe bytes are shared.
+constexpr int kCEDedupHeaderBytes=80;
+__forceinline__ __device__ uint64_t ce_allocate_dedup(int peer, int bytes) {
+    int slot=get_lane_id()==0 ? atomicAdd(ce_device.counts+peer,1) : 0;
+    slot=__shfl_sync(0xffffffff,slot,0);
+    EP_DEVICE_ASSERT(slot<ce_device.token_capacity and bytes%16==0);
+    auto packet=ce_device.send+peer*ce_device.frame_bytes+16ull+slot*(bytes+kCEDedupHeaderBytes);
+    return packet;
+}
+
 __forceinline__ __device__ uint64_t ce_allocate(int peer, uint64_t offset, int bytes) {
     int slot=get_lane_id()==0 ? atomicAdd(ce_device.counts+peer,1) : 0;
     slot=__shfl_sync(0xffffffff,slot,0);
@@ -128,11 +151,11 @@ __forceinline__ __device__ uint64_t ce_allocate(int peer, uint64_t offset, int b
     return packet+16;
 }
 
-__global__ __launch_bounds__(32,1) void ce_finalize_frames(int payload_bytes) {
+__global__ __launch_bounds__(32,1) void ce_finalize_frames(int payload_bytes, bool dedup) {
     const int peer=threadIdx.x;
     if (peer<ce_device.world) {
         auto header=reinterpret_cast<int4*>(ce_device.send+peer*ce_device.frame_bytes);
-        *header=make_int4(ce_device.counts[peer],payload_bytes+16,0,0);
+        *header=make_int4(ce_device.counts[peer],payload_bytes+(dedup ? kCEDedupHeaderBytes : 16),dedup,0);
     }
 }
 
@@ -157,7 +180,7 @@ __global__ __launch_bounds__(32,1) void ce_exchange_completion(int epoch) {
     }
 }
 
-__global__ __launch_bounds__(1024,1) void ce_unpack(void* output, uint64_t output_bytes) {
+__global__ __launch_bounds__(1024,1) void ce_unpack(void* output, uint64_t output_bytes, bool dedup) {
     const int warp=blockIdx.x*32+threadIdx.x/32;
     for (int peer=0; peer<ce_device.world; ++peer) {
         if (ce_device.peers[peer]==0 or peer==ce_device.rank or peer==(ce_device.rank^1)) continue;
@@ -166,12 +189,28 @@ __global__ __launch_bounds__(1024,1) void ce_unpack(void* output, uint64_t outpu
         EP_DEVICE_ASSERT(header.x>=0 and header.x<=ce_device.capacity);
         for (int slot=warp; slot<header.x; slot+=gridDim.x*32) {
             const auto packet=frame+16ull+slot*static_cast<uint64_t>(header.y);
-            const auto offset=*reinterpret_cast<const uint64_t*>(packet);
-            const auto bytes=reinterpret_cast<const int*>(packet)[2];
-            EP_DEVICE_ASSERT(bytes>0 and bytes%16==0 and header.y==bytes+16 and offset+bytes<=output_bytes);
-            const auto* src=reinterpret_cast<const int4*>(packet+16);
-            auto* dst=reinterpret_cast<int4*>(static_cast<uint8_t*>(output)+offset);
-            UNROLLED_WARP_COPY(4,get_lane_id(),bytes/16,dst,src,ld_nc_global,st_na_global);
+            EP_DEVICE_ASSERT(header.z==static_cast<int>(dedup));
+            if (dedup) {
+                const auto metadata=*reinterpret_cast<const int4*>(packet);
+                const int count=metadata.x, bytes=metadata.y;
+                EP_DEVICE_ASSERT(count>0 and count<=8 and bytes==5120*2+16 and
+                                 header.y==bytes+kCEDedupHeaderBytes and header.x<=ce_device.token_capacity);
+                const auto* offsets=reinterpret_cast<const uint64_t*>(packet+16);
+                const auto* src=reinterpret_cast<const int4*>(packet+kCEDedupHeaderBytes);
+                for (int i=0; i<count; ++i) {
+                    const auto offset=offsets[i];
+                    EP_DEVICE_ASSERT(offset%16==0 and offset+bytes<=output_bytes);
+                    auto* dst=reinterpret_cast<int4*>(static_cast<uint8_t*>(output)+offset);
+                    UNROLLED_WARP_COPY(4,get_lane_id(),bytes/16,dst,src,ld_nc_global,st_na_global);
+                }
+            } else {
+                const auto offset=*reinterpret_cast<const uint64_t*>(packet);
+                const auto bytes=reinterpret_cast<const int*>(packet)[2];
+                EP_DEVICE_ASSERT(bytes>0 and bytes%16==0 and header.y==bytes+16 and offset+bytes<=output_bytes);
+                const auto* src=reinterpret_cast<const int4*>(packet+16);
+                auto* dst=reinterpret_cast<int4*>(static_cast<uint8_t*>(output)+offset);
+                UNROLLED_WARP_COPY(4,get_lane_id(),bytes/16,dst,src,ld_nc_global,st_na_global);
+            }
         }
     }
 }
@@ -200,7 +239,8 @@ void ce_begin(int rank, int world, int hidden, int experts, int capacity, cudaSt
 void ce_finish(bool dispatch_mode, void* recv, int* flags, int* mask, cudaStream_t stream) {
     const int payload_bytes=5120*2+(dispatch_mode ? 16 : 0);
     const uint64_t output_bytes=dispatch_mode ? 24ull*ce_host.token_capacity*payload_bytes : 24ull*ce_host.token_capacity*(5120*2+160);
-    ce_finalize_frames<<<1,32,0,stream>>>(payload_bytes);
+    const bool dedup=dispatch_mode and ce_host.dispatch_dedup;
+    ce_finalize_frames<<<1,32,0,stream>>>(payload_bytes,dedup);
     // Dynamic GPU counts become CPU memcpy sizes. This synchronization is
     // deliberately included in the real dispatch/combine timing.
     EP_HOST_ASSERT(cudaMemcpyAsync(ce_host_counts,ce_host.counts,ce_host.world*sizeof(int),cudaMemcpyDeviceToHost,stream)==cudaSuccess);
@@ -210,14 +250,15 @@ void ce_finish(bool dispatch_mode, void* recv, int* flags, int* mask, cudaStream
         const int count=ce_host_counts[peer];
         EP_HOST_ASSERT(count>=0 and count<=ce_host.capacity and (eligible or count==0));
         if (not eligible) continue;
-        const size_t bytes=16ull+static_cast<size_t>(count)*(payload_bytes+16);
+        const size_t bytes=16ull+static_cast<size_t>(count)*(payload_bytes+(dedup ? kCEDedupHeaderBytes : 16));
+        EP_HOST_ASSERT(bytes<=ce_host.frame_bytes);
         EP_HOST_ASSERT(cudaMemcpyAsync(reinterpret_cast<void*>(ce_host.peers[peer]+ce_host.rank*ce_host.frame_bytes),
             reinterpret_cast<const void*>(ce_host.send+peer*ce_host.frame_bytes),bytes,cudaMemcpyDeviceToDevice,stream)==cudaSuccess);
         ++ce_metrics[1]; ce_metrics[2]+=bytes; ce_metrics[3]+=count;
     }
     const int epoch=++ce_epoch;
     ce_exchange_completion<false><<<1,32,0,stream>>>(epoch);
-    ce_unpack<<<24,1024,0,stream>>>(recv,output_bytes);
+    ce_unpack<<<24,1024,0,stream>>>(recv,output_bytes,dedup);
     // Ack only after the target has unpacked: scratch cannot be overwritten by
     // a fast peer's next dispatch/combine. All flag traffic and waits are timed.
     ce_exchange_completion<true><<<1,32,0,stream>>>(epoch);
@@ -472,6 +513,53 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                 }
             }
             asm volatile("bar.sync 1, %0;" ::"r"(num_threads));
+
+            // A single leader warp per (token, destination GPU) allocates all
+            // expert slots, packs their offsets, and copies the token once.
+            // No cross-warp spinlock, extra kernel, or larger launch geometry.
+            if constexpr (kUseCE) {
+                if (ce_device.dispatch_dedup) {
+                    EP_DEVICE_ASSERT(not kUseFP8 and num_topk<=8 and not early_rdma_payload_only);
+                    if (dst_expert_idx>=0) {
+                        const int dst_rank=dst_expert_idx/num_local_experts;
+                        bool leader=true;
+                        for (int i=0; i<warp_id; ++i) {
+                            const int expert=static_cast<int>(__ldg(topk_idx+token_idx*num_topk+i));
+                            if (expert>=0 and expert/num_local_experts==dst_rank) leader=false;
+                        }
+                        if (leader and is_cross_pair_pcie(reinterpret_cast<uint64_t>(rdma_recv_x),
+                                                         rank,dst_rank,nvlink_pair_only)) {
+                            const int expert=lane_id<num_topk ?
+                                static_cast<int>(__ldg(topk_idx+token_idx*num_topk+lane_id)) : -1;
+                            const bool selected=expert>=0 and expert/num_local_experts==dst_rank;
+                            const unsigned selected_mask=__ballot_sync(0xffffffff,selected);
+                            const int destinations=__popc(selected_mask);
+                            const auto packet=ce_allocate_dedup(dst_rank,num_bytes_per_msg);
+                            if (lane_id==0)
+                                *reinterpret_cast<int4*>(packet)=make_int4(destinations,num_bytes_per_msg,0,0);
+                            if (lane_id<8) reinterpret_cast<uint64_t*>(packet+16)[lane_id]=0;
+                            __syncwarp();
+                            if (selected) {
+                                const int slot=atomicAdd(atomic_counter_per_expert+expert,1);
+                                EP_DEVICE_ASSERT(slot<num_max_dispatch_tokens_per_rank);
+                                const uint64_t offset=(static_cast<uint64_t>(expert%num_local_experts)*num_ranks*
+                                    num_max_dispatch_tokens_per_rank+rank*num_max_dispatch_tokens_per_rank+slot)*num_bytes_per_msg;
+                                const int index=__popc(selected_mask & ((1u<<lane_id)-1));
+                                reinterpret_cast<uint64_t*>(packet+16)[index]=offset;
+                            }
+                            __syncwarp();
+                            if (not is_rank_masked<true>(mask_buffer_ptr,dst_rank)) {
+                                const auto* src=reinterpret_cast<const int4*>(rdma_x_src_idx);
+                                auto* dst=reinterpret_cast<int4*>(packet+kCEDedupHeaderBytes);
+                                UNROLLED_WARP_COPY(8,lane_id,num_int4_per_msg,dst,src,ld_nc_global,st_na_global);
+                            }
+                            __syncwarp();
+                            if (selected) atomic_add_release_global(atomic_finish_counter_per_expert+expert,1);
+                        }
+                    }
+                    continue;
+                }
+            }
 
             // Issue IBGDA sends
             if (dst_expert_idx >= 0) {
