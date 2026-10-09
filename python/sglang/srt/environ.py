@@ -589,6 +589,9 @@ class Envs:
     # PP: skip output send/recv when the entire batch consists of non-final chunked prefill requests,
     # since process_batch_result_prefill discards next_token_ids for those anyway.
     SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM = EnvBool(False)
+    # Experimental ordinary-PP scheduling: keep every request's prefill chunks
+    # and decode in one ring slot, enforcing the per-slot microbatch cap.
+    SGLANG_PP_SLOT_AFFINITY = EnvBool(False)
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
 
     # ===================================================================

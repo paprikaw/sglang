@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     ReconfigureElasticPPReqOutput,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload, resolve_forward_inputs
+from sglang.srt.managers.pp_slot_affinity import PPSlotAffinityState
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -581,6 +582,11 @@ class SchedulerPPMixin:
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self._pp_current_slot = mb_id
+                if self._pp_slot_affinity is not None:
+                    # Input handlers (including abort) must see this slot's
+                    # state, rather than the previous iteration's chunk.
+                    self._pp_slot_affinity.load(self, mb_id)
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
@@ -610,6 +616,14 @@ class SchedulerPPMixin:
                         )
                         self.running_batch = plan.running_batch
                         self.mbs[mb_id] = plan.batch_to_run
+                        if self._pp_slot_affinity is not None:
+                            self._pp_slot_affinity.check_plan(
+                                mb_id,
+                                self.running_batch,
+                                plan.batch_to_run,
+                                self.chunked_req,
+                            )
+                            self._pp_slot_affinity.save(self)
                 self.running_mbs[mb_id] = self.running_batch
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
@@ -1078,6 +1092,35 @@ class SchedulerPPMixin:
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.ps.pp_size + get_parallel().pp_async_batch_depth
+        if envs.SGLANG_PP_SLOT_AFFINITY.get():
+            PPSlotAffinityState.validate_supported(
+                pd_disaggregation=get_disagg().disaggregation_mode != "null",
+                elastic_pp=get_parallel().enable_elastic_pp,
+                speculative_decoding=not self.spec_algorithm.is_none(),
+                dllm=self.dllm_config is not None,
+                hierarchical_cache=self.enable_hierarchical_cache,
+                hisparse=self.enable_hisparse,
+                flexkv=self.server_args.enable_flexkv,
+                dp_attention=get_parallel().enable_dp_attention,
+                async_batch_depth=get_parallel().pp_async_batch_depth != 0,
+                mixed_chunk=self.is_mixed_chunk,
+                dynamic_chunking=self.enable_dynamic_chunking,
+                priority_preemption=self.enable_priority_preemption,
+                hybrid_swa=self.is_hybrid_swa,
+                lora=self.enable_lora,
+                pdmux=self.enable_pdmux,
+            )
+            if self._pp_slot_affinity is not None:
+                self._pp_slot_affinity.reset()
+            self._pp_slot_affinity = PPSlotAffinityState(
+                self.pp_loop_size, get_parallel().pp_max_micro_batch_size
+            )
+            logger.info(
+                "PP slot affinity enabled: %s slots, cap=%s; no KV migration",
+                self.pp_loop_size,
+                get_parallel().pp_max_micro_batch_size,
+            )
+        self._pp_current_slot = None
         # In CP mode, attention weights are duplicated, eliminating the need for the attention TP all-gather operation.
         self.require_attn_tp_allgather = (
             not get_parallel().enable_dsa_prefill_context_parallel
