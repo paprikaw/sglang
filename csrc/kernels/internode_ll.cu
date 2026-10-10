@@ -96,10 +96,15 @@ static bool ce_skip_local_drain=false;
 // the early phase, so draining payload QPs and a global barrier are redundant.
 // Existing completion/ack and per-expert notification ordering remain intact.
 extern "C" __attribute__((visibility("default"))) int deepep_ce_set_skip_local_drain(int enabled) {
-    if (not ce_configured or ce_host.world!=4 or (enabled!=0 and enabled!=1))
+    if (not ce_configured or (ce_host.world!=4 and ce_host.world!=8) or (enabled!=0 and enabled!=1))
         return static_cast<int>(cudaErrorInvalidValue);
-    for (int i=0; i<ce_host.world; ++i) if (ce_host.peers[i]==0)
-        return static_cast<int>(cudaErrorInvalidValue);
+    // EP8 has remote payloads. Disabling this optimization is valid there,
+    // but enabling it remains confined to the validated all-local EP4 case.
+    if (enabled) {
+        if (ce_host.world!=4) return static_cast<int>(cudaErrorInvalidValue);
+        for (int i=0; i<ce_host.world; ++i) if (ce_host.peers[i]==0)
+            return static_cast<int>(cudaErrorInvalidValue);
+    }
     auto status=cudaDeviceSynchronize();
     if (status!=cudaSuccess) return static_cast<int>(status);
     ce_skip_local_drain=enabled;
@@ -109,7 +114,7 @@ extern "C" __attribute__((visibility("default"))) int deepep_ce_set_skip_local_d
 // Pairwise matching avoids both source GPUs targeting the same PCIe receiver.
 // Set only between completed operations; payload and flags are unchanged.
 extern "C" __attribute__((visibility("default"))) int deepep_ce_set_matched_peer_order(int enabled) {
-    if (not ce_configured or ce_host.world!=4 or (enabled!=0 and enabled!=1))
+    if (not ce_configured or (ce_host.world!=4 and ce_host.world!=8) or (enabled!=0 and enabled!=1))
         return static_cast<int>(cudaErrorInvalidValue);
     auto status=cudaDeviceSynchronize();
     if (status!=cudaSuccess) return static_cast<int>(status);
@@ -147,7 +152,7 @@ extern "C" __attribute__((visibility("default"))) int deepep_ce_snapshot(uint64_
 // Experimental runtime switch; caller changes it only between completed pairs.
 // Kept off by default. The initial validation scope is BF16 EP4/top-k <= 8.
 extern "C" __attribute__((visibility("default"))) int deepep_ce_set_dispatch_dedup(int enabled) {
-    if (not ce_configured or ce_host.world != 4 or (enabled != 0 and enabled != 1))
+    if (not ce_configured or (ce_host.world!=4 and ce_host.world!=8) or (enabled != 0 and enabled != 1))
         return static_cast<int>(cudaErrorInvalidValue);
     auto status=cudaDeviceSynchronize();
     if (status!=cudaSuccess) return static_cast<int>(status);
@@ -156,10 +161,10 @@ extern "C" __attribute__((visibility("default"))) int deepep_ce_set_dispatch_ded
 }
 
 extern "C" __attribute__((visibility("default"))) int deepep_ce_set_local_notify(int enabled) {
-    if (not ce_configured or ce_host.world!=4 or (enabled!=0 and enabled!=1))
+    if (not ce_configured or (ce_host.world!=4 and ce_host.world!=8) or (enabled!=0 and enabled!=1))
         return static_cast<int>(cudaErrorInvalidValue);
-    for (int i=0;i<ce_host.world;++i) if (ce_host.peers[i]==0)
-        return static_cast<int>(cudaErrorInvalidValue);
+    // ce_notify consumes frame metadata only for mapped cross-pair peers.
+    // Unmapped (cross-node) peers retain their original RDMA notifications.
     auto status=cudaDeviceSynchronize();
     if (status!=cudaSuccess) return static_cast<int>(status);
     ce_host.local_notify=enabled;
