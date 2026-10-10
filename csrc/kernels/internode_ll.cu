@@ -95,11 +95,11 @@ extern "C" __attribute__((visibility("default"))) int deepep_ce_configure_v2(
     int* notifications, int* host_counts, int capacity, int rank, int world, int token_capacity) {
     if (ce_configured or (world != 3 and world != 4 and world != 8) or
         token_capacity <= 0 or token_capacity > 2048 or
-        capacity != token_capacity * (24/world) or rank < 0 or rank >= world)
+        capacity <= 0 or capacity % token_capacity != 0 or capacity / token_capacity > 256 or rank < 0 or rank >= world)
         return static_cast<int>(cudaErrorInvalidValue);
     ce_host.send=send; ce_host.recv=recv; ce_host.counts=counts;
     ce_host.notifications=notifications; ce_host.capacity=capacity; ce_host.rank=rank;
-    ce_host.world=world; ce_host.local_experts=24/world;
+    ce_host.world=world; ce_host.local_experts=capacity/token_capacity;
     ce_host.token_capacity=token_capacity;
     ce_host.frame_bytes=16ull + capacity * (16ull + 16 + 5120 * 2);
     ce_host.ready_offset=ce_host.frame_bytes * world;
@@ -216,9 +216,9 @@ __global__ __launch_bounds__(1024,1) void ce_unpack(void* output, uint64_t outpu
 }
 
 __global__ __launch_bounds__(32,1) void ce_notify(bool dispatch_mode, int* flags, int* mask) {
-    const int i=threadIdx.x;
-    if (i>=24) return;
     const int nlocal=ce_device.local_experts;
+    // One warp retains the original notification SM budget for any expert count.
+    for (int i=threadIdx.x; i<nlocal*ce_device.world; i+=blockDim.x) {
     const int dst=i/nlocal, local_expert=i%nlocal, rank=ce_device.rank;
     const auto ptr=reinterpret_cast<uint64_t>(flags+(dispatch_mode ? local_expert*ce_device.world+rank : rank*nlocal+local_expert));
     const auto p2p=control_p2p_ptr(ptr,rank,dst,false);
@@ -227,10 +227,11 @@ __global__ __launch_bounds__(32,1) void ce_notify(bool dispatch_mode, int* flags
         if (p2p==0) nvshmemi_ibgda_rma_p(reinterpret_cast<int*>(ptr),value,dst,local_expert);
         else st_release_sys_global(reinterpret_cast<int*>(p2p),value);
     }
+    }
 }
 
 void ce_begin(int rank, int world, int hidden, int experts, int capacity, cudaStream_t stream) {
-    EP_HOST_ASSERT(ce_configured and rank==ce_host.rank and world==ce_host.world and hidden==5120 and experts==24 and capacity==ce_host.token_capacity);
+    EP_HOST_ASSERT(ce_configured and rank==ce_host.rank and world==ce_host.world and hidden==5120 and experts==ce_host.local_experts*ce_host.world and capacity==ce_host.token_capacity);
     cudaStreamCaptureStatus capture;
     EP_HOST_ASSERT(cudaStreamIsCapturing(stream,&capture)==cudaSuccess and capture==cudaStreamCaptureStatusNone);
     EP_HOST_ASSERT(cudaMemsetAsync(ce_host.counts,0,ce_host.world*sizeof(int),stream)==cudaSuccess);
@@ -238,7 +239,7 @@ void ce_begin(int rank, int world, int hidden, int experts, int capacity, cudaSt
 
 void ce_finish(bool dispatch_mode, void* recv, int* flags, int* mask, cudaStream_t stream) {
     const int payload_bytes=5120*2+(dispatch_mode ? 16 : 0);
-    const uint64_t output_bytes=dispatch_mode ? 24ull*ce_host.token_capacity*payload_bytes : 24ull*ce_host.token_capacity*(5120*2+160);
+    const uint64_t output_bytes=dispatch_mode ? static_cast<uint64_t>(ce_host.local_experts)*ce_host.world*ce_host.token_capacity*payload_bytes : static_cast<uint64_t>(ce_host.local_experts)*ce_host.world*ce_host.token_capacity*(5120*2+160);
     const bool dedup=dispatch_mode and ce_host.dispatch_dedup;
     ce_finalize_frames<<<1,32,0,stream>>>(payload_bytes,dedup);
     // Dynamic GPU counts become CPU memcpy sizes. This synchronization is
