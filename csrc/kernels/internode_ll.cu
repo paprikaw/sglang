@@ -191,11 +191,10 @@ __forceinline__ __device__ uint64_t ce_allocate(int peer, uint64_t offset, int b
 }
 
 __global__ __launch_bounds__(32,1) void ce_finalize_frames(int payload_bytes, bool dedup, bool dispatch_mode) {
-    if (dispatch_mode and ce_device.local_notify) {
-        for (int i=threadIdx.x; i<ce_device.world*ce_device.local_experts; i+=blockDim.x) {
-            const int p=i/ce_device.local_experts,e=i%ce_device.local_experts;
-            reinterpret_cast<int*>(ce_device.send+p*ce_device.frame_bytes+16)[e]=ce_device.notifications[i];
-        }
+    for (int i=threadIdx.x; i<ce_device.world*ce_device.local_experts; i+=blockDim.x) {
+        const int p=i/ce_device.local_experts,e=i%ce_device.local_experts;
+        reinterpret_cast<int*>(ce_device.send+p*ce_device.frame_bytes+16)[e]=
+            (dispatch_mode and ce_device.local_notify) ? ce_device.notifications[i] : 0;
     }
     const int peer=threadIdx.x;
     if (peer<ce_device.world) {
@@ -316,10 +315,11 @@ void ce_finish(bool dispatch_mode, void* recv, int* flags, int* mask, cudaStream
     const int epoch=++ce_epoch;
     ce_exchange_completion<false><<<1,32,0,stream>>>(epoch);
     ce_unpack<<<24,1024,0,stream>>>(recv,output_bytes,dedup);
-    // Ack only after the target has unpacked: scratch cannot be overwritten by
-    // a fast peer's next dispatch/combine. All flag traffic and waits are timed.
-    ce_exchange_completion<true><<<1,32,0,stream>>>(epoch);
+    // Notification metadata is another receive-frame consumer. Publish it
+    // before ACK permits a fast sender to reuse this frame for the next call.
+    // Payload unpack, metadata consumption, and completion are all timed.
     ce_notify<<<1,32,0,stream>>>(dispatch_mode,flags,mask);
+    ce_exchange_completion<true><<<1,32,0,stream>>>(epoch);
     EP_HOST_ASSERT(cudaGetLastError()==cudaSuccess);
     ++ce_metrics[0]; ++ce_metrics[dispatch_mode ? 4 : 5];
 }
