@@ -90,6 +90,21 @@ static int ce_epoch = 0;
 // calls, memcpy calls, wire bytes, payload copies, dispatch calls, combine calls
 static uint64_t ce_metrics[6]{};
 static bool ce_matched_peer_order=false;
+static bool ce_skip_local_drain=false;
+
+// Every payload peer must be mapped locally. No RDMA data is issued in
+// the early phase, so draining payload QPs and a global barrier are redundant.
+// Existing completion/ack and per-expert notification ordering remain intact.
+extern "C" __attribute__((visibility("default"))) int deepep_ce_set_skip_local_drain(int enabled) {
+    if (not ce_configured or ce_host.world!=4 or (enabled!=0 and enabled!=1))
+        return static_cast<int>(cudaErrorInvalidValue);
+    for (int i=0; i<ce_host.world; ++i) if (ce_host.peers[i]==0)
+        return static_cast<int>(cudaErrorInvalidValue);
+    auto status=cudaDeviceSynchronize();
+    if (status!=cudaSuccess) return static_cast<int>(status);
+    ce_skip_local_drain=enabled;
+    return 0;
+}
 
 // Pairwise matching avoids both source GPUs targeting the same PCIe receiver.
 // Set only between completed operations; payload and flags are unchanged.
@@ -904,7 +919,7 @@ void dispatch(void* packed_recv_x,
         };                                                   \
         if (split_rdma_first and (phases & LOW_LATENCY_SEND_PHASE)) { \
             launch_dispatch_phase(LOW_LATENCY_SEND_PHASE | kRDMAFirstPayloadPhase); \
-            launch_drain_rdma_before_pcie(rank, num_ranks, stream); \
+            if (not ce_configured or not ce_skip_local_drain) launch_drain_rdma_before_pcie(rank, num_ranks, stream); \
         }                                                    \
         if (ce_configured and split_rdma_first and (phases & LOW_LATENCY_SEND_PHASE)) { \
             EP_HOST_ASSERT(not use_fp8); \
@@ -1760,7 +1775,7 @@ void combine(void* combined_x,
         };                                                                                                                         \
         if (split_rdma_first and (phases & LOW_LATENCY_SEND_PHASE)) {                                                               \
             launch_combine_phase(LOW_LATENCY_SEND_PHASE | kRDMAFirstPayloadPhase);                                                   \
-            launch_drain_rdma_before_pcie(rank, num_ranks, stream);                                                                \
+            if (not ce_configured or not ce_skip_local_drain) launch_drain_rdma_before_pcie(rank, num_ranks, stream);                                                                \
         }                                                                                                                        \
         if (ce_configured and split_rdma_first and (phases & LOW_LATENCY_SEND_PHASE)) { \
             EP_HOST_ASSERT(not use_logfmt and not zero_copy); \
