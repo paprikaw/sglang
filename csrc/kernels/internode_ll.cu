@@ -89,6 +89,18 @@ static bool ce_configured = false;
 static int ce_epoch = 0;
 // calls, memcpy calls, wire bytes, payload copies, dispatch calls, combine calls
 static uint64_t ce_metrics[6]{};
+static bool ce_matched_peer_order=false;
+
+// Pairwise matching avoids both source GPUs targeting the same PCIe receiver.
+// Set only between completed operations; payload and flags are unchanged.
+extern "C" __attribute__((visibility("default"))) int deepep_ce_set_matched_peer_order(int enabled) {
+    if (not ce_configured or ce_host.world!=4 or (enabled!=0 and enabled!=1))
+        return static_cast<int>(cudaErrorInvalidValue);
+    auto status=cudaDeviceSynchronize();
+    if (status!=cudaSuccess) return static_cast<int>(status);
+    ce_matched_peer_order=enabled;
+    return 0;
+}
 
 extern "C" __attribute__((visibility("default"))) int deepep_ce_configure_v2(
     uint64_t send, uint64_t recv, const uint64_t* peers, int* counts,
@@ -246,7 +258,8 @@ void ce_finish(bool dispatch_mode, void* recv, int* flags, int* mask, cudaStream
     // deliberately included in the real dispatch/combine timing.
     EP_HOST_ASSERT(cudaMemcpyAsync(ce_host_counts,ce_host.counts,ce_host.world*sizeof(int),cudaMemcpyDeviceToHost,stream)==cudaSuccess);
     EP_HOST_ASSERT(cudaStreamSynchronize(stream)==cudaSuccess);
-    for (int peer=0; peer<ce_host.world; ++peer) {
+    for (int index=0; index<ce_host.world; ++index) {
+        const int peer=ce_matched_peer_order ? (ce_host.rank ^ index) : index;
         const bool eligible=ce_host.peers[peer]!=0 and peer!=ce_host.rank and peer!=(ce_host.rank^1);
         const int count=ce_host_counts[peer];
         EP_HOST_ASSERT(count>=0 and count<=ce_host.capacity and (eligible or count==0));
