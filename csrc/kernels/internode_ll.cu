@@ -78,9 +78,9 @@ struct CEDevice {
     uint64_t send, recv, peers[8];
     int* counts;
     int* notifications;
-    uint64_t frame_bytes, ready_offset, ack_offset;
+    uint64_t frame_bytes, ready_offset, ack_offset, header_bytes;
     int capacity, rank, world, local_experts, token_capacity;
-    int dispatch_dedup;
+    int dispatch_dedup, local_notify;
 };
 __device__ __constant__ CEDevice ce_device;
 static CEDevice ce_host{};
@@ -128,7 +128,8 @@ extern "C" __attribute__((visibility("default"))) int deepep_ce_configure_v2(
     ce_host.notifications=notifications; ce_host.capacity=capacity; ce_host.rank=rank;
     ce_host.world=world; ce_host.local_experts=capacity/token_capacity;
     ce_host.token_capacity=token_capacity;
-    ce_host.frame_bytes=16ull + capacity * (16ull + 16 + 5120 * 2);
+    ce_host.header_bytes=16ull+align_up(ce_host.local_experts*4,16);
+    ce_host.frame_bytes=ce_host.header_bytes + capacity * (16ull + 16 + 5120 * 2);
     ce_host.ready_offset=ce_host.frame_bytes * world;
     ce_host.ack_offset=ce_host.ready_offset + world * 128;
     for (int i=0; i<world; ++i) ce_host.peers[i]=peers[i];
@@ -154,6 +155,17 @@ extern "C" __attribute__((visibility("default"))) int deepep_ce_set_dispatch_ded
     return static_cast<int>(cudaMemcpyToSymbol(ce_device,&ce_host,sizeof(ce_host)));
 }
 
+extern "C" __attribute__((visibility("default"))) int deepep_ce_set_local_notify(int enabled) {
+    if (not ce_configured or ce_host.world!=4 or (enabled!=0 and enabled!=1))
+        return static_cast<int>(cudaErrorInvalidValue);
+    for (int i=0;i<ce_host.world;++i) if (ce_host.peers[i]==0)
+        return static_cast<int>(cudaErrorInvalidValue);
+    auto status=cudaDeviceSynchronize();
+    if (status!=cudaSuccess) return static_cast<int>(status);
+    ce_host.local_notify=enabled;
+    return static_cast<int>(cudaMemcpyToSymbol(ce_device,&ce_host,sizeof(ce_host)));
+}
+
 // Header (16), eight destination offsets (64), then one source-token payload.
 // Every route still gets its original expert slot. Only PCIe bytes are shared.
 constexpr int kCEDedupHeaderBytes=80;
@@ -161,7 +173,7 @@ __forceinline__ __device__ uint64_t ce_allocate_dedup(int peer, int bytes) {
     int slot=get_lane_id()==0 ? atomicAdd(ce_device.counts+peer,1) : 0;
     slot=__shfl_sync(0xffffffff,slot,0);
     EP_DEVICE_ASSERT(slot<ce_device.token_capacity and bytes%16==0);
-    auto packet=ce_device.send+peer*ce_device.frame_bytes+16ull+slot*(bytes+kCEDedupHeaderBytes);
+    auto packet=ce_device.send+peer*ce_device.frame_bytes+ce_device.header_bytes+slot*(bytes+kCEDedupHeaderBytes);
     return packet;
 }
 
@@ -169,7 +181,7 @@ __forceinline__ __device__ uint64_t ce_allocate(int peer, uint64_t offset, int b
     int slot=get_lane_id()==0 ? atomicAdd(ce_device.counts+peer,1) : 0;
     slot=__shfl_sync(0xffffffff,slot,0);
     EP_DEVICE_ASSERT(slot < ce_device.capacity and bytes % 16 == 0);
-    auto packet=ce_device.send+peer*ce_device.frame_bytes+16ull+slot*(bytes+16ull);
+    auto packet=ce_device.send+peer*ce_device.frame_bytes+ce_device.header_bytes+slot*(bytes+16ull);
     if (get_lane_id()==0) {
         *reinterpret_cast<uint64_t*>(packet)=offset;
         reinterpret_cast<int*>(packet)[2]=bytes;
@@ -178,7 +190,13 @@ __forceinline__ __device__ uint64_t ce_allocate(int peer, uint64_t offset, int b
     return packet+16;
 }
 
-__global__ __launch_bounds__(32,1) void ce_finalize_frames(int payload_bytes, bool dedup) {
+__global__ __launch_bounds__(32,1) void ce_finalize_frames(int payload_bytes, bool dedup, bool dispatch_mode) {
+    if (dispatch_mode and ce_device.local_notify) {
+        for (int i=threadIdx.x; i<ce_device.world*ce_device.local_experts; i+=blockDim.x) {
+            const int p=i/ce_device.local_experts,e=i%ce_device.local_experts;
+            reinterpret_cast<int*>(ce_device.send+p*ce_device.frame_bytes+16)[e]=ce_device.notifications[i];
+        }
+    }
     const int peer=threadIdx.x;
     if (peer<ce_device.world) {
         auto header=reinterpret_cast<int4*>(ce_device.send+peer*ce_device.frame_bytes);
@@ -215,7 +233,7 @@ __global__ __launch_bounds__(1024,1) void ce_unpack(void* output, uint64_t outpu
         const auto header=*reinterpret_cast<const int4*>(frame);
         EP_DEVICE_ASSERT(header.x>=0 and header.x<=ce_device.capacity);
         for (int slot=warp; slot<header.x; slot+=gridDim.x*32) {
-            const auto packet=frame+16ull+slot*static_cast<uint64_t>(header.y);
+            const auto packet=frame+ce_device.header_bytes+slot*static_cast<uint64_t>(header.y);
             EP_DEVICE_ASSERT(header.z==static_cast<int>(dedup));
             if (dedup) {
                 const auto metadata=*reinterpret_cast<const int4*>(packet);
@@ -247,6 +265,16 @@ __global__ __launch_bounds__(32,1) void ce_notify(bool dispatch_mode, int* flags
     // One warp retains the original notification SM budget for any expert count.
     for (int i=threadIdx.x; i<nlocal*ce_device.world; i+=blockDim.x) {
     const int dst=i/nlocal, local_expert=i%nlocal, rank=ce_device.rank;
+    const bool cross_pair=ce_device.peers[dst]!=0 and dst!=rank and dst!=(rank^1);
+    if (ce_device.local_notify and cross_pair) {
+        // The CE completion and unpack kernels have completed on this stream.
+        // Publish this source's expert completion locally; no per-expert RDMA.
+        const auto* metadata=reinterpret_cast<const int*>(ce_device.recv+dst*ce_device.frame_bytes+16);
+        const int value=dispatch_mode ? metadata[local_expert] : 1;
+        int* flag=flags+(dispatch_mode ? local_expert*ce_device.world+dst : dst*nlocal+local_expert);
+        if (not is_rank_masked(mask,dst)) st_release_sys_global(flag,value);
+        continue;
+    }
     const auto ptr=reinterpret_cast<uint64_t>(flags+(dispatch_mode ? local_expert*ce_device.world+rank : rank*nlocal+local_expert));
     const auto p2p=control_p2p_ptr(ptr,rank,dst,false);
     const int value=dispatch_mode ? ce_device.notifications[i] : 1;
@@ -268,7 +296,7 @@ void ce_finish(bool dispatch_mode, void* recv, int* flags, int* mask, cudaStream
     const int payload_bytes=5120*2+(dispatch_mode ? 16 : 0);
     const uint64_t output_bytes=dispatch_mode ? static_cast<uint64_t>(ce_host.local_experts)*ce_host.world*ce_host.token_capacity*payload_bytes : static_cast<uint64_t>(ce_host.local_experts)*ce_host.world*ce_host.token_capacity*(5120*2+160);
     const bool dedup=dispatch_mode and ce_host.dispatch_dedup;
-    ce_finalize_frames<<<1,32,0,stream>>>(payload_bytes,dedup);
+    ce_finalize_frames<<<1,32,0,stream>>>(payload_bytes,dedup,dispatch_mode);
     // Dynamic GPU counts become CPU memcpy sizes. This synchronization is
     // deliberately included in the real dispatch/combine timing.
     EP_HOST_ASSERT(cudaMemcpyAsync(ce_host_counts,ce_host.counts,ce_host.world*sizeof(int),cudaMemcpyDeviceToHost,stream)==cudaSuccess);
@@ -279,7 +307,7 @@ void ce_finish(bool dispatch_mode, void* recv, int* flags, int* mask, cudaStream
         const int count=ce_host_counts[peer];
         EP_HOST_ASSERT(count>=0 and count<=ce_host.capacity and (eligible or count==0));
         if (not eligible) continue;
-        const size_t bytes=16ull+static_cast<size_t>(count)*(payload_bytes+(dedup ? kCEDedupHeaderBytes : 16));
+        const size_t bytes=ce_host.header_bytes+static_cast<size_t>(count)*(payload_bytes+(dedup ? kCEDedupHeaderBytes : 16));
         EP_HOST_ASSERT(bytes<=ce_host.frame_bytes);
         EP_HOST_ASSERT(cudaMemcpyAsync(reinterpret_cast<void*>(ce_host.peers[peer]+ce_host.rank*ce_host.frame_bytes),
             reinterpret_cast<const void*>(ce_host.send+peer*ce_host.frame_bytes),bytes,cudaMemcpyDeviceToDevice,stream)==cudaSuccess);
