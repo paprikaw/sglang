@@ -136,6 +136,23 @@ class DeepEPMoE(FusedMoE):
         elif (
             quant_config is None
             and self.w13_weight.dtype == torch.bfloat16
+            and get_moe_runner_backend().is_triton()
+            and get_moe_a2a_backend().is_deepep()
+            and not _is_npu
+            and not _is_hip
+        ):
+            if not get_deepep_mode().is_low_latency():
+                raise NotImplementedError(
+                    "Unquantized Triton DeepEP currently requires "
+                    "--deepep-mode low_latency"
+                )
+            # BF16 expert compute does not require native FP8 instructions or
+            # DeepGEMM. Only the LL expert-major layout bridge is implemented here.
+            self.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
+            self.deprecate_flag = True
+        elif (
+            quant_config is None
+            and self.w13_weight.dtype == torch.bfloat16
             and get_moe_runner_backend().is_deep_gemm()
             and (get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_pplx())
             and not _is_npu

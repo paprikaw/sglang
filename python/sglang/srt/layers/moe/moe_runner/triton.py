@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
@@ -332,4 +332,59 @@ def post_permute_triton_to_standard(
 
     return StandardCombineInput(
         hidden_states=runner_output.hidden_states,
+    )
+
+
+@register_fused_func("deepep", "triton")
+def fused_experts_deepep_ll_to_triton_bf16(
+    dispatch_output,
+    quant_info: TritonMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+):
+    from sglang.srt.layers.moe.moe_runner.bf16_deepep import prepare_bf16_deepep_ll
+    from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    if not DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+        raise NotImplementedError("BF16 Triton DeepEP bridge only supports LL dispatch")
+    if (
+        dispatch_output.hidden_states_scale is not None
+        or quant_info.w13_weight.dtype != torch.bfloat16
+        or quant_info.w2_weight.dtype != torch.bfloat16
+        or quant_info.use_mxfp8
+        or quant_info.use_fp8_w8a8
+        or quant_info.use_int8_w8a8
+        or quant_info.use_int8_w8a16
+        or quant_info.use_int4_w4a16
+    ):
+        raise TypeError("Triton DeepEP bridge supports unquantized BF16 only")
+    hidden, weights, expert_ids, valid = prepare_bf16_deepep_ll(
+        dispatch_output.hidden_states, dispatch_output.masked_m
+    )
+    local_config = replace(
+        runner_config,
+        top_k=1,
+        inplace=False,
+        no_combine=False,
+        apply_router_weight_on_input=False,
+        routed_scaling_factor=None,
+    )
+    output = fused_experts_none_to_triton(
+        StandardDispatchOutput(
+            hidden_states=hidden,
+            hidden_states_scale=None,
+            topk_output=StandardTopKOutput(weights, expert_ids, None),
+        ),
+        quant_info,
+        local_config,
+    ).hidden_states.reshape_as(dispatch_output.hidden_states)
+    output = torch.where(valid.unsqueeze(-1), output, 0)
+    # Routing weights (including any model scaling) are consumed exactly once
+    # by native LL combine, not by the one-expert-per-received-slot GEMM above.
+    return DeepEPLLCombineInput(
+        hidden_states=output,
+        topk_ids=dispatch_output.topk_ids,
+        topk_weights=dispatch_output.topk_weights,
     )
