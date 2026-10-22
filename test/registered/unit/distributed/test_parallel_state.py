@@ -50,6 +50,36 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
 
 
+@pytest.mark.parametrize(
+    "is_draft,pp_size,pp_spec,expected",
+    [
+        (True, 2, True, "tp"),
+        (False, 2, True, "world"),
+        (True, 1, True, "world"),
+        (True, 2, False, "world"),
+        (False, 1, False, "world"),
+    ],
+)
+def test_tail_only_pp_draft_memory_probe_uses_participating_group(
+    is_draft, pp_size, pp_spec, expected
+):
+    from sglang.srt.distributed import bootstrap
+
+    # The target still needs a global PP minimum. Only the additional
+    # last-stage draft probe must stay off that collective sequence.
+    world, tp = Mock(world_size=8), Mock(world_size=4)
+    with (
+        patch.object(bootstrap, "get_world_group", return_value=world) as world_get,
+        patch.object(bootstrap, "get_tp_group", return_value=tp) as tp_get,
+    ):
+        group = bootstrap._pre_model_load_memory_group(
+            is_draft_worker=is_draft, pp_size=pp_size, pp_spec_enabled=pp_spec
+        )
+    assert group is (tp if expected == "tp" else world)
+    assert tp_get.call_count == (expected == "tp")
+    assert world_get.call_count == (expected == "world")
+
+
 def test_group_coordinator_logical_routing_keeps_physical_group_resident():
     coordinator = parallel_state.GroupCoordinator.__new__(
         parallel_state.GroupCoordinator

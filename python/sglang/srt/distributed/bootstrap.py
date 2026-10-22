@@ -66,6 +66,20 @@ class TorchDistributedResult(msgspec.Struct, frozen=True, kw_only=True):
     elastic_pp_migration_group: object = None
 
 
+def _pre_model_load_memory_group(
+    *, is_draft_worker: bool, pp_size: int, pp_spec_enabled: bool
+):
+    # Opt-in PP+spec creates a draft only on the last PP stage. A draft
+    # world-group probe would therefore match earlier stages' TARGET pool
+    # probes instead. Their next int64 token-capacity reduction then meets a
+    # float32 free-memory reduction (Gloo: 8 vs 4 bytes). Keep the tail-only
+    # probe on its participating TP group; target pool sizing still reduces
+    # over every PP stage after target and draft weights are resident.
+    if pp_spec_enabled and is_draft_worker and pp_size > 1:
+        return get_tp_group()
+    return get_world_group()
+
+
 def init_torch_distributed(
     *,
     server_args: ServerArgs,
@@ -134,11 +148,16 @@ def init_torch_distributed(
         ):
             _prewarm_tp_lm_head_all_to_all()
 
+    memory_group = _pre_model_load_memory_group(
+        is_draft_worker=is_draft_worker,
+        pp_size=ps.pp_size,
+        pp_spec_enabled=envs.SGLANG_ENABLE_PP_SPEC.get(),
+    )
     pre_model_load_memory = get_available_gpu_memory(
         device,
         ps.gpu_id,
-        distributed=get_world_group().world_size > 1,
-        cpu_group=get_world_group().cpu_group,
+        distributed=memory_group.world_size > 1,
+        cpu_group=memory_group.cpu_group,
     )
     tp_group = get_tp_group()
     pp_group = get_pp_group()
