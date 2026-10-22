@@ -964,6 +964,42 @@ class TestBuildDecodeRegistry(unittest.TestCase):
         self.assertTrue(torch.all(hs[:3] == 1))
         self.assertTrue(torch.all(hs[3:] == 0))  # tail untouched
 
+    def test_allocated_pp_verify_hidden_and_residual_cover_every_token(self):
+        from sglang.srt.model_executor.runner.base_runner import _allocate_decode_buffers
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import build_decode_registry
+
+        for width in (1, 3):
+            for blocks in (None, 2):
+                with self.subTest(tokens_per_request=width, residual_blocks=blocks):
+                    tokens = 4 * width
+                    src = _allocate_decode_buffers(
+                        device=torch.device("cpu"), max_bs=4, max_num_token=tokens,
+                        hidden_size=8, vocab_size=16, dtype=torch.float32,
+                        dp_size=1, pp_size=2, is_encoder_decoder=False,
+                        require_mlp_tp_gather=False, seq_len_fill_value=1,
+                        encoder_len_fill_value=0, num_tokens_per_req=width,
+                        cache_loc_dtype=torch.int64, enable_mamba_track=False,
+                        pp_proxy_residual_num_blocks=blocks,
+                    )
+                    expected_residual = (tokens, 8) if blocks is None else (tokens, blocks, 8)
+                    self.assertEqual(tuple(src.pp_proxy_tensors["hidden_states"].shape), (tokens, 8))
+                    self.assertEqual(tuple(src.pp_proxy_tensors["residual"].shape), expected_residual)
+                    registry = build_decode_registry(
+                        device=torch.device("cpu"), max_bs=4, max_num_token=tokens,
+                        seq_len_fill_value=1, cache_loc_dtype=torch.int64, source=src,
+                    )
+                    proxy = SimpleNamespace(tensors={
+                        key: torch.full_like(value, 2)
+                        for key, value in src.pp_proxy_tensors.items()
+                    })
+                    registry.fill_from(
+                        _MiniForwardBatch(batch_size=4), raw_bs=4, padded_bs=4,
+                        raw_num_tokens=tokens, padded_num_tokens=tokens,
+                        pp_proxy_tensors=proxy,
+                    )
+                    for value in src.pp_proxy_tensors.values():
+                        self.assertTrue(torch.all(value == 2))
+
     def test_source_with_canary_registers_bs_slots(self):
         from sglang.srt.model_executor.cuda_graph_buffer_registry import (
             build_decode_registry,
