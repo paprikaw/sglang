@@ -7,6 +7,7 @@ slow path (`organize_draft_results`) for num_steps in {1, 2, 3, 4}.
 """
 
 import contextlib
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,6 +19,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
+from sglang.srt.speculative import eagle_worker_v2 as eagle_module
 from sglang.test.ci.ci_register import register_amd_ci, register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -27,6 +29,80 @@ register_amd_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small-amd")
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+class TestPPCanonicalDraftEmbedding(unittest.TestCase):
+    def worker(self):
+        worker = object.__new__(EagleDraftWorker)
+        worker.hot_token_id = None
+        worker.speculative_algorithm = SimpleNamespace(is_eagle3=lambda: False)
+        cfg = SimpleNamespace(load_format="auto", download_dir="unchanged")
+        head = object()
+        target = SimpleNamespace(
+            load_config=cfg,
+            model_config=SimpleNamespace(model_path="/original/checkpoint", revision=None),
+            model=SimpleNamespace(lm_head=SimpleNamespace(weight=head)),
+        )
+        worker.target_worker = SimpleNamespace(model_runner=target)
+        worker.draft_runner = SimpleNamespace(model=SimpleNamespace(
+            _canonical_cpu_weight_cache_key="admitted-key", set_embed_and_head=MagicMock()
+        ))
+        return worker, cfg, head
+
+    def test_new_authenticated_view_is_bound_without_mutating_target_config(self):
+        worker, target_cfg, head = self.worker()
+        embed = SimpleNamespace(weight_loader=MagicMock())
+        tensor = object()
+        pinned = [False]
+
+        @contextlib.contextmanager
+        def view(*args):
+            pinned[0] = True
+            try:
+                yield "/authenticated/ram-view", {"group_key": "admitted-key"}
+            finally:
+                pinned[0] = False
+
+        def load(**kwargs):
+            self.assertTrue(pinned[0])
+            self.assertEqual(kwargs["model_path"], "/authenticated/ram-view")
+            cfg = kwargs["load_config"]
+            self.assertIsNot(cfg, target_cfg)
+            self.assertEqual(cfg._canonical_weight_cache_view, kwargs["model_path"])
+            self.assertEqual(cfg.download_dir, "unchanged")
+            return tensor
+
+        with (
+            patch.dict(os.environ, {"SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET": "/bank/socket"}),
+            patch.object(eagle_module.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True),
+            patch.object(eagle_module, "get_parallel", return_value=SimpleNamespace(pp_size=2)),
+            patch.object(eagle_module, "get_model", return_value=SimpleNamespace(load_format="auto")),
+            patch.object(eagle_module, "_find_draft_input_embedding", return_value=SimpleNamespace(weight=embed)),
+            patch("sglang.srt.weight_cache.cpu_canonical.model_view", side_effect=view),
+            patch.object(eagle_module, "_load_checkpoint_tensor", side_effect=load) as loader,
+        ):
+            worker.init_lm_head()
+        self.assertEqual(loader.call_count, 1)
+        embed.weight_loader.assert_called_once_with(embed, tensor)
+        worker.draft_runner.model.set_embed_and_head.assert_called_once_with(embed, head)
+        self.assertFalse(hasattr(target_cfg, "_canonical_weight_cache_view"))
+        self.assertFalse(pinned[0])
+
+    def test_other_bank_key_is_rejected_before_tensor_loading(self):
+        worker, _, _ = self.worker()
+        with (
+            patch.dict(os.environ, {"SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET": "/bank/socket"}),
+            patch.object(eagle_module.envs.SGLANG_ENABLE_PP_SPEC, "get", return_value=True),
+            patch.object(eagle_module, "get_parallel", return_value=SimpleNamespace(pp_size=2)),
+            patch.object(eagle_module, "get_model", return_value=SimpleNamespace(load_format="auto")),
+            patch.object(eagle_module, "_find_draft_input_embedding", return_value=SimpleNamespace(weight=object())),
+            patch("sglang.srt.weight_cache.cpu_canonical.model_view",
+                  return_value=contextlib.nullcontext(("/authenticated/ram-view", {"group_key": "wrong"}))),
+            patch.object(eagle_module, "_load_checkpoint_tensor") as loader,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "different canonical banks"):
+                worker.init_lm_head()
+        loader.assert_not_called()
 
 
 def _fake_server_args(**fields):

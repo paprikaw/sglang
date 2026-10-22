@@ -2,6 +2,7 @@ import contextlib
 import logging
 import os
 import time
+from copy import copy
 from dataclasses import replace
 from typing import List, Optional
 
@@ -394,11 +395,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     ) as (view, bank):
                         if bank["group_key"] != self.draft_runner.model._canonical_cpu_weight_cache_key:
                             raise RuntimeError("MTP embedding and draft used different canonical banks")
+                        # The target's original loader view has already closed.
+                        # Bind this short-lived config to the newly authenticated
+                        # RAM view, without permitting a checkpoint/disk fallback
+                        # or mutating the target runner's reusable load config.
+                        load_config = copy(target_runner.load_config)
+                        load_config._canonical_weight_cache_view = view
                         loaded_embed = _load_checkpoint_tensor(
                             model_path=view,
                             revision=target_runner.model_config.revision,
                             tensor_names=_EMBED_TENSOR_NAMES,
-                            load_config=target_runner.load_config,
+                            load_config=load_config,
                         )
                         embed.weight_loader(embed, loaded_embed)
                         del loaded_embed
