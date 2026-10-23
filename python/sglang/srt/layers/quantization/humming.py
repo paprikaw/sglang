@@ -36,6 +36,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.runtime_context import get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -636,6 +637,9 @@ class HummingLinearMethod(LinearMethodBase):
         # see https://github.com/inclusionAI/humming/blob/main/docs/config.md
         compute_config = {
             "use_f16_accum": envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
+            "use_batch_invariant": (
+                get_exec().deterministic.enable_deterministic_inference
+            ),
             "gemm_type": "dense",
         }
         self.compute_config = json.dumps(compute_config)
