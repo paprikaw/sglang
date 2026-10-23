@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
-from sglang.srt.distributed.parallel_state import P2PWork
+from sglang.srt.distributed.parallel_state import P2PWork, get_pp_spec_feedback_group
 from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationPhase
 from sglang.srt.elastic_pp.topology import DynamicPPTransition, PPTopology
 from sglang.srt.environ import envs
@@ -33,6 +33,7 @@ from sglang.srt.managers.io_struct import (
     ReconfigureElasticPPReqOutput,
 )
 from sglang.srt.managers.overlap_utils import RelayPayload, resolve_forward_inputs
+from sglang.srt.managers.pp_spec_microbatch import launch_then_exchange, own_payload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
@@ -88,6 +89,7 @@ class SchedulerPPMixin:
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
     _pp_spec_relay: bool = False
+    _pp_spec_microbatch: bool = False
 
     def handle_get_elastic_pp_state(
         self: Scheduler, recv_req: GetElasticPPStateReqInput
@@ -630,26 +632,40 @@ class SchedulerPPMixin:
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
-                # With zero async depth, non-last speculative ranks must
+                # Legacy transport: with zero async depth, non-last ranks must
                 # exchange the previous outputs before launching the next batch.
                 # Tree planning synchronizes CUDA on the host; sending alone
                 # leaves the peer's return send unmatched and can block that
                 # synchronization while the peer waits for our next proxy.
-                # The last rank must launch first to produce its output.
-                early_proxy = self._pp_requires_immediate_output_relay()
+                # The last rank must launch first to produce its output. The
+                # microbatch path instead submits activations early and uses
+                # a separate feedback group, breaking that dependency cycle.
+                early_proxy = (
+                    self._pp_requires_immediate_output_relay()
+                    or self._pp_spec_microbatch
+                )
                 exchange_outputs_before_forward = not early_proxy and (
                     get_parallel().pp_async_batch_depth > 0
                     or (self._pp_spec_relay and not self.pp_group.is_last_rank)
                 )
-                if exchange_outputs_before_forward:
+                if self._pp_spec_microbatch:
+                    result, (next_pp_outputs, next_batch_result, d2h_event) = (
+                        self._pp_run_ready_microbatch(
+                            mb_id, cur_batch,
+                            pp_proxy_tensors if cur_batch else None,
+                            next_first_rank_mb_id, next_mb_id,
+                        )
+                    )
+                elif exchange_outputs_before_forward:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(self.send_proxy_work)
-                if cur_batch:
+                if not self._pp_spec_microbatch:
+                    self._pp_commit_comm_work(self.send_proxy_work)
+                if cur_batch and not self._pp_spec_microbatch:
                     result, self.launch_event = self._pp_launch_or_skip_batch(
                         mb_id,
                         cur_batch,
@@ -657,7 +673,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
-                if early_proxy:
+                if early_proxy and not self._pp_spec_microbatch:
                     # Immediate output relays form a full resident-ring
                     # circuit. Its logical last rank may still need this
                     # activation before it can reach the output-send step.
@@ -666,7 +682,10 @@ class SchedulerPPMixin:
                     self._pp_send_launched_proxy(
                         cur_batch, result if cur_batch else None
                     )
-                if not exchange_outputs_before_forward:
+                if (
+                    not exchange_outputs_before_forward
+                    and not self._pp_spec_microbatch
+                ):
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -699,6 +718,28 @@ class SchedulerPPMixin:
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self.on_idle()
+
+    def _pp_run_ready_microbatch(
+        self: Scheduler, mb_id, batch, proxy, next_first_rank_mb_id, next_mb_id,
+    ):
+        # Only reuse a graph/proxy slot after its previous send has completed.
+        # Never wait for the OTHER slot's feedback before submitting this one.
+        self._pp_commit_comm_work(self.send_proxy_work)
+
+        def launch():
+            with torch.profiler.record_function(f"pp_microbatch_launch.slot{mb_id}"):
+                result, self.launch_event = self._pp_launch_or_skip_batch(
+                    mb_id, batch, proxy, self.mb_metadata, self.last_rank_comm_queue,
+                )
+            return result
+
+        return launch_then_exchange(
+            launch if batch is not None else None,
+            lambda result: self._pp_send_launched_proxy(batch, result),
+            lambda: self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                next_first_rank_mb_id, next_mb_id,
+            ),
+        )
 
     def _pp_send_launched_proxy(self: Scheduler, batch, result) -> None:
         if batch and self._pp_rank_is_active() and not self._pp_is_last_rank():
@@ -1123,6 +1164,14 @@ class SchedulerPPMixin:
             and self.ps.pp_size > 1
             and not self.spec_algorithm.is_none()
         )
+        self._pp_spec_microbatch = envs.SGLANG_PP_SPEC_MICROBATCH.get()
+        if self._pp_spec_microbatch:
+            assert self._pp_spec_relay and self.ps.pp_size == self.pp_loop_size == 2
+            self._pp_spec_feedback_group = get_pp_spec_feedback_group()
+            logger.info(
+                "PP/MTP microbatch: two slots, early activation, independent "
+                "feedback group, owned graph payloads"
+            )
 
         self.send_req_work = []
         self.send_proxy_work = []
@@ -1639,8 +1688,13 @@ class SchedulerPPMixin:
                 if dst is None:
                     raise RuntimeError("logical last PP rank cannot send proxy tensors")
         p2p_work = []
+        transport = (
+            self._pp_spec_feedback_group
+            if self._pp_spec_microbatch and msg_type == "output"
+            else self.pp_group
+        )
         p2p_work.extend(
-            self.pp_group.send_tensor_dict(
+            transport.send_tensor_dict(
                 tensor_dict=tensor_dict,
                 dst=dst,
                 all_gather_group=(
@@ -1668,7 +1722,12 @@ class SchedulerPPMixin:
                 return inbox_queue.popleft()
 
         while True:
-            tensor_dict = self.pp_group.recv_tensor_dict(
+            transport = (
+                self._pp_spec_feedback_group
+                if self._pp_spec_microbatch and expected_kind == "output"
+                else self.pp_group
+            )
+            tensor_dict = transport.recv_tensor_dict(
                 src=src, all_gather_group=all_gather_group
             )
             received_kind = tensor_dict.get("__msg_type__", "default")
@@ -2325,6 +2384,24 @@ class SchedulerPPMixin:
                     ),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                 )
+                if (
+                    self._pp_spec_microbatch
+                    and result.spec_verify_out_cache_loc is not None
+                ):
+                    mb_metadata[mb_id].verify_out_cache_loc = (
+                        result.spec_verify_out_cache_loc.clone()
+                    )
+                if self._pp_spec_microbatch and not self.pp_group.is_last_rank:
+                    # Proxy tensors alias the shared graph replay outputs.
+                    result.pp_hidden_states_proxy_tensors = PPProxyTensors(
+                        own_payload(result.pp_hidden_states_proxy_tensors.tensors)
+                    )
+                output_tensors = None
+                if self.pp_group.is_last_rank:
+                    output_tensors = self._pp_prepare_tensor_dict(result, cur_batch)
+                    if self._pp_spec_microbatch:
+                        output_tensors = own_payload(output_tensors)
+                # The send fence must cover snapshots, not only the forward.
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
                 if self.pp_group.is_last_rank:
@@ -2332,9 +2409,7 @@ class SchedulerPPMixin:
                     last_rank_comm_queue.append(
                         (
                             event,
-                            PPProxyTensors(
-                                self._pp_prepare_tensor_dict(result, cur_batch)
-                            ),
+                            PPProxyTensors(output_tensors),
                         )
                     )
         return result, event

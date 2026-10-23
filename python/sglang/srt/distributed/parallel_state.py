@@ -2186,7 +2186,13 @@ def get_moe_tp_group() -> GroupCoordinator:
 get_tensor_model_parallel_group = get_tp_group
 
 _PP: Optional[GroupCoordinator] = None
+_PP_SPEC_FEEDBACK: Optional[GroupCoordinator] = None
 _ELASTIC_PP_MIGRATION: Optional[GroupCoordinator] = None
+
+
+def get_pp_spec_feedback_group() -> GroupCoordinator:
+    assert _PP_SPEC_FEEDBACK is not None, "PP microbatch feedback group is not initialized"
+    return _PP_SPEC_FEEDBACK
 
 
 def get_pp_group() -> GroupCoordinator:
@@ -2847,6 +2853,22 @@ def initialize_model_parallel(
         rank_offset=rank_offset,
         max_world_size=max_world_size,
     )
+    global _PP_SPEC_FEEDBACK
+    assert _PP_SPEC_FEEDBACK is None, "PP feedback group is already initialized"
+    if envs.SGLANG_PP_SPEC_MICROBATCH.get():
+        # Same ranks, different NCCL AND Gloo queues. A target activation and
+        # the other slot's feedback may be in flight in opposite directions.
+        _PP_SPEC_FEEDBACK = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            group_name="pp_spec_feedback",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
     global _ELASTIC_PP_MIGRATION
     assert (
         _ELASTIC_PP_MIGRATION is None
@@ -3096,6 +3118,11 @@ def destroy_model_parallel():
     if _PP:
         _PP.destroy()
     _PP = None
+
+    global _PP_SPEC_FEEDBACK
+    if _PP_SPEC_FEEDBACK:
+        _PP_SPEC_FEEDBACK.destroy()
+    _PP_SPEC_FEEDBACK = None
 
     global _ELASTIC_PP_MIGRATION
     if _ELASTIC_PP_MIGRATION:

@@ -10011,6 +10011,20 @@ class ServerArgs:
             )
 
     def check_server_args(self):
+        from sglang.srt.managers.pp_spec_microbatch import validate_microbatch_config
+
+        validate_microbatch_config(
+            enabled=envs.SGLANG_PP_SPEC_MICROBATCH.get(),
+            pp_size=self.pp_size,
+            pp_async_batch_depth=self.pp_async_batch_depth,
+            pp_spec_enabled=envs.SGLANG_ENABLE_PP_SPEC.get(),
+            speculative_algorithm=self.speculative_algorithm,
+            topk=self.speculative_eagle_topk,
+            overlap_disabled=self.disable_overlap_schedule,
+            elastic=self.enable_elastic_pp,
+            disaggregation_mode=self.disaggregation_mode,
+            dp_attention=self.enable_dp_attention,
+        )
         # Check parallel size constraints
         if self.ep_join_mode != "scale":
             assert (
