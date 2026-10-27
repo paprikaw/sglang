@@ -7,6 +7,7 @@ The default policy delegates to the unmodified implementation.
 
 from collections import Counter
 from contextlib import nullcontext
+from contextvars import ContextVar
 from functools import wraps
 import json
 import mmap
@@ -41,6 +42,14 @@ def execute_two(dispatchers, inputs, core, *, overlap):
 
 
 _INSTALLED = False
+_FORWARD_POLICY = ContextVar("prefill_overlap_forward_policy", default=0)
+
+
+def eligible_rows(global_rows):
+    # Limit the experimental path to large Prefill on both DP ranks. Mixed
+    # Prefill/Decode and idle-rank tails keep the native communication path.
+    return bool(global_rows) and min(global_rows) >= 128
+
 
 
 def install():
@@ -56,6 +65,8 @@ def install():
     from sglang.srt.layers.deep_gemm_wrapper.entrypoint import configure_deep_gemm_num_sms
     from sglang.srt.layers.dp_attention import get_is_extend_in_batch, get_dp_global_num_tokens
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.distributed.parallel_state import get_tp_group
 
     run = Path(os.environ["EP2_PP2_RUN"])
     control = (run / "ep_overlap_policy.bin").open("r+b")
@@ -152,14 +163,14 @@ def install():
 
     @wraps(original)
     def forward(self, hidden_states, topk_output, pre_quant_input=None):
-        policy = mode()
+        policy = _FORWARD_POLICY.get()
         if policy == 0 or not get_is_extend_in_batch():
             counts[0] += 1
             return original(self, hidden_states, topk_output, pre_quant_input=pre_quant_input)
         global_rows = get_dp_global_num_tokens()
         # Every rank makes the same decision from the synchronized CPU list.
         # A tiny health request must not create an all-empty first sub-dispatch.
-        if max(global_rows) < 2 or (policy == 8 and min(global_rows) == 0):
+        if not eligible_rows(global_rows):
             counts[f"bypass_p{policy}"] += 1
             return original(self, hidden_states, topk_output, pre_quant_input=pre_quant_input)
         assert pre_quant_input is None, "The Prefill overlap admission only supports unquantized BF16"
@@ -189,6 +200,23 @@ def install():
         return split_forward(self, hidden_states, topk_output, policy)
 
     FusedMoE.forward_impl = forward
+    original_model_forward = ModelRunner.forward
+
+    @wraps(original_model_forward)
+    def model_forward(self, *args, **kwargs):
+        # Streamed first-token delivery can precede retirement of an extra
+        # scheduler forward. Never read a new cohort policy midway through its
+        # layers or let the two ranks sample a policy transition differently.
+        group = get_tp_group()
+        selected = torch.tensor([mode()], dtype=torch.int64, device="cpu")
+        torch.distributed.broadcast(selected, src=group.ranks[0], group=group.cpu_group)
+        token = _FORWARD_POLICY.set(int(selected.item()))
+        try:
+            return original_model_forward(self, *args, **kwargs)
+        finally:
+            _FORWARD_POLICY.reset(token)
+
+    ModelRunner.forward = model_forward
     original_state = Scheduler.get_internal_state
 
     @wraps(original_state)
