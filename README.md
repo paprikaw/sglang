@@ -1,0 +1,1 @@
+Measured-time PP partition candidate: 25+23 layers. Native FP8 math and policy9/10 are unchanged. Runtime admission checks the exact positive partition with total 48 layers. The tail keeps six full Attention layers; one GDN layer moves to the head.
