@@ -54,7 +54,7 @@ def install():
     )
     from sglang.srt.layers.moe.topk import StandardTopKOutput
     from sglang.srt.layers.deep_gemm_wrapper.entrypoint import configure_deep_gemm_num_sms
-    from sglang.srt.layers.dp_attention import get_is_extend_in_batch
+    from sglang.srt.layers.dp_attention import get_is_extend_in_batch, get_dp_global_num_tokens
     from sglang.srt.managers.scheduler import Scheduler
 
     run = Path(os.environ["EP2_PP2_RUN"])
@@ -113,8 +113,9 @@ def install():
     def split_forward(layer, hidden, topk, policy):
         assert not layer._dwdp_bound and hidden.dtype == torch.bfloat16
         assert isinstance(topk, StandardTopKOutput)
-        assert hidden.shape[0] >= 2 and hidden.shape[0] % 2 == 0
-        cut = hidden.shape[0] // 2
+        origin_dim = hidden.shape[-1]
+        source_rows = hidden.shape[0]
+        cut = source_rows // 2
         inputs = []
         for low, high in ((0, cut), (cut, hidden.shape[0])):
             logits = None if topk.router_logits is None else topk.router_logits[low:high]
@@ -130,15 +131,17 @@ def install():
                 return layer.run_moe_core(dispatch_output=dispatched)
 
         outputs = execute_two(children(layer), inputs, core, overlap=policy != 1)
-        result = torch.cat(outputs, dim=0)[..., :hidden.shape[-1]].contiguous()
+        result = torch.cat(outputs, dim=0)[..., :origin_dim].contiguous()
         if layer.reduce_results and (layer.moe_tp_size > 1 or layer.moe_ep_size > 1):
             from sglang.srt.distributed import tensor_model_parallel_all_reduce
             result = tensor_model_parallel_all_reduce(result)
         counts[policy] += 1
-        shapes[f"p{policy}:T{hidden.shape[0]}:chunk{cut}:gemm_sms{sms}"] += 1
+        shapes[f"p{policy}:T{source_rows}:chunks{cut},{source_rows-cut}:gemm_sms{sms}"] += 1
         return result
 
     def error(reference, value):
+        if reference.numel() == 0:
+            return dict(exact=torch.equal(reference, value), relative_l2=0., max_abs=0., finite=True)
         diff = value.float() - reference.float()
         return dict(exact=torch.equal(reference, value),
                     relative_l2=(torch.linalg.vector_norm(diff) /
@@ -153,16 +156,24 @@ def install():
         if policy == 0 or not get_is_extend_in_batch():
             counts[0] += 1
             return original(self, hidden_states, topk_output, pre_quant_input=pre_quant_input)
+        global_rows = get_dp_global_num_tokens()
+        # Every rank makes the same decision from the synchronized CPU list.
+        # A tiny health request must not create an all-empty first sub-dispatch.
+        if max(global_rows) < 2 or (policy == 8 and min(global_rows) == 0):
+            counts[f"bypass_p{policy}"] += 1
+            return original(self, hidden_states, topk_output, pre_quant_input=pre_quant_input)
         assert pre_quant_input is None, "The Prefill overlap admission only supports unquantized BF16"
         if policy == 8:
+            saved_hidden = hidden_states.clone() if self.layer_id not in qualification else None
+            source_rows = hidden_states.shape[0]
             reference = original(self, hidden_states, topk_output)
             if self.layer_id not in qualification:
-                serial = split_forward(self, hidden_states, topk_output, 1)
-                overlap = split_forward(self, hidden_states, topk_output, 2)
-                reserved = split_forward(self, hidden_states, topk_output, 3)
+                serial = split_forward(self, saved_hidden.clone(), topk_output, 1)
+                overlap = split_forward(self, saved_hidden.clone(), topk_output, 2)
+                reserved = split_forward(self, saved_hidden.clone(), topk_output, 3)
                 row = dict(native_vs_split=error(reference, serial),
                            serial_vs_overlap=error(serial, overlap),
-                           serial_vs_reserved=error(serial, reserved), source_rows=hidden_states.shape[0])
+                           serial_vs_reserved=error(serial, reserved), source_rows=source_rows, global_rows=list(global_rows))
                 row["passed"] = (row["serial_vs_overlap"]["exact"] and
                                  all(row[k]["finite"] and row[k]["relative_l2"] <= .015
                                      for k in ("native_vs_split", "serial_vs_reserved")))
