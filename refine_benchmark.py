@@ -5,6 +5,7 @@ import time
 
 from lookahead_workloads import byte
 from previous_workloads import prompts
+from artifact_visibility import wait_for_stable_json
 
 
 def install(base):
@@ -12,8 +13,14 @@ def install(base):
         byte(cfg['gap_policy_path'], ord('a') if policy == 10 else ord(str(policy)))
 
     def states(cfg, key, policy):
-        info = base.h.http_json(cfg['port'], '/get_server_info', key, timeout=30)
-        values = [s['experiment_gap_state'] for s in info['internal_states']]
+        # The public PP response contains only the head stage. Each broadcast
+        # control request also publishes a private receipt on both stages.
+        for _ in range(3):
+            base.h.http_json(cfg['port'], '/get_server_info', key, timeout=30)
+        directory = Path(cfg['code_root']).parent / 'pp2/gap_receipts'
+        values = [wait_for_stable_json(directory / f'policy{policy}.pp{rank}.json',
+                                      timeout_s=20, poll_s=.01, min_stable_s=.02)[0]
+                  for rank in (0, 1)]
         assert len(values) == 2
         for s in values:
             assert s['policy'] == policy
