@@ -909,6 +909,14 @@ class SchedulerPPMixin:
                 recv_reqs = self.request_receiver.recv_requests()
                 self.process_input_requests(recv_reqs)
 
+                # PP uses its own queue consensus instead of process_decode_queue.
+                # Still reap HiCache writes/loads every slot, including idle slots,
+                # with all pipeline stages participating in the same order. Without
+                # this, completed writes keep prefix locks and idle/flush never
+                # succeeds; host restore cannot retire either.
+                if self.enable_decode_hicache:
+                    self.tree_cache.check_hicache_events()
+
                 if not self._pp_is_physical_last_rank():
                     self._pp_commit_comm_work(self.send_req_work)
 
