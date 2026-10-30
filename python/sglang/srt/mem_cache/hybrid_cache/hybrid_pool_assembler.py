@@ -1292,8 +1292,18 @@ class _MambaStrategy(StackStrategy):
     ):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-        full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
-        mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+        # Forward/RDMA pools use global model layer IDs. The H2D controller
+        # iterates stage-local IDs (as do the per-layer completion counters).
+        # Without this offset, later PP stages silently skip their restores.
+        start_layer = kvcache.start_layer
+        full_layer_mapping = {
+            layer - start_layer: local
+            for layer, local in kvcache.full_attention_layer_id_mapping.items()
+        }
+        mamba_layer_mapping = {
+            layer - start_layer: local
+            for layer, local in params.req_to_token_pool.mamba_map.items()
+        }
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
             params=params,
             server_args=server_args,
