@@ -37,6 +37,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVReceiver
+from sglang.srt.disaggregation.mamba_cache import reserve_decode_mamba_slots
 from sglang.srt.disaggregation.decode_hicache_mixin import (
     DecodeHiCachePreallocMixin,
     DecodeHiCacheTransferMixin,
@@ -634,7 +635,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.tree_cache,
             req,
             req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            # Prefill sends the final prompt state into a separately owned
+            # request slot. Matching only needs the reusable KV prefix here.
+            cow_mamba=False,
             include_req=True,
         )
         # Keep aggregated scheduling semantics while preserving the SWA lock
@@ -1303,6 +1306,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
+            if not reserve_decode_mamba_slots(self.tree_cache, decode_req.req):
+                if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+                    self._release_matched_prefix_lock(decode_req.req)
+                break
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
                 prefix_indices,

@@ -166,6 +166,9 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+    # PD Decode receives the live recurrent state from Prefill. Local HiCache
+    # restore must restore tree checkpoints without overwriting that RDMA slot.
+    copy_mamba_to_request: bool = True
 
 
 class MatchResult(NamedTuple):

@@ -262,8 +262,8 @@ def build_kv_cache(
 
     # Decode-side radix cache supports SWA only through the unified tree, whose
     # component pools preserve the full-attention prefix while transferring the
-    # SWA window fresh. The legacy SWA cache and hybrid SSM pools remain
-    # incompatible with the prefix-match-and-lock allocation path.
+    # SWA window fresh. GDN uses the unified tree and receives its live
+    # recurrent state separately from the reusable full-attention KV prefix.
     if (
         get_disagg().disaggregation_decode_enable_radix_cache
         and get_disagg().disaggregation_mode == "decode"
@@ -292,10 +292,13 @@ def build_kv_cache(
                     "--disaggregation-decode-enable-radix-cache does not support "
                     "SWA-compress models (e.g. Gemma4 / MiMo-V2) yet."
                 )
-        if is_hybrid_ssm:
+        if is_hybrid_ssm and (
+            hybrid_gdn_config(tp_worker.model_runner.model_config) is None
+            or not spec_algorithm.is_none()
+        ):
             raise ValueError(
-                "--disaggregation-decode-enable-radix-cache is incompatible "
-                "with Mamba/SSM models"
+                "Decode-side recurrent-state prefix caching currently supports "
+                "GDN models without speculative decoding."
             )
 
     effective_chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -352,6 +355,14 @@ def build_kv_cache(
             tp_group=tp_group,
         )
     )
+
+    if (
+        is_hybrid_ssm
+        and get_disagg().disaggregation_mode == "decode"
+        and get_disagg().disaggregation_decode_enable_radix_cache
+        and not isinstance(tree_cache, UnifiedRadixCache)
+    ):
+        raise ValueError("GDN Decode prefix caching requires UnifiedRadixCache.")
 
     if (
         enable_hierarchical_cache or retraction_backup == "host_pool"

@@ -209,6 +209,9 @@ class DecodeHiCacheTransferMixin:
                 best_match_node=rematch.best_match_node,
                 host_hit_length=rematch.host_hit_length,
                 req=dr.req,
+                # The request slot is a live transfer destination, not a CoW
+                # target for the older cached recurrent-state checkpoint.
+                copy_mamba_to_request=not self.tree_cache.supports_mamba(),
             )
         )
         # Failback: total coverage < required prefix means device alloc likely failed.

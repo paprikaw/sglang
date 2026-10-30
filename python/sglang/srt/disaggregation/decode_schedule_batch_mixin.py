@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, List
 
 import torch
 
+from sglang.srt.disaggregation.mamba_cache import prepare_transferred_mamba_state
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -118,6 +119,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
         last_tokens: List[int] = []
         for req in self.reqs:
             last_tokens.append(req.output_ids[-1])
+            prepare_transferred_mamba_state(req, self.tree_cache)
             maybe_cache_unfinished_req(req, self.tree_cache)
             if req.grammar is not None:
                 # FIXME: this try-except block is for handling unexpected xgrammar issue.
