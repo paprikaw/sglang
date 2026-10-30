@@ -14,6 +14,7 @@ import torch.distributed
 from tqdm import tqdm
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreGatedKVReceiver
 from sglang.srt.disaggregation.utils import poll_and_all_reduce_attn_cp_tp_group
 from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationPhase
@@ -1927,13 +1928,23 @@ class SchedulerPPMixin:
         return result, event
 
     def get_rids(
-        self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group
+        self: Scheduler,
+        req_queue: List[Req],
+        is_send: bool,
+        *poll_statuses_group,
+        gate_hicache: bool = False,
     ):
         """
         Used by PP, get the required rids with the given poll statuses.
         """
+        receivers = [
+            req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue
+        ]
+        if gate_hicache:
+            assert not is_send
+            receivers = [HiCacheRestoreGatedKVReceiver(req) for req in req_queue]
         polls = poll_and_all_reduce_attn_cp_tp_group(
-            [req.disagg_kv_sender if is_send else req.kv_receiver for req in req_queue],
+            receivers,
             self.attn_cp_cpu_group,
             self.attn_tp_cpu_group,
         )
@@ -2019,12 +2030,19 @@ class SchedulerPPMixin:
         return good_rids, bad_rids
 
     def _pp_pd_get_decode_transferred_ids(self: Scheduler):
+        # Local restores must be ready on *every* PP stage before the transfer
+        # consensus releases a request. Starting them only in pop_transferred
+        # lets one stage retire the receiver while another still waits for DMA.
+        if self.enable_decode_hicache:
+            queue = self.disagg_decode_transfer_queue
+            queue._process_hicache_local_restores(queue.queue)
         # get the current stage transfer success
         if self.pp_group.is_first_rank:
             transferred_rids = self.get_rids(
                 self.disagg_decode_transfer_queue.queue,
                 False,
                 [KVPoll.Success, KVPoll.Failed],
+                gate_hicache=self.enable_decode_hicache,
             )
         # if other ranks, do intersection with the previous rank's transferred rids
         else:
@@ -2036,6 +2054,7 @@ class SchedulerPPMixin:
                 self.disagg_decode_transfer_queue.queue,
                 False,
                 [KVPoll.Success, KVPoll.Failed],
+                gate_hicache=self.enable_decode_hicache,
             )
             # 3. new consensus rids = intersection(previous consensus rids, transfer finished rids)
             transferred_rids = list(
