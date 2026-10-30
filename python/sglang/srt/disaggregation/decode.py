@@ -292,6 +292,7 @@ class DecodeRequest:
     hicache_restored_node: Any = None
     hicache_load_consumer_index: int = -1
     hicache_restore_status: HiCacheRestoreResult = HiCacheRestoreResult.PENDING
+    hicache_load_back_retry_started: Optional[float] = None
 
     @property
     def seqlen(self) -> int:

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.mem_cache.base_prefix_cache import InitLoadBackParams
@@ -186,7 +188,8 @@ class DecodeHiCacheTransferMixin:
         On success, ``dr.hicache_restored_node`` and ``hicache_restored_kv_indices``
         are populated, and an inc_lock_ref is held until commit/abort.
         Trivial cases (all-on-device / no needed coverage) auto-flip to READY.
-        Failback paths flip to FAILED.
+        A complete host match with a failed allocation remains PENDING. Missing
+        coverage, partial restore, or an exhausted retry deadline flips to FAILED.
         """
         pm = dr.prefix_match
 
@@ -204,6 +207,18 @@ class DecodeHiCacheTransferMixin:
             cow_mamba=False,
             include_req=True,
         )
+        available_prefix = len(rematch.device_indices) + rematch.host_hit_length
+        if available_prefix < pm.decode_prefix_len:
+            logger.warning(
+                "HiCache promised prefix lost for rid=%s: device=%d, host=%d, "
+                "required=%d; refusing incomplete restore",
+                dr.req.rid,
+                len(rematch.device_indices),
+                rematch.host_hit_length,
+                pm.decode_prefix_len,
+            )
+            dr.hicache_restore_status = HiCacheRestoreResult.FAILED
+            return False
         new_indices, restored_node = self.tree_cache.init_load_back(
             InitLoadBackParams(
                 best_match_node=rematch.best_match_node,
@@ -214,8 +229,31 @@ class DecodeHiCacheTransferMixin:
                 copy_mamba_to_request=not self.tree_cache.supports_mamba(),
             )
         )
-        # Failback: total coverage < required prefix means device alloc likely failed.
+        # A zero-length result with intact host coverage is a normal capacity
+        # miss. Hybrid load rolls back all KV/aux allocations before returning
+        # it, so the next scheduler tick may retry without publishing a DMA or
+        # modifying the live Prefill->Decode recurrent-state destination.
         if len(rematch.device_indices) + len(new_indices) < pm.decode_prefix_len:
+            if len(new_indices) == 0:
+                now = time.monotonic()
+                if dr.hicache_load_back_retry_started is None:
+                    dr.hicache_load_back_retry_started = now
+                    logger.warning(
+                        "HICACHE_LOAD_BACK_DEFERRED: rid=%s device=%d host=%d "
+                        "required=%d; waiting for restore capacity",
+                        dr.req.rid,
+                        len(rematch.device_indices),
+                        rematch.host_hit_length,
+                        pm.decode_prefix_len,
+                    )
+                elapsed = now - dr.hicache_load_back_retry_started
+                if elapsed < envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get():
+                    return False
+                logger.error(
+                    "HiCache load_back retry timed out for rid=%s after %.1fs",
+                    dr.req.rid,
+                    elapsed,
+                )
             logger.warning(
                 "HiCache load_back failed for rid=%s: device_indices=%d, "
                 "new_indices=%d, expected decode_prefix_len=%d (l1=%d, l2=%d, l3=%d)",
@@ -230,6 +268,13 @@ class DecodeHiCacheTransferMixin:
             dr.hicache_restore_status = HiCacheRestoreResult.FAILED
             return False
 
+        if dr.hicache_load_back_retry_started is not None:
+            logger.info(
+                "HICACHE_LOAD_BACK_RETRY_SUCCEEDED: rid=%s after %.3fs",
+                dr.req.rid,
+                time.monotonic() - dr.hicache_load_back_retry_started,
+            )
+            dr.hicache_load_back_retry_started = None
         dr.hicache_restored_kv_indices = torch.cat(
             [rematch.device_indices[pm.l1_prefix_len :], new_indices]
         )
