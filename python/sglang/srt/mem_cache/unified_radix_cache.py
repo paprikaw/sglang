@@ -2689,7 +2689,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if not finish_event.query():
             return False
 
-        self.loading_check()
+        # A local CUDA event can become ready at different scheduler slots on
+        # different pipeline stages.  loading_check() emits a PP collective;
+        # calling it conditionally here can pair it with an unrelated event
+        # packet on another stage.  PP Decode retires acknowledgements once per
+        # slot in check_hicache_events_pp_decode(), in pipeline order.
+        if self.pp_size == 1:
+            self.loading_check()
         return True
 
     # ---- Query / Inspection APIs ----
