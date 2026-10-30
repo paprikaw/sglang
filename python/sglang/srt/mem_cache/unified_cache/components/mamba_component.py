@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -40,6 +41,8 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -483,13 +486,18 @@ class MambaComponent(TreeComponent):
                 self.tree_core.component_protected_size_[ct] -= vlen
             cd.lock_ref -= 1
 
-    def _alloc_mamba_slot(self) -> torch.Tensor:
-        """Allocate one mamba pool slot, evicting if necessary."""
+    def _try_alloc_mamba_slot(self) -> Optional[torch.Tensor]:
+        """Reclaim an evictable state, returning None if all states are pinned."""
         slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
         if slot is None:
             self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
-            assert slot is not None, "Can not alloc mamba cache"
+        return slot
+
+    def _alloc_mamba_slot(self) -> torch.Tensor:
+        """Allocate a required state; callers must reserve capacity for it."""
+        slot = self._try_alloc_mamba_slot()
+        assert slot is not None, "Can not alloc mamba cache"
         return slot
 
     @property
@@ -579,22 +587,35 @@ class MambaComponent(TreeComponent):
                     mamba_value_donated = self._commit_int8_checkpoint(
                         req.mamba_pool_idx.view(-1)
                     )
-            elif self.cache.enable_mamba_extra_buffer:
-                new_slot = self._alloc_mamba_slot()
-                mamba_value_donated = (
-                    self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
-                        req, new_slot
-                    )
-                )
             else:
-                mamba_value_donated = self._alloc_mamba_slot()
-                # mamba_pool is a pure PHYSICAL store; translate both slot ids
-                # virtual->physical (identity for the non-unified memory pool) first.
-                translate = self.cache.req_to_token_pool.translate_mamba_indices
-                self.cache.req_to_token_pool.mamba_pool.copy_from(
-                    translate(req.mamba_pool_idx.unsqueeze(0)),
-                    translate(mamba_value_donated),
-                )
+                new_slot = self._try_alloc_mamba_slot()
+                if new_slot is None:
+                    # Other live/preallocated requests can consume a slot after
+                    # admission checked it. An unfinished radix snapshot is
+                    # optional: keep the request's state, tracking buffers and
+                    # existing prefix lock, and let completion donate a state.
+                    if not getattr(self, "_warned_checkpoint_pressure", False):
+                        logger.warning(
+                            "MAMBA_CACHE_CHECKPOINT_DEFERRED: no evictable state "
+                            "slot; retaining active request state and KV cache"
+                        )
+                        self._warned_checkpoint_pressure = True
+                    return 0
+                if self.cache.enable_mamba_extra_buffer:
+                    mamba_value_donated = (
+                        self.cache.req_to_token_pool.donate_mamba_ping_pong_slot(
+                            req, new_slot
+                        )
+                    )
+                else:
+                    mamba_value_donated = new_slot
+                    # mamba_pool is a pure PHYSICAL store; translate both slot ids
+                    # virtual->physical (identity for the non-unified memory pool).
+                    translate = self.cache.req_to_token_pool.translate_mamba_indices
+                    self.cache.req_to_token_pool.mamba_pool.copy_from(
+                        translate(req.mamba_pool_idx.unsqueeze(0)),
+                        translate(mamba_value_donated),
+                    )
             insert_params.mamba_value = mamba_value_donated
             return cache_len
 
@@ -640,7 +661,10 @@ class MambaComponent(TreeComponent):
                 insert_result is None or insert_result.mamba_exist
             ):
                 self._free_mamba_value(insert_params.mamba_value)
-            req.mamba_last_track_seqlen = None
+            # A skipped insertion never donated/replaced the tracking slot.
+            # Its recorded depth remains valid for a later retry or completion.
+            if insert_params.mamba_value is not None:
+                req.mamba_last_track_seqlen = None
 
     # ---- HiCache Hooks ----
 
