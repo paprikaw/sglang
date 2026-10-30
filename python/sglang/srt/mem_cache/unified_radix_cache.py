@@ -287,17 +287,21 @@ class UnifiedRadixCache(BasePrefixCache):
         if not waited and self.tp_world_size > 1:
             torch.distributed.barrier(group=self.tp_group)
 
-    def _drain_async_work(self):
+    def _drain_async_work(self, *, blocking: bool = True):
         """
-        Block until all outstanding async sends are consumed, then clear.
+        Retire async sends, optionally waiting for all outstanding work.
 
-        Called at the start of each event round, so work_list holds the sends
-        accumulated since the last round. This bounds it and applies
-        backpressure when a downstream PP rank lags. Scheduler thread only.
+        Normal event rounds wait for downstream consumption. PP Decode must
+        retain unfinished sends without waiting ahead of its consensus ring.
+        Scheduler thread only.
         """
+        pending = []
         for work in self.work_list:
-            work.wait()
-        self.work_list.clear()
+            if blocking or work.is_completed():
+                work.wait()
+            else:
+                pending.append(work)
+        self.work_list = pending
 
     def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
         """
@@ -2595,10 +2599,19 @@ class UnifiedRadixCache(BasePrefixCache):
             last_best_match_device_node_id,
         )
 
-    def check_hicache_events(self) -> None:
+    def check_hicache_events_pp_decode(self) -> None:
+        """Poll without waiting ahead of the pipelined request-consensus ring.
+
+        A downstream Decode stage may need this stage's consensus message
+        before it can receive our previous HiCache packet. Retain unfinished
+        send work instead of waiting here; the PP ring already bounds lead.
+        """
+        self.check_hicache_events(wait_for_pp_sync=False)
+
+    def check_hicache_events(self, *, wait_for_pp_sync: bool = True) -> None:
         """Called per scheduler step to poll async HiCache events."""
         # Reap the previous round's PP-sync sends before issuing new ones.
-        self._drain_async_work()
+        self._drain_async_work(blocking=wait_for_pp_sync)
 
         if self.pp_size != 1:
             finish_counts = torch.zeros(2, dtype=torch.int, device="cpu")

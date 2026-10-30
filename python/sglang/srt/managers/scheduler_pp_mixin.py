@@ -916,7 +916,12 @@ class SchedulerPPMixin:
                 # this, completed writes keep prefix locks and idle/flush never
                 # succeeds; host restore cannot retire either.
                 if self.enable_decode_hicache:
-                    self.tree_cache.check_hicache_events()
+                    poll_cache = getattr(
+                        self.tree_cache,
+                        "check_hicache_events_pp_decode",
+                        self.tree_cache.check_hicache_events,
+                    )
+                    poll_cache()
 
                 if not self._pp_is_physical_last_rank():
                     self._pp_commit_comm_work(self.send_req_work)
