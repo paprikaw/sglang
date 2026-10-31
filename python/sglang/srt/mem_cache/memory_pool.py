@@ -2548,6 +2548,14 @@ class MHATokenToKVPool(KVCache):
         Override when the registerable storage differs from k/v_buffer."""
         return self.k_buffer + self.v_buffer
 
+    def get_kv_layer_ids(self):
+        """Global layer ids for the native K-then-V per-layer wire layout."""
+        if len(self.get_contiguous_buf_infos()[0]) != 2 * self.layer_num:
+            # Quantized/envelope subclasses need their own wire mapping.
+            return []
+        layer_ids = list(range(self.start_layer, self.start_layer + self.layer_num))
+        return layer_ids * 2
+
     def get_contiguous_buf_infos(self):
         """(ptrs, lens, item_lens) for PD KV transfer, derived from the descriptors.
         ``lens`` is the final span at the CURRENT serving size -- for a post-capture
