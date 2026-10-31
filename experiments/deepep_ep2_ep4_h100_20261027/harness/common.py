@@ -1,0 +1,53 @@
+"""Pinned no-model H100 EP2/EP4 communication; accepted SM90 native, no model compute."""
+import hashlib,json,os
+from pathlib import Path
+ROOT=Path(__file__).resolve().parent
+WORKSPACE=Path('/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling')
+MANAGER=Path('/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager')
+DEEP=WORKSPACE/'.third_party/deepep-pcie-coalesced-20261006'
+DEEP_COMMIT='05d46157c7ccfa0784b59a5198253a701215c4d3'
+HOST_COMMIT='7d1ebddc49649fe06d6b8ccd2f77876e2ba9b4ce'
+DEEP_TAG='experiment/deepep/custom-sm90-20261007'
+NATIVE_SO=MANAGER/'runtime/deepep_h100_custom_ep8_20261007_r2/native12/python/deep_ep_cpp.cpython-312-x86_64-linux-gnu.so'
+NATIVE_SHA='d9b26ac86748517800ce9f9734d865be20d089d473d9d4f6d66dde98c673d76b'
+CACHED_NATIVE_RECEIPT=NATIVE_SO.parents[1]/'build_result.json'
+PYTHON='/data/gpfs/projects/punim2715/vllm_workbench/sglang_overlap_compare/venv-dd15fb57-cu12/bin/python'
+CUDA='/apps/easybuild-2022/easybuild/software/Core/CUDA/12.8.0'
+GUARD_SCRIPTS=Path('/home/bxb1/.codex/skills/llm-experiment-guard/scripts')
+GUARD=GUARD_SCRIPTS/'dashboard_guard.py'
+DEFAULT_RUN=WORKSPACE/'experiments/deepep_ep2_ep4_h100_20261027/runs/h100178_ep2_ep4_r1'
+NODES=('spartan-gpgpu178',)
+JOBS=('33646188',)
+TRACE_SHIM=WORKSPACE/'experiments/deepep_ah_diagnosis_h100_20260928/trace_verbs.so'
+TRACE_SHIM_SHA='d0434685656281f372a6cda96f26e14778e325e77d8af96be1fc3698b58f6a68'
+CAPACITY,HIDDEN,EXPERTS,TOPK,WARMUP,ITERATIONS=1024,5120,160,8,3,3
+TOKEN_SWEEP=(1,128)
+def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+def save(path,value):
+    path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_name(path.name+f'.{os.getpid()}.tmp')
+    tmp.write_text(json.dumps(value,indent=2,ensure_ascii=False)+'\n');tmp.replace(path)
+def native_for(run, model):
+    if model == 'glm':
+        assert sha(NATIVE_SO) == NATIVE_SHA
+        return dict(path=str(NATIVE_SO), sha256=NATIVE_SHA, reused=True)
+    assert model == 'hy3'
+    receipt=json.loads((Path(run)/'candidate/build_result.json').read_text())
+    assert receipt['passed'] and receipt['host_base_native_sha256']==NATIVE_SHA
+    assert receipt['cuda_source_sha256']==sha(ROOT/'hy3_internode_ll.cu')
+    assert sha(receipt['native_path'])==receipt['native_sha256']
+    return dict(path=receipt['native_path'],sha256=receipt['native_sha256'],reused=False)
+
+def environment(physical_gpus, native_path=None, threshold=0):
+    assert tuple(physical_gpus) in ((0,1),(2,3),(0,2),(0,1,2,3))
+    env={k:v for k,v in os.environ.items() if not k.startswith(('SGLANG_','VLLM_','NVSHMEM_','DEEPEP_','NCCL_','HUMMING_','EXPERIMENT_GUARD_')) and k not in ('LD_PRELOAD','PYTHONPATH','CUDA_VISIBLE_DEVICES')}
+    env.update(CUDA_VISIBLE_DEVICES=','.join(map(str,physical_gpus)),PYTHONPATH=f'{DEEP}:{Path(native_path or NATIVE_SO).parent}',
+        LD_LIBRARY_PATH=f'/home/bxb1/conda/lib:{CUDA}/lib64:/apps/easybuild-2022/easybuild/software/Core/OpenSSL/1.1/lib',
+        LD_PRELOAD=str(TRACE_SHIM),PATH=f'{Path(PYTHON).parent}:{CUDA}/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+        PYTHONUNBUFFERED='1',PYTHONDONTWRITEBYTECODE='1',OMP_NUM_THREADS='4',MKL_NUM_THREADS='1',CUDA_HOME=CUDA,CUDA_PATH=CUDA,
+        GLOO_SOCKET_IFNAME='bond0.3027',NCCL_SOCKET_IFNAME='bond0.3027',NCCL_CUMEM_HOST_ENABLE='0',
+        NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME='bond0.3027',NVSHMEM_HCA_LIST='mlx5_bond_0:1',NVSHMEM_IB_ADDR_FAMILY='AF_INET',
+        NVSHMEM_IB_ADDR_RANGE='172.26.92.0/22',NVSHMEM_IBGDA_NIC_HANDLER='cpu_host_memory',NVSHMEM_DISABLE_P2P='0',
+        NVSHMEM_DEBUG='INFO',
+        NVSHMEM_QP_DEPTH='4096',DEEPEP_AH_ZERO_STATIC_RATE='1',DEEPEP_LL_NVLINK_PAIR_ONLY='0',DEEPEP_LL_PCIE_P2P_MAX_TOKENS=str(threshold),SGLANG_DEEPEP_DISABLE_NVLINK_LOW_LATENCY='0')
+    return env
