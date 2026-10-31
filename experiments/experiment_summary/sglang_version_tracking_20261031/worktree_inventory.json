@@ -1,0 +1,892 @@
+[
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling",
+    "HEAD": "74734b15fbfd96681b07663243309fef2b24bee5",
+    "branch": "refs/heads/codex/autoscaling-kvcached",
+    "untracked": [
+      "python/sglang/kernels/ops/attention/verify_as_decode.py",
+      "tools/cache_monitor/README.md",
+      "tools/cache_monitor/probe.py",
+      "tools/cache_monitor/server.py",
+      "tools/cache_monitor/static/app.js",
+      "tools/cache_monitor/static/index.html",
+      "tools/cache_monitor/static/style.css",
+      "tools/cache_monitor/test_frontend.mjs",
+      "tools/cache_monitor/test_monitor.py",
+      "tools/gpu_dashboard_client/README.md",
+      "tools/gpu_dashboard_client/build_installer.py",
+      "tools/gpu_dashboard_client/gpu-dashboard",
+      "tools/gpu_dashboard_client/install-macos.sh",
+      "tools/idle_gpu_benchmark/PREFILL.md",
+      "tools/idle_gpu_benchmark/README.md",
+      "tools/idle_gpu_benchmark/check_hy3_idle.py",
+      "tools/idle_gpu_benchmark/coordinator.py",
+      "tools/idle_gpu_benchmark/dataset.py",
+      "tools/idle_gpu_benchmark/fleet_monitor.py",
+      "tools/idle_gpu_benchmark/hy3_controller.py",
+      "tools/idle_gpu_benchmark/hy3_manager.py",
+      "tools/idle_gpu_benchmark/loadgen.py",
+      "tools/idle_gpu_benchmark/prefill_client.py",
+      "tools/idle_gpu_benchmark/prefill_monitor.py",
+      "tools/idle_gpu_benchmark/prefill_trace.py",
+      "tools/idle_gpu_benchmark/prefill_worker.py",
+      "tools/idle_gpu_benchmark/prefill_worker_append.py",
+      "tools/idle_gpu_benchmark/prefill_worker_ephemeral.py",
+      "tools/idle_gpu_benchmark/prefill_worker_ephemeral_lease.py",
+      "tools/idle_gpu_benchmark/test_coordinator.py",
+      "tools/idle_gpu_benchmark/test_dataset.py",
+      "tools/idle_gpu_benchmark/test_hy3_preemption.py",
+      "tools/idle_gpu_benchmark/test_integration_contract.py",
+      "tools/idle_gpu_benchmark/test_loadgen.py",
+      "tools/idle_gpu_benchmark/test_prefill_client.py",
+      "tools/idle_gpu_benchmark/test_prefill_concurrency.py",
+      "tools/idle_gpu_benchmark/test_prefill_monitor.py",
+      "tools/idle_gpu_benchmark/test_prefill_trace.py",
+      "tools/idle_gpu_benchmark/test_prefill_worker.py",
+      "tools/idle_gpu_benchmark/test_prefill_worker_append.py",
+      "tools/idle_gpu_benchmark/test_prefill_worker_ephemeral.py",
+      "tools/idle_gpu_benchmark/test_prefill_worker_lease.py",
+      "tools/idle_gpu_benchmark/test_trace_stream.py",
+      "tools/idle_gpu_benchmark/trace_stream.py",
+      "tools/idle_gpu_benchmark/verify_hy3_handoff.py",
+      "tools/idle_gpu_benchmark/verify_hy3_resume.py",
+      "tools/idle_gpu_benchmark/worker.py",
+      "tools/idle_gpu_service/README.md",
+      "tools/idle_gpu_service/cache_model_discovery.py",
+      "tools/idle_gpu_service/cluster_backfill.py",
+      "tools/idle_gpu_service/install_user_services.py",
+      "tools/idle_gpu_service/manager.py",
+      "tools/idle_gpu_service/node_runner.py",
+      "tools/idle_gpu_service/node_runner_benchmark.py",
+      "tools/idle_gpu_service/test_benchmark_runner.py",
+      "tools/idle_gpu_service/test_cache_model_discovery.py",
+      "tools/idle_gpu_service/test_cluster_backfill.py",
+      "tools/idle_gpu_service/test_ephemeral_runner.py",
+      "tools/idle_gpu_service/test_manager.py",
+      "tools/idle_gpu_service/test_monitor_resilience.py",
+      "tools/idle_gpu_service/test_node_runner.py",
+      "tools/idle_gpu_service/test_resilient_runner.py",
+      "tools/idle_gpu_service/test_resource_hardware.py",
+      "tools/idle_gpu_service/test_resource_states.py"
+    ],
+    "recent": [
+      "74734b15fb Add TraceLab agentic serving replay",
+      "f0609fb359 Report hybrid cache eviction pressure",
+      "871116844a Support Qwen3.5 hybrid elastic PP migration",
+      "ba459803dd Fix elastic PP ring relay accounting"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 8,
+    "tracked_dirty_status_counts": {
+      " M": 8
+    },
+    "tracked_dirty_paths": [
+      " M python/sglang/srt/disaggregation/common/conn.py",
+      " M python/sglang/srt/disaggregation/mooncake/conn.py",
+      " M python/sglang/srt/environ.py",
+      " M python/sglang/srt/layers/attention/triton_backend.py",
+      " M python/sglang/srt/mem_cache/memory_pool.py",
+      " M test/registered/attention/test_verify_splitkv.py",
+      " M test/registered/disaggregation/test_disaggregation_pp.py",
+      " M test/registered/unit/disaggregation/test_disaggregation_wire.py"
+    ]
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/.worktrees/e2e-repair",
+    "HEAD": "8482ec93f139a6b85886d1645e627810515b176e",
+    "branch": "refs/heads/codex/elastic-pp-active-route-fix",
+    "untracked": [],
+    "recent": [
+      "8482ec93f1 Synchronize elastic PP drain fences",
+      "057fbfb641 Anchor movable PP outputs at resident tail",
+      "54a083ab2a Align movable PP output origin with resident ring",
+      "07f7bfac5f Preserve staged output ring for movable PP endpoints"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 5,
+    "tracked_dirty_status_counts": {
+      " M": 5
+    },
+    "tracked_dirty_paths": [
+      " M python/sglang/srt/elastic_pp/coordinator.py",
+      " M python/sglang/srt/elastic_pp/kv_transport.py",
+      " M test/registered/unit/elastic_pp/test_coordinator.py",
+      " M test/registered/unit/elastic_pp/test_kv_transport.py",
+      " M test/registered/unit/elastic_pp/test_kvcached_pool.py"
+    ]
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/.worktrees/glm47-pp4-hicache-l3-20260902",
+    "HEAD": "92580291f087ffbeb3439714a360b7ff3a99e369",
+    "branch": "refs/heads/codex/pp4-hicache-l3-replay",
+    "untracked": [],
+    "recent": [
+      "92580291f0 [HiCache] Fix PP inconsistency with HiCache L3 (#22607) (#27010)",
+      "74734b15fb Add TraceLab agentic serving replay",
+      "f0609fb359 Report hybrid cache eviction pressure",
+      "871116844a Support Qwen3.5 hybrid elastic PP migration"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/.worktrees/heterogeneous-tp-pp",
+    "HEAD": "44ce47e296d740b39f26223acdbb276a6280a3d7",
+    "branch": "refs/heads/codex/heterogeneous-tp-pp",
+    "untracked": [],
+    "recent": [
+      "44ce47e296 feat: support heterogeneous TP widths across PP stages",
+      "c19b263e02 Keep inactive PP rank batch state aligned across reconfiguration",
+      "a3f6bac291 Support moving elastic PP output endpoints and PP1 to PP2 routes",
+      "fd7078fdab Separate logical PP routing from resident process groups"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/.worktrees/llama70b-burstgpt-tp-20260829",
+    "HEAD": "74734b15fbfd96681b07663243309fef2b24bee5",
+    "detached": true,
+    "untracked": [],
+    "recent": [
+      "74734b15fb Add TraceLab agentic serving replay",
+      "f0609fb359 Report hybrid cache eviction pressure",
+      "871116844a Support Qwen3.5 hybrid elastic PP migration",
+      "ba459803dd Fix elastic PP ring relay accounting"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/.worktrees/qwen-integration",
+    "HEAD": "c2101ddac7af5451cc102ee1ceb37d982d0adc4e",
+    "branch": "refs/heads/codex/qwen38-codex-integration",
+    "untracked": [],
+    "recent": [
+      "c2101ddac7 Add Codex adapter for local Qwen SGLang serving",
+      "95f5ecd3d2 [AMD] Update amd deepseek v4 cookbook 0822 (#35854)",
+      "d1af3c8923 [diffusion] feat: support loading native diffusers miniMax h3 components (#36067)",
+      "de6a1dbd7a [diffusion] feat: support hybrid conditioning for minimax h3 (#36080)"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/.worktrees/serving",
+    "HEAD": "2c7fb9a02ceabe4165d804b423c331c2c290e6b1",
+    "branch": "refs/heads/codex/sglang-serving",
+    "untracked": [],
+    "recent": [
+      "2c7fb9a02c Prevent runaway Qwen tool reasoning",
+      "9d850dc235 Record verified 256K serving runtime",
+      "685031413a Use stable sglang-serving source path",
+      "4f49f75c5c Add Codex adapter for local Qwen SGLang serving"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/agentx-gdn-pd-hicache-20261030",
+    "HEAD": "4dbd0ae28f0e5e66271d2711f99d671a1cf32f2a",
+    "branch": "refs/heads/codex/agentx-gdn-pd-hicache-20261030",
+    "untracked": [],
+    "recent": [
+      "4dbd0ae28f Preserve transferred GDN state during Decode prefix caching and HiCache restore",
+      "0f2f199099 Capture fixed-policy low-latency Decode MoE overlap with independent handles",
+      "7960005f41 Latch overlap policy across ranks and preserve native mixed-phase tails",
+      "c0b720a993 Handle idle DP ranks and preserve numerical replay inputs"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/agentx-gdn-pd-hicache-r2-20261030",
+    "HEAD": "c4802f0a3bc76c1f2778fe6249ba98b0a6579b23",
+    "branch": "refs/heads/codex/agentx-gdn-pd-hicache-r2-20261030",
+    "untracked": [],
+    "recent": [
+      "c4802f0a3b Gate PP transfer consensus on every stage host-cache restore",
+      "6143265d6e Poll HiCache completion events in pipeline disaggregated Decode",
+      "4dbd0ae28f Preserve transferred GDN state during Decode prefix caching and HiCache restore",
+      "0f2f199099 Capture fixed-policy low-latency Decode MoE overlap with independent handles"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/agentx-gdn-pd-hicache-r3-20261030",
+    "HEAD": "f5f599725795e8ce03e0f1797ad7e96cb0bb2811",
+    "branch": "refs/heads/codex/agentx-gdn-pd-hicache-r3-20261030",
+    "untracked": [],
+    "recent": [
+      "f5f5997257 Avoid blocking PP Decode consensus on HiCache async sends",
+      "c4802f0a3b Gate PP transfer consensus on every stage host-cache restore",
+      "6143265d6e Poll HiCache completion events in pipeline disaggregated Decode",
+      "4dbd0ae28f Preserve transferred GDN state during Decode prefix caching and HiCache restore"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/agentx-gdn-pd-hicache-r4-20261030",
+    "HEAD": "f8237955ef141d6e8c9e78c7d7ad93854671e81b",
+    "branch": "refs/heads/codex/agentx-gdn-pd-hicache-r4-20261030",
+    "untracked": [],
+    "recent": [
+      "f8237955ef Keep PP Decode restore readiness polling free of conditional collectives",
+      "f5f5997257 Avoid blocking PP Decode consensus on HiCache async sends",
+      "c4802f0a3b Gate PP transfer consensus on every stage host-cache restore",
+      "6143265d6e Poll HiCache completion events in pipeline disaggregated Decode"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/agentx-gdn-pd-hicache-r5-20261031",
+    "HEAD": "37e0828c642ce4f3795c4c4394f4ce913bcd1a35",
+    "branch": "refs/heads/codex/agentx-gdn-pd-hicache-r5-20261031",
+    "untracked": [],
+    "recent": [
+      "37e0828c64 Fix pipeline-local hybrid HiCache restore layer mapping",
+      "f8237955ef Keep PP Decode restore readiness polling free of conditional collectives",
+      "f5f5997257 Avoid blocking PP Decode consensus on HiCache async sends",
+      "c4802f0a3b Gate PP transfer consensus on every stage host-cache restore"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/agentx-gdn-pd-hicache-r6-20261031",
+    "HEAD": "fc014e3553c4d234f38f3088a3158c0333e64830",
+    "detached": true,
+    "untracked": [],
+    "recent": [
+      "fc014e3553 Defer optional Mamba cache checkpoints under state pressure",
+      "37e0828c64 Fix pipeline-local hybrid HiCache restore layer mapping",
+      "f8237955ef Keep PP Decode restore readiness polling free of conditional collectives",
+      "f5f5997257 Avoid blocking PP Decode consensus on HiCache async sends"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/agentx-hicache-restore-retry-r7-20261031",
+    "HEAD": "797f6488cf5fea2f88e38ccaeb1703443deec537",
+    "branch": "refs/heads/agentx-hicache-restore-retry-r7-20261031",
+    "untracked": [],
+    "recent": [
+      "797f6488cf Retry Decode HiCache restoration under temporary pool pressure",
+      "fc014e3553 Defer optional Mamba cache checkpoints under state pressure",
+      "37e0828c64 Fix pipeline-local hybrid HiCache restore layer mapping",
+      "f8237955ef Keep PP Decode restore readiness polling free of conditional collectives"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/agentx-mha-pp-kv-layer-map-r8-20261031",
+    "HEAD": "fa52c3cd95d2c171c9eac9a8bfdc32296aa8c75f",
+    "branch": "refs/heads/codex/agentx-mha-pp-kv-layer-map-20261031",
+    "untracked": [],
+    "recent": [
+      "fa52c3cd95 Map hybrid MHA PP transfers by registered global KV layer IDs",
+      "797f6488cf Retry Decode HiCache restoration under temporary pool pressure",
+      "fc014e3553 Defer optional Mamba cache checkpoints under state pressure",
+      "37e0828c64 Fix pipeline-local hybrid HiCache restore layer mapping"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-canonical-weight-cache-20261003",
+    "HEAD": "92e1823d518603bd9b1fb802503739f7370b68fa",
+    "branch": "refs/heads/codex/glm47-canonical-weight-cache-20261003",
+    "untracked": [],
+    "recent": [
+      "92e1823d51 Add topology-independent canonical CPU weight cache banks",
+      "40870a66c2 Fix daemon replica identity hook environment import",
+      "fa5f3ec4c2 Add independent CPU weight daemon and prepared GLM snapshot restore",
+      "8466a7e4f9 Support suspendable HiCache host pools"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-deepep-local-opt-20261002",
+    "HEAD": "42c42a700dc4f9e8c139f3c4e3474a7cbc8ad262",
+    "branch": "refs/heads/codex/glm47-deepep-local-opt-20261002",
+    "untracked": [],
+    "recent": [
+      "42c42a700d Tune masked Humming activation and cover changing CUDA graph counts",
+      "2d92582f37 Skip padded expert rows in Humming low-latency SiLU activation",
+      "e19e7fed83 Mark Humming AWQ expert zero points as group-quantized during loading",
+      "e77d3141b0 Allow explicit RDMA-only DeepEP low-latency buffers on partial NVLink nodes"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-ep16-canonical-profile-20261004",
+    "HEAD": "870269702285d94bdd926a50cc29ad1a20bcf60c",
+    "branch": "refs/heads/codex/glm47-ep16-canonical-profile-20261004",
+    "untracked": [],
+    "recent": [
+      "8702697022 Port canonical raw CPU bank loader onto validated EP16 Humming source",
+      "42c42a700d Tune masked Humming activation and cover changing CUDA graph counts",
+      "2d92582f37 Skip padded expert rows in Humming low-latency SiLU activation",
+      "e19e7fed83 Mark Humming AWQ expert zero points as group-quantized during loading"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-humming-deepep-full-20261001",
+    "HEAD": "e19e7fed83fc8a5b736372abff10e12bfb86c53a",
+    "branch": "refs/heads/codex/glm47-humming-deepep-full-20261001",
+    "untracked": [],
+    "recent": [
+      "e19e7fed83 Mark Humming AWQ expert zero points as group-quantized during loading",
+      "e77d3141b0 Allow explicit RDMA-only DeepEP low-latency buffers on partial NVLink nodes",
+      "ca790b3f53 Fix AWQ MoE zero-point loading with expert parallelism",
+      "74734b15fb Add TraceLab agentic serving replay"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-native-ep8-wna16-20260921",
+    "HEAD": "ca790b3f53915cee3d88ae16d1ae3000cbb638e1",
+    "branch": "refs/heads/codex/glm47-native-ep8-wna16-20260921",
+    "untracked": [],
+    "recent": [
+      "ca790b3f53 Fix AWQ MoE zero-point loading with expert parallelism",
+      "74734b15fb Add TraceLab agentic serving replay",
+      "f0609fb359 Report hybrid cache eviction pressure",
+      "871116844a Support Qwen3.5 hybrid elastic PP migration"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp-hicache-admission-20261002",
+    "HEAD": "e53c15ddf98341238dcb15331fcf70d542f8922d",
+    "branch": "refs/heads/codex/glm47-pp-hicache-admission-20261002",
+    "untracked": [],
+    "recent": [
+      "e53c15ddf9 Propagate HiCache prefetch admission from pipeline stage zero",
+      "e23a84795c Scope PP runtime HiCache prefetch groups to stage members",
+      "041ce35b5e Support static Mooncake prefill PP1 to native decode PP2",
+      "74734b15fb Add TraceLab agentic serving replay"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp-hicache-attach-scope-20261002",
+    "HEAD": "2261fec4aea737975da05c80c7e2f8641b51bbaa",
+    "branch": "refs/heads/codex/glm47-pp-hicache-attach-scope-20261002",
+    "untracked": [],
+    "recent": [
+      "2261fec4ae Scope PP runtime HiCache prefetch groups to stage members",
+      "85725e8665 Synchronize HiCache storage progress across pipeline stages",
+      "041ce35b5e Support static Mooncake prefill PP1 to native decode PP2",
+      "74734b15fb Add TraceLab agentic serving replay"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp-hicache-consensus-20261002",
+    "HEAD": "85725e8665ce675e55bc66afeca1be4e36dd0658",
+    "branch": "refs/heads/codex/glm47-pp-hicache-consensus-20261002",
+    "untracked": [],
+    "recent": [
+      "85725e8665 Synchronize HiCache storage progress across pipeline stages",
+      "041ce35b5e Support static Mooncake prefill PP1 to native decode PP2",
+      "74734b15fb Add TraceLab agentic serving replay",
+      "f0609fb359 Report hybrid cache eviction pressure"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp-hicache-metrics-20261002",
+    "HEAD": "40870a66c2bf648506819af6bc18f2b21fb610ca",
+    "branch": "refs/heads/codex/glm47-pp-hicache-metrics-20261002",
+    "untracked": [],
+    "recent": [
+      "40870a66c2 Fix daemon replica identity hook environment import",
+      "fa5f3ec4c2 Add independent CPU weight daemon and prepared GLM snapshot restore",
+      "8466a7e4f9 Support suspendable HiCache host pools",
+      "97ab987e8a Export the HiCache loadback counter before the first transfer"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp-slot-affinity-20261009",
+    "HEAD": "61a8a9f40aa53c68599aa97bf9c5c6acd0ef40f4",
+    "branch": "refs/heads/codex/glm47-pp-slot-affinity-20261009",
+    "untracked": [],
+    "recent": [
+      "61a8a9f40a Keep chunked prefill and decode requests in their PP ring slots",
+      "8702697022 Port canonical raw CPU bank loader onto validated EP16 Humming source",
+      "42c42a700d Tune masked Humming activation and cover changing CUDA graph counts",
+      "2d92582f37 Skip padded expert rows in Humming low-latency SiLU activation"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp-spec-20261023",
+    "HEAD": "a0940c4c011804cab0334c9ad37aa8f02445688a",
+    "branch": "refs/heads/codex/glm47-pp-spec-20261023",
+    "untracked": [],
+    "recent": [
+      "a0940c4c01 Pipeline parallelism x speculative decoding (EAGLE/MTP) compatibility (#30775)",
+      "8702697022 Port canonical raw CPU bank loader onto validated EP16 Humming source",
+      "42c42a700d Tune masked Humming activation and cover changing CUDA graph counts",
+      "2d92582f37 Skip padded expert rows in Humming low-latency SiLU activation"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp-spec-bankfix-20261023",
+    "HEAD": "752bc6876ef3449ea32526a639ed5b7bd480bfb5",
+    "branch": "refs/heads/codex/glm47-pp-spec-bankfix-20261023",
+    "untracked": [],
+    "recent": [
+      "752bc6876e Bind PP MTP embedding reads to authenticated canonical RAM view",
+      "a9c4b5566f Fix last-stage PP draft memory-probe collective group",
+      "a0940c4c01 Pipeline parallelism x speculative decoding (EAGLE/MTP) compatibility (#30775)",
+      "8702697022 Port canonical raw CPU bank loader onto validated EP16 Humming source"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp-spec-graphfix-20261023",
+    "HEAD": "c14e375f6b832cf084a41e20bcb2e4495fc36cba",
+    "branch": "refs/heads/codex/glm47-pp-spec-graphfix-20261023",
+    "untracked": [],
+    "recent": [
+      "c14e375f6b Size ordinary PP residual graph buffers in verify tokens",
+      "752bc6876e Bind PP MTP embedding reads to authenticated canonical RAM view",
+      "a9c4b5566f Fix last-stage PP draft memory-probe collective group",
+      "a0940c4c01 Pipeline parallelism x speculative decoding (EAGLE/MTP) compatibility (#30775)"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp-spec-memfix-20261023",
+    "HEAD": "a9c4b5566f78ba7ea6469c944954fd9908cadb40",
+    "branch": "refs/heads/codex/glm47-pp-spec-memfix-20261023",
+    "untracked": [],
+    "recent": [
+      "a9c4b5566f Fix last-stage PP draft memory-probe collective group",
+      "a0940c4c01 Pipeline parallelism x speculative decoding (EAGLE/MTP) compatibility (#30775)",
+      "8702697022 Port canonical raw CPU bank loader onto validated EP16 Humming source",
+      "42c42a700d Tune masked Humming activation and cover changing CUDA graph counts"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp-spec-microbatch-20261023",
+    "HEAD": "f415858311c0d7646b368b30b64b371dca3427e4",
+    "branch": "refs/heads/codex/glm47-pp-spec-microbatch-20261023",
+    "untracked": [],
+    "recent": [
+      "f415858311 Pipeline two PP2 MTP microbatches with independent feedback",
+      "751f3c4f86 Allocate decode graph PP proxies for all verify tokens",
+      "c14e375f6b Size ordinary PP residual graph buffers in verify tokens",
+      "752bc6876e Bind PP MTP embedding reads to authenticated canonical RAM view"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp-spec-microbatch-invariant-20261023",
+    "HEAD": "9e48f876a8eb2d7460317bc713bfa8680d78aea5",
+    "branch": "refs/heads/codex/glm47-pp-spec-microbatch-invariant-20261023",
+    "untracked": [],
+    "recent": [
+      "9e48f876a8 Forward native deterministic mode to Humming GEMM tuning",
+      "f415858311 Pipeline two PP2 MTP microbatches with independent feedback",
+      "751f3c4f86 Allocate decode graph PP proxies for all verify tokens",
+      "c14e375f6b Size ordinary PP residual graph buffers in verify tokens"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp-spec-tokenbuf-20261023",
+    "HEAD": "751f3c4f863394c6da7ef500ab3ae4076d0da0ef",
+    "branch": "refs/heads/codex/glm47-pp-spec-tokenbuf-20261023",
+    "untracked": [],
+    "recent": [
+      "751f3c4f86 Allocate decode graph PP proxies for all verify tokens",
+      "c14e375f6b Size ordinary PP residual graph buffers in verify tokens",
+      "752bc6876e Bind PP MTP embedding reads to authenticated canonical RAM view",
+      "a9c4b5566f Fix last-stage PP draft memory-probe collective group"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/glm47-pp2ep4-ep8-heavy-20261004",
+    "HEAD": "0803db84f19836a366498bc11826ee5e55a42d51",
+    "branch": "refs/heads/codex/glm47-pp2ep4-ep8-heavy-20261004",
+    "untracked": [],
+    "recent": [
+      "0803db84f1 Export the HiCache loadback counter before the first transfer",
+      "b129ccbacc Propagate HiCache prefetch admission from pipeline stage zero",
+      "86a8872253 Scope PP runtime HiCache prefetch groups to stage members",
+      "8702697022 Port canonical raw CPU bank loader onto validated EP16 Humming source"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/hy3-a100-qualification-20261018",
+    "HEAD": "77b6177a9dc963d791116e133b70b8755f8711c9",
+    "branch": "refs/heads/codex/hy3-a100-qualification-20261018",
+    "untracked": [],
+    "recent": [
+      "77b6177a9d fix: size Triton attention metadata for DP-padded decode batches",
+      "161bb497f2 feat: load Hy3 node-specific immutable CPU weight banks without disk fallback",
+      "5988a3eed1 Bridge BF16 DeepEP low-latency slots to the Triton expert runner",
+      "79e48a036b Support Hy3 pipeline stages and attention DP with expert dispatch"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/pd-decode-pp2-smoke-20260927",
+    "HEAD": "041ce35b5e0d01bce84af1240d39dbb4368a768f",
+    "branch": "refs/heads/codex/pd-decode-pp2-smoke-20260927",
+    "untracked": [],
+    "recent": [
+      "041ce35b5e Support static Mooncake prefill PP1 to native decode PP2",
+      "74734b15fb Add TraceLab agentic serving replay",
+      "f0609fb359 Report hybrid cache eviction pressure",
+      "871116844a Support Qwen3.5 hybrid elastic PP migration"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/pd-hetero-staging-fix-20260927",
+    "HEAD": "041ce35b5e0d01bce84af1240d39dbb4368a768f",
+    "branch": "refs/heads/codex/pd-hetero-staging-fix-20260927",
+    "untracked": [],
+    "recent": [
+      "041ce35b5e Support static Mooncake prefill PP1 to native decode PP2",
+      "74734b15fb Add TraceLab agentic serving replay",
+      "f0609fb359 Report hybrid cache eviction pressure",
+      "871116844a Support Qwen3.5 hybrid elastic PP migration"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/pd-hicache-loadback-sync",
+    "HEAD": "785225702f1f2f0bc36d6a40b018cea5883920c3",
+    "branch": "refs/heads/codex/pd-hicache-loadback-sync",
+    "untracked": [],
+    "recent": [
+      "785225702f Synchronize load-back readiness before HiCache completion collectives",
+      "92580291f0 [HiCache] Fix PP inconsistency with HiCache L3 (#22607) (#27010)",
+      "74734b15fb Add TraceLab agentic serving replay",
+      "f0609fb359 Report hybrid cache eviction pressure"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/qwen35-ep2-tbo-20261027",
+    "HEAD": "870269702285d94bdd926a50cc29ad1a20bcf60c",
+    "branch": "refs/heads/codex/qwen35-ep2-tbo-20261027",
+    "untracked": [
+      "python/sglang/srt/batch_overlap/qwen35_tbo.py"
+    ],
+    "recent": [
+      "8702697022 Port canonical raw CPU bank loader onto validated EP16 Humming source",
+      "42c42a700d Tune masked Humming activation and cover changing CUDA graph counts",
+      "2d92582f37 Skip padded expert rows in Humming low-latency SiLU activation",
+      "e19e7fed83 Mark Humming AWQ expert zero points as group-quantized during loading"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 4,
+    "tracked_dirty_status_counts": {
+      " M": 4
+    },
+    "tracked_dirty_paths": [
+      " M python/sglang/srt/batch_overlap/operations_strategy.py",
+      " M python/sglang/srt/batch_overlap/two_batch_overlap.py",
+      " M python/sglang/srt/layers/attention/tbo_backend.py",
+      " M python/sglang/srt/models/qwen3_5.py"
+    ]
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/qwen35b-decode-ep-overlap-20261027",
+    "HEAD": "0f2f1990994774472b1089d2b0682f0bf926a6b4",
+    "branch": "refs/heads/codex/qwen35b-decode-ep-overlap-20261027",
+    "untracked": [],
+    "recent": [
+      "0f2f199099 Capture fixed-policy low-latency Decode MoE overlap with independent handles",
+      "7960005f41 Latch overlap policy across ranks and preserve native mixed-phase tails",
+      "c0b720a993 Handle idle DP ranks and preserve numerical replay inputs",
+      "2a0df104be Add opt-in eager MoE-only DeepEP Prefill overlap schedule"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/qwen35b-prefill-ep-overlap-20261027",
+    "HEAD": "2a0df104beb7449da319378b8e3fb84238036d36",
+    "branch": "refs/heads/codex/qwen35b-prefill-ep-overlap-20261027",
+    "untracked": [],
+    "recent": [
+      "2a0df104be Add opt-in eager MoE-only DeepEP Prefill overlap schedule",
+      "8702697022 Port canonical raw CPU bank loader onto validated EP16 Humming source",
+      "42c42a700d Tune masked Humming activation and cover changing CUDA graph counts",
+      "2d92582f37 Skip padded expert rows in Humming low-latency SiLU activation"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/qwen35b-prefill-ep-overlap-r2-20261027",
+    "HEAD": "c0b720a993a76db2b2fe2da84fbfe98462d48012",
+    "branch": "refs/heads/codex/qwen35b-prefill-ep-overlap-r2-20261027",
+    "untracked": [],
+    "recent": [
+      "c0b720a993 Handle idle DP ranks and preserve numerical replay inputs",
+      "2a0df104be Add opt-in eager MoE-only DeepEP Prefill overlap schedule",
+      "8702697022 Port canonical raw CPU bank loader onto validated EP16 Humming source",
+      "42c42a700d Tune masked Humming activation and cover changing CUDA graph counts"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.engine-worktrees/qwen35b-prefill-ep-overlap-r3-20261027",
+    "HEAD": "7960005f41afe0d3b2bad9d69b0433f9f885c088",
+    "branch": "refs/heads/codex/qwen35b-prefill-ep-overlap-r3-20261027",
+    "untracked": [],
+    "recent": [
+      "7960005f41 Latch overlap policy across ranks and preserve native mixed-phase tails",
+      "c0b720a993 Handle idle DP ranks and preserve numerical replay inputs",
+      "2a0df104be Add opt-in eager MoE-only DeepEP Prefill overlap schedule",
+      "8702697022 Port canonical raw CPU bank loader onto validated EP16 Humming source"
+    ],
+    "instructions": [
+      "docs/AGENTS.md"
+    ],
+    "tracked_dirty_count": 0,
+    "tracked_dirty_status_counts": {},
+    "tracked_dirty_paths": []
+  },
+  {
+    "worktree": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.runner-worktrees/experiment-dashboard-guard",
+    "HEAD": "74734b15fbfd96681b07663243309fef2b24bee5",
+    "branch": "refs/heads/codex/experiment-dashboard-guard",
+    "untracked": [
+      "tools/experiment_control/dashboards/templates/cached-stage-sweep-v1/app.js",
+      "tools/experiment_control/dashboards/templates/cached-stage-sweep-v1/index.html",
+      "tools/experiment_control/dashboards/templates/cached-stage-sweep-v1/progress_detail.py",
+      "tools/experiment_control/dashboards/templates/cached-stage-sweep-v1/server.py",
+      "tools/experiment_control/dashboards/templates/cached-stage-sweep-v1/style.css",
+      "tools/experiment_control/dashboards/templates/cached-stage-sweep-v1/template.json",
+      "tools/experiment_control/dashboards/templates/parallel-tasks-v1/adapter.py",
+      "tools/experiment_control/dashboards/templates/parallel-tasks-v1/app.js",
+      "tools/experiment_control/dashboards/templates/parallel-tasks-v1/index.html",
+      "tools/experiment_control/dashboards/templates/parallel-tasks-v1/style.css",
+      "tools/experiment_control/dashboards/templates/parallel-tasks-v1/template.json",
+      "tools/experiment_control/skills/llm-experiment-guard/SKILL.md",
+      "tools/experiment_control/skills/llm-experiment-guard/agents/openai.yaml",
+      "tools/experiment_control/skills/llm-experiment-guard/current_experiment_config_baseline.yaml",
+      "tools/experiment_control/skills/llm-experiment-guard/legacy_llama_qwen_e2e_b691_config_baseline.yaml",
+      "tools/experiment_control/skills/llm-experiment-guard/legacy_qwen_e2e_d996_config_baseline.yaml",
+      "tools/experiment_control/skills/llm-experiment-guard/llama70b_synth128x256_config_baseline.yaml",
+      "tools/experiment_control/skills/llm-experiment-guard/profiling_controls.yaml",
+      "tools/experiment_control/skills/llm-experiment-guard/scripts/dashboard_guard.py",
+      "tools/experiment_control/skills/llm-experiment-guard/scripts/live_progress.py",
+      "tools/experiment_control/skills/llm-experiment-guard/scripts/verify_config_baseline.py"
+    ],
+    "recent": [
+      "74734b15fb Add TraceLab agentic serving replay",
+      "f0609fb359 Report hybrid cache eviction pressure",
+      "871116844a Support Qwen3.5 hybrid elastic PP migration",
+      "ba459803dd Fix elastic PP ring relay accounting"
+    ],
+    "instructions": [],
+    "tracked_dirty_count": 8334,
+    "tracked_dirty_status_counts": {
+      "D ": 8334
+    },
+    "tracked_dirty_paths": [],
+    "note": "Source-only dashboard worktree: the staged empty engine tree was not archived as engine deletions."
+  }
+]

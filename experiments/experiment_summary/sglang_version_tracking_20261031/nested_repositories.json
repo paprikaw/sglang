@@ -1,0 +1,20 @@
+{
+  "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/h100_qwen122b_pp_refine_20261027/balance_source": {
+    "head": "51f0c569184b04d4f7f39df3776feadf72910cf7",
+    "branch": "codex/qwen122b-pp-balance",
+    "dirty": "",
+    "remote": ""
+  },
+  "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/h100_qwen122b_pp_refine_20261027/source": {
+    "head": "9dc22d22deb09522fe49033e8d11d8b2582e635a",
+    "branch": "codex/qwen122b-pp-feedback-refine",
+    "dirty": "",
+    "remote": ""
+  },
+  "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/h100_qwen122b_pp_refine_20261027/balance_warm_source": {
+    "head": "10372426b45d3d99b3e8a12eaa4de684ddadef03",
+    "branch": "codex/qwen122b-pp-balance-warm",
+    "dirty": "",
+    "remote": ""
+  }
+}

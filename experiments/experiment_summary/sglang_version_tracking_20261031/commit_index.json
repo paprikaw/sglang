@@ -1,0 +1,98 @@
+{
+  "created_at": "2026-10-31T08:43:47.478407+00:00",
+  "new_commits": [
+    {
+      "branch": "codex/archive/sglang-development-20261031",
+      "commit": "7b5d2d27f2d9eb8f1120a0fb05358416b4532b66",
+      "message": "fix(pd): preserve native MHA PP1-to-PP2 transfer work",
+      "file_count": 5
+    },
+    {
+      "branch": "codex/archive/sglang-development-20261031",
+      "commit": "f7a876241b98f611a157ba0c8061543030b43fcf",
+      "message": "feat(attention): archive opt-in SM80 causal verify decode path",
+      "file_count": 4
+    },
+    {
+      "branch": "codex/archive/elastic-pp-fence-20261031",
+      "commit": "f8a0c6edcd58367414d9d01e2845606a972416d9",
+      "message": "fix(elastic-pp): snapshot live KV only at the drained scheduler fence",
+      "file_count": 5
+    },
+    {
+      "branch": "codex/archive/qwen35-ep2-tbo-wip-20261031",
+      "commit": "746240bfa944d175b96695045813a1fc5b9ed00e",
+      "message": "wip(qwen35): preserve experimental two-batch overlap implementation",
+      "file_count": 5
+    },
+    {
+      "branch": "codex/archive/qwen-capacity-adapter-wip-20261031",
+      "commit": "be0a22a81946b6aaa764c3cf03ee8ecacba92ef1",
+      "message": "wip(cache): preserve Qwen capacity admission adapter changes",
+      "file_count": 3
+    },
+    {
+      "branch": "codex/archive/experiment-dashboard-source-20261031",
+      "commit": "5f866b70446f8e443a754d8f8d44b05921ff6d8a",
+      "message": "chore(experiments): archive source-only experiment dashboard helpers",
+      "file_count": 21
+    },
+    {
+      "branch": "codex/sglang-optimization-records-20261031",
+      "commit": "808bd4d82c79e9c670c3d3af82a52e99931e311e",
+      "message": "chore(research): version agentx optimization sources and evidence",
+      "file_count": 3514
+    },
+    {
+      "branch": "codex/sglang-optimization-records-20261031",
+      "commit": "ce007b672671971405f4520ab00b27a972670ee5",
+      "message": "chore(research): version benchmark-support optimization sources and evidence",
+      "file_count": 3247
+    },
+    {
+      "branch": "codex/sglang-optimization-records-20261031",
+      "commit": "b488145a97bd46da314beac1cc8fadba58c48513",
+      "message": "chore(research): version component-and-communication optimization sources and evidence",
+      "file_count": 498
+    },
+    {
+      "branch": "codex/sglang-optimization-records-20261031",
+      "commit": "8d70ba21aa5cabb4e95b5ca2cac6f47d71963bc9",
+      "message": "chore(research): version pipeline-and-prefill optimization sources and evidence",
+      "file_count": 2407
+    },
+    {
+      "branch": "codex/sglang-optimization-records-20261031",
+      "commit": "824d3db8a7f2408c2d3bd446d6293efea8ca8ebb",
+      "message": "chore(research): version reports optimization sources and evidence",
+      "file_count": 458
+    },
+    {
+      "branch": "codex/sglang-optimization-records-20261031",
+      "commit": "758570b51568fddaa7e7ca3b96ec342fdf5e742d",
+      "message": "chore(research): version tools/cache_monitor optimization sources and evidence",
+      "file_count": 8
+    },
+    {
+      "branch": "codex/sglang-optimization-records-20261031",
+      "commit": "9fa483c0a7177a3b8bbd6a4725fe90376dc50c73",
+      "message": "chore(research): version tools/gpu_dashboard_client optimization sources and evidence",
+      "file_count": 4
+    },
+    {
+      "branch": "codex/sglang-optimization-records-20261031",
+      "commit": "fdc197a1adcbf361ee3b3815a1696d58ff42e7df",
+      "message": "chore(research): version tools/idle_gpu_benchmark optimization sources and evidence",
+      "file_count": 34
+    },
+    {
+      "branch": "codex/sglang-optimization-records-20261031",
+      "commit": "473e0c8fc1de85c4e4c691e04aaa6ce80d0c2e56",
+      "message": "chore(research): version tools/idle_gpu_service optimization sources and evidence",
+      "file_count": 17
+    }
+  ],
+  "current_engine": "fa52c3cd95d2c171c9eac9a8bfdc32296aa8c75f",
+  "historical_e5_engine": "37e0828c642ce4f3795c4c4394f4ce913bcd1a35",
+  "engine_versions_are_distinct_from_replay_versions": true
+}

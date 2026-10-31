@@ -1,0 +1,601 @@
+[
+  {
+    "repository": "git@github.com:paprikaw/sglang.git",
+    "label": "sglang",
+    "branches": 83,
+    "tags": 42,
+    "main_unchanged": true,
+    "refs": [
+      {
+        "ref": "refs/heads/codex/agentx-gdn-pd-hicache-20261030",
+        "sha": "4dbd0ae28f0e5e66271d2711f99d671a1cf32f2a"
+      },
+      {
+        "ref": "refs/heads/codex/agentx-gdn-pd-hicache-r2-20261030",
+        "sha": "c4802f0a3bc76c1f2778fe6249ba98b0a6579b23"
+      },
+      {
+        "ref": "refs/heads/codex/agentx-gdn-pd-hicache-r3-20261030",
+        "sha": "f5f599725795e8ce03e0f1797ad7e96cb0bb2811"
+      },
+      {
+        "ref": "refs/heads/codex/agentx-gdn-pd-hicache-r4-20261030",
+        "sha": "f8237955ef141d6e8c9e78c7d7ad93854671e81b"
+      },
+      {
+        "ref": "refs/heads/codex/agentx-gdn-pd-hicache-r5-20261031",
+        "sha": "37e0828c642ce4f3795c4c4394f4ce913bcd1a35"
+      },
+      {
+        "ref": "refs/heads/codex/agentx-gdn-pd-hicache-r6-20261031",
+        "sha": "fc014e3553c4d234f38f3088a3158c0333e64830"
+      },
+      {
+        "ref": "refs/heads/codex/agentx-hicache-restore-retry-r7-20261031",
+        "sha": "797f6488cf5fea2f88e38ccaeb1703443deec537"
+      },
+      {
+        "ref": "refs/heads/codex/agentx-mha-pp-kv-layer-map-20261031",
+        "sha": "fa52c3cd95d2c171c9eac9a8bfdc32296aa8c75f"
+      },
+      {
+        "ref": "refs/heads/codex/archive/elastic-pp-fence-20261031",
+        "sha": "f8a0c6edcd58367414d9d01e2845606a972416d9"
+      },
+      {
+        "ref": "refs/heads/codex/archive/experiment-dashboard-source-20261031",
+        "sha": "5f866b70446f8e443a754d8f8d44b05921ff6d8a"
+      },
+      {
+        "ref": "refs/heads/codex/archive/qwen35-ep2-tbo-wip-20261031",
+        "sha": "746240bfa944d175b96695045813a1fc5b9ed00e"
+      },
+      {
+        "ref": "refs/heads/codex/archive/sglang-development-20261031",
+        "sha": "f7a876241b98f611a157ba0c8061543030b43fcf"
+      },
+      {
+        "ref": "refs/heads/codex/autoscaling-kvcached",
+        "sha": "74734b15fbfd96681b07663243309fef2b24bee5"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-ce-dispatch-dedup-20261008",
+        "sha": "6ecef7b428acb1fcb72df4fd971db07702bb886c"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-ce-fixed3-topology-20261007",
+        "sha": "ab455cec47350ad1c1aa5594f9d3dedd28614623"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-ce-fixed4-topology-20261007",
+        "sha": "60e6c68fa959b79cb88d44f360182e98a77042c2"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-ce-glm-ep8-20261010",
+        "sha": "81a1b5960f5fc73bce33045a56e5b6970e2bcb3c"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-ce-payload-sweep-20261007",
+        "sha": "eef6a2ff3efda75b5e3d4afce282addd4d716c54"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-ce-prefill160-20261010",
+        "sha": "cb694cb83d9448aac2b10e5e589f9d7b42b41ecb"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-ce-prefill160-local-20261010",
+        "sha": "4be2bee619b52a239b124c827d09fa478c6abba8"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-ce-prefill160-matched-20261010",
+        "sha": "5cd4550d009f7a60b6f24928dff96096f646cc7f"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-ce-prefill160-notify-20261010",
+        "sha": "24ebbeb6b35431685dded4ab3bf09ef18de274d9"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-ce-prefill160-notify-safe-20261010",
+        "sha": "da39774bb838e55cc2b915549edac49838ae3bdd"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-dynamic-copy-engine-20261007",
+        "sha": "64573a718111cedc0772bf547c49ebab9962b1c5"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-fixed-qp-selector-20261007",
+        "sha": "cd8df4efec613c1aef66171d976c1634c89e1c1e"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-late-stage-trace-20261007",
+        "sha": "88968a2fc40f056d3656e708d9a374e6710a11fb"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-nvlink-pair-frozen-20261003",
+        "sha": "77e365dd488f42fab8e0ef0cfe00430989c5882f"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-nvlink-pair-opt-20261003",
+        "sha": "31b72f9ce9bba7e38c03fc03e46950d9dbad8af5"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-nvshmem345-cpu-postsend",
+        "sha": "af5177cefd41e61b77df02d791a84bbdeaccd466"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-padded-pcie-control-20261007",
+        "sha": "10558bc9c08ceae02bfa1ec8beb7b2c29fde438c"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-pcie-balanced-warps-20261007",
+        "sha": "3b698aedfa71458319ea2b451d75d2a05b10f8ae"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-pcie-coalesced-20261006",
+        "sha": "05d46157c7ccfa0784b59a5198253a701215c4d3"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-pcie-copy-engine-probe-20261007",
+        "sha": "c0fd5753a5c2f48780246404a984e4fa56f38165"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-pcie-cpu-post-batch-20261007",
+        "sha": "8df17c6862df782fc64a1a31f583ec1342be5740"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-pcie-fused-post-batch-20261007",
+        "sha": "4a48b5f93f879eff177499a1c8f3bf578ec46b8c"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-pcie-inline-flags-20261007",
+        "sha": "c190d6047e2cc9b6dd3345f3ecf5592c4f881b2d"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-pcie-payload-phase-20261007",
+        "sha": "9ed3d3fb3538de8794b1eaeaae3c2be555f32f74"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-pcie-rdma-control-20261007",
+        "sha": "e32c583fc996b6b283bb74b29700fb78d2a7223f"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-pcie-rotated-warps-20261007",
+        "sha": "e9f6e3ba7fc456211504dea083930cd686fdd39f"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-pcie-tail-flush-ablation-20261007",
+        "sha": "2a8f748335615bc10787c2059a1be2c827b55522"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-rdma-drain-before-pcie-20261007",
+        "sha": "f1be4b91551b27a97ac9cecc627c45a280550435"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-rdma-first-pcie-20261007",
+        "sha": "7d2bc3f402b3ee6316651b166b086960619852c3"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-token-routing-ep16-20261003",
+        "sha": "4d0c54734927be88b24e73f64078cddc4173feef"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-token-routing-ep4-20261004",
+        "sha": "7d1ebddc49649fe06d6b8ccd2f77876e2ba9b4ce"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/deepep-token-routing-frozen-20261003",
+        "sha": "31b72f9ce9bba7e38c03fc03e46950d9dbad8af5"
+      },
+      {
+        "ref": "refs/heads/codex/dependency-deepep/ep12-low-latency-20261006",
+        "sha": "50be6136eea4c1e4fe57d79dbbe9527f52e9f41c"
+      },
+      {
+        "ref": "refs/heads/codex/elastic-pp-active-route-fix",
+        "sha": "8482ec93f139a6b85886d1645e627810515b176e"
+      },
+      {
+        "ref": "refs/heads/codex/experiment-dashboard-guard",
+        "sha": "74734b15fbfd96681b07663243309fef2b24bee5"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-canonical-weight-cache-20261003",
+        "sha": "92e1823d518603bd9b1fb802503739f7370b68fa"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-deepep-local-opt-20261002",
+        "sha": "42c42a700dc4f9e8c139f3c4e3474a7cbc8ad262"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-ep16-canonical-profile-20261004",
+        "sha": "870269702285d94bdd926a50cc29ad1a20bcf60c"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-humming-deepep-full-20261001",
+        "sha": "e19e7fed83fc8a5b736372abff10e12bfb86c53a"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-native-ep8-wna16-20260921",
+        "sha": "ca790b3f53915cee3d88ae16d1ae3000cbb638e1"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp-hicache-admission-20261002",
+        "sha": "e53c15ddf98341238dcb15331fcf70d542f8922d"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp-hicache-attach-scope-20261002",
+        "sha": "2261fec4aea737975da05c80c7e2f8641b51bbaa"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp-hicache-consensus-20261002",
+        "sha": "85725e8665ce675e55bc66afeca1be4e36dd0658"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp-hicache-metrics-20261002",
+        "sha": "40870a66c2bf648506819af6bc18f2b21fb610ca"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp-slot-affinity-20261009",
+        "sha": "61a8a9f40aa53c68599aa97bf9c5c6acd0ef40f4"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp-spec-20261023",
+        "sha": "a0940c4c011804cab0334c9ad37aa8f02445688a"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp-spec-bankfix-20261023",
+        "sha": "752bc6876ef3449ea32526a639ed5b7bd480bfb5"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp-spec-graphfix-20261023",
+        "sha": "c14e375f6b832cf084a41e20bcb2e4495fc36cba"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp-spec-memfix-20261023",
+        "sha": "a9c4b5566f78ba7ea6469c944954fd9908cadb40"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp-spec-microbatch-20261023",
+        "sha": "f415858311c0d7646b368b30b64b371dca3427e4"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp-spec-microbatch-invariant-20261023",
+        "sha": "9e48f876a8eb2d7460317bc713bfa8680d78aea5"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp-spec-tokenbuf-20261023",
+        "sha": "751f3c4f863394c6da7ef500ab3ae4076d0da0ef"
+      },
+      {
+        "ref": "refs/heads/codex/glm47-pp2ep4-ep8-heavy-20261004",
+        "sha": "0803db84f19836a366498bc11826ee5e55a42d51"
+      },
+      {
+        "ref": "refs/heads/codex/heterogeneous-tp-pp",
+        "sha": "44ce47e296d740b39f26223acdbb276a6280a3d7"
+      },
+      {
+        "ref": "refs/heads/codex/hy3-a100-qualification-20261018",
+        "sha": "77b6177a9dc963d791116e133b70b8755f8711c9"
+      },
+      {
+        "ref": "refs/heads/codex/pd-decode-pp2-smoke-20260927",
+        "sha": "041ce35b5e0d01bce84af1240d39dbb4368a768f"
+      },
+      {
+        "ref": "refs/heads/codex/pd-hetero-staging-fix-20260927",
+        "sha": "041ce35b5e0d01bce84af1240d39dbb4368a768f"
+      },
+      {
+        "ref": "refs/heads/codex/pd-hicache-loadback-sync",
+        "sha": "785225702f1f2f0bc36d6a40b018cea5883920c3"
+      },
+      {
+        "ref": "refs/heads/codex/pp4-hicache-l3-replay",
+        "sha": "92580291f087ffbeb3439714a360b7ff3a99e369"
+      },
+      {
+        "ref": "refs/heads/codex/qwen122b-pp-balance",
+        "sha": "51f0c569184b04d4f7f39df3776feadf72910cf7"
+      },
+      {
+        "ref": "refs/heads/codex/qwen122b-pp-balance-warm",
+        "sha": "10372426b45d3d99b3e8a12eaa4de684ddadef03"
+      },
+      {
+        "ref": "refs/heads/codex/qwen122b-pp-feedback-refine",
+        "sha": "9dc22d22deb09522fe49033e8d11d8b2582e635a"
+      },
+      {
+        "ref": "refs/heads/codex/qwen35-ep2-tbo-20261027",
+        "sha": "870269702285d94bdd926a50cc29ad1a20bcf60c"
+      },
+      {
+        "ref": "refs/heads/codex/qwen35b-decode-ep-overlap-20261027",
+        "sha": "0f2f1990994774472b1089d2b0682f0bf926a6b4"
+      },
+      {
+        "ref": "refs/heads/codex/qwen35b-prefill-ep-overlap-20261027",
+        "sha": "2a0df104beb7449da319378b8e3fb84238036d36"
+      },
+      {
+        "ref": "refs/heads/codex/qwen35b-prefill-ep-overlap-r2-20261027",
+        "sha": "c0b720a993a76db2b2fe2da84fbfe98462d48012"
+      },
+      {
+        "ref": "refs/heads/codex/qwen35b-prefill-ep-overlap-r3-20261027",
+        "sha": "7960005f41afe0d3b2bad9d69b0433f9f885c088"
+      },
+      {
+        "ref": "refs/heads/codex/qwen38-codex-integration",
+        "sha": "c2101ddac7af5451cc102ee1ceb37d982d0adc4e"
+      },
+      {
+        "ref": "refs/heads/codex/sglang-optimization-records-20261031",
+        "sha": "473e0c8fc1de85c4e4c691e04aaa6ce80d0c2e56"
+      },
+      {
+        "ref": "refs/heads/codex/sglang-serving",
+        "sha": "2c7fb9a02ceabe4165d804b423c331c2c290e6b1"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm4.7-awq/agentic6-hicache-tp4-tp8-20260829",
+        "sha": "6902339b851eb7e963583282f97e976c00615eb3"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm4.7-awq/agentic8-hicache-2xpp4-pp8-20260830",
+        "sha": "6a3222b5d0ff6f64cc523f9d5034abc6a3ac9d03"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm4.7-awq/agentic8-hicache-tp4pp2-20260830",
+        "sha": "bb138fd103ac36ab7457de4cbf3a18b1de5954db"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm4.7-awq/humming-deepep-full-candidate-20261001",
+        "sha": "56eebf1f93d8c5b61a087b4eae2747801f2e7a87"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm4.7-awq/humming-deepep-full-validated-20261001",
+        "sha": "f494e7e1e2f1d156062313764c4e02328f78f581"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm4.7-awq/humming-deepep-loaderfix-candidate-20261001",
+        "sha": "6de38972288e7e924d3d5cef88a8a28a4cf1845c"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm4.7-awq/native-ep8-wna16-20260921",
+        "sha": "87152df2745126124d7ab52f012df195ff7fe92c"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm4.7-awq/pp4-hicache-l3-replay-20260902",
+        "sha": "8c0857eaaf6c37480c824939a9e7dadba6dc5068"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/canonical-weight-cache-20261003",
+        "sha": "d4b9cda1fd18a9814d88547d4adcb9e4c83b0277"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/cpu-weight-daemon-envfix-20261003",
+        "sha": "10b684d9de2ddf22690914f881dd86e3af7099fe"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/cpu-weight-daemon-unit-tested-20261003",
+        "sha": "e1c17ec0e4ef460923ce04b0f9b9740fe079ed41"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/hicache-host-sleep-20261003",
+        "sha": "8466a7e4f95e108dbfb2b5cc174d21fe8e58c326"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/mtp-pp-bankfix-20261023",
+        "sha": "9f9ece160d24b120981696761b02a71f3bd93ad7"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/mtp-pp-cpu-qualified-20261023",
+        "sha": "3233ba43d2172b7e4823526474c503add78214bc"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/mtp-pp-graphfix-20261023",
+        "sha": "62b83262108872eaa12c1bc75f70c4c8e2c6c087"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/mtp-pp-memfix-20261023",
+        "sha": "b1c6d85bdbdafa9eaf5f5545622305bd7b97585d"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/mtp-pp-tokenbuf-20261023",
+        "sha": "751f3c4f863394c6da7ef500ab3ae4076d0da0ef"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/pd-decode-pp2-smoke-20260927",
+        "sha": "ea1bd77578dc2edc6daf80c16f1c0a0d2a36e765"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/pd-hicache-loadback-sync-20260906",
+        "sha": "f7374210b8e6953575795d7af29a969f057cb91d"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/pp-hicache-admission-20261002",
+        "sha": "dad7aa699031ca968a4bf9da52904a9b24b4ae19"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/pp-hicache-attach-scope-20261002",
+        "sha": "9b8b6011249d8db039d59d1db727885cd58e5d86"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/pp-hicache-metrics-20261002",
+        "sha": "4a9a9407e96acfdc3181abb7a2de8daf1cbb2427"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/pp-hicache-storage-consensus-20261002",
+        "sha": "2f9a541dcb9797a58324470b887d79b89c5b2bdc"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/glm47-awq/pp-mtp-microbatch-20261023",
+        "sha": "b24657de030e655d68923868ce1330c2a2dba697"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/hy3-bf16/dp-triton-metadata-cpu-tested-20261019",
+        "sha": "763f3cb1bb58e61ad17b32568c48278f90011c6c"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/hy3-bf16/node-local-cpu-qualified-20261019",
+        "sha": "ce4b5ecbada0a75fa5d9c57730a2951bca5701ff"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/llama3.3-70b-fp8/burstgpt-tp4-tp8-20260829",
+        "sha": "d5e135710a50ccdef8316c00f1db95f3bf1611f2"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen3-30b-a3b/deepep-ep4-tp4-h100-20260927",
+        "sha": "90767f58798dc0be60630cd9010b0bc24d513790"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen3-30b-a3b/deepep-h100-quick-20260927",
+        "sha": "6c393f562398e8f2524cd47704b0c3166a6bd925"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen3-30b-a3b/ep-tp-diagnosis-h100-20260927",
+        "sha": "584276e85363996c05b7ab4b6e318fe95ab9abff"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen3-30b-a3b/ep2-topology-20260923",
+        "sha": "49b6310679710c75065fd93d1cb9d7edd92d21dd"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen3-30b-a3b/ep2-tp2-topology-20260927",
+        "sha": "8a36892fe8b690dc233ab24db6af4e02a643f55d"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen3-30b-a3b/ep4-ll-sm80-tp4-h100-20260927",
+        "sha": "2450d53870c23d08eee175f601ed815d21c63645"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen3-30b-a3b/ep4-sm80-tp4-prefill-cg-h100-20260927",
+        "sha": "b69bbc92e8db90b57603d7970b32a66c967c7887"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen35b/agentx-gdn-pd-candidate-r1-20261030",
+        "sha": "c980eb6bf7d3d1f81cb45b553cd790fdab0d8520"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen35b/agentx-gdn-pd-candidate-r2-20261030",
+        "sha": "e57c55d049dd66ba879e35ba544a623d13370c82"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen35b/agentx-gdn-pd-candidate-r3-20261030",
+        "sha": "bd5a3c42f9cb4b83f6a1e4fd499c8ea0ee234048"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen35b/agentx-gdn-pd-candidate-r4-20261030",
+        "sha": "6d391b271831a1a99fe5c12e10cbfa71b7c2fa5f"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen35b/agentx-gdn-pd-candidate-r5-20261031",
+        "sha": "37e0828c642ce4f3795c4c4394f4ce913bcd1a35"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen35b/agentx-gdn-pd-candidate-r6-20261031",
+        "sha": "ed14506e84acc7d38ec2dc5908a8916561273fc0"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen35b/agentx-hicache-retry-candidate-r7-20261031",
+        "sha": "a6369b59a5f7d3d12183e03018d1fc6eef770c54"
+      },
+      {
+        "ref": "refs/tags/serving/sglang/qwen35b/agentx-mha-pp-layer-map-r8-20261031",
+        "sha": "0d81c6c309c7b7db480ac9c0231ebc965fe9c2b6"
+      }
+    ]
+  },
+  {
+    "repository": "git@github.com:paprikaw/sglang-cpu-kv-decode-replay.git",
+    "label": "replay",
+    "branches": 17,
+    "tags": 0,
+    "main_unchanged": true,
+    "refs": [
+      {
+        "ref": "refs/heads/codex/chunked-attention-20260913",
+        "sha": "ad98f8e195907b892a3d7dfad47f50b527465603"
+      },
+      {
+        "ref": "refs/heads/codex/cooperative-eager-decode-20260913",
+        "sha": "460b9e2e57fed63c8bf38095df32feece42d67b4"
+      },
+      {
+        "ref": "refs/heads/codex/ffn-pair-cost-20260917",
+        "sha": "d486cb56989940f4684188bd5a46cbec79265909"
+      },
+      {
+        "ref": "refs/heads/codex/four-gpu-prefill-slo",
+        "sha": "06fb32bfcb408c06832a4bf2a2dd8d0acff8fe93"
+      },
+      {
+        "ref": "refs/heads/codex/independent-decode-20260913",
+        "sha": "d1e814216bdbfbae003c1fb0b675c8563f0c1620"
+      },
+      {
+        "ref": "refs/heads/codex/pd-fresh-slo-20260906",
+        "sha": "c968a68162659bdd46f3c20f9ddb182d49982de5"
+      },
+      {
+        "ref": "refs/heads/codex/pd-prefill-audit",
+        "sha": "c4a54638106f297c459260a6511770f7754a93fd"
+      },
+      {
+        "ref": "refs/heads/codex/pd-prefill-crossover",
+        "sha": "c661146016d866ab8f8fdd9227978c2f6b83c7f7"
+      },
+      {
+        "ref": "refs/heads/codex/pd-short-slo-20260905",
+        "sha": "958ef42ee541ed7c666b9cfb5a6ccd2bccc1c20f"
+      },
+      {
+        "ref": "refs/heads/codex/sixteen-layer-bucket-20260916",
+        "sha": "971ce1b8b9e5957b66845e563cb43e91b3410b9b"
+      },
+      {
+        "ref": "refs/heads/codex/three-layer-bucket-20260916",
+        "sha": "89d42435d17149598b6e9f9458839c9e976fbaf2"
+      },
+      {
+        "ref": "refs/heads/codex/three-layer-bucket-opt-20260916",
+        "sha": "fb1db91657b802332c27a936f5887ffb9afb385d"
+      },
+      {
+        "ref": "refs/heads/codex/three-layer-cudagraph-20260916",
+        "sha": "e5792d25e1f74fe1f775cee121a813e92f646516"
+      },
+      {
+        "ref": "refs/heads/codex/three-layer-overlap-20260916",
+        "sha": "dda531962dc8c14d9802fce8ff8c2b0cc7c9dc98"
+      },
+      {
+        "ref": "refs/heads/codex/three-length-ffn-20260916",
+        "sha": "3532a556ebc6570fe5111764cadd9a717af4c034"
+      },
+      {
+        "ref": "refs/heads/codex/unified-attention-buckets-20260917",
+        "sha": "fbdc4eb4156f725a2acc0f93fb1e439b87dc4015"
+      },
+      {
+        "ref": "refs/heads/codex/unified-grouped-ffn-20260917",
+        "sha": "68ec8d10ec62261d3a9dd078a15637665f9187f0"
+      }
+    ]
+  },
+  {
+    "repository": "git@github.com:paprikaw/experiment-guard.git",
+    "label": "guard",
+    "branches": 1,
+    "tags": 0,
+    "main_unchanged": true,
+    "refs": [
+      {
+        "ref": "refs/heads/codex/archive/qwen-capacity-adapter-wip-20261031",
+        "sha": "be0a22a81946b6aaa764c3cf03ee8ecacba92ef1"
+      }
+    ]
+  }
+]

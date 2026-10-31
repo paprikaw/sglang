@@ -1,0 +1,26 @@
+{
+  "kind": "CPU-only archival checks; no GPU benchmark",
+  "checks": [
+    {
+      "pattern": "test_heterogeneous_owner_routing.py",
+      "returncode": 0,
+      "output": "......\n----------------------------------------------------------------------\nRan 6 tests in 0.004s\n\nOK\n"
+    },
+    {
+      "pattern": "test_branch_timing.py",
+      "returncode": 1,
+      "output": "E\n======================================================================\nERROR: test_branch_timing (unittest.loader._FailedTest.test_branch_timing)\n----------------------------------------------------------------------\nImportError: Failed to import test module: test_branch_timing\nTraceback (most recent call last):\n  File \"/apps/easybuild-2022/easybuild/software/Core/Miniconda3/23.10.0-1/lib/python3.11/unittest/loader.py\", line 407, in _find_test_path\n    module = self._get_module_from_name(name)\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/apps/easybuild-2022/easybuild/software/Core/Miniconda3/23.10.0-1/lib/python3.11/unittest/loader.py\", line 350, in _get_module_from_name\n    __import__(name)\n  File \"/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_dynamic_20261030/test_branch_timing.py\", line 24, in <module>\n    from aiperf.common.enums import ConversationBranchMode, CreditPhase\n  File \"/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/datasets/agentx_20261030/harness/SemiAnalysisAI-agentx-harness-e4bb2f8/src/aiperf/common/enums/__init__.py\", line 94, in <module>\n    from aiperf.plugin.enums import DatasetFormat\n  File \"/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/datasets/agentx_20261030/harness/SemiAnalysisAI-agentx-harness-e4bb2f8/src/aiperf/plugin/enums.py\", line 29, in <module>\n    APIRouterType = plugins.create_enum(PluginType.API_ROUTER, \"APIRouterType\", module=__name__)\n                                        ^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/datasets/agentx_20261030/harness/SemiAnalysisAI-agentx-harness-e4bb2f8/src/aiperf/plugin/extensible_enums.py\", line 39, in __getattr__\n    raise AttributeError(f\"'{cls.__name__}' has no attribute '{name}'\")\nAttributeError: 'PluginType' has no attribute 'API_ROUTER'\n\n\n----------------------------------------------------------------------\nRan 1 test in 0.000s\n\nFAILED (errors=1)\n"
+    },
+    {
+      "pattern": "test_decode_slot_budget.py",
+      "returncode": 0,
+      "output": ".mamba_size (80) is less than decode side's max_slots_needed (144 = 48 reqs * 3 slots/req), raising effective_mamba_size to 144\n..mamba_size (40) is less than decode side's max_slots_needed (48 = 16 reqs * 3 slots/req), raising effective_mamba_size to 48\n.\n----------------------------------------------------------------------\nRan 4 tests in 0.126s\n\nOK\n"
+    }
+  ],
+  "additional_environment_check": {
+    "interpreter": "/data/gpfs/projects/punim2715/vllm_workbench/.venv/bin/python",
+    "pattern": "test_branch_timing.py",
+    "status": "import blocked",
+    "reason": "ModuleNotFoundError: No module named ruamel. No engine or harness dependency was changed by this archival task."
+  }
+}

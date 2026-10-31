@@ -1,5 +1,13 @@
 # 实验总览：性能、容量、组件特性与优化记录
 
+<!-- begin sglang_version_tracking_20261031 -->
+### SGLang 优化源码与 GitHub 版本追踪（2026-10-31）
+
+PP/EP、HiCache/GDN、PD、AgentX replay 与 frozen code 的版本归档；保留历史提交和标签，新增独立快照分支，已核对远端 SHA。
+[简报](sglang_version_tracking_20261031/REPORT.md) · [提交清单](sglang_version_tracking_20261031/commit_index.json) · [远端核验](sglang_version_tracking_20261031/remote_verification.json)
+<!-- end sglang_version_tracking_20261031 -->
+
+
 本文件是全部实验的统一总结与检索入口，不限于 EP8 或 PP2×EP4。按实验类别持续收录完整推理、KV Cache 容量与缓存恢复、单层 Attention／Expert、通信拓扑及调度优化；每项保留负载、计时口径、简短报告和原始数据入口。当前已收录并核验的实验如下，后续实验继续加入对应表格。
 
 ## 专题报告索引
@@ -9,6 +17,7 @@
 | 专题 | 内容 | 文档 |
 |---|---|---|
 | AgentX 2P6D／GDN 状态槽 | PP2 P＋EP4/EP2 D 与 PP2 P＋3×EP2 D；槽预算、运行结果、C8 混部／4P4D 对照及单卡优势分解 | [实验方案与结果](agentx_2p6d_20261031/REPORT.md) · [C8 六配置对照](agentx_2p6d_20261031/C8_COLOCATED_COMPARISON.md) · [单卡为何更快](agentx_2p6d_20261031/SINGLE_VS_PD_DIAGNOSIS.md) |
+| AgentX：混布／P/D 前缀命中与改进（简明） | 45 轮完整结果去重复核；P 端口径、缓存预算、状态与热点、分离接收拥堵及三步改进 | [简单报告](agentx_prefix_cache_overview_20261031/REPORT.md) <!-- qwen35b_h100_agentx_prefix_cache_overview_20261031 --> |
 | AgentX：HiCache 总命中为何不同 | 同一 E5/V3 的 18 轮逐请求核对；32 GB 实际拆分、KV/GDN 容量、子请求热点与整段前缀丢失 | [专项核查](agentx_hicache_hit_audit_20261031/REPORT.md) <!-- qwen35b_h100_agentx_hicache_hit_audit_20261031 --> |
 | AgentX workload 画像与回放方法 | 官方 full／256k 与当前八族的覆盖差异；会话大小、分支、长尾、缓存命中口径及预取指标缺口 | [负载探索报告](agentx_workload_exploration_20261031/REPORT.md) |
 | AgentX C8／C128 workload 与缓存分布 | 21 个已审计 episode；逐请求／逐对话 context、新增 Prefill、Decode、GPU／CPU 命中与延迟分布 | [统计报告](agentx_workload_profile_20261031/REPORT.md) |

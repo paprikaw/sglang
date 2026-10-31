@@ -1,0 +1,17 @@
+{
+  "root": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling",
+  "file_count": 10187,
+  "groups": {
+    "component-and-communication": 498,
+    "pipeline-and-prefill": 2407,
+    "agentx": 3514,
+    "benchmark-support": 3247,
+    "reports": 458,
+    "tools/cache_monitor": 8,
+    "tools/gpu_dashboard_client": 4,
+    "tools/idle_gpu_benchmark": 34,
+    "tools/idle_gpu_service": 17
+  },
+  "excluded_nested_repositories": 3,
+  "excluded_runtime": "Large logs, generated payloads, datasets, weights, KV bytes, native binaries, upstream audit copies and Guard runtime bundles stay in GPFS."
+}

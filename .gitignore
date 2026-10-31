@@ -281,3 +281,17 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Spartan experiment runtime data. Track source and compact reports explicitly.
+/.engine-worktrees/
+/.runner-worktrees/
+/.guard-worktrees/
+/.third_party/
+/.dashboard-template-*/
+/datasets/
+/results/
+/experiment-report-hub*/
+/experiments/**/runs/
+/experiments/**/logs/
+/experiments/**/profiles/
+/experiments/**/traces/
