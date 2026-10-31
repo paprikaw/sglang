@@ -1,0 +1,66 @@
+--- old/agentx_replay.py
++++ new/agentx_replay.py
+@@ -268,7 +268,7 @@
+ 
+ 
+ def replay(graphs, endpoints, policy, concurrency, key, body, health,
+-           namespace, idle_gap_cap_s=10, copies=1):
++           namespace, idle_gap_cap_s=10, copies=1, episode_timeout_s=7200, partial_rows=None):
+     # Every arm replays the same finite trees. Concurrency changes only admission.
+     trees = [(g, f'{namespace}:copy{copy}:') for copy in range(copies) for g in graphs]
+     queued = list(trees)
+@@ -276,7 +276,8 @@
+     active_roots = set()
+     remaining = {}
+     complete = {}
+-    completed_rows = []
++    completed_rows = partial_rows if partial_rows is not None else []
++    assert not completed_rows and episode_timeout_s > 0
+     futures = {}
+     blocks = {}
+     lanes = {}
+@@ -287,13 +288,13 @@
+     start = time.perf_counter()
+     shift = 0.0
+     skipped_idle = 0.0
+-    deadline = start + 2400
++    deadline = start + episode_timeout_s
+     next_health = start
+     with cf.ThreadPoolExecutor(max_workers=128) as pool:
+         while queued or pending or futures:
+             now = time.perf_counter()
+             if now > deadline:
+-                raise TimeoutError('Finite AgentX episode exceeded 2400 seconds')
++                raise TimeoutError(f'Finite AgentX episode exceeded {episode_timeout_s} seconds')
+             if now >= next_health:
+                 health()
+                 next_health = now + 2
+@@ -371,5 +372,6 @@
+                 output_tokens_per_s=sum(r['output_tokens'] for r in completed_rows)/wall,
+                 completed_requests=len(completed_rows), switched_requests=sum(r['switched'] for r in completed_rows),
+                 idle_compressed_s=skipped_idle, idle_gap_cap_s=idle_gap_cap_s, slo=slo,
++                episode_timeout_s=episode_timeout_s,
+                 clone_lane_policy='pool_counterbalanced_copy_offset_v2',
+                 protocol='Clone-copy cyclic offset with conversation affinity; full selected AgentX DAGs; exact source lengths; native GPU/host cache; global idle compression only; source hash-prefix synthetic input_ids; not official AgentX score.')
+--- old/cluster_runner.py
++++ new/cluster_runner.py
+@@ -17,6 +17,7 @@
+ import traceback
+ 
+ import agentx_replay as replay
++from episode_capture import replay_with_failure_capture
+ 
+ # Spawned scheduler children re-import this module instead of load_base().
+ # Install the same rank-local runtime before any scheduler constructs its model.
+@@ -302,8 +303,9 @@
+                     stage=f'{arm}:{case["id"]}:{policy}:r{repeat+1}', timestamp=time.time(),
+                     valid_points=len(list(run.glob('results/*/*/*/formal.r*.json'))), expected=root['expected_points']))
+                 before = forward_snapshot(run, root, arm)
+-                result = replay.replay(graphs, endpoints, policy, case['concurrency'], key, body, health,
+-                    namespace=f'agentx-{case["id"]}-repeat{repeat+1}', idle_gap_cap_s=root['idle_gap_cap_s'], copies=case.get('copies', 1))
++                result = replay_with_failure_capture(replay.replay, base.h.save, out/f'partial.r{repeat+1}.json',
++                    graphs, endpoints, policy, case['concurrency'], key, body, health,
++                    namespace=f'agentx-{case["id"]}-repeat{repeat+1}', idle_gap_cap_s=root['idle_gap_cap_s'], copies=case.get('copies', 1), episode_timeout_s=root['episode_timeout_s'])
+                 finish_episode(base, run, root, arm, out, repeat, before, result)
+     return 0
+ 
