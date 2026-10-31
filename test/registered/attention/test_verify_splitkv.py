@@ -20,13 +20,12 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.extend_attention import (
-    extend_attention_fwd,
+from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
+from sglang.kernels.ops.attention.verify_as_decode import CausalDecodeState
+from sglang.kernels.ops.attention.verify_as_decode import (
+    supported as causal_decode_supported,
 )
-from sglang.kernels.ops.attention.verify_splitkv import (
-    can_handle,
-    verify_splitkv_fwd,
-)
+from sglang.kernels.ops.attention.verify_splitkv import can_handle, verify_splitkv_fwd
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -247,6 +246,109 @@ class TestVerifySplitKV(CustomTestCase):
         self.assertFalse(
             can_handle(q, k, v, kb, vb, qo, kvp, kvi, None, True, None, mle)
         )
+
+
+class TestCausalDecodeVerifySupport(unittest.TestCase):
+    def test_only_qualified_causal_shape(self):
+        config = dict(
+            sm=(8, 0),
+            deterministic=True,
+            topk=1,
+            draft_tokens=3,
+            is_verify=True,
+            causal=True,
+            q_heads=24,
+            kv_heads=2,
+            head_dim=128,
+            value_dim=128,
+            page_size=64,
+            q_dtype="torch.bfloat16",
+            kv_dtype="torch.bfloat16",
+            sliding=-1,
+            logit_cap=0.0,
+            sinks=None,
+            score_mod=None,
+            temperature=-1,
+        )
+        self.assertTrue(causal_decode_supported(**config))
+        for key, value in dict(
+            sm=(9, 0),
+            topk=2,
+            causal=False,
+            deterministic=False,
+            draft_tokens=1,
+            kv_dtype="torch.float8_e4m3fn",
+            sliding=128,
+            logit_cap=30.0,
+            sinks=object(),
+        ).items():
+            with self.subTest(key=key):
+                self.assertFalse(
+                    causal_decode_supported(**dict(config, **{key: value}))
+                )
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "GPU required")
+class TestCausalDecodeVerify(CustomTestCase):
+    def test_strided_physical_indices_and_graph_replay(self):
+        if tuple(torch.cuda.get_device_capability()) != (8, 0):
+            self.skipTest("This opt-in path is qualified only for SM80")
+        prefix = [512, 0, 256, 128]
+        q, k, v, kb, vb, qo, ptr, _, length = _build_verify_inputs(
+            prefix, 3, 24, 2, 128, 128, torch.bfloat16, "cuda"
+        )
+        count = kb.shape[0]
+        slots = torch.arange(2 * (count + k.shape[0]), device="cuda", dtype=torch.int64)
+        # Both physical slot vectors are strided views; treating them as dense
+        # was a real prototype bug that the Q1 boundary qualification caught.
+        prefix_ids = slots[: 2 * count : 2]
+        extend_ids = slots[2 * count :: 2]
+        key = torch.randn(slots.numel(), 2, 128, device="cuda", dtype=torch.bfloat16)
+        value = torch.randn_like(key)
+        key[prefix_ids], value[prefix_ids] = kb, vb
+        key[extend_ids], value[extend_ids] = k, v
+        expected, actual = torch.empty_like(q), torch.empty_like(q)
+        state = CausalDecodeState(4, 3, 24, 128, 1024, 256, q.device)
+
+        def reference():
+            extend_attention_fwd(
+                q,
+                k,
+                v,
+                expected,
+                key,
+                value,
+                qo,
+                ptr,
+                prefix_ids.contiguous(),
+                None,
+                True,
+                None,
+                length,
+                k_scale=1.0,
+                v_scale=1.0,
+                sm_scale=128**-0.5,
+            )
+
+        def run():
+            state.run(q, actual, key, value, ptr, prefix_ids, extend_ids, 128**-0.5, 64)
+
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        graph.replay()
+        reference()
+        torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
+        # Reusing a graph must read changed physical KV contents, not stale
+        # Python metadata or a cached tensor result.
+        key[extend_ids] = torch.zeros_like(k)
+        value[extend_ids] = torch.zeros_like(v)
+        k.zero_()
+        v.zero_()
+        graph.replay()
+        reference()
+        torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
 
 
 if __name__ == "__main__":
