@@ -654,8 +654,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         layers_params = None
 
         # Decode pp size should be equal to prefill pp size or 1
-        if self.is_mla_backend or self.is_hybrid_mla_backend or force_flat:
+        if (
+            self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or force_flat
+            or src_layer_ids
+            or dst_layer_ids
+        ):
             # Layer IDs map PP-local buffers to global decode entries.
+            # Hybrid MHA also needs this mapping: full-attention buffers are
+            # compacted and the PP model-layer offset is not a buffer offset.
+            # Repeated layer IDs retain the separate K/V tensor occurrences.
             # Registrations without them retain the existing PP mapping.
             if src_layer_ids or dst_layer_ids:
                 pairs = build_transfer_entry_pairs(
