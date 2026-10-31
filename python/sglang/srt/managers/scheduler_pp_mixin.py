@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import time
 from array import array
 from collections import defaultdict, deque
+from copy import copy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
@@ -877,6 +879,45 @@ class SchedulerPPMixin:
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
         self.init_pp_loop_state()
+        self._pp_pd_early_proxy = os.environ.get("SGLANG_PP_PD_EARLY_PROXY", "0") == "1"
+        self._pp_pd_hicache_poll_steps = int(
+            os.environ.get("SGLANG_PP_PD_HICACHE_POLL_STEPS", "1")
+        )
+        if not 1 <= self._pp_pd_hicache_poll_steps <= 64:
+            raise ValueError("PP Decode HiCache polling interval must be in [1,64]")
+        self._pp_pd_microsteps = 0
+        self._pp_pd_hicache_polls = 0
+        self._pp_pd_early_proxy_sends = 0
+        if self._pp_pd_early_proxy:
+            if (
+                self.ps.pp_size != 2
+                or self.ps.tp_size != 1
+                or self._pp_topology() is not None
+                or get_parallel().pp_async_batch_depth != 0
+            ):
+                raise ValueError("Early PD proxy currently requires static PP2 x TP1")
+            # Activations may overtake the token echo. Isolate both tensor and
+            # metadata transports, while retaining native dynamic tensor schemas
+            # and P2PWork buffer ownership. No fixed batch/cohort is assumed.
+            self._pp_pd_tensor_channels = []
+            for _ in range(3):
+                channel = copy(self.pp_group)
+                channel.cpu_group = torch.distributed.new_group(
+                    ranks=self.pp_group.ranks, backend="gloo"
+                )
+                channel.device_group = torch.distributed.new_group(
+                    ranks=self.pp_group.ranks, backend="nccl"
+                )
+                torch.distributed.barrier(
+                    group=channel.device_group,
+                    device_ids=[torch.cuda.current_device()],
+                )
+                self._pp_pd_tensor_channels.append(channel)
+        logger.info(
+            "PP_PD_DECODE_CONTROLS early_proxy=%s hicache_poll_steps=%s",
+            self._pp_pd_early_proxy,
+            self._pp_pd_hicache_poll_steps,
+        )
 
         # PD additional state initialization
         rmbs = [None] * self.pp_loop_size
@@ -915,13 +956,20 @@ class SchedulerPPMixin:
                 # with all pipeline stages participating in the same order. Without
                 # this, completed writes keep prefix locks and idle/flush never
                 # succeeds; host restore cannot retire either.
-                if self.enable_decode_hicache:
+                # The microstep cadence is identical across pipeline stages,
+                # including idle slots. It bounds acknowledgement delay without
+                # making collective participation depend on local queue state.
+                if self.enable_decode_hicache and (
+                    self._pp_pd_microsteps % self._pp_pd_hicache_poll_steps == 0
+                ):
                     poll_cache = getattr(
                         self.tree_cache,
                         "check_hicache_events_pp_decode",
                         self.tree_cache.check_hicache_events,
                     )
                     poll_cache()
+                    self._pp_pd_hicache_polls += 1
+                self._pp_pd_microsteps += 1
 
                 if not self._pp_is_physical_last_rank():
                     self._pp_commit_comm_work(self.send_req_work)
@@ -974,6 +1022,14 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if (
+                        self._pp_pd_early_proxy
+                        and not cur_batch.forward_mode.is_prebuilt()
+                        and self._pp_rank_is_active()
+                        and not self._pp_is_last_rank()
+                    ):
+                        self._pp_send_launched_proxy(cur_batch, result)
+                        self._pp_pd_early_proxy_sends += 1
 
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -1061,6 +1117,7 @@ class SchedulerPPMixin:
                         and not cur_batch.forward_mode.is_prebuilt()
                         and self._pp_rank_is_active()
                         and not self._pp_is_last_rank()
+                        and not self._pp_pd_early_proxy
                     ):
                         self.device_module.current_stream().wait_event(
                             self.launch_event
@@ -1589,9 +1646,14 @@ class SchedulerPPMixin:
                 dst = self._pp_next_active_rank()
                 if dst is None:
                     raise RuntimeError("logical last PP rank cannot send proxy tensors")
+        channel = self.pp_group
+        channels = getattr(self, "_pp_pd_tensor_channels", None)
+        if channels and msg_type in ("proxy", "output"):
+            index = 0 if msg_type == "proxy" else (1 if self.pp_group.is_last_rank else 2)
+            channel = channels[index]
         p2p_work = []
         p2p_work.extend(
-            self.pp_group.send_tensor_dict(
+            channel.send_tensor_dict(
                 tensor_dict=tensor_dict,
                 dst=dst,
                 all_gather_group=(
@@ -1613,6 +1675,17 @@ class SchedulerPPMixin:
         If a message of the wrong kind is received, it's stashed in the queue
         and we continue receiving until we get the expected kind.
         """
+        channels = getattr(self, "_pp_pd_tensor_channels", None)
+        if channels and expected_kind in ("proxy", "output"):
+            if any(self._pp_tensor_dict_inbox.values()):
+                raise RuntimeError("PD typed channel cannot bypass a native inbox")
+            index = 0 if expected_kind == "proxy" else (2 if self.pp_group.is_last_rank else 1)
+            result = channels[index].recv_tensor_dict(
+                src=src, all_gather_group=all_gather_group
+            )
+            if result.get("__msg_type__") != expected_kind:
+                raise RuntimeError("PD tensor channel message type mismatch")
+            return result
         if expected_kind in self._pp_tensor_dict_inbox:
             inbox_queue = self._pp_tensor_dict_inbox[expected_kind]
             if inbox_queue:
