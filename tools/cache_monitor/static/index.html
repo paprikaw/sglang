@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>CPU 缓存 · GPU Layout</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <main class="page">
+    <header class="page-header">
+      <div>
+        <p class="eyebrow"><span class="brand-dot"></span> SGLANG · CACHE OBSERVER</p>
+        <h1>CPU 缓存与 GPU 布局</h1>
+        <p class="subtitle">查看各节点的共享 weight、KV cache，以及 TP / EP / PP 分布。</p>
+      </div>
+      <div class="header-actions">
+        <div id="connection" class="connection"><span class="status-dot"></span><span id="connection-label">正在连接</span></div>
+        <button id="refresh" class="primary-button" type="button"><span aria-hidden="true">↻</span> 立即刷新</button>
+      </div>
+    </header>
+
+    <section class="toolbar" aria-label="监控设置">
+      <div class="timestamp"><span id="observed-at">等待首次采样</span><span id="next-refresh" class="muted"></span></div>
+      <div class="toolbar-controls">
+        <label class="history-toggle"><input id="show-history" type="checkbox"> 显示历史 / 已取消节点</label>
+        <label class="refresh-setting">刷新间隔 <select id="refresh-seconds" aria-label="刷新间隔"><option value="15">15 秒</option><option value="30">30 秒</option><option value="60">60 秒</option></select></label>
+      </div>
+    </section>
+
+    <div id="alerts" class="alerts" aria-live="polite"></div>
+    <section id="summary" class="summary-grid" aria-label="在线节点缓存总量"></section>
+
+    <section aria-labelledby="nodes-heading">
+      <div class="section-heading">
+        <h2 id="nodes-heading">节点与布局</h2>
+        <div class="legend"><span><i class="legend-weight"></i>Weight</span><span><i class="legend-kv"></i>KV cache</span><span><i class="legend-free"></i>可用 CPU 内存</span></div>
+      </div>
+      <div id="nodes" class="nodes"><div class="empty-state"><span class="loading-ring" aria-hidden="true"></span><p>正在读取实时缓存状态…</p></div></div>
+    </section>
+
+    <footer class="footnote">
+      <strong>观察口径</strong>
+      <p>Weight 是节点共享的 CPU 模型缓存，每个节点只计一次。GPU 卡片展示硬件与逻辑布局，不表示每张卡各存一份 CPU weight。KV 当前统计节点 /dev/shm 中的 checkpoint 文件；「逻辑量」表示文件 / shard 大小，「resident」表示已验证仍在 RAM 的量。活跃引擎的 HiCache host pool 单独显示，未接入遥测时为「—」。未知值不会按 0 计入已测总量。</p>
+      <p>总览只计入本次可达的在线节点。历史、已取消和不可达节点不计入总量；缓存明细是逻辑布局，并非物理地址图。物理 GPU 映射没有证据时，单独显示逻辑 rank。页面只读取状态，不加载、清理或迁移缓存。</p>
+    </footer>
+  </main>
+</body>
+</html>
