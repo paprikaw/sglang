@@ -1,0 +1,229 @@
+"""Private PP2 scheduling candidates, switched only at a drained cohort fence.
+
+0: shared GEMM baseline; 1: original activation send submitted early;
+2: additionally retire the tail's own result, eliminating its head echo;
+3: additionally reuse warmed message schemas for fixed B4 tensor messages.
+All payloads use the original NCCL group, producer event and P2PWork ownership.
+"""
+from dataclasses import dataclass
+from functools import wraps
+import json
+import os
+from pathlib import Path
+
+from pp_schedule_opt import open_policy
+
+_INSTALLED = False
+_POLICY = None
+
+
+def mode():
+    value = _POLICY[0] - ord("0")
+    if value not in (0, 1, 2, 3):
+        raise RuntimeError("Unknown PP gap policy")
+    return value
+
+
+@dataclass
+class Pending:
+    event: object
+    payload: object
+    rids: tuple
+
+
+class Slots:
+    def __init__(self):
+        self.pending = {}
+        self.produced = self.retired = 0
+
+    def put(self, slot, event, payload, rids):
+        if slot not in (0, 1) or slot in self.pending:
+            raise RuntimeError("Local feedback slot overwrite")
+        self.pending[slot] = Pending(event, payload, tuple(rids))
+        self.produced += 1
+
+    def pop(self, slot, rids):
+        pending = self.pending.pop(slot)
+        if pending.rids != tuple(rids):
+            raise RuntimeError("Local feedback request ancestry mismatch")
+        self.retired += 1
+        return pending
+
+
+def install_local(cls, read_mode, can_skip):
+    init = cls.init_pp_loop_state
+    send = cls._pp_send_output_to_next_stage
+    receive = cls._pp_recv_dict_from_prev_stage
+    exchange = cls._pp_send_recv_and_preprocess_output_tensors
+
+    def init_wrapped(self, *args, **kwargs):
+        result = init(self, *args, **kwargs)
+        if self.ps.pp_size != 2 or self.pp_loop_size != 2 or self._pp_topology() is not None:
+            raise RuntimeError("Candidate requires static PP2 with two ring slots")
+        self._gap_slots = Slots()
+        self._gap_retiring = None
+        self._gap_echo_skipped = 0
+        return result
+
+    def send_wrapped(self, first_id, batches, queue, previous):
+        if read_mode() < 2:
+            return send(self, first_id, batches, queue, previous)
+        if not self.pp_group.is_last_rank:
+            if previous is not None:
+                self._gap_echo_skipped += 1
+            return []
+        target = batches[first_id]
+        if target is None:
+            return []
+        event, payload = queue.popleft()
+        if target.forward_mode.is_prebuilt() or can_skip(target):
+            return []
+        self._gap_slots.put(first_id, event, payload, [r.rid for r in target.reqs])
+        self.device_module.current_stream().wait_event(event)
+        return self._pp_send_dict_to_next_stage(payload.tensors, async_send=True, msg_type="output")
+
+    def receive_wrapped(self):
+        if read_mode() < 2 or not self.pp_group.is_last_rank:
+            return receive(self)
+        if self._gap_retiring is None:
+            raise RuntimeError("Local feedback outside retirement")
+        slot, rids = self._gap_retiring
+        pending = self._gap_slots.pop(slot, rids)
+        self.device_module.current_stream().wait_event(pending.event)
+        return pending.payload.tensors
+
+    def exchange_wrapped(self, first_id, next_id, batches, metadata, queue, previous):
+        if read_mode() < 2:
+            return exchange(self, first_id, next_id, batches, metadata, queue, previous)
+        if self._pp_requires_immediate_output_relay():
+            raise RuntimeError("Local feedback does not cover elastic PP")
+        target = batches[next_id]
+        self._gap_retiring = (next_id, tuple(r.rid for r in target.reqs)) if target is not None else None
+        try:
+            return exchange(self, first_id, next_id, batches, metadata, queue, previous)
+        finally:
+            self._gap_retiring = None
+
+    cls.init_pp_loop_state = init_wrapped
+    cls._pp_send_output_to_next_stage = send_wrapped
+    cls._pp_recv_dict_from_prev_stage = receive_wrapped
+    cls._pp_send_recv_and_preprocess_output_tensors = exchange_wrapped
+
+
+def describe(torch, payload):
+    tensors, values = [], []
+    for key, value in payload.items():
+        if torch.is_tensor(value):
+            if not value.is_cuda or not value.is_contiguous():
+                return None
+            if not value.shape or value.shape[0] != 4:
+                return None
+            tensors.append((key, tuple(value.shape), value.dtype, value.device))
+        else:
+            values.append((key, value))
+    return (tuple(tensors), tuple(values)) if tensors else None
+
+
+def install_schema(cls, torch, read_mode, P2PWork):
+    original_send = cls._pp_send_dict_to_next_stage
+    original_receive = cls._pp_recv_typed_dict
+
+    def cache(self):
+        if not hasattr(self, "_gap_schemas"):
+            self._gap_schemas = {}
+            self._gap_fast_sent = self._gap_fast_received = 0
+        return self._gap_schemas
+
+    def send(self, payload, async_send=True, msg_type="default", dst=None):
+        remembered = cache(self)
+        if read_mode() < 3:
+            result = original_send(self, payload, async_send=async_send, msg_type=msg_type, dst=dst)
+            schema = describe(torch, payload)
+            if schema is not None:
+                remembered["send", msg_type] = schema
+            return result
+        expected = "output" if self.pp_group.is_last_rank else "proxy"
+        if msg_type != expected or dst is not None or not async_send:
+            raise RuntimeError("Fast path requires one-way static PP2 messages")
+        payload["__msg_type__"] = msg_type
+        schema = describe(torch, payload)
+        if schema is None or schema != remembered.get(("send", msg_type)):
+            raise RuntimeError("Fast PP send schema differs from warmed native message")
+        group = self.pp_group
+        peer = group.ranks[(group.rank_in_group + 1) % 2]
+        work = []
+        for key, shape, dtype, device in schema[0]:
+            tensor = payload[key]
+            # This is the native payload operation, including payload retention.
+            handle = torch.distributed.isend(tensor, peer, group=group.device_group)
+            work.append(P2PWork(handle, tensor))
+        self._gap_fast_sent += 1
+        return work
+
+    def receive(self, expected_kind="default", all_gather_group=None, src=None):
+        remembered = cache(self)
+        if read_mode() < 3:
+            result = original_receive(self, expected_kind=expected_kind, all_gather_group=all_gather_group, src=src)
+            schema = describe(torch, result)
+            if schema is not None:
+                remembered["recv", expected_kind] = schema
+            return result
+        expected = "proxy" if self.pp_group.is_last_rank else "output"
+        if expected_kind != expected or src is not None or getattr(all_gather_group, "world_size", 1) != 1:
+            raise RuntimeError("Fast PP receive requires static PP2 x TP1")
+        schema = remembered.get(("recv", expected_kind))
+        if schema is None:
+            raise RuntimeError("Fast PP receive has no warmed native schema")
+        if any(self._pp_tensor_dict_inbox.values()):
+            raise RuntimeError("Fast PP receive cannot bypass a queued native message")
+        group = self.pp_group
+        peer = group.ranks[(group.rank_in_group - 1) % 2]
+        result = {}
+        for key, shape, dtype, device in schema[0]:
+            tensor = torch.empty(shape, dtype=dtype, device=device)
+            handle = torch.distributed.irecv(tensor, src=peer, group=group.device_group)
+            handle.wait()  # Same stream dependency as native recv_tensor_dict.
+            result[key] = tensor
+        result.update(schema[1])
+        self._gap_fast_received += 1
+        return result
+
+    cls._pp_send_dict_to_next_stage = send
+    cls._pp_recv_typed_dict = receive
+
+
+def install():
+    global _INSTALLED, _POLICY
+    if _INSTALLED or os.environ["EP2_PP2_ARM"] != "pp2":
+        return
+    import torch
+    from sglang.srt.distributed.parallel_state import P2PWork
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin, _pp_can_skip_output_comm
+    from pp_schedule_opt import wrap_methods
+    _POLICY = open_policy(os.environ["PP_GAP_POLICY_PATH"])
+    wrap_methods(SchedulerPPMixin, lambda: ord("1") if mode() >= 1 else ord("0"))
+    install_local(SchedulerPPMixin, mode, _pp_can_skip_output_comm)
+    install_schema(SchedulerPPMixin, torch, mode, P2PWork)
+    internal = Scheduler.get_internal_state
+
+    @wraps(internal)
+    def state(self, *args, **kwargs):
+        result = internal(self, *args, **kwargs)
+        slots = getattr(self, "_gap_slots", None)
+        result.internal_state["experiment_gap_state"] = dict(
+            policy=mode(), produced=slots.produced if slots else 0,
+            retired=slots.retired if slots else 0,
+            pending=list(slots.pending) if slots else [],
+            echoes_skipped=getattr(self, "_gap_echo_skipped", 0),
+            fast_sent=getattr(self, "_gap_fast_sent", 0),
+            fast_received=getattr(self, "_gap_fast_received", 0))
+        directory = Path(os.environ["EP2_PP2_RUN"]) / "pp2" / "gap_receipts"
+        directory.mkdir(exist_ok=True)
+        # Control requests run outside measured cohorts. Keep a bounded latest
+        # receipt per policy/rank, never add telemetry to the per-token path.
+        (directory / f"policy{mode()}.pp{self.ps.pp_rank}.json").write_text(
+            json.dumps(result.internal_state["experiment_gap_state"], indent=2) + "\n")
+        return result
+    Scheduler.get_internal_state = state
+    _INSTALLED = True
