@@ -118,7 +118,6 @@ class _KVTransport:
 
     def prepare_transition(self, transition):
         del transition
-        return torch.tensor([1, 3], dtype=torch.long)
 
     def exchange_phase(self, transition, phase, slot_ids):
         del transition
@@ -223,7 +222,7 @@ def test_prepare_fence_commit_and_deferred_cleanup():
         threading.current_thread().name,
     ]
     assert kv_transport.applied
-    assert kv_transport.finished
+    assert not kv_transport.finished
 
     coordinator.start_cleanup()
     done = coordinator.wait_for_phase(ElasticPPMigrationPhase.DONE, timeout=2)
@@ -272,7 +271,7 @@ def test_prepare_peer_failure_aborts_without_changing_source_generation():
     assert coordinator.current_topology == transition.source
     assert runner.aborted_layers
     assert runner.aborted_kv
-    assert kv_transport.finished
+    assert not kv_transport.finished
 
 
 def test_fence_slot_failure_reaches_consensus_before_abort():
@@ -299,7 +298,7 @@ def test_fence_slot_failure_reaches_consensus_before_abort():
     assert coordinator.snapshot().source_usable
     assert runner.aborted_layers
     assert runner.aborted_kv
-    assert kv_transport.finished
+    assert not kv_transport.finished
 
 
 def test_rank_skewed_bulk_and_delta_snapshots_are_allowed():
@@ -328,3 +327,28 @@ def test_peer_commit_failure_is_reported_as_nonrecoverable_partial_commit():
         raise AssertionError("peer commit failure unexpectedly succeeded")
     assert runner.committed
     assert not coordinator.snapshot().source_usable
+
+
+def test_pp2_pp4_pp2_reuses_coordinator_without_slot_tracker_lifecycle():
+    group = _Group()
+    group.world_size = 4
+    group.all_gather_object = lambda report: [
+        dict(report, rank=rank) for rank in range(4)
+    ]
+    coordinator, _, _, kv_transport = _coordinator(group)
+    coordinator.current_topology = PPTopology.from_layer_counts(
+        [2, 2, 0, 0], generation=0
+    )
+    for generation, counts in enumerate(([1, 1, 1, 1], [2, 2, 0, 0]), start=1):
+        transition = DynamicPPTransition.build(
+            coordinator.current_topology,
+            PPTopology.from_layer_counts(counts, generation=generation),
+        )
+        coordinator.begin(transition)
+        coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+        coordinator.finalize_at_fence(lambda topology: None)
+        assert not kv_transport.finished
+        coordinator.start_cleanup()
+        coordinator.wait_for_phase(ElasticPPMigrationPhase.DONE, timeout=2)
+        assert coordinator.current_topology == transition.target
+    assert kv_transport.phases == [("bulk", (1, 3, 5)), ("delta", ())] * 2

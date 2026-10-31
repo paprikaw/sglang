@@ -91,8 +91,6 @@ class ElasticPPMigrationCoordinator:
         self._fence_microstep: int | None = None
         self._layer_prepared = False
         self._kv_prepared = False
-        self._slot_tracking = False
-        self._bulk_slots: torch.Tensor | None = None
         self._drain_consensus_tensor: torch.Tensor | None = None
         self._drain_consensus_work: Any = None
 
@@ -178,8 +176,6 @@ class ElasticPPMigrationCoordinator:
             self._fence_microstep = None
             self._layer_prepared = False
             self._kv_prepared = False
-            self._slot_tracking = False
-            self._bulk_slots = None
             self._drain_consensus_tensor = None
             self._drain_consensus_work = None
             self._thread = Thread(
@@ -363,21 +359,20 @@ class ElasticPPMigrationCoordinator:
                     generation,
                     self.rank,
                 )
-                self._bulk_slots = self.kv_transport.prepare_transition(transition)
+                # Only prepare unpublished backing here. The scheduler still
+                # allocates/frees KV slots, including deferred free groups, so
+                # neither a live-slot snapshot nor a tracker is safe off-path.
+                # finalize_at_fence owns the single authoritative snapshot.
+                self.kv_transport.prepare_transition(transition)
                 self._kv_prepared = True
-                self._slot_tracking = True
-                slot_signature = self._slot_signature(self._bulk_slots)
                 logger.info(
-                    "Elastic PP generation=%d rank=%d KV prepare complete "
-                    "in %.3f s with %d live slots",
+                    "Elastic PP generation=%d rank=%d KV prepare complete in %.3f s",
                     generation,
                     self.rank,
                     time.monotonic() - stage_started,
-                    slot_signature[0],
                 )
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
-                slot_signature = None
 
             logger.info(
                 "Elastic PP generation=%d rank=%d allocation consensus begin",
@@ -388,7 +383,6 @@ class ElasticPPMigrationCoordinator:
                 "prepare_allocations",
                 success=local_error is None,
                 error=local_error,
-                details=slot_signature,
             )
             self._raise_peer_failures("prepare allocations", reports)
             logger.info(
@@ -566,8 +560,6 @@ class ElasticPPMigrationCoordinator:
             )
             self._raise_peer_failures("commit", reports)
 
-            self.kv_transport.finish_slot_tracking(transition)
-            self._slot_tracking = False
             with self._condition:
                 self.current_topology = transition.target
                 self._committed_at = time.monotonic()
@@ -635,12 +627,6 @@ class ElasticPPMigrationCoordinator:
             self.kv_transport.abort_staged(transition)
         except BaseException:
             pass
-        if self._slot_tracking:
-            try:
-                self.kv_transport.finish_slot_tracking(transition)
-            except BaseException:
-                pass
-            self._slot_tracking = False
         if self._kv_prepared:
             try:
                 self.model_runner.abort_elastic_pp_kv_layers(generation=generation)

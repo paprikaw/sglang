@@ -165,12 +165,7 @@ class ElasticPPKVTransport:
         rank: int,
         slot_chunk_size: int = 1024,
     ) -> None:
-        required_allocator_methods = (
-            "begin_elastic_pp_slot_tracking",
-            "elastic_pp_live_slots",
-            "elastic_pp_delta_slots",
-            "finish_elastic_pp_slot_tracking",
-        )
+        required_allocator_methods = ("elastic_pp_live_slots",)
         missing = [
             name for name in required_allocator_methods if not hasattr(allocator, name)
         ]
@@ -253,31 +248,28 @@ class ElasticPPKVTransport:
             )
         )
 
-    def prepare_transition(self, transition: DynamicPPTransition) -> torch.Tensor:
-        slots = self.allocator.begin_elastic_pp_slot_tracking(
-            generation=transition.target.generation
-        )
+    def prepare_transition(self, transition: DynamicPPTransition) -> None:
+        """Prepare backing without reading or tracking the serving allocator.
+
+        All KV payload is copied at the drained scheduler fence. A background
+        snapshot is unused in that protocol and races with allocation and
+        deferred frees; even a closed free-group flag is not a synchronization
+        boundary. Only fence_slots may read the live set for this transition.
+        """
+
         try:
             self.prepare_target(transition)
         except BaseException:
-            # The coordinator cannot set its prepared/tracking flags until this
+            # The coordinator cannot set its prepared flag until this
             # method returns. Roll back locally so a failure after backing
-            # allocation (for example a KVCacheD VMM map failure) cannot leak a
-            # pending generation or leave slot-delta tracking active.
+            # allocation cannot leak a pending generation.
             try:
                 self.model_runner.abort_elastic_pp_kv_layers(
                     generation=transition.target.generation
                 )
             except BaseException:
                 pass
-            try:
-                self.allocator.finish_elastic_pp_slot_tracking(
-                    generation=transition.target.generation
-                )
-            except BaseException:
-                pass
             raise
-        return slots
 
     def prepare_target(self, transition: DynamicPPTransition) -> frozenset[int]:
         with self._stream_context(self._receive_stream):
@@ -293,20 +285,10 @@ class ElasticPPKVTransport:
             ready_event.synchronize()
         return prepared
 
-    def bulk_slots(self, transition: DynamicPPTransition) -> torch.Tensor:
-        return self.allocator.begin_elastic_pp_slot_tracking(
-            generation=transition.target.generation
-        )
-
-    def delta_slots(self, transition: DynamicPPTransition) -> torch.Tensor:
-        return self.allocator.elastic_pp_delta_slots(
-            generation=transition.target.generation
-        )
-
     def fence_slots(self, transition: DynamicPPTransition) -> torch.Tensor:
         """Return the authoritative live rows at the drained scheduler fence.
 
-        The background allocator snapshot is intentionally not reused here.
+        No allocator snapshot is taken by the background preparation thread.
         Requests can allocate, free, or reuse slots while target backing is
         prepared.  Once every PP rank has drained at the common fence, the
         current source-owner snapshot is both complete and stable for the
@@ -624,8 +606,3 @@ class ElasticPPKVTransport:
             for key, value in self._staged_chunks.items()
             if key[0] != generation
         }
-
-    def finish_slot_tracking(self, transition: DynamicPPTransition) -> None:
-        self.allocator.finish_elastic_pp_slot_tracking(
-            generation=transition.target.generation
-        )
