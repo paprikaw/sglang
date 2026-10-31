@@ -1,0 +1,78 @@
+#!/bin/bash
+# macOS launcher. SSH forwards only loopback; remote serving remains unchanged.
+set -euo pipefail
+
+usage() {
+    cat <<'HELP'
+Usage: gpu-dashboard [--no-open]
+
+Open the Spartan GPU dashboard, reusing an existing healthy local tunnel.
+GPU_DASHBOARD_SSH_HOST overrides the SSH target (including a ~/.ssh/config alias).
+GPU_DASHBOARD_PORT overrides the local port (default 19510).
+HELP
+}
+
+no_open=0
+if [ "$#" -gt 1 ]; then usage >&2; exit 2; fi
+case "${1:-}" in
+    '') ;;
+    --help|-h) usage; exit 0 ;;
+    --no-open) no_open=1 ;;
+    *) usage >&2; exit 2 ;;
+esac
+
+if [ "$(uname -s)" != Darwin ]; then
+    printf '%s\n' '请在 Mac 本地终端运行 gpu-dashboard。' >&2
+    exit 1
+fi
+
+dashboard_host="${GPU_DASHBOARD_SSH_HOST:-bxb1@spartan-login2.hpc.unimelb.edu.au}"
+dashboard_port="${GPU_DASHBOARD_PORT:-19510}"
+case "$dashboard_port" in
+    ''|*[!0-9]*) printf '%s\n' 'GPU_DASHBOARD_PORT 必须是 1–65535 的端口。' >&2; exit 2 ;;
+esac
+if [ "${#dashboard_port}" -gt 5 ]; then
+    printf '%s\n' 'GPU_DASHBOARD_PORT 必须是 1–65535 的端口。' >&2; exit 2
+fi
+dashboard_port=$((10#$dashboard_port))
+if [ "$dashboard_port" -lt 1 ] || [ "$dashboard_port" -gt 65535 ]; then
+    printf '%s\n' 'GPU_DASHBOARD_PORT 必须是 1–65535 的端口。' >&2; exit 2
+fi
+case "$dashboard_host" in
+    ''|-*|*$'\n'*|*$'\r'*) printf '%s\n' '无效的 SSH 主机。' >&2; exit 2 ;;
+esac
+dashboard_url="http://127.0.0.1:$dashboard_port/"
+
+dashboard_ready() {
+    local response
+    response=$(curl --noproxy '*' -fsS --connect-timeout 1 --max-time 2 \
+        "${dashboard_url}api/health" 2>/dev/null) || return 1
+    # Require the actual dashboard identity, rather than any HTTP200 listener.
+    case "$response" in
+        *'"service": "resource-overview-v1"'*|*'"service":"resource-overview-v1"'*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if ! dashboard_ready; then
+    printf '正在连接 %s…\n' "$dashboard_host"
+    if ! ssh -fNT -o ExitOnForwardFailure=yes -o ConnectTimeout=15 \
+        -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+        -L "127.0.0.1:$dashboard_port:127.0.0.1:19510" "$dashboard_host"; then
+        printf '%s\n' 'SSH 连接失败，请检查平常使用的 Spartan 网络和 SSH 配置。' \
+            '若本地端口被占用，可运行：GPU_DASHBOARD_PORT=19511 gpu-dashboard' >&2
+        exit 1
+    fi
+    dashboard_attempt=0
+    until dashboard_ready; do
+        dashboard_attempt=$((dashboard_attempt + 1))
+        if [ "$dashboard_attempt" -ge 10 ]; then
+            printf '隧道已建立，dashboard 尚未就绪；稍后重试：%s\n' "$dashboard_url" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+fi
+
+if [ "$no_open" -eq 0 ]; then open "$dashboard_url"; fi
+printf '%s\n' "$dashboard_url"
