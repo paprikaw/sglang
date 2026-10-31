@@ -1,0 +1,150 @@
+# P/D 混合负载：完整原始轮次的算术平均
+
+每节点分别比较；单位均为绝对毫秒。未通过客户端到达偏差检查的点不作为受控到达结论。原始请求、全部轮次和各自源目录保留。
+
+## spartan-gpgpu011
+
+| run | workload | 布局／路由 | PP policy／微批上限 | 平均 TTFT | 平均 TPOT | 平均 E2E | 完整流量完成时间 | 到达有效 |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| 011_mixed_r1 | balanced_rps16 | ep4/least_outstanding | — | 308.33 | 71.35 | 3272.80 | 6302.63 | True |
+| 011_mixed_r1 | balanced_rps16 | four_ep1/least_outstanding | — | 145.97 | 10.65 | 1567.96 | 5777.13 | True |
+| 011_mixed_r1 | balanced_rps16 | mixed/least_outstanding | 0/8 | 336.99 | 26.57 | 2560.01 | 7592.85 | True |
+| 011_mixed_r1 | balanced_rps16 | mixed/p_to_ep | 0/8 | 664.07 | 72.29 | 3368.45 | 8391.25 | True |
+| 011_mixed_r1 | balanced_rps16 | mixed/p_to_pp | 0/8 | 156.24 | 26.33 | 2471.40 | 6731.46 | True |
+| 011_mixed_r1 | balanced_rps16 | two_ep2/least_outstanding | — | 267.34 | 39.67 | 2797.60 | 6485.73 | True |
+| 011_mixed_r1 | balanced_rps16 | two_pp2/least_outstanding | 0/8 | 168.92 | 23.29 | 2486.88 | 7151.70 | True |
+| 011_mixed_r1 | balanced_rps32 | ep4/least_outstanding | — | 444.58 | 40.12 | 2579.28 | 4751.82 | True |
+| 011_mixed_r1 | balanced_rps32 | four_ep1/least_outstanding | — | 250.11 | 25.44 | 2048.80 | 4573.69 | True |
+| 011_mixed_r1 | balanced_rps32 | mixed/least_outstanding | 0/8 | 508.73 | 31.57 | 2686.09 | 6924.77 | True |
+| 011_mixed_r1 | balanced_rps32 | mixed/p_to_ep | 0/8 | 1178.51 | 55.12 | 3577.66 | 7443.66 | True |
+| 011_mixed_r1 | balanced_rps32 | mixed/p_to_pp | 0/8 | 327.48 | 74.48 | 3234.89 | 5052.05 | True |
+| 011_mixed_r1 | balanced_rps32 | two_ep2/least_outstanding | — | 349.14 | 37.38 | 2444.17 | 4659.31 | True |
+| 011_mixed_r1 | balanced_rps32 | two_pp2/least_outstanding | 0/8 | 360.60 | 24.64 | 2543.61 | 5798.35 | True |
+| 011_mixed_r1 | cold_b16_q8192 | ep4/least_outstanding | — | 720.38 | — | 720.38 | 1030.50 | True |
+| 011_mixed_r1 | cold_b16_q8192 | four_ep1/least_outstanding | — | 501.32 | — | 501.32 | 706.53 | True |
+| 011_mixed_r1 | cold_b16_q8192 | mixed/least_outstanding | 0/8 | 587.97 | — | 587.97 | 1029.40 | True |
+| 011_mixed_r1 | cold_b16_q8192 | two_ep2/least_outstanding | — | 687.48 | — | 687.48 | 1034.23 | True |
+| 011_mixed_r1 | cold_b16_q8192 | two_pp2/least_outstanding | 0/8 | 424.94 | — | 424.94 | 721.86 | True |
+| 011_mixed_r1 | cold_b32_q512 | ep4/least_outstanding | — | 219.11 | — | 219.11 | 223.47 | True |
+| 011_mixed_r1 | cold_b32_q512 | four_ep1/least_outstanding | — | 163.39 | — | 163.39 | 169.76 | True |
+| 011_mixed_r1 | cold_b32_q512 | mixed/least_outstanding | 0/8 | 189.82 | — | 189.82 | 229.86 | True |
+| 011_mixed_r1 | cold_b32_q512 | two_ep2/least_outstanding | — | 205.88 | — | 205.88 | 214.19 | True |
+| 011_mixed_r1 | cold_b32_q512 | two_pp2/least_outstanding | 0/8 | 146.06 | — | 146.06 | 176.43 | True |
+| 011_mixed_r1 | cold_b8_q16384 | ep4/least_outstanding | — | 834.77 | — | 834.77 | 1033.45 | True |
+| 011_mixed_r1 | cold_b8_q16384 | four_ep1/least_outstanding | — | 567.40 | — | 567.40 | 707.10 | True |
+| 011_mixed_r1 | cold_b8_q16384 | mixed/least_outstanding | 0/8 | 628.88 | — | 628.88 | 977.92 | True |
+| 011_mixed_r1 | cold_b8_q16384 | two_ep2/least_outstanding | — | 786.91 | — | 786.91 | 987.57 | True |
+| 011_mixed_r1 | cold_b8_q16384 | two_pp2/least_outstanding | 0/8 | 483.94 | — | 483.94 | 750.16 | True |
+| 011_mixed_r1 | dheavy_rps16 | ep4/least_outstanding | — | 273.85 | 41.47 | 3854.36 | 6494.27 | True |
+| 011_mixed_r1 | dheavy_rps16 | four_ep1/least_outstanding | — | 113.17 | 10.90 | 2244.42 | 6034.89 | True |
+| 011_mixed_r1 | dheavy_rps16 | mixed/least_outstanding | 0/8 | 511.03 | 20.60 | 3618.43 | 8264.61 | True |
+| 011_mixed_r1 | dheavy_rps16 | mixed/p_to_ep | 0/8 | 1820.01 | 14.46 | 4383.44 | 10982.69 | True |
+| 011_mixed_r1 | dheavy_rps16 | mixed/p_to_pp | 0/8 | 793.33 | 14.01 | 3695.42 | 8539.36 | True |
+| 011_mixed_r1 | dheavy_rps16 | two_ep2/least_outstanding | — | 217.82 | 25.40 | 3574.56 | 6661.44 | True |
+| 011_mixed_r1 | dheavy_rps16 | two_pp2/least_outstanding | 0/8 | 757.25 | 17.29 | 3742.36 | 8586.95 | True |
+| 011_mixed_r1 | dheavy_rps32 | ep4/least_outstanding | — | 299.18 | 25.72 | 2987.43 | 4633.24 | True |
+| 011_mixed_r1 | dheavy_rps32 | four_ep1/least_outstanding | — | 155.14 | 14.01 | 2639.24 | 4736.90 | True |
+| 011_controlled_r3 | dheavy_rps32 | four_ep1/phase_pools | — | 742.37 | 11.42 | 3089.77 | 6601.25 | True |
+| 011_mixed_r1 | dheavy_rps32 | mixed/least_outstanding | 0/8 | 825.54 | 22.33 | 3619.16 | 7767.14 | True |
+| 011_controlled_r3 | dheavy_rps32 | mixed/least_outstanding | 1/16 | 196.64 | 30.74 | 3515.49 | 5688.28 | True |
+| 011_mixed_r1 | dheavy_rps32 | mixed/p_to_ep | 0/8 | 2074.97 | 25.12 | 4581.69 | 9729.09 | True |
+| 011_controlled_r3 | dheavy_rps32 | mixed/p_to_ep | 1/16 | 978.05 | 27.75 | 4143.42 | 8295.54 | True |
+| 011_mixed_r1 | dheavy_rps32 | mixed/p_to_pp | 0/8 | 830.58 | 18.02 | 3242.68 | 6730.72 | True |
+| 011_controlled_r3 | dheavy_rps32 | mixed/p_to_pp | 1/16 | 829.53 | 17.76 | 3240.35 | 6704.15 | True |
+| 011_mixed_r1 | dheavy_rps32 | two_ep2/least_outstanding | — | 281.69 | 25.70 | 3127.61 | 4859.45 | True |
+| 011_controlled_r3 | dheavy_rps32 | two_ep2/phase_pools | — | 882.50 | 24.89 | 3394.77 | 6750.36 | True |
+| 011_mixed_r1 | dheavy_rps32 | two_pp2/least_outstanding | 0/8 | 1072.79 | 18.01 | 3756.68 | 7479.93 | True |
+| 011_controlled_r3 | dheavy_rps32 | two_pp2/least_outstanding | 1/16 | 110.70 | 32.84 | 3685.15 | 5632.36 | True |
+| 011_controlled_r3 | dheavy_rps32 | two_pp2/phase_pools | 1/16 | 928.14 | 20.58 | 3996.32 | 8289.52 | True |
+| 011_mixed_r1 | pheavy_rps16 | ep4/least_outstanding | — | 348.19 | 101.46 | 2753.32 | 6018.49 | True |
+| 011_mixed_r1 | pheavy_rps16 | four_ep1/least_outstanding | — | 190.27 | 9.93 | 875.40 | 5389.64 | True |
+| 011_controlled_r3 | pheavy_rps16 | four_ep1/phase_pools | — | 332.36 | 56.08 | 1545.02 | 5157.39 | True |
+| 011_mixed_r1 | pheavy_rps16 | mixed/least_outstanding | 0/8 | 215.94 | 47.45 | 1886.47 | 6643.81 | True |
+| 011_controlled_r3 | pheavy_rps16 | mixed/least_outstanding | 1/16 | 215.40 | 57.26 | 2053.55 | 6699.51 | True |
+| 011_mixed_r1 | pheavy_rps16 | mixed/p_to_ep | 0/8 | 694.15 | 67.20 | 2439.84 | 6330.07 | True |
+| 011_controlled_r3 | pheavy_rps16 | mixed/p_to_ep | 1/16 | 678.83 | 66.32 | 2423.51 | 6281.79 | True |
+| 011_mixed_r1 | pheavy_rps16 | mixed/p_to_pp | 0/8 | 364.73 | 83.40 | 2239.66 | 5794.65 | True |
+| 011_controlled_r3 | pheavy_rps16 | mixed/p_to_pp | 1/16 | 345.65 | 82.21 | 2206.98 | 5787.52 | True |
+| 011_mixed_r1 | pheavy_rps16 | two_ep2/least_outstanding | — | 307.65 | 88.64 | 2538.76 | 6153.25 | True |
+| 011_controlled_r3 | pheavy_rps16 | two_ep2/phase_pools | — | 648.29 | 64.57 | 2232.48 | 5754.49 | True |
+| 011_mixed_r1 | pheavy_rps16 | two_pp2/least_outstanding | 0/8 | 123.15 | 29.93 | 1492.53 | 6333.27 | True |
+| 011_controlled_r3 | pheavy_rps16 | two_pp2/least_outstanding | 1/16 | 125.87 | 31.11 | 1510.47 | 6448.14 | True |
+| 011_controlled_r3 | pheavy_rps16 | two_pp2/phase_pools | 1/16 | 360.61 | 84.90 | 2414.79 | 6504.59 | True |
+| 011_mixed_r1 | pheavy_rps32 | ep4/least_outstanding | — | 764.81 | 63.35 | 2484.50 | 5036.95 | True |
+| 011_mixed_r1 | pheavy_rps32 | four_ep1/least_outstanding | — | 385.85 | 49.83 | 1719.50 | 4003.97 | True |
+| 011_controlled_r3 | pheavy_rps32 | four_ep1/phase_pools | — | 997.50 | 55.78 | 2351.78 | 4421.73 | False |
+| 011_arrival_recheck_r4 | pheavy_rps32 | four_ep1/phase_pools | — | 981.94 | 55.58 | 2332.98 | 4398.29 | True |
+| 011_mixed_r1 | pheavy_rps32 | mixed/least_outstanding | 0/8 | 533.42 | 41.81 | 1988.35 | 5711.01 | True |
+| 011_controlled_r3 | pheavy_rps32 | mixed/least_outstanding | 1/16 | 440.60 | 71.82 | 2370.72 | 5229.25 | True |
+| 011_mixed_r1 | pheavy_rps32 | mixed/p_to_ep | 0/8 | 1421.89 | 69.32 | 3240.01 | 5504.60 | True |
+| 011_controlled_r3 | pheavy_rps32 | mixed/p_to_ep | 1/16 | 1445.51 | 69.89 | 3358.66 | 5543.10 | True |
+| 011_mixed_r1 | pheavy_rps32 | mixed/p_to_pp | 0/8 | 1079.62 | 82.60 | 3006.99 | 4984.30 | True |
+| 011_controlled_r3 | pheavy_rps32 | mixed/p_to_pp | 1/16 | 1045.86 | 82.20 | 2966.90 | 4936.14 | True |
+| 011_mixed_r1 | pheavy_rps32 | two_ep2/least_outstanding | — | 624.94 | 59.44 | 2272.95 | 4840.17 | True |
+| 011_controlled_r3 | pheavy_rps32 | two_ep2/phase_pools | — | 1435.47 | 68.48 | 3149.06 | 5480.56 | True |
+| 011_mixed_r1 | pheavy_rps32 | two_pp2/least_outstanding | 0/8 | 331.98 | 35.92 | 1735.80 | 5124.12 | True |
+| 011_controlled_r3 | pheavy_rps32 | two_pp2/least_outstanding | 1/16 | 231.46 | 78.69 | 2347.99 | 5377.12 | True |
+| 011_controlled_r3 | pheavy_rps32 | two_pp2/phase_pools | 1/16 | 1052.39 | 84.92 | 3239.25 | 5257.68 | True |
+
+## spartan-gpgpu171
+
+| run | workload | 布局／路由 | PP policy／微批上限 | 平均 TTFT | 平均 TPOT | 平均 E2E | 完整流量完成时间 | 到达有效 |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| 171_mixed_r1 | balanced_rps16 | ep4/least_outstanding | — | 301.35 | 69.91 | 3242.25 | 6300.56 | True |
+| 171_mixed_r1 | balanced_rps16 | four_ep1/least_outstanding | — | 141.00 | 10.50 | 1607.01 | 5728.86 | True |
+| 171_mixed_r1 | balanced_rps16 | mixed/least_outstanding | 0/8 | 341.02 | 30.93 | 2725.25 | 7966.53 | True |
+| 171_mixed_r1 | balanced_rps16 | mixed/p_to_ep | 0/8 | 668.83 | 70.76 | 3367.57 | 8466.79 | True |
+| 171_mixed_r1 | balanced_rps16 | mixed/p_to_pp | 0/8 | 157.92 | 28.72 | 2529.42 | 6787.19 | True |
+| 171_mixed_r1 | balanced_rps16 | two_ep2/least_outstanding | — | 269.71 | 36.95 | 2772.95 | 6551.80 | True |
+| 171_mixed_r1 | balanced_rps16 | two_pp2/least_outstanding | 0/8 | 153.05 | 23.33 | 2497.83 | 6993.53 | True |
+| 171_mixed_r1 | balanced_rps32 | ep4/least_outstanding | — | 493.90 | 34.71 | 2559.53 | 4822.15 | True |
+| 171_mixed_r1 | balanced_rps32 | four_ep1/least_outstanding | — | 233.90 | 30.60 | 2230.73 | 4713.79 | True |
+| 171_mixed_r1 | balanced_rps32 | mixed/least_outstanding | 0/8 | 515.93 | 31.15 | 2704.47 | 7008.69 | True |
+| 171_mixed_r1 | balanced_rps32 | mixed/p_to_ep | 0/8 | 1187.75 | 55.21 | 3608.01 | 7530.20 | True |
+| 171_mixed_r1 | balanced_rps32 | mixed/p_to_pp | 0/8 | 352.83 | 77.08 | 3329.08 | 5122.54 | True |
+| 171_mixed_r1 | balanced_rps32 | two_ep2/least_outstanding | — | 351.19 | 37.81 | 2456.20 | 4653.36 | True |
+| 171_mixed_r1 | balanced_rps32 | two_pp2/least_outstanding | 0/8 | 394.32 | 25.39 | 2606.00 | 6269.65 | True |
+| 171_mixed_r1 | cold_b16_q8192 | ep4/least_outstanding | — | 715.72 | — | 715.72 | 1005.49 | True |
+| 171_mixed_r1 | cold_b16_q8192 | four_ep1/least_outstanding | — | 504.93 | — | 504.93 | 714.92 | True |
+| 171_mixed_r1 | cold_b16_q8192 | mixed/least_outstanding | 0/8 | 580.16 | — | 580.16 | 985.78 | True |
+| 171_mixed_r1 | cold_b16_q8192 | two_ep2/least_outstanding | — | 665.32 | — | 665.32 | 972.93 | True |
+| 171_mixed_r1 | cold_b16_q8192 | two_pp2/least_outstanding | 0/8 | 430.30 | — | 430.30 | 732.25 | True |
+| 171_mixed_r1 | cold_b32_q512 | ep4/least_outstanding | — | 220.66 | — | 220.66 | 225.12 | True |
+| 171_mixed_r1 | cold_b32_q512 | four_ep1/least_outstanding | — | 163.80 | — | 163.80 | 170.09 | True |
+| 171_mixed_r1 | cold_b32_q512 | mixed/least_outstanding | 0/8 | 193.52 | — | 193.52 | 235.71 | True |
+| 171_mixed_r1 | cold_b32_q512 | two_ep2/least_outstanding | — | 205.32 | — | 205.32 | 210.87 | True |
+| 171_mixed_r1 | cold_b32_q512 | two_pp2/least_outstanding | 0/8 | 145.80 | — | 145.80 | 174.33 | True |
+| 171_mixed_r1 | cold_b8_q16384 | ep4/least_outstanding | — | 826.57 | — | 826.57 | 1019.55 | True |
+| 171_mixed_r1 | cold_b8_q16384 | four_ep1/least_outstanding | — | 570.81 | — | 570.81 | 722.84 | True |
+| 171_mixed_r1 | cold_b8_q16384 | mixed/least_outstanding | 0/8 | 633.66 | — | 633.66 | 968.90 | True |
+| 171_mixed_r1 | cold_b8_q16384 | two_ep2/least_outstanding | — | 772.77 | — | 772.77 | 995.48 | True |
+| 171_mixed_r1 | cold_b8_q16384 | two_pp2/least_outstanding | 0/8 | 506.35 | — | 506.35 | 773.99 | True |
+| 171_mixed_r1 | dheavy_rps16 | ep4/least_outstanding | — | 269.93 | 41.09 | 3863.54 | 6519.83 | True |
+| 171_mixed_r1 | dheavy_rps16 | four_ep1/least_outstanding | — | 113.78 | 11.06 | 2289.92 | 6109.64 | True |
+| 171_mixed_r1 | dheavy_rps16 | mixed/least_outstanding | 0/8 | 505.24 | 21.45 | 3653.48 | 8305.92 | True |
+| 171_mixed_r1 | dheavy_rps16 | mixed/p_to_ep | 0/8 | 1862.37 | 14.57 | 4458.20 | 11118.81 | True |
+| 171_mixed_r1 | dheavy_rps16 | mixed/p_to_pp | 0/8 | 849.62 | 14.53 | 3867.29 | 8879.22 | True |
+| 171_mixed_r1 | dheavy_rps16 | two_ep2/least_outstanding | — | 221.65 | 28.99 | 3721.97 | 6802.51 | True |
+| 171_mixed_r1 | dheavy_rps16 | two_pp2/least_outstanding | 0/8 | 759.00 | 17.37 | 3756.23 | 8593.16 | True |
+| 171_mixed_r1 | dheavy_rps32 | ep4/least_outstanding | — | 297.54 | 25.77 | 2997.73 | 4611.67 | True |
+| 171_mixed_r1 | dheavy_rps32 | four_ep1/least_outstanding | — | 154.66 | 14.06 | 2646.66 | 4727.44 | True |
+| 171_mixed_r1 | dheavy_rps32 | mixed/least_outstanding | 0/8 | 846.48 | 22.59 | 3653.42 | 7780.31 | True |
+| 171_mixed_r1 | dheavy_rps32 | mixed/p_to_ep | 0/8 | 2150.40 | 25.06 | 4728.35 | 10035.63 | True |
+| 171_mixed_r1 | dheavy_rps32 | mixed/p_to_pp | 0/8 | 852.14 | 18.38 | 3351.94 | 6892.65 | True |
+| 171_mixed_r1 | dheavy_rps32 | two_ep2/least_outstanding | — | 283.35 | 26.41 | 3194.07 | 4931.57 | True |
+| 171_mixed_r1 | dheavy_rps32 | two_pp2/least_outstanding | 0/8 | 1114.10 | 18.77 | 3842.30 | 7520.24 | True |
+| 171_mixed_r1 | pheavy_rps16 | ep4/least_outstanding | — | 340.07 | 102.85 | 2786.98 | 6097.75 | True |
+| 171_mixed_r1 | pheavy_rps16 | four_ep1/least_outstanding | — | 182.47 | 10.46 | 903.49 | 5468.70 | True |
+| 171_mixed_r1 | pheavy_rps16 | mixed/least_outstanding | 0/8 | 209.18 | 51.85 | 1988.98 | 6843.88 | True |
+| 171_mixed_r1 | pheavy_rps16 | mixed/p_to_ep | 0/8 | 677.14 | 65.85 | 2401.14 | 6330.15 | True |
+| 171_mixed_r1 | pheavy_rps16 | mixed/p_to_pp | 0/8 | 382.52 | 84.38 | 2282.88 | 5839.82 | True |
+| 171_mixed_r1 | pheavy_rps16 | two_ep2/least_outstanding | — | 317.09 | 92.84 | 2633.79 | 6265.20 | True |
+| 171_mixed_r1 | pheavy_rps16 | two_pp2/least_outstanding | 0/8 | 125.04 | 31.59 | 1529.99 | 6447.07 | True |
+| 171_mixed_r1 | pheavy_rps32 | ep4/least_outstanding | — | 754.72 | 64.43 | 2512.01 | 5118.63 | True |
+| 171_mixed_r1 | pheavy_rps32 | four_ep1/least_outstanding | — | 364.21 | 51.19 | 1732.41 | 4000.57 | True |
+| 171_mixed_r1 | pheavy_rps32 | mixed/least_outstanding | 0/8 | 520.79 | 45.08 | 2050.00 | 5715.47 | True |
+| 171_mixed_r1 | pheavy_rps32 | mixed/p_to_ep | 0/8 | 1431.12 | 69.52 | 3264.47 | 5519.40 | True |
+| 171_mixed_r1 | pheavy_rps32 | mixed/p_to_pp | 0/8 | 1114.30 | 84.39 | 3080.43 | 5094.62 | True |
+| 171_mixed_r1 | pheavy_rps32 | two_ep2/least_outstanding | — | 624.24 | 59.40 | 2284.61 | 4888.44 | True |
+| 171_mixed_r1 | pheavy_rps32 | two_pp2/least_outstanding | 0/8 | 327.33 | 37.35 | 1754.24 | 5170.66 | True |
+
