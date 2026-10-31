@@ -1,0 +1,120 @@
+--- /data/gpfs/projects/punim2715/bookings/A100-fullnode.sh.before
++++ /data/gpfs/projects/punim2715/bookings/A100-fullnode.sh
+@@ -6,12 +6,15 @@
+ #SBATCH --partition=deeplearn
+ #SBATCH --time=7-00:00:00
+ #SBATCH --cpus-per-task=32
+-#SBATCH --mem=700000
++#SBATCH --mem=0
++#SBATCH --exclusive
+ #SBATCH -A punim2715
+ #SBATCH --output=outputs/myjob_%j.out
+ #SBATCH --constraint=dlg5
+ 
+ # Full-node A100 booking (one entire 4-GPU node)
++
++# --mem=0 requests all Slurm-configured node RAM; omitting --mem uses defaults.
+ 
+ module purge
+ module load GCCcore/11.3.0
+--- /data/gpfs/projects/punim2715/bookings/A100-node-managed-fullnode.sh.before
++++ /data/gpfs/projects/punim2715/bookings/A100-node-managed-fullnode.sh
+@@ -7,11 +7,13 @@
+ #SBATCH --partition=deeplearn
+ #SBATCH --time=7-00:00:00
+ #SBATCH --cpus-per-task=32
+-#SBATCH --mem=700000
++#SBATCH --mem=0
+ #SBATCH --account=punim2715
+ #SBATCH --constraint=dlg5
+ #SBATCH --exclusive
+ #SBATCH --output=outputs/node-managed_%j.out
++
++# --mem=0 requests all Slurm-configured node RAM; omitting --mem uses defaults.
+ 
+ BOOKING_DIR=/data/gpfs/projects/punim2715/bookings
+ cd "$BOOKING_DIR" || exit 1
+--- /data/gpfs/projects/punim2715/bookings/A100-ConnectX6-fullnode.sh.before
++++ /data/gpfs/projects/punim2715/bookings/A100-ConnectX6-fullnode.sh
+@@ -7,11 +7,13 @@
+ #SBATCH --partition=deeplearn
+ #SBATCH --time=7-00:00:00
+ #SBATCH --cpus-per-task=32
+-#SBATCH --mem=700000
++#SBATCH --mem=0
+ #SBATCH --account=punim2715
+ #SBATCH --constraint=dlg5
+ #SBATCH --exclusive
+ #SBATCH --output=outputs/connectx6-booking/job_%j.out
++
++# --mem=0 requests all Slurm-configured node RAM; omitting --mem uses defaults.
+ 
+ BOOKING_DIR=/data/gpfs/projects/punim2715/bookings
+ cd "$BOOKING_DIR" || exit 1
+--- /home/bxb1/.codex/skills/spartan-node-manager/scripts/node_manager.py.before
++++ /home/bxb1/.codex/skills/spartan-node-manager/scripts/node_manager.py
+@@ -18,10 +18,11 @@
+ BOOK = Path('/data/gpfs/projects/punim2715/bookings')
+ STATE = BOOK / 'node_inventory'
+ GUARD = Path('/data/gpfs/projects/punim2715/vllm_workbench/.experiment_guard/gpu_registry')
+-PROFILES = {'deeplearn': ('punim2715', 'gpgpudeeplearn', 700000, 'dlg5'),
+-            'feit-gpu-a100': ('punim2565', 'feit', 700000, 'avx512'),
+-            'gpu-a100': ('punim2715', 'publicgpu', 450000, 'avx512'),
+-            'gpu-a100-preempt': ('punim2715', 'publicgpu', 700000, 'avx512')}
++# Slurm --mem=0 requests all configured RAM on the selected node.
++PROFILES = {'deeplearn': ('punim2715', 'gpgpudeeplearn', 0, 'dlg5'),
++            'feit-gpu-a100': ('punim2565', 'feit', 0, 'avx512'),
++            'gpu-a100': ('punim2715', 'publicgpu', 0, 'avx512'),
++            'gpu-a100-preempt': ('punim2715', 'publicgpu', 0, 'avx512')}
+ FIELDS = ('id', 'state', 'partition', 'allocated', 'requested', 'nodes', 'cpus', 'gres', 'name', 'end', 'features', 'user')
+ 
+ 
+--- /data/gpfs/projects/punim2715/bookings/book_fast_nic.py.before
++++ /data/gpfs/projects/punim2715/bookings/book_fast_nic.py
+@@ -60,7 +60,7 @@
+     excluded = sorted(set(request["excluded_nodes"]) | set(request["rejected_nodes"]))
+     argv = ["sbatch", "--parsable", "--job-name=" + NAME,
+             "--partition=deeplearn", "--qos=gpgpudeeplearn", "--account=punim2715",
+-            "--nodes=1", "--ntasks=1", "--cpus-per-task=32", "--mem=700000",
++            "--nodes=1", "--ntasks=1", "--cpus-per-task=32", "--mem=0", "--exclusive",
+             "--gres=gpu:A100:4", "--constraint=dlg5", "--time=" + request["time"],
+             "--chdir=" + str(ROOT), "--output=" + str(record_dir / "job_%j.out"),
+             "--comment=fast-nic-" + request["request_id"] + "-slot" + str(slot)]
+--- /data/gpfs/projects/punim2715/bookings/maintain_connectx6.py.before
++++ /data/gpfs/projects/punim2715/bookings/maintain_connectx6.py
+@@ -78,7 +78,7 @@
+                     '--comment=connectx6-manual-booking',
+                     str(ROOT / 'A100-ConnectX6-fullnode.sh')]
+             if dry_run:
+-                print(node, '将提交一次整节点预约：4 张 A100 / 32 CPU / 700000 MiB / 7 天', flush=True)
++                print(node, '将提交一次整节点预约：4 张 A100 / 32 CPU / 节点全部可分配 CPU 内存（--mem=0）/ 7 天', flush=True)
+                 continue
+             job_id = run(argv).split(';')[0]
+             if not job_id.isdigit():
+--- /data/gpfs/projects/punim2715/bookings/README-fast-nic.md.before
++++ /data/gpfs/projects/punim2715/bookings/README-fast-nic.md
+@@ -10,7 +10,7 @@
+ ```
+ 
+ Without `--submit` or `--test-only`, the script only prints a preview. Each slot
+-requests one A100 node / four GPUs, 32 CPUs and 700000 MiB, as in the existing
++requests one A100 node / four GPUs, 32 CPUs and all node RAM (`--mem=0 --exclusive`), as in the
+ full-node booking. Default duration is 24 hours. Existing bookings are untouched.
+ 
+ Slurm currently has no NIC-specific feature in `deeplearn`; `dlg5` includes mixed
+--- /home/bxb1/.codex/skills/spartan-node-manager/SKILL.md.before
++++ /home/bxb1/.codex/skills/spartan-node-manager/SKILL.md
+@@ -45,8 +45,11 @@
+ Every new batch payload records local hardware once, then holds the booking;
+ it does not poll, prune, or renew jobs.
+ 
+-Follow the user's `A100-fullnode.sh`: 4 A100s, 32 CPUs and 7 days. Private
+-partitions use 700000 MiB; public A100 uses 450000 MiB to fit smaller host RAM.
++Follow the user's `A100-fullnode.sh`: 4 A100s, 32 CPUs and 7 days. Use `--mem=0 --exclusive` for every whole-node A100 booking: Slurm requests
++all configured node RAM instead of a fixed MiB ceiling. Keep `--mem=0` explicit;
++omitting it can select a partition default. Validated with `sbatch --test-only`
++on deeplearn, feit-gpu-a100, gpu-a100 and gpu-a100-preempt on 2026-10-20.
++Test-only acceptance is not a guarantee of start time or future policy acceptance.
+ FEIT uses `punim2565` / QoS `feit`; public uses `punim2715` / `publicgpu`.
+ Pending commitments inform advice and duplicate avoidance; they do not count
+ toward the four-running-node limit. Do not silently replace pending reservations

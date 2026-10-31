@@ -1,0 +1,522 @@
+"""CPU-only layout/key/publication and direct-host import checks; no SGLang/GPU."""
+import ast
+import copy
+import dataclasses
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import sys
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import numpy as np
+import pytest
+
+MODULE = Path(__file__).resolve().parents[1] / 'runtime' / 'semantic_bank.py'
+spec = importlib.util.spec_from_file_location('semantic_bank_under_test', MODULE)
+b = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(b)
+
+
+def prompts():
+    return [[index + 1] * 4097 for index in range(8)]
+
+
+def identity():
+    return dict(engine_commit=b.ENGINE_COMMIT, model_config_sha256='a' * 64,
+                model_index_sha256='b' * 64, model_revision='frozen-model-revision')
+
+
+def manifest():
+    return dict(pieces=[dict(geometry=b.producer_geometry(rank), filename=f'rank{rank}.bin')
+                        for rank in range(8)])
+
+
+@pytest.mark.parametrize('pp,mtp', [(1, False), (1, True), (2, False), (2, True)])
+def test_fourway_all_rank_component_request_head_mapping(pp, mtp):
+    for rank in range(8):
+        stage = rank // 4 if pp == 2 else 0
+        dp = 0 if pp == 2 else rank // 4
+        geom = b.geometry(rank=rank, pp_rank=stage, pp_size=pp,
+                          attn_tp_rank=rank % 4, attn_tp_size=4,
+                          attn_dp_rank=dp, attn_dp_size=2 if pp == 1 else 1,
+                          target_start=46 * stage if pp == 2 else 0,
+                          target_end=46 * (stage + 1) if pp == 2 else 92, mtp=mtp)
+        plan = b.import_plan(manifest(), geom)
+        assert sorted(dst for entry in plan for _, dst in entry['layer_pairs']) == list(range(len(geom['component_layers'])))
+        assert all(entry['piece']['geometry']['kv_head_start'] == (rank % 4) * 2 for entry in plan)
+        assert geom['request_indices'] == (list(range(8)) if pp == 2 else list(range(dp * 4, dp * 4 + 4)))
+        assert ('draft/0' in geom['component_layers']) == (mtp and (pp == 1 or stage == 1))
+
+
+def test_rank_partition_and_attention_tp_fail_closed():
+    bad = b.producer_geometry(0)
+    with pytest.raises(ValueError):
+        b.geometry(rank=0, pp_rank=0, pp_size=2, attn_tp_rank=0, attn_tp_size=8,
+                   attn_dp_rank=0, attn_dp_size=1, target_start=0, target_end=46, mtp=True)
+    with pytest.raises(ValueError):
+        b.geometry(rank=4, pp_rank=1, pp_size=2, attn_tp_rank=0, attn_tp_size=4,
+                   attn_dp_rank=0, attn_dp_size=1, target_start=45, target_end=92, mtp=True)
+    assert bad['component_layers'][-1] == 'target/45'
+
+
+def test_exact_total_payload_no_second_full_copy():
+    size = sum(8 * 63 * b.page_bytes(b.producer_geometry(rank)) for rank in range(8))
+    assert size == 12287213568
+    assert size / 1024**3 == 11.443359375
+    for rank in range(8):
+        assert 2 * b.page_bytes(b.producer_geometry(rank)) < b.MAX_SCRATCH_BYTES
+
+
+def test_identity_binds_full_tail_and_lookahead_not_topology():
+    source = prompts()
+    original = b.bank_identity(source, identity())
+    edited = copy.deepcopy(source)
+    edited[0][4032] += 1
+    changed = b.bank_identity(edited, identity())
+    assert original['cached_target_token_sha256'] == changed['cached_target_token_sha256']
+    assert original['draft_bigram_raw_sha256'] != changed['draft_bigram_raw_sha256']
+    assert original['prompt_sha256'] != changed['prompt_sha256']
+    edited = copy.deepcopy(source)
+    edited[0][-1] += 1
+    assert b.bank_identity(edited, identity()) != original
+
+
+def test_identity_rejects_missing_wrong_engine_and_semantic_shape():
+    for changed in ({}, dict(identity(), engine_commit='f' * 40),
+                    dict(identity(), model_config_sha256='invalid')):
+        with pytest.raises(ValueError):
+            b.bank_identity(prompts(), changed)
+    with pytest.raises(ValueError):
+        b.bank_identity(prompts()[:4], identity())
+    with pytest.raises(ValueError):
+        b.bank_identity([list(range(4097))] * 8, identity())
+
+
+def test_plan_rejects_component_missing_or_duplicated():
+    geom = b.producer_geometry(4)
+    missing = manifest()
+    missing['pieces'] = [piece for piece in missing['pieces'] if piece['geometry']['rank'] != 4]
+    with pytest.raises(ValueError, match='Missing/overlapping'):
+        b.import_plan(missing, geom)
+    doubled = manifest()
+    doubled['pieces'].append(copy.deepcopy(doubled['pieces'][4]))
+    with pytest.raises(ValueError, match='Missing/overlapping'):
+        b.import_plan(doubled, geom)
+
+
+def test_strided_byte_copy_preserves_target_and_draft_independently():
+    source = np.arange(2 * 2 * 3 * 2 * 2 * 2, dtype=np.uint8).reshape(2, 2, 3, 2, 2, 2)
+    backing = np.zeros((2, 6, 2, 2, 2, 2), dtype=np.uint8)
+    destination = backing[:, 2:4]
+    b.copy_page_layers(destination, source, [(0, 1), (2, 0)])
+    assert np.array_equal(destination[:, :, 0], source[:, :, 2])
+    assert np.array_equal(destination[:, :, 1], source[:, :, 0])
+    assert not backing[:, :2].any()
+    with pytest.raises(ValueError):
+        b.copy_page_layers(destination, source[0], [(0, 0)])
+
+
+def test_native_key_metadata_calls_engine_hash_on_bigram_and_plain_keys():
+    class Key:
+        def __init__(self, eagle): self.eagle = eagle
+        def __len__(self): return b.CACHED
+        def hash_page(self, start, end, prior):
+            return hashlib.sha256(f'{self.eagle},{start},{end},{prior}'.encode()).hexdigest()
+    with patch.object(b, '_native_key', side_effect=lambda tokens, eagle: Key(eagle)):
+        mtp = b.native_key_metadata(prompts()[0], True)
+        plain = b.native_key_metadata(prompts()[0], False)
+    assert mtp['raw_token_count'] == 4033 and plain['raw_token_count'] == 4032
+    assert len(mtp['page_hashes']) == 63
+    assert mtp['page_hashes'] != plain['page_hashes']
+
+
+def test_publication_requires_actual_two_node_exit_evidence(tmp_path):
+    with pytest.raises(ValueError, match='exit/owned'):
+        b.finalize_bank(tmp_path, prompts(), identity(), {})
+    with pytest.raises(ValueError, match='evidence'):
+        b.finalize_bank(tmp_path, prompts(), identity(), dict(producer_exited=True, cleanup_passed=True))
+    proof = tmp_path / 'exit.json'
+    proof.write_text('{}')
+    with pytest.raises(ValueError, match='evidence'):
+        b.finalize_bank(tmp_path, prompts(), identity(),
+                        dict(producer_exited=True, cleanup_passed=True,
+                             evidence=[dict(path=str(proof), sha256='0' * 64)] * 2))
+    other = tmp_path / 'exit2.json'
+    other.write_text('{}')
+    with pytest.raises(ValueError, match='changed/missing'):
+        b.finalize_bank(tmp_path, prompts(), identity(),
+                        dict(producer_exited=True, cleanup_passed=True,
+                             evidence=[dict(path=str(path), sha256='0' * 64) for path in (proof, other)]))
+
+
+def test_publication_rejects_ready_mutation_and_unsafe_paths(tmp_path):
+    (tmp_path / 'READY.json').write_text('{}')
+    with pytest.raises(RuntimeError, match='immutable'):
+        b.finalize_bank(tmp_path, prompts(), identity(), {})
+    for filename in ('../outside.bin', '.', 'missing.bin'):
+        with pytest.raises(ValueError):
+            b._piece_path(tmp_path, filename)
+    link = tmp_path / 'alias.bin'
+    link.symlink_to(tmp_path / 'READY.json')
+    with pytest.raises(ValueError):
+        b._piece_path(tmp_path, link.name)
+
+
+@pytest.mark.parametrize('corrupt_piece', [False, True])
+def test_full_publication_and_reload_hash_every_rank_piece(tmp_path, corrupt_piece):
+    """Tiny byte payload exercises actual publication, not a forged READY file."""
+    def producer(rank):
+        return dict(rank=rank, component_layers=['target/0'], kv_head_start=0, kv_head_end=2)
+    def key(tokens, eagle):
+        return dict(is_bigram=eagle, raw_token_count=b.CACHED + int(eagle),
+                    raw_token_sha256=b.token_sha(tokens[:b.CACHED + int(eagle)]),
+                    page_hashes=[hashlib.sha256(f'{tokens[0]}-{eagle}-{i}'.encode()).hexdigest()
+                                 for i in range(2)], implementation='native_RadixKey.hash_page')
+    proof_paths = [tmp_path / 'owned-exit-node0.json', tmp_path / 'owned-exit-node1.json']
+    for path in proof_paths:
+        path.write_text(json.dumps(dict(passed=True, owned_processes_exited=True)))
+    proof = dict(producer_exited=True, cleanup_passed=True,
+                 evidence=[dict(path=str(path), sha256=b.sha_file(path)) for path in proof_paths])
+    with patch.object(b, 'REQUESTS', 2), patch.object(b, 'CACHED', 4), \
+         patch.object(b, 'PAGE', 2), patch.object(b, 'HEAD_DIM', 2), \
+         patch.object(b, 'producer_geometry', side_effect=producer), \
+         patch.object(b, 'native_key_metadata', side_effect=key):
+        semantic = prompts()[:2]
+        logical = b.bank_identity(semantic, identity())
+        for rank in range(8):
+            geom = producer(rank)
+            length = b.CACHED // b.PAGE * b.page_bytes(geom)
+            payload = bytes([rank]) * length * 2
+            (tmp_path / f'rank{rank}.bin').write_bytes(payload)
+            record = dict(schema=b.SCHEMA, complete_rank=True, identity=logical,
+                          bank_identity_sha256=b._digest(logical), geometry=geom, axes=b.AXES,
+                          filename=f'rank{rank}.bin', bytes=len(payload),
+                          sha256=hashlib.sha256(payload).hexdigest(), synthetic_kv=False,
+                          native_hicache_quiescent=True, pending_counts={'pending': 0},
+                          requests=[dict(request_index=i, offset=i * length, bytes=length,
+                                         sha256=hashlib.sha256(payload[i * length:(i + 1) * length]).hexdigest(),
+                                         mtp_key=key(semantic[i], True), plain_key=key(semantic[i], False))
+                                    for i in range(2)])
+            (tmp_path / f'rank{rank}.json').write_text(json.dumps(record))
+        if corrupt_piece:
+            (tmp_path / 'rank7.bin').write_bytes(bytes([99]) * len(payload))
+            with pytest.raises(ValueError, match='content checksum'):
+                b.finalize_bank(tmp_path, semantic, identity(), proof)
+            assert not (tmp_path / 'READY.json').exists()
+        else:
+            published = b.finalize_bank(tmp_path, semantic, identity(), proof)
+            assert published['state'] == 'READY'
+            assert published['guard_post_pending'] and not published['archive_qualified']
+            assert published['total_bytes'] == len(payload) * 8
+            assert b.load_manifest(tmp_path, semantic, identity()) == published
+            altered = copy.deepcopy(published)
+            altered['pieces'][7]['geometry']['rank'] = 0
+            (tmp_path / 'READY.json').write_text(json.dumps(altered))
+            with pytest.raises(ValueError, match='integrity'):
+                b.load_manifest(tmp_path, semantic, identity())
+
+
+class Tensor:
+    """Small CPU tensor facade; tests do not import torch or create CUDA state."""
+    device = 'cpu'
+    def __init__(self, value): self.value = np.asarray(value)
+    def view(self, dtype): return Tensor(self.value.view(dtype))
+    def numpy(self): return self.value
+    def tolist(self): return self.value.tolist()
+    def __len__(self): return len(self.value)
+    def __getitem__(self, item):
+        value = self.value[item]
+        return Tensor(value) if isinstance(value, np.ndarray) else value
+    def clone(self): return Tensor(self.value.copy())
+    def numel(self): return self.value.size
+
+
+class Host:
+    def __init__(self, corrupt_readback=False):
+        self.buffer = np.zeros((2, 16, 1, 2, 2), dtype=np.uint16)
+        self.next = 4
+        self.freed = []
+        self.corrupt_readback = corrupt_readback
+    def alloc(self, count):
+        result = Tensor(np.arange(self.next, self.next + count))
+        self.next += count
+        return result
+    def free(self, indices): self.freed.extend(indices.tolist())
+    def get_data_page(self, first, flat=True):
+        result = self.buffer[:, int(first):int(first) + b.PAGE]
+        if flat:
+            result = result.flatten()
+            if self.corrupt_readback:
+                result[0] += 1
+        return Tensor(result)
+
+
+ENGINE_MEM = Path(__file__).resolve().parents[3] / '.engine-worktrees/glm47-pp-spec-microbatch-invariant-20261023/python/sglang/srt/mem_cache'
+
+
+def native_types():
+    """Execute exact pinned native class/method ASTs, with CPU tensor facades.
+
+    This retains URC NodeId resolution, FULL state, native InsertResult, the
+    actual insert_host implementation, and action consumption. Imports of the
+    whole serving package would initialize CUDA dependencies on a login node.
+    """
+    namespace = dict(dataclasses=dataclasses, ComponentType=SimpleNamespace(FULL=0),
+                     BASE_COMPONENT_TYPE=0, _NUM_COMPONENT_TYPES=4,
+                     ComponentData=lambda: SimpleNamespace(value=None, host_value=None),
+                     get_and_increase_time_counter=lambda: 0)
+    def load(filename, classname, methods=None):
+        tree = ast.parse((ENGINE_MEM / filename).read_text())
+        node = next(row for row in tree.body if isinstance(row, ast.ClassDef) and row.name == classname)
+        if methods is not None:
+            node.body = [row for row in node.body if isinstance(row, (ast.FunctionDef, ast.AsyncFunctionDef)) and row.name in methods]
+            node.bases = []
+            node.decorator_list = []
+        module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0), node], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(ENGINE_MEM / filename), 'exec'), namespace)
+        return namespace[classname]
+    insert_result = load('base_prefix_cache.py', 'InsertResult')
+    node = load('unified_cache/unified_tree_core.py', 'UnifiedTreeNode')
+    core = load('unified_cache/unified_tree_core.py', 'UnifiedTreeCore', {'insert_host'})
+    cache = load('unified_radix_cache.py', 'UnifiedRadixCache',
+                 {'resolve_node_handle', 'root_node_handle', '_apply_cache_actions'})
+    return node, core, cache, insert_result
+
+
+class Key:
+    def __init__(self, values): self.values = list(values)
+    def __len__(self): return len(self.values)
+    def __getitem__(self, sl): return Key(self.values[sl])
+    def child_key(self, page_size): return tuple(self.values[:page_size])
+
+
+def unified_fixture(host, eagle=False):
+    Node, NativeCore, NativeCache, _ = native_types()
+    class Core(NativeCore):
+        def __init__(self):
+            self.is_eagle, self.page_size = eagle, b.PAGE
+            self.arena, self.touched, self.updated = {}, [], []
+            self.root_node = self._new_node()
+            self.pending_insert = False
+        def _new_node(self, priority=0):
+            node = Node((0,), priority)
+            self.arena[node.id] = node
+            return node
+        def node_by_id(self, ident): return self.arena[ident]
+        def root_node_handle(self, extra_key=None): return self.root_node.id
+        def _touch_node(self, node): self.touched.append(node.id)
+        def _update_evictable_leaf_sets(self, node): self.updated.append(node.id)
+        def has_ongoing_insert(self): return self.pending_insert
+    cache = NativeCache()
+    cache.tree_core = Core()
+    cache.host_pool_group = SimpleNamespace(alloc=host.alloc, free=host.free,
+        get_pool=lambda name: host, entry_map={'kv': host},
+        anchor_entry=SimpleNamespace(host_pool=host))
+    cache.tree_components = (0,)
+    cache.applied = []
+    cache._apply_cache_action = cache.applied.append
+    cache.root_node = cache.tree_core.root_node
+    cache.cache_controller = SimpleNamespace(**{key: [] for key in
+        ('load_queue', 'write_queue', 'ack_load_queue', 'ack_write_queue')})
+    for key in ('ongoing_load_back', 'ongoing_write_through', 'ongoing_prefetch', 'ongoing_backup'):
+        setattr(cache, key, {})
+    return cache
+
+
+def tiny_torch():
+    return SimpleNamespace(uint8=np.uint8, cat=lambda tensors: Tensor(np.concatenate([row.value for row in tensors])))
+
+
+def run_tiny_import(tmp_path, *, corrupt_source=False, corrupt_readback=False):
+    geom = dict(component_layers=['target/0'], request_indices=[0, 1],
+                kv_head_start=0, kv_head_end=2)
+    source_geom = dict(component_layers=['target/0', 'draft/0'], kv_head_start=0, kv_head_end=2)
+    shape = (2, 2, 2, 2, 2, 2, 2, 2)
+    values = np.arange(np.prod(shape), dtype=np.uint8).reshape(shape)
+    path = tmp_path / 'rank0.bin'
+    path.write_bytes(values.tobytes())
+    key = lambda tokens, eagle: dict(is_bigram=eagle, page_hashes=['native0', 'native1'])
+    piece = dict(filename=path.name, geometry=source_geom,
+                 requests=[dict(request_index=i, sha256=hashlib.sha256(values[i].tobytes()).hexdigest(),
+                                plain_key=key([i], False)) for i in range(2)])
+    if corrupt_source:
+        changed = bytearray(path.read_bytes())
+        changed[0] ^= 1
+        path.write_bytes(changed)
+    saved = dict(pieces=[piece], bank_identity_sha256='bank', manifest_sha256='manifest')
+    host = Host(corrupt_readback)
+    cache = unified_fixture(host)
+    patches = [patch.object(b, name, value) for name, value in
+               [('REQUESTS', 2), ('CACHED', 4), ('PAGE', 2), ('HEAD_DIM', 2)]]
+    for manager in patches: manager.start()
+    try:
+        with patch.dict(sys.modules, torch=tiny_torch()), \
+             patch.object(b, 'load_manifest', return_value=saved), \
+             patch.object(b, '_runtime', return_value=(cache, host, geom)), \
+             patch.object(b, 'quiescent', return_value={'pending': 0}), \
+             patch.object(b, 'native_key_metadata', side_effect=key), \
+             patch.object(b, '_full_component', return_value=0), \
+             patch.object(b, '_native_key', side_effect=lambda tokens, eagle: Key([tokens[0]] * b.CACHED)), \
+             patch.object(b, '_match', return_value=SimpleNamespace(device_indices=[], host_hit_length=4)):
+            receipt = b.import_rank(SimpleNamespace(), tmp_path, [[0], [1]], {})
+    finally:
+        for manager in reversed(patches): manager.stop()
+    return receipt, host, cache, values
+
+
+def test_direct_host_import_new_slots_slices_draft_and_checks_readback(tmp_path):
+    receipt, host, cache, source = run_tiny_import(tmp_path)
+    nodes = {node.key.values[0]: node.component(0).host_value.tolist()
+             for node in cache.root_node.children.values()}
+    assert nodes == {0: [4, 5, 6, 7], 1: [8, 9, 10, 11]}
+    assert not hasattr(cache, 'is_eagle') and not hasattr(cache, '_insert_helper_host')
+    assert len(cache.tree_core.updated) == 4  # native host LRU/leaf updates
+    assert receipt['page_readback_verified'] and receipt['new_native_host_slots']
+    assert receipt['cpu_source_bytes_read'] == source.nbytes
+    assert receipt['cpu_host_bytes_written'] == source.nbytes // 2
+    assert receipt['cpu_host_readback_bytes'] == receipt['cpu_host_bytes_written']
+    for index, row in enumerate(receipt['imported_requests']):
+        assert row['cpu_host_sha256'] == row['source_view_sha256']
+        assert len(row['page_sha256']) == 2
+        for page in range(2):
+            first = nodes[index][page * 2]
+            actual = host.buffer[:, first:first + 2].flatten().view(np.uint8)
+            assert actual.tobytes() == source[index, page, :, :, :1].tobytes()
+
+
+def test_direct_host_import_rejects_corrupt_source_before_radix_publication(tmp_path):
+    with pytest.raises(RuntimeError, match='content checksum'):
+        run_tiny_import(tmp_path, corrupt_source=True)
+
+
+def test_direct_host_import_rejects_failed_host_readback(tmp_path):
+    with pytest.raises(RuntimeError, match='readback checksum'):
+        run_tiny_import(tmp_path, corrupt_readback=True)
+
+
+def test_module_has_no_cuda_or_distributed_launch_api():
+    source = MODULE.read_text()
+    for forbidden in ('torch.cuda', 'cuda.synchronize', 'torch.distributed', 'subprocess', 'os.system'):
+        assert forbidden not in source
+
+
+def test_unified_native_insert_drains_actions_and_checks_result():
+    host = Host()
+    cache = unified_fixture(host)
+    _, _, _, Result = native_types()
+    result = Result(prefix_len=0, total_len=4, inserted_host_node=cache.root_node.id,
+                    cache_actions=['native-action'])
+    cache.root_node.component(0).host_value = Tensor(np.arange(4))
+    with patch.object(b, 'CACHED', 4), patch.object(b, '_full_component', return_value=0), \
+         patch.object(cache.tree_core, 'insert_host', return_value=result):
+        b._insert_host(cache, Key(range(4)), Tensor(range(4)), [])
+        assert cache.applied == ['native-action'] and result.cache_actions == []
+        for name, value in [('prefix_len', 2), ('total_len', 3), ('host_insert_dropped', True), ('inserted_host_node', None)]:
+            original = getattr(result, name)
+            setattr(result, name, value)
+            with pytest.raises(RuntimeError, match='dropped, partial'):
+                b._insert_host(cache, Key(range(4)), Tensor(range(4)), [])
+            setattr(result, name, original)
+
+
+def test_unified_native_host_indices_resolves_integer_handles_and_full_state():
+    host = Host()
+    cache = unified_fixture(host, eagle=True)
+    first = cache.tree_core._new_node()
+    last = cache.tree_core._new_node()
+    first.parent, last.parent = cache.root_node, first
+    first.component(0).host_value = Tensor([4, 5])
+    last.component(0).host_value = Tensor([8, 9])
+    match = SimpleNamespace(last_host_node=last.id)
+    with patch.object(b, 'CACHED', 4), patch.object(b, 'PAGE', 2), \
+         patch.object(b, '_full_component', return_value=0), patch.dict(sys.modules, torch=tiny_torch()):
+        assert b._cache_mode(cache) is True
+        assert b._host_indices(cache, match).tolist() == [4, 5, 8, 9]
+        last.component(0).value = Tensor([1, 2])
+        with pytest.raises(RuntimeError, match='CPU-only'):
+            b._host_indices(cache, match)
+        last.component(0).value = None
+        first.parent = last
+        with pytest.raises(RuntimeError, match='cyclic'):
+            b._host_indices(cache, match)
+
+
+@pytest.mark.parametrize('pending', ['ongoing_backup', 'ongoing_tree_insert'])
+def test_unified_quiescence_rejects_pending_core_or_storage(pending):
+    cache = unified_fixture(Host())
+    scheduler = SimpleNamespace(tree_cache=cache, is_fully_idle=lambda: True)
+    assert not any(b.quiescent(scheduler).values())
+    if pending == 'ongoing_tree_insert':
+        cache.tree_core.pending_insert = True
+    else:
+        cache.ongoing_backup[1] = object()
+    with pytest.raises(RuntimeError, match='quiescent'):
+        b.quiescent(scheduler)
+
+
+def test_unified_native_export_cpu_only_nodeid_and_component_state(tmp_path):
+    host = Host()
+    cache = unified_fixture(host, eagle=True)
+    geom = dict(rank=0, request_indices=[0, 1], component_layers=['target/0'],
+                kv_head_start=0, kv_head_end=2)
+    matches = {}
+    for index in range(2):
+        node = cache.tree_core._new_node()
+        node.parent = cache.root_node
+        node.component(0).host_value = host.alloc(4)
+        matches[index] = SimpleNamespace(last_host_node=node.id, device_indices=[], host_hit_length=4)
+    host.buffer[:] = np.arange(host.buffer.size, dtype=np.uint16).reshape(host.buffer.shape)
+    semantic = prompts()[:2]
+    def key(tokens, eagle):
+        return dict(is_bigram=eagle, raw_token_count=4 + int(eagle),
+                    raw_token_sha256=b.token_sha(tokens[:4 + int(eagle)]),
+                    page_hashes=['a' * 64, 'b' * 64], implementation='native_RadixKey.hash_page')
+    with patch.object(b, 'REQUESTS', 2), patch.object(b, 'CACHED', 4), \
+         patch.object(b, 'PAGE', 2), patch.object(b, 'HEAD_DIM', 2), \
+         patch.object(b, '_full_component', return_value=0), patch.dict(sys.modules, torch=tiny_torch()), \
+         patch.object(b, '_runtime', return_value=(cache, host, geom)), \
+         patch.object(b, 'producer_geometry', return_value=geom), \
+         patch.object(b, '_match', side_effect=lambda cache, tokens: matches[tokens[0] - 1]), \
+         patch.object(b, 'native_key_metadata', side_effect=key):
+        record = b.export_rank(SimpleNamespace(tree_cache=cache, is_fully_idle=lambda: True), tmp_path, semantic, identity())
+    assert record['passed'] and record['bytes'] == 128
+    assert record['sha256'] == b.sha_file(tmp_path / 'rank0.bin')
+    assert record['gpu_tensor_reads'] == 0 and not hasattr(cache, 'is_eagle')
+
+
+@pytest.mark.parametrize('pp,mtp', [(1, False), (1, True), (2, False), (2, True)])
+def test_runtime_reads_urc_core_mode_and_validates_packed_full_pool(pp, mtp):
+    rank = 4
+    stage = rank // 4 if pp == 2 else 0
+    dp = 0 if pp == 2 else rank // 4
+    geom = b.geometry(rank=rank, pp_rank=stage, pp_size=pp,
+                      attn_tp_rank=0, attn_tp_size=4, attn_dp_rank=dp,
+                      attn_dp_size=2 if pp == 1 else 1,
+                      target_start=46 * stage if pp == 2 else 0,
+                      target_end=46 * (stage + 1) if pp == 2 else 92, mtp=mtp)
+    host = Host()
+    host.layout, host.dtype, host.page_size = 'page_first', 'torch.bfloat16', 64
+    host.layer_num, host.head_num, host.head_dim = len(geom['component_layers']), 2, 128
+    host.target_layer_num = geom['target_end'] - geom['target_start']
+    host.mtp_draft_device_pools = [object()] if 'draft/0' in geom['component_layers'] else []
+    host.kv_buffer = Tensor([])
+    cache = unified_fixture(host, eagle=mtp)
+    cache.page_size, cache.enable_storage = 64, False
+    parallel = SimpleNamespace(world_rank=rank, attn_tp_rank=0, attn_tp_size=4,
+                               attn_dp_rank=dp, attn_dp_size=2 if pp == 1 else 1)
+    scheduler = SimpleNamespace(tree_cache=cache, ps=SimpleNamespace(pp_rank=stage, pp_size=pp),
+        tp_worker=SimpleNamespace(model_runner=SimpleNamespace(model=SimpleNamespace(
+            start_layer=geom['target_start'], end_layer=geom['target_end']))))
+    modules = {'sglang.srt.runtime_context': SimpleNamespace(get_parallel=lambda: parallel),
+               'sglang.srt.mem_cache.hicache_storage': SimpleNamespace(PoolName=SimpleNamespace(KV='kv'))}
+    with patch.dict(sys.modules, modules), patch.object(b, '_full_component', return_value=0):
+        assert b._runtime(scheduler) == (cache, host, geom)
+        cache.tree_components = (0, 1)
+        with pytest.raises(RuntimeError, match='FULL-only'):
+            b._runtime(scheduler)
+        cache.tree_components = (0,)
+        host.mtp_draft_device_pools = [] if host.mtp_draft_device_pools else [object()]
+        with pytest.raises(RuntimeError, match='MTP draft'):
+            b._runtime(scheduler)

@@ -1,0 +1,1730 @@
+diff --git a/python/sglang/srt/arg_groups/validation_hook.py b/python/sglang/srt/arg_groups/validation_hook.py
+--- a/python/sglang/srt/arg_groups/validation_hook.py
++++ b/python/sglang/srt/arg_groups/validation_hook.py
+@@ -77,6 +77,36 @@ def check_server_args(server_args: Any):
+                     "NPU PP + speculative decoding (MTP) is only supported "
+                     "on prefill nodes (disaggregation-mode=prefill)"
+                 )
++        elif envs.SGLANG_ENABLE_PP_SPEC.get():
++            assert cfg.disable_overlap_schedule, (
++                "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"
++            )
++            # The relay carries an EAGLE-shaped tree and only EAGLEWorkerV2
++            # tail-drafts; every other algorithm would be mis-rebuilt.
++            assert (
++                cfg.speculative_algorithm == "EAGLE"
++                and not cfg.enable_multi_layer_eagle
++            ), (
++                "SGLANG_ENABLE_PP_SPEC supports single-layer EAGLE/MTP only, "
++                f"got {cfg.speculative_algorithm}"
++            )
++            # PD prefill relays topk_p / topk_index / hidden states through
++            # RelayPayload; the gated flow replaces that relay with its own
++            # and does not carry those fields.
++            assert cfg.disaggregation_mode == "null", (
++                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
++            )
++            # The PP relay slices spec results with the configured
++            # num_draft_tokens; adaptive spec changes it at runtime.
++            assert not cfg.speculative_adaptive, (
++                "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
++            )
++            # Every stage rebuilds the same verify input from the relayed
++            # per-request state, so all stages must see the same batch.
++            # DP attention partitions it per DP rank.
++            assert not cfg.enable_dp_attention, (
++                "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
++            )
+         else:
+             # Non-NPU: PP + speculative decoding is not supported
+             assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -1300,6 +1300,10 @@ class Envs:
+     # Speculative decoding
+     # ===================================================================
+     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
++    # Experimental: allow pipeline parallelism x speculative decoding
++    # (EAGLE/MTP). Off by default; see the PP+spec RFC for constraints
++    # (non-overlap schedule, no DP attention).
++    SGLANG_ENABLE_PP_SPEC = EnvBool(False)
+     # Capture the per-replay attention-metadata prep (init_forward_metadata_out_graph)
+     # into a small CUDA graph, collapsing its host dispatch cost to one launch.
+     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1027,6 +1027,17 @@ def maybe_init_draft_worker(self):
+             self.external_corpus_manager = None
+             return
+ 
++        if (
++            envs.SGLANG_ENABLE_PP_SPEC.get()
++            and self.ps.pp_size > 1
++            and self.ps.pp_rank != self.ps.pp_size - 1
++        ):
++            # PP+spec: the draft model (MTP layer) needs final hidden states and
++            # the lm_head, both of which live on the last PP stage only.
++            self.draft_worker = None
++            self.external_corpus_manager = None
++            return
++
+         # Launch a draft worker for speculative decoding. It builds its draft
+         # from this process's own config: what differs for the draft — the
+         # target's context length, the draft load format, its attention backend
+@@ -1155,7 +1166,9 @@ def init_model_worker(self):
+             model_runner.post_capture_elastic_ep_recover()
+ 
+         # Dispatch the model worker
+-        if self.spec_algorithm.is_none():
++        if self.spec_algorithm.is_none() or self.draft_worker is None:
++            # PP+spec: non-last stages have no draft worker; they run the
++            # verify-shaped target forward through the plain tp_worker.
+             self.model_worker = self.tp_worker
+         else:
+             self.model_worker = self.draft_worker
+@@ -4391,31 +4404,99 @@ def run_batch(
+                 batch.input_ids = None
+                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
+             elif not batch.spec_algorithm.is_none():
+-                # Non-overlap: drive the V2 worker synchronously (no
+-                # future_map relay / on_publish).
+-                resolve_forward_inputs(batch, self.future_map)
+-                with self._forward_isolation(batch, overlap=False):
+-                    batch_result = self.model_worker.forward_batch_generation(
+-                        batch, pp_proxy_tensors=pp_proxy_tensors
+-                    )
+-                # The isolation restore reverted the worker's in-forward SB edits;
+-                # re-apply what must carry to the next iter.
+-                batch.spec_info = batch_result.next_draft_input
+-                if batch_result.new_seq_lens is not None:
+-                    batch.seq_lens = batch_result.new_seq_lens
+-                    if batch.seq_lens_cpu is not None:
+-                        batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
+-                        batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
+-                batch.input_ids = None  # rebuilt next iter from draft_token
+-                self.update_cache_from_scheduler(batch, batch_result)
+-                # Only the last PP rank owns real results requiring D2H; other ranks
+-                # consume device tensors rebuilt from the output ring.
+-                batch_result.copy_done = self.device_module.Event()
+-                if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
+-                    batch_result.copy_to_cpu(
+-                        return_logprob=batch.return_logprob,
+-                        return_hidden_states=batch.return_hidden_states,
++                is_verify_round = self.ps.pp_size > 1 and not (
++                    batch.forward_mode.is_extend() or batch.is_extend_in_batch
++                )
++                # The relayed tree is what the requests carry between rounds;
++                # the rebuild below swaps it for this round's verify input, so
++                # hold on to it and put it back once the forward is done.
++                relay_input = batch.spec_info if is_verify_round else None
++                if is_verify_round:
++                    # PP+spec decode: every stage rebuilds the same verify
++                    # input from relayed per-req state (draft lives on the
++                    # last stage only).
++                    self._pp_spec_rebuild_verify_input(batch)
++                if not self.pp_group.is_last_rank:
++                    # PP+spec: non-last stages run only their model chunk on
++                    # the verify-shaped batch; sampling, accept and draft all
++                    # live on the last stage. The plain tp_worker path already
++                    # returns pp_hidden_states_proxy_tensors for relay.
++                    resolve_forward_inputs(batch, self.future_map)
++                    if is_verify_round:
++                        from sglang.srt.speculative.eagle_utils import (
++                            eagle_prepare_for_verify,
++                        )
++
++                        # Isolation is load-bearing: eagle_prepare_for_verify
++                        # mutates SB fields (forward_mode -> TARGET_VERIFY,
++                        # input_ids, out_cache_loc); without the restore the
++                        # next get_next_batch_to_run treats this decode batch
++                        # as extend and re-merges it (duplicate reqs).
++                        with self._forward_isolation(batch, overlap=False):
++                            verify_forward_batch, can_run_cuda_graph = (
++                                eagle_prepare_for_verify(
++                                    batch.spec_info,
++                                    self.req_to_token_pool,
++                                    batch,
++                                    self.tp_worker,
++                                )
++                            )
++                            batch_result = self.tp_worker.forward_batch_generation(
++                                batch=None,
++                                forward_batch=verify_forward_batch,
++                                pp_proxy_tensors=pp_proxy_tensors,
++                                is_verify=True,
++                            )
++                        batch_result.can_run_cuda_graph = can_run_cuda_graph
++                        # The isolation above restores batch.out_cache_loc, but
++                        # this stage still has to compact its own accepted-path
++                        # KV once the last stage relays which nodes it kept, so
++                        # the verify slots have to outlive the forward.
++                        batch_result.spec_verify_out_cache_loc = (
++                            verify_forward_batch.out_cache_loc
++                        )
++                    else:
++                        batch_result = self.model_worker.forward_batch_generation(
++                            batch, pp_proxy_tensors=pp_proxy_tensors
++                        )
++                    batch.input_ids = None
++                    # The verify input is per-round; between iterations
++                    # spec_info carries the relayed tree, which is
++                    # merge/filter-safe.
++                    batch.spec_info = relay_input
++                else:
++                    # Non-overlap: drive the V2 worker synchronously (no
++                    # future_map relay / on_publish).
++                    resolve_forward_inputs(batch, self.future_map)
++                    with self._forward_isolation(batch, overlap=False):
++                        batch_result = self.model_worker.forward_batch_generation(
++                            batch, pp_proxy_tensors=pp_proxy_tensors
++                        )
++                    # The isolation restore reverted the worker's in-forward SB edits;
++                    # re-apply what must carry to the next iter. Under PP the
++                    # tail draft already consumed the draft input in-round, and
++                    # the next round's tree comes from the relay, so the last
++                    # stage carries the same relayed tree as the others.
++                    batch.spec_info = (
++                        relay_input
++                        if is_verify_round
++                        else batch_result.next_draft_input
+                     )
++                    if batch_result.new_seq_lens is not None:
++                        batch.seq_lens = batch_result.new_seq_lens
++                        if batch.seq_lens_cpu is not None:
++                            batch.seq_lens_cpu = batch_result.new_seq_lens.to("cpu")
++                            batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
++                    batch.input_ids = None  # rebuilt next iter from draft_token
++                    self.update_cache_from_scheduler(batch, batch_result)
++                    # Only the last PP rank owns real results requiring D2H; other ranks
++                    # consume device tensors rebuilt from the output ring.
++                    batch_result.copy_done = self.device_module.Event()
++                    if batch_result.has_sampled_token_ids and self.ps.pp_size == 1:
++                        batch_result.copy_to_cpu(
++                            return_logprob=batch.return_logprob,
++                            return_hidden_states=batch.return_hidden_states,
++                        )
+             else:
+                 kwargs = (
+                     {"pp_proxy_tensors": pp_proxy_tensors}
+diff --git a/python/sglang/srt/managers/scheduler_pp_mixin.py b/python/sglang/srt/managers/scheduler_pp_mixin.py
+--- a/python/sglang/srt/managers/scheduler_pp_mixin.py
++++ b/python/sglang/srt/managers/scheduler_pp_mixin.py
+@@ -26,7 +26,7 @@
+     PPProxyTensors,
+ )
+ from sglang.srt.observability.req_time_stats import set_time_batch
+-from sglang.srt.runtime_context import get_disagg, get_parallel
++from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
+ from sglang.srt.sampling.sampling_observer_pp import (
+     add_auxiliary_output_to_pp_tensors,
+     pop_auxiliary_output_from_pp_tensors,
+@@ -56,9 +56,20 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
+ @dataclass
+ class PPBatchMetadata:
+     can_run_cuda_graph: bool
++    # PP+spec: forward-time snapshot of the microbatch (ScheduleBatch.copy()).
++    # The live mb object can be merged/filtered in place before its relayed
++    # result arrives, so relayed tensors must be applied against the
++    # composition that actually ran the forward.
++    fwd_batch: Optional[ScheduleBatch] = None
++    verify_out_cache_loc: Optional[torch.Tensor] = None
+ 
+ 
+ class SchedulerPPMixin:
++    # Gated PP+spec relay flow. Class-level default so schedulers that never
++    # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
++    # init_pp_loop_state overwrites it per instance.
++    _pp_spec_relay: bool = False
++
+     @DynamicGradMode()
+     def event_loop_pp(self: Scheduler):
+         """
+@@ -116,7 +127,17 @@ def event_loop_pp(self: Scheduler):
+                 next_pp_outputs = None
+                 next_batch_result = None
+                 d2h_event = None
+-                if get_parallel().pp_async_batch_depth > 0:
++                # With zero async depth, non-last speculative ranks must
++                # exchange the previous outputs before launching the next batch.
++                # Tree planning synchronizes CUDA on the host; sending alone
++                # leaves the peer's return send unmatched and can block that
++                # synchronization while the peer waits for our next proxy.
++                # The last rank must launch first to produce its output.
++                exchange_outputs_before_forward = (
++                    get_parallel().pp_async_batch_depth > 0
++                    or (self._pp_spec_relay and not self.pp_group.is_last_rank)
++                )
++                if exchange_outputs_before_forward:
+                     next_pp_outputs, next_batch_result, d2h_event = (
+                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                             next_first_rank_mb_id,
+@@ -132,7 +153,7 @@ def event_loop_pp(self: Scheduler):
+                         self.mb_metadata,
+                         self.last_rank_comm_queue,
+                     )
+-                if get_parallel().pp_async_batch_depth == 0:
++                if not exchange_outputs_before_forward:
+                     next_pp_outputs, next_batch_result, d2h_event = (
+                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
+                             next_first_rank_mb_id,
+@@ -141,9 +162,15 @@ def event_loop_pp(self: Scheduler):
+                     )
+                 if self.mbs[next_mb_id] is not None:
+                     d2h_event.synchronize()
++                    process_target = self.mbs[next_mb_id]
++                    next_md = self.mb_metadata[next_mb_id]
++                    if next_md is not None and next_md.fwd_batch is not None:
++                        # PP+spec: process against the forward-time snapshot;
++                        # the live mb may have been recomposed since launch.
++                        process_target = next_md.fwd_batch
+                     with torch.profiler.record_function("process_batch_result"):
+                         self._pp_process_batch_result(
+-                            self.mbs[next_mb_id],
++                            process_target,
+                             next_batch_result,
+                         )
+                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+@@ -561,6 +588,11 @@ def init_pp_loop_state(self: Scheduler):
+         self.mb_metadata: List[Optional[PPBatchMetadata]] = [None] * self.pp_loop_size
+         self.pp_outputs: Optional[PPProxyTensors] = None
+         self.last_rank_comm_queue: deque[Tuple[torch.Event, PPProxyTensors]] = deque()
++        self._pp_spec_relay = (
++            envs.SGLANG_ENABLE_PP_SPEC.get()
++            and self.ps.pp_size > 1
++            and not self.spec_algorithm.is_none()
++        )
+ 
+         self.send_req_work = []
+         self.send_proxy_work = []
+@@ -773,6 +805,29 @@ def _pp_prepare_tensor_dict(
+             "next_token_ids": result.next_token_ids,
+         }
+ 
++        if self._pp_spec_relay and result.accept_lens is not None:
++            # PP+spec verify round: earlier stages need the accept results to
++            # mirror seq_lens/KV bookkeeping and the bonus token to root the
++            # next round's verify chain.
++            tensor_dict["spec_accept_lens"] = result.accept_lens
++            tensor_dict["spec_new_seq_lens"] = result.new_seq_lens
++            tensor_dict["spec_bonus_tokens"] = result.next_draft_input.bonus_tokens
++            if (
++                result.accept_index is not None
++                and get_spec().speculative_eagle_topk > 1
++            ):
++                # Only a tree needs it: a chain's accepted path is already the
++                # front of each block, so compacting it is an identity.
++                tensor_dict["spec_accept_index"] = result.accept_index
++            if result.next_verify_chain is not None:
++                # Tail-drafted tree for the next verify round (root = bonus),
++                # with the topology its tokens were arranged by.
++                tensor_dict["spec_next_chain"] = result.next_verify_chain
++                tensor_dict["spec_next_parents"] = result.next_verify_parent_list
++                tensor_dict["spec_next_top_scores"] = (
++                    result.next_verify_top_scores_index
++                )
++
+         # Draft extend runs only on the last stage, but every rank needs its relayed
+         # output to fill PD auxiliary buffers.
+         draft_input = result.next_draft_input
+@@ -928,6 +983,63 @@ def _pp_prep_batch_result(
+                 if logits_output is None:
+                     logits_output = LogitsProcessorOutput(next_token_logits=None)
+                 logits_output.auxiliary_device_output = auxiliary_output
++
++        if self._pp_spec_relay and "spec_accept_lens" in pp_outputs.tensors:
++            # PP+spec verify round. Relayed tensors align with the composition
++            # that ran the forward (mb_metadata.fwd_batch snapshot); the live
++            # mb object may have been merged/filtered in place since. Mirror
++            # the seq state per-rid onto the live batch, stash the bonus
++            # tokens that root the next verify chain, and rebuild a result the
++            # spec output processor can consume (CPU tensors).
++            fwd_batch = (
++                mb_metadata.fwd_batch if mb_metadata.fwd_batch is not None else batch
++            )
++            new_seq_lens = pp_outputs["spec_new_seq_lens"]
++            fwd_rids = [req.rid for req in fwd_batch.reqs]
++            live_rids = [req.rid for req in batch.reqs]
++            self._pp_spec_compact_accept_kv(
++                batch,
++                fwd_batch,
++                fwd_rids,
++                live_rids,
++                mb_metadata.verify_out_cache_loc,
++                pp_outputs,
++            )
++            if live_rids == fwd_rids:
++                batch.seq_lens = new_seq_lens
++                if batch.seq_lens_cpu is not None:
++                    batch.seq_lens_cpu = new_seq_lens.to("cpu")
++                    batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
++            else:
++                row_by_rid = {rid: i for i, rid in enumerate(fwd_rids)}
++                new_cpu = new_seq_lens.tolist()
++                cur_cpu = batch.seq_lens.tolist()
++                merged = [
++                    new_cpu[row_by_rid[rid]] if rid in row_by_rid else cur_cpu[j]
++                    for j, rid in enumerate(live_rids)
++                ]
++                batch.seq_lens = torch.tensor(
++                    merged, dtype=batch.seq_lens.dtype, device=batch.seq_lens.device
++                )
++                if batch.seq_lens_cpu is not None:
++                    batch.seq_lens_cpu = torch.tensor(
++                        merged, dtype=batch.seq_lens_cpu.dtype
++                    )
++                    batch.seq_lens_sum = int(sum(merged))
++            self._pp_spec_adopt_relayed_tree(batch, fwd_rids, pp_outputs)
++            output_result = GenerationBatchResult(
++                logits_output=logits_output,
++                pp_hidden_states_proxy_tensors=None,
++                next_token_ids=pp_outputs["next_token_ids"].cpu(),
++                accept_lens=pp_outputs["spec_accept_lens"].cpu(),
++                new_seq_lens=new_seq_lens,
++                speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,
++                extend_input_len_per_req=extend_input_len_per_req,
++                extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
++                can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
++            )
++            return output_result
++
+         next_token_ids = pp_outputs["next_token_ids"].to(torch.int64)
+ 
+         # Rebind the last stage's ring proposal as batch.spec_info so the PD result
+@@ -946,22 +1058,52 @@ def _pp_prep_batch_result(
+             )
+             batch.spec_info = next_draft_input
+ 
+-        # PP rank 0 also relays into output_tokens_buf so the next iter's
+-        # resolve_forward_inputs finds these tokens for the decode portion
+-        # of mixed-chunk batches (which gather via mix_running_indices).
+-        self.future_map.stash(
+-            batch.req_pool_indices,
+-            RelayPayload(
+-                bonus_tokens=next_token_ids,
+-                topk_p=None if next_draft_input is None else next_draft_input.topk_p,
+-                topk_index=(
+-                    None if next_draft_input is None else next_draft_input.topk_index
+-                ),
+-                hidden_states=(
+-                    None if next_draft_input is None else next_draft_input.hidden_states
++        if self._pp_spec_relay:
++            # Gated single-instance PP+spec: the sampled first token roots
++            # round 1's tree. Only the chunk that finishes the prompt samples
++            # a real token; a middle chunk's next_token_ids is a placeholder
++            # no consumer reads, and storing it would seed the next verify
++            # round with a token the model never emitted. The decode rounds
++            # relay their own state, so the future_map stash is skipped.
++            if batch.contains_last_prefill_chunk:
++                from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
++
++                fwd_batch = (
++                    mb_metadata.fwd_batch
++                    if mb_metadata.fwd_batch is not None
++                    else batch
++                )
++                self._pp_spec_set_relay(
++                    batch,
++                    PPSpecRelayInput.degenerate(
++                        rids=[req.rid for req in fwd_batch.reqs],
++                        bonus_tokens=next_token_ids,
++                        num_draft_tokens=get_spec().speculative_num_draft_tokens,
++                    ),
++                )
++        else:
++            # PP rank 0 also relays into output_tokens_buf so the next iter's
++            # resolve_forward_inputs finds these tokens for the decode portion
++            # of mixed-chunk batches (which gather via mix_running_indices).
++            self.future_map.stash(
++                batch.req_pool_indices,
++                RelayPayload(
++                    bonus_tokens=next_token_ids,
++                    topk_p=(
++                        None if next_draft_input is None else next_draft_input.topk_p
++                    ),
++                    topk_index=(
++                        None
++                        if next_draft_input is None
++                        else next_draft_input.topk_index
++                    ),
++                    hidden_states=(
++                        None
++                        if next_draft_input is None
++                        else next_draft_input.hidden_states
++                    ),
+                 ),
+-            ),
+-        )
++            )
+         batch.input_ids = None
+         output_result = GenerationBatchResult(
+             logits_output=logits_output,
+@@ -980,6 +1122,237 @@ def _pp_process_batch_result(
+     ):
+         self.process_batch_result(batch, output_result)
+ 
++    def _pp_spec_compact_accept_kv(
++        self: Scheduler,
++        batch: ScheduleBatch,
++        fwd_batch: ScheduleBatch,
++        fwd_rids: List[str],
++        live_rids: List[str],
++        verify_out_cache_loc: Optional[torch.Tensor],
++        pp_outputs,
++    ) -> None:
++        """Move this stage's accepted-path KV to the front of each request block.
++
++        The verify forward writes one KV slot per tree node, in node order. The
++        committed prefix that every later read assumes is the accepted path laid
++        out contiguously, so the two have to be reconciled once per round -- and
++        each stage has to do it for its own layers, since KV is not relayed.
++        The last stage does it inside verify (_finalize_accept_tree_path); this
++        is the same step for the stages that only ran the target forward.
++
++        Must run before seq_lens advances: the move writes into the block that
++        starts at the pre-advance length.
++        """
++        accept_index = pp_outputs.tensors.get("spec_accept_index")
++        if accept_index is None or fwd_batch.forward_mode.is_idle():
++            return
++        if verify_out_cache_loc is None:
++            return
++        from sglang.srt.speculative.spec_utils import (
++            move_accept_tokens_to_target_kvcache,
++        )
++
++        # The destination base is the length each request had when the forward
++        # ran. ScheduleBatch.copy() drops seq_lens but keeps seq_lens_cpu, and
++        # that snapshot is already in the forward's row order -- the live batch
++        # may have been filtered or merged since, and reindexing it would skip
++        # exactly the rounds whose composition changed.
++        device = verify_out_cache_loc.device
++        if fwd_batch.seq_lens_cpu is not None:
++            seq_lens = fwd_batch.seq_lens_cpu.to(device=device, dtype=torch.int64)
++        elif live_rids == fwd_rids:
++            seq_lens = batch.seq_lens
++        else:
++            return
++        fwd_batch.seq_lens = seq_lens
++        fwd_batch.out_cache_loc = verify_out_cache_loc
++        move_accept_tokens_to_target_kvcache(
++            fwd_batch,
++            accept_index.to(device),
++            pp_outputs["spec_accept_lens"].to(device) - 1,
++            self.token_to_kv_pool_allocator,
++        )
++
++    def _pp_spec_adopt_relayed_tree(
++        self: Scheduler,
++        batch: ScheduleBatch,
++        fwd_rids: List[str],
++        pp_outputs: PPProxyTensors,
++    ) -> None:
++        """Fold the tree the last stage drafted into the live batch.
++
++        The relayed rows are labelled with the composition that ran the
++        forward; the live microbatch may have been recomposed since, so they
++        are folded in by rid rather than by position."""
++        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
++
++        num_draft_tokens = get_spec().speculative_num_draft_tokens
++        chain = pp_outputs.tensors.get("spec_next_chain")
++        if chain is None:
++            # The last stage verified but skipped drafting (num_steps == 0
++            # keeps draft KV warm without proposing). The bonus token it
++            # sampled must still become the next round's root: keeping the
++            # old row would re-verify a token that was already accepted.
++            relayed = PPSpecRelayInput.degenerate(
++                rids=fwd_rids,
++                bonus_tokens=pp_outputs["spec_bonus_tokens"],
++                num_draft_tokens=num_draft_tokens,
++            )
++        else:
++            relayed = PPSpecRelayInput(
++                rids=fwd_rids,
++                tokens=chain.to(torch.int64).reshape(len(fwd_rids), num_draft_tokens),
++                parents=pp_outputs.tensors.get("spec_next_parents"),
++                top_scores=pp_outputs.tensors.get("spec_next_top_scores"),
++            )
++        self._pp_spec_set_relay(batch, relayed)
++
++    def _pp_spec_set_relay(self: Scheduler, batch: ScheduleBatch, relayed) -> None:
++        """Attach rows labelled with the forward-time composition to the live
++        batch: fold them into what the requests already carry, or relabel them
++        into the live order when the batch carries nothing yet."""
++        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
++
++        if isinstance(batch.spec_info, PPSpecRelayInput):
++            batch.spec_info.adopt(relayed)
++            return
++        live_rids = [req.rid for req in batch.reqs]
++        batch.spec_info = (
++            relayed if live_rids == relayed.rids else relayed.reindex(live_rids)
++        )
++
++    def _pp_spec_chain_topology(
++        self: Scheduler, bs: int, device: str
++    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        """Build valid fallback topology using the tree kernel's row strides.
++
++        A not-yet-drafted row still uses the configured topk and token count.
++        Consecutive selected indices and earlier parents give an acyclic tree;
++        topk=1 reduces to a chain. Single-step drafts need no parent entries.
++        """
++        spec = get_spec()
++        num_steps = spec.speculative_num_steps
++        parent_width = (
++            spec.speculative_eagle_topk * (num_steps - 1) + 1 if num_steps > 1 else 0
++        )
++        parent_list = torch.arange(
++            -1, parent_width - 1, dtype=torch.long, device=device
++        ).repeat(bs, 1)
++        top_scores_index = torch.arange(
++            spec.speculative_num_draft_tokens - 1, dtype=torch.long, device=device
++        ).repeat(bs, 1)
++        return parent_list, top_scores_index
++
++    def _pp_spec_rebuild_verify_input(self: Scheduler, batch: ScheduleBatch) -> None:
++        """Rebuild batch.spec_info (EagleVerifyInput) from relayed per-request
++        state, without a draft model.
++
++        Runs on every stage, including the last one, so all stages verify the
++        exact same tree. The tokens and the topology both come from the last
++        stage's tail draft; a request that has not been drafted for yet (its
++        first decode after prefill) carries a degenerate row -- bonus token
++        plus zero drafts over a chain topology -- whose drafts simply get
++        rejected, costing acceptance rate, not correctness."""
++        from sglang.srt.speculative.eagle_info import EagleVerifyInput
++        from sglang.srt.speculative.eagle_utils import (
++            TreeMaskMode,
++            build_tree_kernel_efficient,
++            default_tree_mask_mode,
++        )
++        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
++
++        spec = get_spec()
++        steps = spec.speculative_num_steps
++        num_draft_tokens = spec.speculative_num_draft_tokens
++        bs = batch.batch_size()
++        device = self.device
++
++        if batch.forward_mode.is_idle() or bs == 0:
++            batch.spec_info = EagleVerifyInput.create_idle_input(
++                topk=spec.speculative_eagle_topk,
++                spec_steps=steps,
++                num_verify_tokens=num_draft_tokens,
++                device=device,
++            )
++            return
++
++        relay: PPSpecRelayInput = batch.spec_info
++        # The rows track the batch through filter / merge, but a recomposition
++        # that bypasses those hooks would leave them labelled for a different
++        # order, and the rebuild reads them positionally. Relabel rather than
++        # hand the verify kernel another request's bonus token.
++        live_rids = [req.rid for req in batch.reqs]
++        if relay.rids != live_rids:
++            relay = relay.reindex(live_rids)
++            batch.spec_info = relay
++        tree_rows = relay.tokens.to(device=device, dtype=torch.int64)
++        bonus_tokens = tree_rows[:, 0].contiguous()
++        draft_tokens = tree_rows[:, 1:].contiguous()
++        # Topology as drafted on the last stage. It is data-dependent once
++        # topk > 1, so it rides the relay rather than being re-derived here;
++        # requests that have not been drafted for yet fall back to the chain
++        # constants, and their zero drafts get rejected either way.
++        parent_list, top_scores_index = relay.topology(
++            fallback=lambda: self._pp_spec_chain_topology(bs, device)
++        )
++        parent_list = parent_list.to(device=device, dtype=torch.long)
++        top_scores_index = top_scores_index.to(device=device, dtype=torch.long)
++
++        # Mask selection mirrors the last stage's draft() tail
++        # (build_eagle_verify_input) so every stage builds the same mask.
++        verify_mask = self.tp_worker.model_runner.attn_backend.verify_mask
++        if verify_mask is None:
++            tree_mask_buf, mask_mode, fill_mask = None, default_tree_mask_mode(), True
++        else:
++            mask_mode, fill_mask = verify_mask.mode, verify_mask.is_read
++            tree_mask_buf = verify_mask.buffer if verify_mask.fits(bs) else None
++
++        seq_lens_sum = batch.seq_lens_sum
++        if seq_lens_sum is None:
++            if tree_mask_buf is not None or mask_mode == TreeMaskMode.QLEN_ONLY:
++                seq_lens_sum = 0  # preallocated / bs-sized -> kernel ignores it
++            else:
++                # Conservative upper bound; backend-agnostic (not every
++                # attention backend exposes max_context_len).
++                seq_lens_sum = bs * self.tp_worker.model_runner.model_config.context_len
++
++        (
++            tree_mask,
++            positions,
++            retrieve_index,
++            retrieve_next_token,
++            retrieve_next_sibling,
++            flat_draft_tokens,
++        ) = build_tree_kernel_efficient(
++            bonus_tokens,
++            parent_list,
++            top_scores_index,
++            draft_tokens,
++            batch.seq_lens,
++            seq_lens_sum,
++            spec.speculative_eagle_topk,
++            steps,
++            num_draft_tokens,
++            mask_mode,
++            tree_mask_buf,
++            fill_prefix_mask=fill_mask,
++        )
++        batch.spec_info = EagleVerifyInput(
++            draft_token=flat_draft_tokens,
++            custom_mask=tree_mask,
++            positions=positions,
++            retrieve_index=retrieve_index,
++            retrieve_next_token=retrieve_next_token,
++            retrieve_next_sibling=retrieve_next_sibling,
++            retrieve_cum_len=None,
++            spec_steps=steps,
++            topk=spec.speculative_eagle_topk,
++            draft_token_num=num_draft_tokens,
++            capture_hidden_mode=None,
++            seq_lens_sum=batch.seq_lens_sum,
++            seq_lens_cpu=batch.seq_lens_cpu,
++        )
++
+     def _pp_send_output_to_next_stage(
+         self: Scheduler,
+         next_first_rank_mb_id: int,
+@@ -1059,7 +1432,14 @@ def _pp_send_recv_and_preprocess_output_tensors(
+ 
+         # CUDA: send first
+         # XPU: even ranks send first, odd ranks recv first.
+-        send_first = (not is_xpu()) or ((self.ps.pp_rank % 2) == 0)
++        # PP+spec also pairs by parity: its relay carries several extra GPU
++        # tensors (accept_lens, new_seq_lens, bonus tokens, next chain), and
++        # device-side P2P stays ordered on the stream, so enqueueing that many
++        # sends before any recv can form the same ring wait on CUDA. Parity
++        # makes rank 1 post its recv first, which breaks the cycle for any
++        # pp_size > 1.
++        needs_pairing = is_xpu() or self._pp_spec_relay
++        send_first = (not needs_pairing) or ((self.ps.pp_rank % 2) == 0)
+ 
+         def _do_send():
+             return self._pp_send_output_to_next_stage(
+@@ -1245,6 +1625,12 @@ def _pp_launch_batch(
+                 )
+                 mb_metadata[mb_id] = PPBatchMetadata(
+                     can_run_cuda_graph=result.can_run_cuda_graph,
++                    fwd_batch=(
++                        cur_batch.copy()
++                        if not cur_batch.spec_algorithm.is_none()
++                        else None
++                    ),
++                    verify_out_cache_loc=result.spec_verify_out_cache_loc,
+                 )
+                 event = self.device_module.Event()
+                 event.record(self.device_module.current_stream())
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -57,6 +57,7 @@
+     get_device,
+     get_exec,
+     get_model,
++    get_parallel,
+     get_schedule,
+     get_serving,
+     get_spec,
+@@ -89,6 +90,12 @@ def forward_batch_generation(self, forward_batch: ForwardBatch):
+     def model_runner(self) -> ModelRunner:
+         pass
+ 
++    def on_verify_complete_cpu(
++        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
++    ) -> None:
++        """No-op mirror of BaseSpecWorker's hook: PP+spec non-last stages
++        process relayed spec results through a plain worker."""
++
+     @property
+     def last_shared_read_runner(self):
+         # The runner that runs the step's LAST shared-buffer-reading phase --
+@@ -391,6 +398,24 @@ def __init__(
+             self.random_seed = random_seed
+         elif get_exec().moe.is_ep_joiner:
+             self.random_seed = get_device().random_seed
++        elif (
++            envs.SGLANG_ENABLE_PP_SPEC.get()
++            and is_draft_worker
++            and get_parallel().pp_size > 1
++        ):
++            # PP+spec: the draft worker exists only on the last PP stage, so a
++            # world-group broadcast here would deadlock (first-stage ranks never
++            # join). Sync within the stage's TP group instead — that is exactly
++            # the set of ranks holding a draft worker. The draft worker is
++            # constructed with pp_rank=0, so derive the caller's global rank
++            # from the TP group rather than tp_size * pp_rank + tp_rank.
++            tp_group = self.model_runner.tp_group
++            self.random_seed = broadcast_pyobj(
++                [get_device().random_seed],
++                tp_group.ranks[self.ps.tp_rank],
++                tp_group.cpu_group,
++                src=tp_group.ranks[0],
++            )[0]
+         else:
+             self.random_seed = broadcast_pyobj(
+                 [get_device().random_seed],
+diff --git a/python/sglang/srt/managers/utils.py b/python/sglang/srt/managers/utils.py
+--- a/python/sglang/srt/managers/utils.py
++++ b/python/sglang/srt/managers/utils.py
+@@ -102,6 +102,25 @@ class GenerationBatchResult:
+     # relay path: forward stream -> next step forward
+     next_draft_input: Optional[SpecInput] = None
+ 
++    # PP+spec: tail-drafted chain tokens (flat bs*num_draft_tokens, root =
++    # bonus) for the NEXT verify round, relayed last stage -> all stages,
++    # with the tree topology the tokens were arranged by (parent_list and
++    # top_scores_index have different widths, so they stay separate).
++    next_verify_chain: Optional[torch.Tensor] = None
++    next_verify_parent_list: Optional[torch.Tensor] = None
++    next_verify_top_scores_index: Optional[torch.Tensor] = None
++
++    # PP+spec: the verify forward's KV slots on a non-last stage. That stage
++    # prepares verify inside forward isolation, which restores
++    # batch.out_cache_loc, so the slots have to travel on the result to survive
++    # until the accepted path comes back over the relay.
++    spec_verify_out_cache_loc: Optional[torch.Tensor] = None
++
++    # PP+spec: [bs, spec_steps + 1] global node indices of the accepted path.
++    # Every stage holds the KV for its own layers, so every stage has to compact
++    # that path into its committed prefix; only the last stage can compute it.
++    accept_index: Optional[torch.Tensor] = None
++
+     # Refs the worker wants scheduler to keep alive for the same 2-iter window
+     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
+     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
+diff --git a/python/sglang/srt/model_executor/cuda_graph_buffer_registry.py b/python/sglang/srt/model_executor/cuda_graph_buffer_registry.py
+--- a/python/sglang/srt/model_executor/cuda_graph_buffer_registry.py
++++ b/python/sglang/srt/model_executor/cuda_graph_buffer_registry.py
+@@ -760,7 +760,10 @@ def _fn(fb, _ctx):
+             def _pp_source(key):
+                 def _fn(_fb, ctx):
+                     ppx = ctx.pp_proxy_tensors
+-                    return None if ppx is None else ppx.tensors[key]
++                    # .get(): a proxy entry can be absent (e.g. topk_indices
++                    # when a DSA model runs a dense attention backend);
++                    # returning None skips the copy for that slot.
++                    return None if ppx is None else ppx.tensors.get(key)
+ 
+                 return _fn
+ 
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -480,9 +480,10 @@ def __init__(
+         )
+ 
+         if self.ps.pp_size > 1:
+-            assert self.support_pp, (
+-                "Pipeline Parallel is not compatible with this model."
+-            )
++            if not (envs.SGLANG_ENABLE_PP_SPEC.get() and self.is_draft_worker):
++                assert self.support_pp, (
++                    "Pipeline Parallel is not compatible with this model."
++                )
+ 
+         # For weight updates
+         self.init_weight_updater()
+diff --git a/python/sglang/srt/model_executor/model_runner_components/layer_setup.py b/python/sglang/srt/model_executor/model_runner_components/layer_setup.py
+--- a/python/sglang/srt/model_executor/model_runner_components/layer_setup.py
++++ b/python/sglang/srt/model_executor/model_runner_components/layer_setup.py
+@@ -5,6 +5,7 @@
+ import msgspec
+ from torch import nn
+ 
++from sglang.srt.environ import envs
+ from sglang.srt.utils import is_npu
+ 
+ if TYPE_CHECKING:
+@@ -219,6 +220,8 @@ def _assert_pp_mtp_compat(
+     num_effective_layers: int,
+     model_num_layers: int,
+ ) -> None:
++    if envs.SGLANG_ENABLE_PP_SPEC.get():
++        return
+     assert (
+         (not model_has_mtp_layers)
+         or (spec_algorithm.is_none())
+diff --git a/python/sglang/srt/model_executor/runner/base_runner.py b/python/sglang/srt/model_executor/runner/base_runner.py
+--- a/python/sglang/srt/model_executor/runner/base_runner.py
++++ b/python/sglang/srt/model_executor/runner/base_runner.py
+@@ -125,12 +125,17 @@ def _allocate_decode_buffers(
+             # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
+             is_mhc = hc_hidden_size is not None
+             hs = hc_hidden_size if is_mhc else hidden_size
++            # Sized in tokens, not requests: under speculative decoding the
++            # verify forward carries num_tokens_per_req tokens per request and
++            # _dummy_run slices these buffers to num_tokens (same as
++            # topk_indices below). Identical for plain decode where
++            # num_tokens_per_req == 1.
+             pp_proxy_tensors = {
+                 "hidden_states": torch.zeros((max_num_token, hs), dtype=dtype),
+             }
+             if not is_mhc:
+                 # Only Kimi K3 supplies num_blocks: its PP bank is token-major
+-                # [T, blocks, H]. Other models keep the legacy [max_bs, H].
++                # [T, blocks, H]. Other models use [T, H].
+                 residual_shape = (
+                     (max_num_token, pp_proxy_residual_num_blocks, hidden_size)
+                     if pp_proxy_residual_num_blocks is not None
+diff --git a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+--- a/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
++++ b/python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py
+@@ -1263,6 +1263,19 @@ def load_batch(
+                 self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
+             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
+             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
++            if (
++                pp_proxy_tensors is not None
++                and self.buffers.pp_proxy_tensors is not None
++            ):
++                # PP + spec verify: the pre-planned load ran without the proxy
++                # (eagle_prepare_for_verify has no access to it), so the
++                # graph's proxy input buffers must be refreshed here -- the
++                # captured graph reads these rows (mirrors fill_from's
++                # side-slot copy).
++                for k, v in pp_proxy_tensors.tensors.items():
++                    buf = self.buffers.pp_proxy_tensors.get(k)
++                    if buf is not None:  # skip markers like __msg_type__
++                        buf[: v.shape[0]].copy_(v)
+             if (
+                 not is_ragged
+                 and self.model_runner.spec_algorithm.is_dflash_family()
+@@ -1470,7 +1483,15 @@ def execute(
+             )
+         else:
+             assert isinstance(output, PPProxyTensors)
+-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
++            # Slice in token rows, not request rows: under speculative verify
++            # each request carries captured_req_width tokens (identical for
++            # plain decode, where captured_req_width == 1).
++            return PPProxyTensors(
++                {
++                    k: v[: self.bs * self.captured_req_width]
++                    for k, v in output.tensors.items()
++                }
++            )
+ 
+     def get_spec_info(self, num_tokens: int):
+         spec_info = None
+diff --git a/python/sglang/srt/speculative/eagle_worker_common.py b/python/sglang/srt/speculative/eagle_worker_common.py
+--- a/python/sglang/srt/speculative/eagle_worker_common.py
++++ b/python/sglang/srt/speculative/eagle_worker_common.py
+@@ -14,6 +14,7 @@
+     CaptureHiddenMode,
+     ForwardBatch,
+     ForwardMode,
++    PPProxyTensors,
+ )
+ from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+ from sglang.srt.speculative.eagle_utils import (
+@@ -471,6 +472,7 @@ def run_eagle_verify(
+     device: str,
+     metadata_ready_pre_pad: bool,
+     finalize_tree_path: bool,
++    pp_proxy_tensors: Optional[PPProxyTensors] = None,
+     grammar_barrier=None,
+     uno_target_max_top_k: Optional[int] = None,
+ ) -> GenerationBatchResult:
+@@ -568,6 +570,7 @@ def run_eagle_verify(
+         batch=None,
+         forward_batch=verify_forward_batch,
+         is_verify=True,
++        pp_proxy_tensors=pp_proxy_tensors,
+     )
+     logits_output = forward_batch_output.logits_output
+ 
+@@ -664,6 +667,7 @@ def run_eagle_verify(
+         speculative_num_draft_tokens=num_draft_tokens,
+         next_draft_input=next_draft_input,
+         accept_lens=accept_lens,
++        accept_index=accept_index,
+         new_seq_lens=new_seq_lens,
+         routed_experts_output=forward_batch_output.routed_experts_output,
+         indexer_topk_output=forward_batch_output.indexer_topk_output,
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -50,6 +50,7 @@
+ from sglang.srt.model_executor.forward_batch_info import (
+     CaptureHiddenMode,
+     ForwardBatch,
++    ForwardMode,
+     PPProxyTensors,
+ )
+ from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+@@ -141,6 +142,85 @@
+ logger = logging.getLogger(__name__)
+ 
+ 
++# Checkpoint spellings of the input embedding across the model families the
++# PP+spec gate admits (GLM/DeepSeek NextN, Bailing MTP, Mistral-style drafts).
++_EMBED_TENSOR_NAMES = (
++    "model.embed_tokens.weight",
++    "embed.weight",
++    "model.word_embeddings.weight",
++    "tok_embeddings.weight",
++)
++
++
++def _find_draft_input_embedding(model) -> "torch.nn.Module":
++    """The draft's input embedding, found by type rather than attribute path.
++
++    Draft models hang it under different names (embed_tokens, word_embeddings,
++    embed, tok_embeddings), but it is always the one VocabParallelEmbedding
++    that is not the ParallelLMHead."""
++    from sglang.srt.layers.vocab_parallel_embedding import (
++        ParallelLMHead,
++        VocabParallelEmbedding,
++    )
++
++    found = [
++        (name, module)
++        for name, module in model.named_modules()
++        if isinstance(module, VocabParallelEmbedding)
++        and not isinstance(module, ParallelLMHead)
++    ]
++    if len(found) != 1:
++        raise ValueError(
++            "PP+spec needs exactly one input embedding on the draft model, "
++            f"found {[name for name, _ in found]!r}"
++        )
++    return found[0][1]
++
++
++def _load_checkpoint_tensor(
++    model_path: str, revision, tensor_names: tuple, load_config
++) -> torch.Tensor:
++    """Load one tensor from a checkpoint via the standard weight loader."""
++    from sglang.srt.configs.load_config import LoadFormat
++    from sglang.srt.model_loader.loader import DefaultModelLoader
++    from sglang.srt.model_loader.weight_utils import (
++        pt_weights_iterator,
++        safetensors_weights_iterator,
++    )
++
++    # Streaming and cache-transport formats have no weight files this helper
++    # could reopen; the dummy format is already skipped by the caller.
++    reopenable = (
++        LoadFormat.AUTO,
++        LoadFormat.SAFETENSORS,
++        LoadFormat.FASTSAFETENSORS,
++        LoadFormat.MISTRAL,
++        LoadFormat.PT,
++        LoadFormat.NPCACHE,
++    )
++    if load_config.load_format not in reopenable:
++        raise ValueError(
++            "PP+spec draft embedding loading cannot re-open weights under "
++            f"load format {load_config.load_format!r}; use a disk-backed "
++            "load format or disable SGLANG_ENABLE_PP_SPEC"
++        )
++    # The target's own load config keeps --download-dir, ignore patterns and
++    # the selected format, so hub ids resolve into the same cache the model
++    # was loaded from instead of a fresh default-location download.
++    _, weight_files, use_safetensors = DefaultModelLoader(load_config)._prepare_weights(
++        model_path, revision, fall_back_to_pt=True
++    )
++    iterator = (
++        safetensors_weights_iterator(weight_files)
++        if use_safetensors
++        else pt_weights_iterator(weight_files)
++    )
++    for name, tensor in iterator:
++        if name in tensor_names:
++            return tensor
++    raise ValueError(f"none of {tensor_names} found in checkpoint at {model_path}")
++
++
+ def _qsa_index_share_requested(hf_config) -> bool:
+     """--json-model-override-args writes top-level hf_config attributes, while
+     checkpoint configs carry the flag on the nested text_config; read both."""
+@@ -318,6 +398,31 @@ def init_token_map(self):
+     def init_lm_head(self):
+         from sglang.srt.lora.layers import unwrap_lora_layer
+ 
++        if envs.SGLANG_ENABLE_PP_SPEC.get() and get_parallel().pp_size > 1:
++            # This branch skips the hot-token-map / EAGLE3 head wiring below.
++            assert self.hot_token_id is None and not (
++                self.speculative_algorithm.is_eagle3()
++            ), "PP+spec does not support --speculative-token-map or EAGLE3 drafts yet"
++            # PP+spec: the target's embedding lives on the first PP stage
++            # (PPMissingLayer here on the last stage) and NextN/MTP layers
++            # carry no embedding of their own in the checkpoint, so the
++            # draft's embedding must be loaded from the checkpoint directly
++            # — otherwise it stays randomly initialized and accept_length
++            # collapses to ~1.
++            embed = _find_draft_input_embedding(self.draft_runner.model).weight
++            if get_model().load_format != "dummy":
++                target_runner = self.target_worker.model_runner
++                loaded_embed = _load_checkpoint_tensor(
++                    model_path=target_runner.model_config.model_path,
++                    revision=target_runner.model_config.revision,
++                    tensor_names=_EMBED_TENSOR_NAMES,
++                    load_config=target_runner.load_config,
++                )
++                embed.weight_loader(embed, loaded_embed)
++            head = self.target_worker.model_runner.model.lm_head.weight
++            self.draft_runner.model.set_embed_and_head(embed, head)
++            return
++
+         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+         target_lm_head = unwrap_lora_layer(
+             getattr(self.target_worker.model_runner.model, "lm_head", None)
+@@ -593,7 +698,7 @@ def _capture_cuda_graphs(self):
+                 f"avail mem={after_mem:.2f} GB.",
+             )
+ 
+-    def draft(self, batch: ScheduleBatch):
++    def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
+         draft_input: EagleDraftInput = batch.spec_info
+         forward_batch, can_run_decode_cuda_graph = prepare_for_draft(
+             draft_input,
+@@ -641,7 +746,7 @@ def draft(self, batch: ScheduleBatch):
+                     self.draft_forward(forward_batch)
+                 )
+ 
+-        return build_eagle_verify_input(
++        verify_input = build_eagle_verify_input(
+             batch,
+             draft_input,
+             parent_list,
+@@ -655,6 +760,12 @@ def draft(self, batch: ScheduleBatch):
+             tree_mask_mode=self.tree_mask_mode,
+             device=self.device,
+         )
++        if with_topology:
++            # PP+spec relays the tree so every stage rebuilds the same verify
++            # input; the mask build needs the topology this one was built from.
++            # Returned rather than stashed on self so the caller owns lifetime.
++            return verify_input, parent_list, top_scores_index
++        return verify_input
+ 
+     def draft_forward(self, forward_batch: ForwardBatch):
+         # Parse args
+@@ -1330,7 +1441,12 @@ def forward_batch_generation(
+                     capture_hidden_mode=capture_mode,
+                     vocab_size=self.target_worker.model_config.vocab_size,
+                 )
+-            if self.speculative_num_steps == 0:
++            if batch.spec_info is not None and batch.spec_info.is_verify_input():
++                # PP+spec: the scheduler pre-built this round's verify input
++                # from relayed per-req chains — it must match what earlier
++                # stages already ran, so do not re-draft here.
++                verify_input = batch.spec_info
++            elif self.speculative_num_steps == 0:
+                 # Drafting disabled (high batch size). _draft_extend below still
+                 # runs, keeping draft KV warm for when the batch shrinks.
+                 verify_input = self._build_trivial_verify_input(batch)
+@@ -1346,7 +1462,11 @@ def forward_batch_generation(
+                     verify_input: EagleVerifyInput = self.draft_worker.draft(batch)
+             assert verify_input.is_verify_input()
+             batch.spec_info = verify_input
+-            batch_output = self.verify(batch, grammar_barrier=grammar_barrier)
++            batch_output = self.verify(
++                batch,
++                pp_proxy_tensors=pp_proxy_tensors,
++                grammar_barrier=grammar_barrier,
++            )
+             # Publish before draft_extend so the fence is at verify-end.
+             if on_publish is not None:
+                 on_publish(batch_output.new_seq_lens)
+@@ -1366,6 +1486,47 @@ def forward_batch_generation(
+                 ):
+                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
+ 
++            if (
++                get_parallel().pp_size > 1
++                and not batch.forward_mode.is_idle()
++                and self.speculative_num_steps > 0
++            ):
++                # PP tail-draft: draft the NEXT round's chain now — earlier
++                # stages must have the tokens before running their half of the
++                # next verify forward, so drafting cannot wait for the next
++                # iteration. Mimic the head-of-iteration state draft() expects;
++                # the scheduler's forward isolation reverts these SB edits, and
++                # the chain rides out on batch_output.
++                batch.spec_info = batch_output.next_draft_input
++                batch.seq_lens = batch_output.new_seq_lens
++                batch.forward_mode = ForwardMode.DECODE
++                # eagle_prepare_for_verify left the verify tokens here; the
++                # head-of-iteration draft always sees None (the scheduler
++                # clears it), so mirror that state.
++                batch.input_ids = None
++                # Attention metadata planning reads the CPU copies; one D2H
++                # per round (TODO: async or upper-bound estimate).
++                batch.seq_lens_cpu = batch_output.new_seq_lens.to("cpu")
++                batch.seq_lens_sum = int(batch.seq_lens_cpu.sum())
++                with (
++                    self.draft_worker.draft_tp_context(
++                        self.draft_worker.draft_runner.tp_group
++                    ),
++                    speculative_moe_backend_context(),
++                    speculative_moe_a2a_backend_context(),
++                    spec_stage_span("draft"),
++                ):
++                    next_verify_input, parent_list, top_scores_index = (
++                        self.draft_worker.draft(batch, with_topology=True)
++                    )
++                batch_output.next_verify_chain = next_verify_input.draft_token
++                # The tree shape is data-dependent once topk > 1, so the other
++                # stages cannot re-derive it; relay it alongside the tokens.
++                # clone(): both come out of cuda-graph-owned buffers under
++                # decode replay and would be overwritten before the relay.
++                batch_output.next_verify_parent_list = parent_list.clone()
++                batch_output.next_verify_top_scores_index = top_scores_index.clone()
++
+             return batch_output
+ 
+     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
+@@ -1663,9 +1824,10 @@ def _override_worker_state(
+             )
+             dw._rebuild_topk1_chain_buffers()
+ 
+-    def verify(self, batch: ScheduleBatch, grammar_barrier=None):
++    def verify(self, batch: ScheduleBatch, pp_proxy_tensors=None, grammar_barrier=None):
+         return run_eagle_verify(
+             batch,
++            pp_proxy_tensors=pp_proxy_tensors,
+             target_worker=self.target_worker,
+             req_to_token_pool=self.req_to_token_pool,
+             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+diff --git a/python/sglang/srt/speculative/pp_spec_relay.py b/python/sglang/srt/speculative/pp_spec_relay.py
+new file mode 100644
+--- /dev/null
++++ b/python/sglang/srt/speculative/pp_spec_relay.py
+@@ -0,0 +1,177 @@
++from __future__ import annotations
++
++from typing import List, Optional
++
++import torch
++
++from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
++
++
++class PPSpecRelayInput(SpecInput):
++    """The draft tree the last PP stage produced, carried by the requests it
++    belongs to so every stage can rebuild the same verify input.
++
++    Under PP the draft model lives on the last stage only, so the other stages
++    receive the tree over the output relay instead of drafting it. It has to
++    survive between rounds and across microbatch recomposition, which is why
++    it rides on ``ScheduleBatch.spec_info`` and implements the filter / merge
++    hooks rather than living in a side table: a request that finishes, gets
++    retracted, or is merged in from a just-finished prefill carries its own
++    row along with it.
++
++    Rows are per request and aligned with ``batch.reqs``. ``rids`` is kept
++    alongside them because the relayed tensors are sized by the composition
++    that ran the forward, which can differ from the live batch by the time
++    the result comes back around the ring.
++
++    This is the algorithm-agnostic half of the PP relay: the tokens plus the
++    topology they were arranged by. A speculative algorithm whose proposal is
++    not an EAGLE-style tree can subclass it (or mirror it) and only has to
++    supply its own rebuild.
++    """
++
++    def __init__(
++        self,
++        rids: List[str],
++        tokens: torch.Tensor,
++        parents: Optional[torch.Tensor] = None,
++        top_scores: Optional[torch.Tensor] = None,
++    ):
++        super().__init__(SpecInputType.PP_SPEC_RELAY)
++        # [bs, num_draft_tokens], column 0 is the bonus token
++        self.rids = rids
++        self.tokens = tokens
++        # parent_list / top_scores_index, [bs, *]. None until the request has
++        # been drafted for: its first decode after prefill carries zero drafts,
++        # which are rejected whatever tree shape they hang on.
++        self.parents = parents
++        self.top_scores = top_scores
++
++    def __repr__(self) -> str:
++        return (
++            f"PPSpecRelayInput(bs={len(self.rids)}, drafted={self.parents is not None})"
++        )
++
++    @classmethod
++    def degenerate(
++        cls, rids: List[str], bonus_tokens: torch.Tensor, num_draft_tokens: int
++    ) -> PPSpecRelayInput:
++        """A tree that proposes nothing: just the sampled token, padded with
++        zeros. What a request carries out of prefill, before the last stage
++        has drafted for it."""
++        tokens = torch.zeros(
++            (len(rids), num_draft_tokens),
++            dtype=torch.int64,
++            device=bonus_tokens.device,
++        )
++        tokens[:, 0] = bonus_tokens.to(torch.int64)
++        return cls(rids=list(rids), tokens=tokens)
++
++    def filter_batch(
++        self, new_indices: torch.Tensor, new_indices_cpu: Optional[List[int]] = None
++    ) -> None:
++        keep = new_indices_cpu if new_indices_cpu is not None else new_indices.tolist()
++        self.rids = [self.rids[i] for i in keep]
++        self.tokens = self.tokens[new_indices]
++        if self.parents is not None:
++            self.parents = self.parents[new_indices]
++            self.top_scores = self.top_scores[new_indices]
++
++    def merge_batch(self, other: PPSpecRelayInput) -> None:
++        if not other.rids:
++            return
++        if not self.rids:
++            self.rids, self.tokens = list(other.rids), other.tokens
++            self.parents, self.top_scores = other.parents, other.top_scores
++            return
++        self.rids = self.rids + list(other.rids)
++        self.tokens = torch.cat([self.tokens, other.tokens])
++        # A batch merging in from prefill has no topology yet; give it the
++        # other side's widths so the rows stay stackable.
++        left, right = self._widths(), other._widths()
++        widths = left if left is not None else right
++        if widths is None:
++            self.parents = self.top_scores = None
++            return
++        self.parents = torch.cat(
++            [self._parents_or_chain(widths), other._parents_or_chain(widths)]
++        )
++        self.top_scores = torch.cat(
++            [self._top_scores_or_chain(widths), other._top_scores_or_chain(widths)]
++        )
++
++    def adopt(self, relayed: PPSpecRelayInput) -> None:
++        """Take the relayed rows for the requests they cover, in this input's
++        order, keeping the current row for any request the relay does not
++        mention (one merged in after the forward was launched)."""
++        by_rid = {rid: i for i, rid in enumerate(relayed.rids)}
++        rows = [by_rid.get(rid) for rid in self.rids]
++        if all(r is None for r in rows):
++            return
++        take = torch.tensor(
++            [r if r is not None else 0 for r in rows],
++            dtype=torch.long,
++            device=relayed.tokens.device,
++        )
++        keep = torch.tensor(
++            [r is None for r in rows], dtype=torch.bool, device=self.tokens.device
++        )
++        relayed_tokens = relayed.tokens.to(self.tokens.device)[take]
++        self.tokens = torch.where(keep.unsqueeze(1), self.tokens, relayed_tokens)
++        if relayed.parents is None:
++            return
++        widths = relayed._widths()
++        self.parents = torch.where(
++            keep.unsqueeze(1),
++            self._parents_or_chain(widths),
++            relayed.parents.to(self.tokens.device)[take],
++        )
++        self.top_scores = torch.where(
++            keep.unsqueeze(1),
++            self._top_scores_or_chain(widths),
++            relayed.top_scores.to(self.tokens.device)[take],
++        )
++
++    def reindex(self, rids: List[str]) -> PPSpecRelayInput:
++        """This input's rows in another composition's order. Every rid must be
++        covered -- the caller is relabelling the same requests, not adding."""
++        by_rid = {rid: i for i, rid in enumerate(self.rids)}
++        take = torch.tensor(
++            [by_rid[rid] for rid in rids], dtype=torch.long, device=self.tokens.device
++        )
++        return PPSpecRelayInput(
++            rids=list(rids),
++            tokens=self.tokens[take],
++            parents=None if self.parents is None else self.parents[take],
++            top_scores=None if self.top_scores is None else self.top_scores[take],
++        )
++
++    def topology(self, *, fallback):
++        """The rows' tree shape, as a rectangular pair. ``fallback`` supplies
++        chain constants for the case where no request has been drafted for
++        yet, since their width comes from the spec config, not from a row."""
++        widths = self._widths()
++        if widths is None:
++            return fallback()
++        return self._parents_or_chain(widths), self._top_scores_or_chain(widths)
++
++    def _widths(self):
++        if self.parents is None:
++            return None
++        return self.parents.shape[1], self.top_scores.shape[1]
++
++    def _parents_or_chain(self, widths) -> torch.Tensor:
++        if self.parents is not None:
++            return self.parents
++        width = widths[0]
++        return torch.arange(
++            -1, width - 1, dtype=torch.long, device=self.tokens.device
++        ).repeat(len(self.rids), 1)
++
++    def _top_scores_or_chain(self, widths) -> torch.Tensor:
++        if self.top_scores is not None:
++            return self.top_scores
++        width = widths[1]
++        return torch.arange(width, dtype=torch.long, device=self.tokens.device).repeat(
++            len(self.rids), 1
++        )
+diff --git a/python/sglang/srt/speculative/spec_info.py b/python/sglang/srt/speculative/spec_info.py
+--- a/python/sglang/srt/speculative/spec_info.py
++++ b/python/sglang/srt/speculative/spec_info.py
+@@ -382,6 +382,10 @@ class SpecInputType(IntEnum):
+     UNO_STATE = auto()
+     UNO_DRAFT = auto()
+     UNO_VERIFY = auto()
++    # Carried between rounds under PP: the tree the last stage drafted, which
++    # every stage rebuilds its verify input from. Neither a draft nor a verify
++    # input -- no forward ever runs on it.
++    PP_SPEC_RELAY = auto()
+ 
+ 
+ class SpecInput(ABC):
+diff --git a/test/registered/e2e/pp/test_pp_spec.py b/test/registered/e2e/pp/test_pp_spec.py
+new file mode 100644
+--- /dev/null
++++ b/test/registered/e2e/pp/test_pp_spec.py
+@@ -0,0 +1,188 @@
++"""
++Usage:
++python3 -m unittest test_pp_spec.TestPPSpecConsistency.test_pp_matches_non_pp
++"""
++
++import os
++import unittest
++from types import SimpleNamespace
++
++import requests
++
++from sglang.srt.utils import kill_process_tree
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.run_eval import run_eval
++from sglang.test.test_utils import (
++    DEFAULT_DRAFT_MODEL_EAGLE,
++    DEFAULT_TARGET_MODEL_EAGLE,
++    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++    DEFAULT_URL_FOR_TEST,
++    CustomTestCase,
++    popen_launch_server,
++)
++
++register_cuda_ci(est_time=900, stage="extra-b", runner_config="4-gpu-h100")
++
++# topk=1 chains and a topk=2 tree: the relayed topology is constant for the
++# former and data-dependent for the latter, so both shapes are covered.
++SPEC_SHAPES = {
++    "chain": ("2", "1", "3"),  # num_steps, eagle_topk, num_draft_tokens
++    "tree": ("2", "2", "4"),
++}
++
++
++class TestPPSpecConsistency(CustomTestCase):
++    """PP x speculative decoding must match plain speculative decoding.
++
++    Every PP stage rebuilds the verify tree from state relayed by the last
++    stage, so a mis-sized proxy buffer or a mis-rebuilt tree shows up as an
++    accuracy drop or as speculation that never gets accepted -- not as a
++    crash. Pin both.
++    """
++
++    def _run(self, pp_size: int, shape: str):
++        num_steps, topk, num_draft_tokens = SPEC_SHAPES[shape]
++        other_args = [
++            "--speculative-algorithm",
++            "EAGLE",
++            "--speculative-draft-model-path",
++            DEFAULT_DRAFT_MODEL_EAGLE,
++            "--speculative-num-steps",
++            num_steps,
++            "--speculative-eagle-topk",
++            topk,
++            "--speculative-num-draft-tokens",
++            num_draft_tokens,
++            "--mem-fraction-static",
++            "0.7",
++        ]
++        if pp_size > 1:
++            other_args += ["--pp-size", str(pp_size), "--disable-overlap-schedule"]
++
++        process = popen_launch_server(
++            DEFAULT_TARGET_MODEL_EAGLE,
++            DEFAULT_URL_FOR_TEST,
++            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
++            other_args=other_args,
++            env={**os.environ, "SGLANG_ENABLE_PP_SPEC": "1"},
++        )
++        try:
++            metrics = run_eval(
++                SimpleNamespace(
++                    base_url=DEFAULT_URL_FOR_TEST,
++                    model=DEFAULT_TARGET_MODEL_EAGLE,
++                    eval_name="gsm8k",
++                    api="completion",
++                    max_tokens=512,
++                    num_examples=256,
++                    num_threads=32,
++                )
++            )
++            server_info = requests.get(f"{DEFAULT_URL_FOR_TEST}/get_server_info")
++            accept_length = server_info.json()["internal_states"][0][
++                "avg_spec_accept_length"
++            ]
++        finally:
++            kill_process_tree(process.pid)
++        return metrics["score"], accept_length
++
++    def _assert_matches(self, shape: str):
++        base_score, base_accept = self._run(pp_size=1, shape=shape)
++        pp_score, pp_accept = self._run(pp_size=2, shape=shape)
++        print(
++            f"[PP spec {shape}] no-PP: score={base_score:.4f} accept={base_accept:.2f}"
++            f" | PP2: score={pp_score:.4f} accept={pp_accept:.2f}"
++        )
++
++        self.assertGreaterEqual(
++            pp_score,
++            base_score - 0.02,
++            msg=(
++                f"PP+spec accuracy dropped more than 2% against plain spec. "
++                f"no-PP: {base_score:.2%}, PP2: {pp_score:.2%}"
++            ),
++        )
++        # A relay that loses the drafted tree still produces correct output --
++        # the bonus token is force-accepted and the rest is rejected -- so
++        # accuracy alone cannot tell drafting from a no-op. Acceptance can.
++        self.assertGreaterEqual(
++            pp_accept,
++            base_accept - 0.2,
++            msg=(
++                f"PP+spec accept length collapsed against plain spec. "
++                f"no-PP: {base_accept:.2f}, PP2: {pp_accept:.2f}"
++            ),
++        )
++
++    def test_pp_matches_non_pp(self):
++        self._assert_matches("chain")
++
++    def test_pp_matches_non_pp_tree(self):
++        self._assert_matches("tree")
++
++
++class TestPPSpecGate(CustomTestCase):
++    """The gate is off by default, and the combinations the relay cannot
++    reproduce identically on every stage are rejected rather than silently
++    mis-rebuilt."""
++
++    def _server_args(self, **overrides):
++        from sglang.srt.server_args import ServerArgs
++        from sglang.test.mock_model.utils import MOCK_MODEL_PATH
++
++        # Argument validation only reads the config, so the small mock model
++        # keeps these cases off the GPU entirely.
++        args = dict(
++            model_path=MOCK_MODEL_PATH,
++            pp_size=2,
++            disable_overlap_schedule=True,
++            speculative_algorithm="EAGLE",
++            speculative_draft_model_path=MOCK_MODEL_PATH,
++            speculative_num_steps=2,
++            speculative_eagle_topk=1,
++            speculative_num_draft_tokens=3,
++        )
++        args.update(overrides)
++        server_args = ServerArgs(**args)
++        # check_server_args reads resolution-filled fields (served_model_name,
++        # chunked_prefill_size); the bare constructor leaves them None.
++        server_args.resolve_once()
++        return server_args
++
++    def test_gate_off_keeps_the_ban(self):
++        os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
++        with self.assertRaises(AssertionError):
++            self._server_args().check_server_args()
++
++    def test_gate_on_rejects_unsupported_combinations(self):
++        os.environ["SGLANG_ENABLE_PP_SPEC"] = "1"
++        try:
++            self._server_args().check_server_args()
++            # DP attention partitions the batch per DP rank, so the stages
++            # would no longer rebuild the same verify tree.
++            with self.assertRaises(AssertionError):
++                self._server_args(
++                    tp_size=2, dp_size=2, enable_dp_attention=True
++                ).check_server_args()
++            # Adaptive spec changes num_draft_tokens at runtime, which the
++            # relay slices results with.
++            with self.assertRaises(AssertionError):
++                self._server_args(
++                    speculative_adaptive=True, speculative_num_steps=3
++                ).check_server_args()
++            # The relay carries an EAGLE-shaped tree; other algorithms would
++            # be mis-rebuilt on the non-last stages.
++            with self.assertRaises(AssertionError):
++                self._server_args(
++                    speculative_algorithm="NGRAM", speculative_draft_model_path=None
++                ).check_server_args()
++            # PD prefill needs the RelayPayload draft fields the gated flow
++            # does not carry.
++            with self.assertRaises(AssertionError):
++                self._server_args(disaggregation_mode="prefill").check_server_args()
++        finally:
++            os.environ.pop("SGLANG_ENABLE_PP_SPEC", None)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/e2e/pp/test_pp_spec_embed_scan.py b/test/registered/e2e/pp/test_pp_spec_embed_scan.py
+new file mode 100644
+--- /dev/null
++++ b/test/registered/e2e/pp/test_pp_spec_embed_scan.py
+@@ -0,0 +1,120 @@
++"""
++Usage:
++python3 -m unittest test_pp_spec_embed_scan.TestDraftEmbedScan
++"""
++
++import os
++import unittest
++
++import torch
++from transformers import MistralConfig, PretrainedConfig
++
++from sglang.test.ci.ci_register import register_cuda_ci
++from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
++
++register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-small")
++
++# Shrunk from inclusionAI/Ling-mini-2.0; the field names are the real
++# checkpoint's, only the sizes are cut down for test speed.
++_BAILING_CONFIG = {
++    "architectures": ["BailingMoeV2ForCausalLM"],
++    "model_type": "bailing_moe",
++    "num_hidden_layers": 1,
++    "num_nextn_predict_layers": 1,
++    "hidden_size": 256,
++    "intermediate_size": 512,
++    "moe_intermediate_size": 128,
++    "moe_shared_expert_intermediate_size": 128,
++    "num_shared_experts": 1,
++    "num_experts": 16,
++    "num_experts_per_tok": 4,
++    "n_group": 4,
++    "topk_group": 2,
++    "norm_topk_prob": True,
++    "moe_router_enable_expert_bias": True,
++    "routed_scaling_factor": 2.5,
++    "score_function": "sigmoid",
++    "router_dtype": "fp32",
++    "first_k_dense_replace": 0,
++    "num_attention_heads": 4,
++    "num_key_value_heads": 2,
++    "head_dim": 64,
++    "partial_rotary_factor": 0.5,
++    "use_qk_norm": True,
++    "use_qkv_bias": False,
++    "use_bias": False,
++    "hidden_act": "silu",
++    "rms_norm_eps": 1e-6,
++    "max_position_embeddings": 4096,
++    "rope_parameters": {"rope_theta": 600000, "rope_type": "default"},
++    "vocab_size": 1024,
++    "tie_word_embeddings": False,
++}
++
++
++class TestDraftEmbedScan(CustomTestCase):
++    """PP+spec loads the draft input embedding via a type scan plus a
++    checkpoint-name table; a draft family whose embedding hangs under a new
++    attribute name (or grows a second VocabParallelEmbedding) would misload
++    silently. Pin the scan on the families the runtime GLM/DSv4 tests miss.
++    """
++
++    @classmethod
++    def setUpClass(cls):
++        from sglang.srt.distributed.parallel_state import (
++            init_distributed_environment,
++            initialize_model_parallel,
++        )
++        from sglang.srt.runtime_context import get_context
++        from sglang.srt.server_args import ServerArgs
++
++        server_args = ServerArgs(model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
++        server_args.resolve_once()
++        get_context().set_server_args(server_args)
++
++        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
++        os.environ.setdefault("MASTER_PORT", "29611")
++        init_distributed_environment(
++            world_size=1, rank=0, local_rank=0, distributed_init_method="env://"
++        )
++        initialize_model_parallel(tensor_model_parallel_size=1)
++        torch.set_default_dtype(torch.bfloat16)
++        torch.cuda.set_device(0)
++
++    def test_bailing_nextn_embedding_is_found(self):
++        from sglang.srt.models.bailing_moe_nextn import BailingMoeForCausalLMNextN
++        from sglang.srt.speculative.eagle_worker_v2 import _find_draft_input_embedding
++
++        config = PretrainedConfig.from_dict(dict(_BAILING_CONFIG))
++        with torch.device("cuda"):
++            model = BailingMoeForCausalLMNextN(config)
++        self.assertIs(_find_draft_input_embedding(model), model.model.word_embeddings)
++
++    def test_mistral_eagle_embedding_is_found(self):
++        from sglang.srt.models.mistral_eagle import MistralForCausalLMEagle
++        from sglang.srt.speculative.eagle_worker_v2 import _find_draft_input_embedding
++
++        config = MistralConfig(
++            vocab_size=1024,
++            hidden_size=256,
++            intermediate_size=512,
++            num_hidden_layers=1,
++            num_attention_heads=4,
++            num_key_value_heads=2,
++        )
++        with torch.device("cuda"):
++            model = MistralForCausalLMEagle(config)
++        self.assertIs(_find_draft_input_embedding(model), model.model.embed_tokens)
++
++    def test_name_table_matches_published_checkpoints(self):
++        from sglang.srt.speculative.eagle_worker_v2 import _EMBED_TENSOR_NAMES
++
++        # External-source literals: the embedding tensor's spelling in each
++        # family's published target checkpoint (inclusionAI/Ling-*-2.0
++        # model.safetensors.index.json; Mistral-Large-3 consolidated index).
++        self.assertIn("model.word_embeddings.weight", _EMBED_TENSOR_NAMES)
++        self.assertIn("tok_embeddings.weight", _EMBED_TENSOR_NAMES)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/managers/test_auxiliary_output.py b/test/registered/unit/managers/test_auxiliary_output.py
+--- a/test/registered/unit/managers/test_auxiliary_output.py
++++ b/test/registered/unit/managers/test_auxiliary_output.py
+@@ -167,7 +167,7 @@ def test_pipeline_sampling_mask_round_trip_without_logprobs():
+         next_token_ids=torch.tensor([3]),
+     )
+     payload = Scheduler._pp_prepare_tensor_dict(
+-        SimpleNamespace(), result, SimpleNamespace(return_logprob=False)
++        object.__new__(Scheduler), result, SimpleNamespace(return_logprob=False)
+     )
+     output, _, _ = get_logprob_from_pp_outputs(PPProxyTensors(payload))
+     for name in ("token_ids", "lengths", "selected_logprobs", "statuses"):
+

@@ -1,0 +1,11 @@
+--- frozen-r3/runner.py
++++ reusable_code/runner.py
+@@ -343,6 +343,6 @@
+     cfg=json.loads((args.run/'config.json').read_text())
+     try:
+         result=engine_entry(args.run,cfg,args.arm,args.replica) if args.engine_entry else worker(args.run,cfg) if args.worker else controller(args.run,cfg)
+-        sys.exit(result or 0)
+     except BaseException:
+-        traceback.print_exc();sys.exit(1)
++        traceback.print_exc();result=1
++    sys.exit(result or 0)

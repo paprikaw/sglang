@@ -1,0 +1,1 @@
+User explicitly approved a single A100 Attention no-model qualification on 2026-10-23. Scope: one booked node, one physical GPU, frozen Decode/Verify kernels, timing and correctness only. No weights, Expert, HiCache or Bank mutation. Global lease, source freeze, cleanup and unchanged normal model-cache policy remain mandatory. This isolated Guard copy is not installed globally.

@@ -1,0 +1,269 @@
+"""One controlled Decode experiment: real full models and GPU-hot prefixes."""
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import statistics
+import subprocess
+import threading
+import time
+
+
+def byte(path,value):
+    fd=os.open(path,os.O_WRONLY|os.O_NOFOLLOW)
+    try:os.pwrite(fd,bytes([value]),0)
+    finally:os.close(fd)
+
+
+def install(base):
+    def engine_args(cfg,arm,replica):
+        row=base.layout(cfg,arm);ep=row['ep'];pp=row['pp']
+        profile=cfg['profiles'][row['profile']]
+        running=profile['max_requests']//row['replicas']
+        args=['--model-path',cfg['model_path'],'--host','127.0.0.1','--port',str(base.port(cfg,arm,replica)),
+          '--dist-init-addr',f"127.0.0.1:{cfg['dist_port']+cfg['layouts'].index(row)*100+replica*10}",
+          '--tp-size',str(ep),'--ep-size',str(ep),'--dp-size',str(ep),'--pp-size',str(pp),
+          '--dtype','bfloat16','--kv-cache-dtype','bfloat16','--context-length',str(profile['max_context']),
+          '--mem-fraction-static',str(cfg['mem_fraction_static']),'--page-size','64',
+          '--max-running-requests',str(running),'--max-mamba-cache-size',str(profile['mamba_equiv']*ep*pp),
+          '--mamba-max-states-per-path','1','--mamba-ssm-dtype','float32',
+          '--cuda-graph-max-bs-decode',str(profile['max_requests']//4),'--cuda-graph-backend-prefill','disabled',
+          '--chunked-prefill-size',str(4096*ep),'--max-prefill-tokens',str(4096*ep),
+          '--attention-backend','fa3','--linear-attn-backend','triton',
+          '--moe-runner-backend','deep_gemm','--moe-a2a-backend','deepep' if ep>1 else 'none',
+          '--disable-custom-all-reduce','--skip-server-warmup',
+          '--enable-cache-report','--json-model-override-args','{"language_model_only":true}']
+        if pp>1:args+=['--pp-max-micro-batch-size','8','--pp-async-batch-depth','0']
+        if ep>1:args+=['--enable-dp-attention','--deepep-mode','auto','--deepep-dispatcher-output-dtype','bf16']
+        return args
+    base.engine_args=engine_args
+
+    def make_tokens(current,case):
+        from transformers import AutoTokenizer
+        tokenizer=AutoTokenizer.from_pretrained(current['model_path'],local_files_only=True)
+        bodies=[
+            'A distributed service keeps a record of independent requests. Explain the computation and communication clearly.\n',
+            'Consider the proof of a theorem about prime numbers and modular arithmetic. State each algebraic step precisely.\n',
+            'def merge_records(left, right):\n    result = sorted(left + right)\n    return result\nDescribe the Python algorithm.\n',
+            'A historian compares medieval trade routes, port cities, and the movement of goods across several regions.\n',
+            'The spacecraft changes its trajectory using a sequence of orbital maneuvers. Explain velocity and acceleration.\n',
+            'Describe how musical harmony, rhythm, and instrument timbre shape a short orchestral composition.\n',
+            'A botanist records leaf shapes, soil conditions, rainfall, and seasonal changes across the research garden.\n',
+            'Database transactions use indexes, snapshots, and isolation levels to maintain consistency under concurrent updates.\n']
+        rows=[]
+        for i in range(current['requests']):
+            head=[5000+i]+tokenizer.encode(f'Document {i}. ',add_special_tokens=False)
+            body=tokenizer.encode(bodies[i%len(bodies)] if case['family']=='diverse' else bodies[0],add_special_tokens=False)
+            rows.append((head+body*(case['P']//len(body)+2))[:case['P']])
+        assert all(len(t)==case['P'] for t in rows)
+        return rows
+
+    def states(cfg,arm,key):
+        return base.each_server(cfg,arm,lambda c:base.h.http_json(c['port'],'/get_server_info',key,timeout=30))
+
+    counter_epoch=[0]
+    def counts(run,cfg,arm,key):
+        from artifact_visibility import wait_for_stable_json
+        states(cfg,arm,key)  # Drain native scheduler control before snapshot.
+        counter_epoch[0]=counter_epoch[0]%254+1
+        epoch=counter_epoch[0];byte(cfg['forward_counter_control'],epoch)
+        row=base.layout(cfg,arm);rows=[]
+        for replica in range(row['replicas']):
+            for pp in range(row['pp']):
+                for tp in range(row['tp']):
+                    path=run/'evidence'/f'{arm}.r{replica}'/'forward_counters'/f'pp{pp}.tp{tp}.json'
+                    deadline=time.monotonic()+20
+                    while True:
+                        value,_=wait_for_stable_json(path,timeout_s=20,poll_s=.02,min_stable_s=.02)
+                        if value['epoch']==epoch:break
+                        if time.monotonic()>deadline:raise TimeoutError('Rank counter snapshot epoch was not acknowledged')
+                        time.sleep(.02)
+                    rows.append(dict(replica=replica,shape=value['shape'],counts=value['counts']))
+        assert len(rows)==4
+        return rows
+
+    def summarize(rounds):
+        metrics={}
+        for name,fn in [
+            ('mean_request_tpot_ms',lambda g:statistics.mean(r['tpot_ms'] for r in g['requests'])),
+            ('mean_request_e2e_ms',lambda g:statistics.mean(r['e2e_s']*1000 for r in g['requests'])),
+            ('mean_request_ttft_ms',lambda g:statistics.mean(r['ttft_s']*1000 for r in g['requests'])),
+            ('cohort_makespan_ms',lambda g:g['makespan_s']*1000),
+            ('output_tokens_per_s',lambda g:g['output_tokens_per_s'])]:
+            values=[fn(g) for g in rounds]
+            metrics[name]=dict(mean=statistics.mean(values),samples=values,stdev=statistics.stdev(values) if len(values)>1 else 0)
+        return dict(rounds=rounds,metrics=metrics)
+
+    def workload(run,cfg,arm,key,case,health):
+        row=base.layout(cfg,arm);current=dict(cfg,requests=case['requests'],prefix_tokens=case['P'])
+        out=run/'results'/arm/case['id'];out.mkdir(parents=True,exist_ok=True)
+        per_instance=case['requests']//(row['replicas']*row['dp'])
+        needed=per_instance*(case['P']+128+64)
+        admission=row['actual_admission']
+        if needed>min(admission['kv_tokens']) or per_instance>min(admission['max_running']):
+            base.h.save(out/'infeasible.json',dict(status='native_capacity_infeasible',performance_sample=False,
+                case=case,layout=arm,required_resident_requests=per_instance,required_kv_tokens=needed,
+                actual_admission=admission,scope='This frozen memory profile; no Decode speed assigned.'))
+            return
+        tokens=make_tokens(current,case)
+        base.h.save(out/'protocol.json',dict(case,global_new_tokens_per_decode_step=case['requests'],
+            Q=1,O=128,cpu_kv_restore=False,hicache=False,gpu_hot=True,
+            prompt_sha256=[hashlib.sha256(str(t).encode()).hexdigest() for t in tokens],
+            pp_slots=row['pp'],target_microbatch=case['requests']//4,
+            pp_policy=9 if row['pp']==2 else 0))
+        byte(cfg['gap_policy_path'],ord('0'));byte(cfg['fixed_cohort_control'],0)
+        byte(cfg['diagnostic_eager_policy_path'],ord('0'));byte(cfg['fragment_policy_path'],ord('0'))
+        if row['pp']>1:
+            answers=base.each_server(cfg,arm,lambda c:base.h.http_json(c['port'],'/set_internal_state',key,
+                dict(server_args=dict(pp_max_micro_batch_size=case['requests']//4)),timeout=30))
+            base.h.save(out/'microbatch_update.json',answers)
+        base.flush(cfg,arm,key);health()
+        prime=base.cohort(current,arm,key,tokens,1)
+        assert len(prime['requests'])==case['requests']
+        assert all((r.get('cached_tokens') or 0)==0 for r in prime['requests'])
+        base.h.save(out/'prefix_preparation.json',dict(performance_sample=False,result=prime))
+        decode=[t+[198] for t in tokens]
+        def check(group):
+            assert len(group['requests'])==case['requests']
+            for r in group['requests']:
+                assert r['prompt_tokens']==case['P']+1 and r['output_tokens']==128 and r['cached_tokens']==case['P']
+                assert len(r['output_ids'])==128
+                if r.get('cached_tokens_details'):
+                    assert r['cached_tokens_details'].get('host',0)==0 and r['cached_tokens_details'].get('storage',0)==0
+        epoch=1
+        def gap_states():
+            from artifact_visibility import wait_for_stable_json
+            values=[]
+            for replica in range(row['replicas']):
+                for rank in range(2):
+                    p=run/'evidence'/f'{arm}.r{replica}'/'pp2'/'gap_receipts'/f'policy9.pp{rank}.json'
+                    value,_=wait_for_stable_json(p,timeout_s=20,poll_s=.02,min_stable_s=.02)
+                    assert not value['pending'] and not value['ahead_pending']
+                    assert value['ahead_produced']==value['ahead_consumed']
+                    assert value['prepared_next']==value['prepared_consumed']
+                    values.append(dict(replica=replica,rank=rank,**value))
+            return values
+        def full_cohort():
+            nonlocal epoch
+            this_epoch=epoch
+            if row['pp']==2:
+                byte(cfg['fixed_cohort_control'],epoch);epoch=epoch%254+1
+            group=base.cohort(current,arm,key,decode,128)
+            for _ in range(3): info=states(cfg,arm,key)
+            if row['pp']==2:
+                for replica,server in enumerate(info):
+                    receipts=[s['experiment_fixed_group_receipt'] for s in server['internal_states']
+                              if 'experiment_fixed_group_receipt' in s]
+                    local=case['requests']//2
+                    order=list(range(0,local,2))+list(range(1,local,2))
+                    expected=[5000+replica+2*i for i in order]
+                    assert len(receipts)==1 and receipts[0]['epoch']==this_epoch and receipts[0]['ordered_markers']==expected,receipts
+                group['fixed_group_receipts']=[s['experiment_fixed_group_receipt'] for server in info
+                    for s in server['internal_states'] if 'experiment_fixed_group_receipt' in s]
+            return group
+        # Native PP wire schemas and all selected graph sizes are warmed first.
+        for n in sorted(set([4,case['requests']//2,case['requests']]))+[case['requests']]:
+            health();group=base.cohort(current,arm,key,decode[:min(n,case['requests'])],128)
+            assert all(r['cached_tokens']==case['P'] for r in group['requests'])
+        if row['pp']==2:
+            byte(cfg['fixed_cohort_size'],case['requests']//2)
+            native=full_cohort();check(native)
+            base.h.save(out/'native_fixed_group_validation.json',dict(performance_sample=False,result=native))
+            byte(cfg['gap_policy_path'],ord('9'))
+        for _ in range(1):
+            health();check(full_cohort())
+        formal=[]
+        for repeat in range(cfg['repeats']):
+            health();base.progress(run,cfg,f'timing_{arm}_{case["id"]}',repeat=repeat+1)
+            before=counts(run,cfg,arm,key)
+            gap_before=gap_states() if row['pp']==2 else None
+            group=full_cohort();check(group)
+            after=counts(run,cfg,arm,key)
+            if row['pp']==2:
+                gap_after=gap_states()
+                deltas=[dict(replica=b['replica'],rank=b['rank'],
+                    ahead=b['ahead_produced']-a['ahead_produced'],
+                    consumed=b['ahead_consumed']-a['ahead_consumed'],
+                    fast_sent=b['fast_sent']-a['fast_sent']) for a,b in zip(gap_before,gap_after)]
+                assert all(d['ahead']>0 and d['ahead']==d['consumed'] and d['fast_sent']>0 for d in deltas),deltas
+                group['scheduling_receipt']=dict(policy=9,deltas=deltas,states=gap_after)
+            delta=[]
+            assert len(before)==len(after)==4
+            for b,a in zip(before,after):
+                assert b['shape']==a['shape'] and b['replica']==a['replica']
+                d={k:v-b['counts'].get(k,0) for k,v in a['counts'].items() if v-b['counts'].get(k,0)}
+                assert any(k.startswith('DECODE:') for k in d),d
+                assert any(k.startswith('graph_eligible:') for k in d),d
+                delta.append(dict(replica=a['replica'],shape=a['shape'],counts=d))
+            group['forward_deltas']=delta
+            formal.append(group)
+            base.h.save(out/f'formal.r{repeat+1}.json',dict(performance_sample=True,result=group))
+            base.h.save(out/'metrics.decode.json',summarize(formal))
+        ref=[r['output_ids'] for r in formal[0]['requests']]
+        agreement=all([r['output_ids'] for r in g['requests']]==ref for g in formal)
+        base.h.save(out/'output_agreement.json',dict(all_formal_sequences_equal=agreement,
+            requirement='PP2 fixed-group repeatability; cross-layout numerical batch effects may change generated sequences.'))
+        if row['pp']==2:
+            assert agreement
+            assert ref==[r['output_ids'] for r in native['requests']],'PP lookahead changed native fixed-group output'
+        byte(cfg['gap_policy_path'],ord('0'));byte(cfg['fixed_cohort_control'],0)
+        base.h.save(out/'completed.json',dict(passed=True,formal_rounds=cfg['repeats']))
+
+    def worker(run,cfg):
+        incoming=json.loads(base.sys.stdin.readline());env=dict(os.environ,**incoming['environment'])
+        base.check(run,cfg,env,True)
+        def interrupted(signum,frame):raise RuntimeError('Guard/controller requested cleanup')
+        signal.signal(signal.SIGTERM,interrupted)
+        def watch_parent():base.sys.stdin.read();os.kill(os.getpid(),signal.SIGTERM)
+        threading.Thread(target=watch_parent,daemon=True).start();key=base.h.read_key(cfg)
+        topo=subprocess.run(['nvidia-smi','topo','-m'],capture_output=True,text=True,timeout=20)
+        (run/'topology.txt').write_text(topo.stdout+topo.stderr)
+        def health():base.check(run,cfg,env,True)
+        for row in cfg['layouts']:
+            arm=row['id'];children=[]
+            try:
+                base.progress(run,cfg,'loading_'+arm)
+                for replica in range(row['replicas']):children.append(base.launch(run,cfg,arm,replica,env,key))
+                deadline=time.monotonic()+cfg['startup_timeout_s']
+                kv=[];running=[];mamba=[]
+                for replica,child in enumerate(children):
+                    while True:
+                        health()
+                        if child['process'].poll() is not None:raise RuntimeError(arm+f'.r{replica} exited during startup')
+                        try:info=base.h.http_json(base.port(cfg,arm,replica),'/get_server_info',key,timeout=3);break
+                        except Exception:
+                            if time.monotonic()>deadline:raise TimeoutError('Full model startup timeout')
+                            time.sleep(2)
+                    base.h.save(run/'evidence'/f'{arm}.r{replica}'/'server_info.json',base.h.safe_server_info(info))
+                    qs=list((run/'evidence'/f'{arm}.r{replica}'/('ep2' if row['ep']>1 else 'pp2')/'qualification').glob('*.json'))
+                    assert len(qs)==row['ep']*row['pp'] and all(json.loads(p.read_text())['passed'] for p in qs)
+                    assert all(not s.get('enable_hierarchical_cache',False) for s in info['internal_states'])
+                    startup=Path(row['usage_logs'][replica]['path']).read_text()
+                    limits=re.findall(r'max_total_num_tokens=\d+.*?max_running_requests=(\d+)',startup)
+                    assert limits,(arm,replica,'missing native concurrency evidence')
+                    capacity=base.capacity_values(info)
+                    kv.append(capacity);running.append(min(map(int,limits)))
+                    mamba.extend(map(int,re.findall(r'Mamba Cache is allocated\. max_mamba_cache_size: (\d+)',startup)))
+                row['actual_admission']=dict(kv_tokens=kv,max_running=running,mamba_slots=mamba,
+                    static_memory_fraction=cfg['mem_fraction_static'],native_auto_kv=True)
+                base.h.save(run/'evidence'/arm/'actual_admission.json',row['actual_admission'])
+                for case in cfg['workloads']:
+                    if case['profile']==row['profile']:workload(run,cfg,arm,key,case,health)
+            finally:
+                if children:
+                    evidence=base.h.cleanup(children);base.h.save(run/'evidence'/arm/'cleanup.json',evidence)
+                    if not evidence['cleanup_verified']:raise RuntimeError('Owned process cleanup failed')
+        return 0
+    base.worker=worker
+    def progress(run,cfg,stage,**extra):
+        measured=len(list(run.glob('results/*/*/completed.json')))
+        infeasible=len(list(run.glob('results/*/*/infeasible.json')))
+        base.h.save(run/'task/progress.json',dict(experiment_id=cfg['id'],task_id='comparison',stage=stage,
+            timestamp=time.time(),controller_pid=json.loads((run/'task/controller_identity.json').read_text())['pid']
+            if (run/'task/controller_identity.json').exists() else os.getpid(),
+            valid_points=measured+infeasible,measured_points=measured,infeasible_points=infeasible,
+            expected=cfg['expected_points'],**extra))
+    base.progress=progress
