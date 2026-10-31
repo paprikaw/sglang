@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "parallel-tasks-v1",
+  "version": 1,
+  "engines": ["*"],
+  "protocol": "task-events-v1",
+  "features": ["parallel-tasks", "task-progress", "guard"],
+  "adapter": "adapter.py",
+  "assets": ["index.html", "app.js", "style.css"],
+  "description": "Engine-independent concurrent task dashboard using saved progress and cleanup evidence; no inference or SSH."
+}

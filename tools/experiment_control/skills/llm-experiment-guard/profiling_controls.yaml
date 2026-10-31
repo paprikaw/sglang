@@ -1,0 +1,49 @@
+schema_version: 1
+last_updated: "2026-08-05"
+default_policy: disabled
+description: >
+  Central profiling and high-volume trace controls used by every experiment
+  baseline. Normal guard checks reject enabled diagnostics. Intentional
+  diagnostic runs must pass --allow-profiling and remain separate from clean
+  performance-frontier results.
+
+diagnostic_enable_envs:
+  - VLLM_DYNAMIC_PP_CUDA_PROFILE
+  - VLLM_DYNAMIC_PP_LIFETIME_TRACE
+  - VLLM_DYNAMIC_PP_NCCL_EDGE_TRACE
+  - VLLM_DYNAMIC_PP_NCCL_DEBUG
+  - VLLM_AUTOSCALING_KVCACHED_DEBUG
+  - VLLM_AUTOSCALING_KVCACHED_DEBUG_VERBOSE
+  - VLLM_AUTOSCALING_POST_TRACE
+
+cuda_event_profiler:
+  enable_env: VLLM_DYNAMIC_PP_CUDA_PROFILE
+  runtime_envs:
+    VLLM_DYNAMIC_PP_CUDA_PROFILE:
+      default: "0"
+      purpose: Explicit master enable; unset and falsy values keep profiling off.
+    VLLM_DYNAMIC_PP_CUDA_PROFILE_DIR:
+      default: null
+      purpose: Rank-local JSONL output directory; inert while the master enable is off.
+    VLLM_DYNAMIC_PP_CUDA_PROFILE_FLUSH_RECORDS:
+      default: "128"
+      purpose: Completed-record write threshold; inert while the master enable is off.
+    VLLM_DYNAMIC_PP_CUDA_PROFILE_SAMPLE_EVERY:
+      default: "1"
+      purpose: Correlated scheduler-step sampling interval; inert while the master enable is off.
+    VLLM_DYNAMIC_PP_CUDA_PROFILE_KINDS:
+      default: ""
+      purpose: Comma-separated interval kinds; inert while the master enable is off.
+  required_when_enabled:
+    - VLLM_DYNAMIC_PP_CUDA_PROFILE_DIR
+    - VLLM_DYNAMIC_PP_CUDA_PROFILE_FLUSH_RECORDS
+    - VLLM_DYNAMIC_PP_CUDA_PROFILE_SAMPLE_EVERY
+    - VLLM_DYNAMIC_PP_CUDA_PROFILE_KINDS
+  positive_integer_envs:
+    - VLLM_DYNAMIC_PP_CUDA_PROFILE_FLUSH_RECORDS
+    - VLLM_DYNAMIC_PP_CUDA_PROFILE_SAMPLE_EVERY
+  allowed_kinds:
+    - stage
+    - transformer
+    - send
+    - recv

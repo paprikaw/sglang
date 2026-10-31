@@ -1,0 +1,4 @@
+interface:
+  display_name: "LLM Experiment Guard"
+  short_description: "Preflight vLLM and SGLang experiments safely"
+  default_prompt: "Use $llm-experiment-guard to preflight this LLM experiment before running it on Spartan."

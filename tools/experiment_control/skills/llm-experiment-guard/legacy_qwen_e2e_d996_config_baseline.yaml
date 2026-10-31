@@ -1,0 +1,79 @@
+schema_version: 1
+last_updated: "2026-07-04"
+source_good_commit: "d996a43c896f0148e4e06439b9173f1a38d92535"
+source_good_tag: "legacy/qwen-e2e-reconfig-good-20260704"
+description: >
+  Baseline for the old d996 Qwen E2E reconfiguration implementation.  This
+  checkout predates the later native VMM/KV resize sweep fields, so this
+  baseline intentionally fixes only fields supported by the d996 experiment
+  schema and known to matter for the historical PP2 reconfiguration path.
+
+defaults:
+  static_config:
+    model:
+      path: "/home/bxb1/data/huggingface/Qwen3-32B-FP8"
+      name: "Qwen3-32B-FP8"
+    vllm:
+      gpu_memory_utilization: 0.95
+
+required:
+  top_level:
+    type: "sweep_test"
+    is_log_cover: true
+    overwrite: true
+
+  envs:
+    RAY_DEDUP_LOGS: "0"
+    NCCL_DEBUG: "INFO"
+    NCCL_CUMEM_HOST_ENABLE: "0"
+    VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
+    VLLM_TORCH_PROFILER_DIR: "/home/bxb1/data/vllm_workbench/profiler/"
+    RAY_CGRAPH_get_timeout: "10000"
+    BENCHMARK_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/benchmark_config.json"
+    DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
+    KV_SYNC_USE_CPU: "0"
+    VLLM_USE_CPU_MODEL: "0"
+    CUDA_LAUNCH_BLOCKING: "0"
+    PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+    VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+    VLLM_USE_RAY_COMPILED_DAG: "1"
+    NCCL_SOCKET_IFNAME: "bond0.3027"
+    GLOO_SOCKET_IFNAME: "bond0.3027"
+    VLLM_SERVER_DEV_MODE: "1"
+    VLLM_DISABLE_CUTLASS_FP8: "1"
+    VLLM_PAGE_ATTENTION_BLOCK_SIZE_KB: "128"
+
+  static_config:
+    vllm:
+      head_addr: "localhost"
+      pipeline_parallel_size: 2
+      max_model_len: 4000
+      max_num_batched_tokens: 8128
+      chunked_prefill: true
+      enable_cuda_graph: false
+      enable_nsight: false
+      weight_chunk_size_mb: 160
+      migration_approach: "async"
+      fixed_num_gpu_blocks: -1
+      block_size: 128
+    benchmark:
+      burstiness: 100.0
+      profile: false
+      print_outputs: false
+      repetition: 1
+      warmup:
+        enabled: false
+
+  sweep_configs:
+    vllm:
+      attention_kernel: ["flexi"]
+      fixed_num_gpu_blocks: [-1]
+      weight_chunk_size_mb: [160]
+      migration_approach: ["async"]
+
+notes:
+  - "Use only with tag legacy/qwen-e2e-reconfig-good-20260704 / commit d996a43c896f0148e4e06439b9173f1a38d92535."
+  - "Use only with tag legacy/qwen-e2e-reconfig-good-20260704 / commit d996a43c896f0148e4e06439b9173f1a38d92535."
+  - "For Llama BurstGPT reruns on d996, use attention_kernel=flexi; the d996 dynamic KV initialization path asserts FlexiAttention."
+  - "The d996 schema does not support later sweep fields such as weight_loading_mode, use_vmm, enable_kv_resize, or enable_cpu_weight_cache."
+  - "Model path/name are defaults, not fixed requirements; Llama BurstGPT reruns may override them."

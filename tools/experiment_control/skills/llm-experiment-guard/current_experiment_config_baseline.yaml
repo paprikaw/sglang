@@ -1,0 +1,113 @@
+schema_version: 2
+last_updated: "2026-08-05"
+source_good_config: "vllm_exp/configs/a-e2e-cmp-qwen.yaml"
+description: >
+  Baseline for the current historical Qwen3 e2e comparison family.  This
+  intentionally tracks the stable 2026-03 Qwen3 PP2 native VMM experiment
+  shape from b6911b94d, while keeping model choice and GPU memory utilization
+  as documented defaults that may be changed per experiment.
+
+allowed_runtime_fields:
+  - project
+  - envs.VLLM_KVCACHE_BACKEND
+  - envs.KVCACHED_PAGE_SIZE_MB
+  - envs.KVCACHED_CONTIGUOUS_LAYOUT
+  - envs.KVCACHED_LAYER_STACKING
+  - envs.KVCACHED_PHYSICAL_BLOCK_SIZE_KB
+  - envs.KVCACHED_MAX_CACHED_TOKENS
+  - envs.KVCACHED_LOG_LEVEL
+  - envs.VLLM_DYNAMIC_PP_CUDA_PROFILE
+  - envs.VLLM_DYNAMIC_PP_CUDA_PROFILE_DIR
+  - envs.VLLM_DYNAMIC_PP_CUDA_PROFILE_FLUSH_RECORDS
+  - envs.VLLM_DYNAMIC_PP_CUDA_PROFILE_SAMPLE_EVERY
+  - envs.VLLM_DYNAMIC_PP_CUDA_PROFILE_KINDS
+  - envs.VLLM_DYNAMIC_PP_LIFETIME_TRACE
+  - envs.VLLM_DYNAMIC_PP_NCCL_EDGE_TRACE
+  - envs.VLLM_DYNAMIC_PP_NCCL_DEBUG
+  - envs.VLLM_AUTOSCALING_KVCACHED_DEBUG
+  - envs.VLLM_AUTOSCALING_KVCACHED_DEBUG_VERBOSE
+  - static_config.model.path
+  - static_config.model.name
+  - static_config.vllm.gpu_memory_utilization
+  - static_config.vllm.pipeline_parallel_size
+  - static_config.vllm.max_num_batched_tokens
+  - static_config.network.rank_to_ip
+  - static_config.network.rank_to_node
+  - static_config.benchmark.benchmark_script_path
+
+defaults:
+  static_config:
+    model:
+      path: "/home/bxb1/data/huggingface/Qwen3-32B-FP8"
+      name: "Qwen3-32B-FP8"
+    vllm:
+      gpu_memory_utilization: 0.95
+
+required:
+  top_level:
+    type: "sweep_test"
+    is_log_cover: true
+    overwrite: true
+
+  envs:
+    RAY_DEDUP_LOGS: "0"
+    NCCL_DEBUG: "INFO"
+    NCCL_CUMEM_HOST_ENABLE: "0"
+    VLLM_NCCL_SO_PATH: "/apps/easybuild-2022/easybuild/software/Compiler/GCCcore/11.3.0/NCCL/2.21.5-CUDA-12.4.1/lib/libnccl.so.2.21.5"
+    VLLM_TORCH_PROFILER_DIR: "/home/bxb1/data/vllm_workbench/profiler/"
+    RAY_CGRAPH_get_timeout: "10000"
+    BENCHMARK_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/benchmark_config.json"
+    DEPLOYMENT_CONFIG_PATH: "/home/bxb1/data/tmp/vllm_exp/vllm_config.json"
+    KV_SYNC_USE_CPU: "0"
+    VLLM_USE_CPU_MODEL: "0"
+    CUDA_LAUNCH_BLOCKING: "0"
+    PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:32"
+    VLLM_USE_RAY_COMPILED_DAG_OVERLAP_COMM: "0"
+    VLLM_USE_RAY_COMPILED_DAG: "0"
+    NCCL_SOCKET_IFNAME: "bond0.3027"
+    GLOO_SOCKET_IFNAME: "bond0.3027"
+    VLLM_SERVER_DEV_MODE: "1"
+    VLLM_DISABLE_CUTLASS_FP8: "1"
+    VLLM_PAGE_ATTENTION_BLOCK_SIZE_KB: "128"
+
+  static_config:
+    vllm:
+      head_addr: "localhost"
+      disable_memory_overhead_monitor: true
+      max_model_len: 4000
+      chunked_prefill: true
+      enable_cuda_graph: false
+      enable_nsight: false
+      weight_chunk_size_mb: 5
+    benchmark:
+      burstiness: 100.0
+      profile: false
+      print_outputs: true
+      repetition: 5
+      warmup:
+        enabled: false
+
+  sweep_configs:
+    vllm:
+      attention_kernel: ["direct"]
+      fixed_num_gpu_blocks: [-1]
+      weight_chunk_size_mb: [160]
+      migration_approach: ["async"]
+      weight_loading_mode: ["async"]
+      block_size: [32]
+      use_vmm: [true]
+      enable_kv_resize: [true]
+      enable_cpu_weight_cache: [true]
+
+notes:
+  - "Model path/name and gpu_memory_utilization are defaults, not fixed baseline requirements."
+  - "pipeline_parallel_size and max_num_batched_tokens are experiment runtime fields and are not fixed by the global baseline."
+  - "All profiling and high-volume trace controls are default-off under profiling_controls.yaml; intentional diagnostic runs require --allow-profiling."
+  - "The Dynamic PP CUDA profiler is enabled only by VLLM_DYNAMIC_PP_CUDA_PROFILE; its DIR, FLUSH_RECORDS, SAMPLE_EVERY, and KINDS variables are inert while the master flag is unset or false."
+  - "For Qwen3-32B-FP8, VLLM_PAGE_ATTENTION_BLOCK_SIZE_KB=128 derives token block_size=32 in current code."
+  - "H100 current-xu comparisons disable Ray compiled DAG because the installed Ray lacks set_global_nccl_lock."
+  - "Native VMM/VRM layer stacking uses vLLM config/env knobs: use_vmm, sweep block_size, and VLLM_PAGE_ATTENTION_BLOCK_SIZE_KB. Do not express native VMM stacking with KVCACHED_* envs."
+  - "KVCacheD layer stacking uses KVCacheD envs: VLLM_KVCACHE_BACKEND=kvcached, KVCACHED_LAYER_STACKING, KVCACHED_PAGE_SIZE_MB, and the logical stacked-block env."
+  - "KVCACHED_PAGE_SIZE_MB is the true KVCacheD backing allocation page size."
+  - "The logical KVCacheD layer-stacked block uses KVCACHED_PHYSICAL_BLOCK_SIZE_KB=128 in current code; this env is legacy/misnamed and is not the true physical CUDA page size."
+  - "Do not change pp_layer_config or request schedule between native VMM and KVCacheD runs."

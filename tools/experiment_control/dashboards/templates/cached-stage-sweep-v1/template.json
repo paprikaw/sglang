@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "cached-stage-sweep-v1",
+  "version": 1,
+  "engines": ["sglang"],
+  "protocol": "cached-stage-sweep",
+  "features": ["parallel-tasks", "fixed-context", "isolated-phases", "kv-checkpoints", "request-rate-sweep", "task-progress", "metrics"],
+  "adapter": "server.py",
+  "assets": ["index.html", "app.js", "style.css"],
+  "description": "Fixed-context Prefill/Decode sweeps; immutable accepted results, live controller identity, separate real and estimated progress."
+}
