@@ -55,6 +55,13 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
+        elif layer_name in (
+            "Qwen3_5LinearDecoderLayer",
+            "Qwen3_5AttentionDecoderLayer",
+        ):
+            from sglang.srt.batch_overlap.qwen35_tbo import build_strategy
+
+            return build_strategy(layers, forward_mode)
         elif layer_name == "MiMoV2DecoderLayer":
             return OperationsStrategy.concat(
                 [

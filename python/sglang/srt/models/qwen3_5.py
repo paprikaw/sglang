@@ -38,6 +38,7 @@ from sglang.srt.configs.qwen3_5 import (
     Qwen3_5MoeConfig,
     Qwen3_5TextConfig,
 )
+from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 
 # Distributed
 from sglang.srt.distributed import get_pp_group
@@ -48,7 +49,7 @@ from sglang.srt.elastic_pp.topology import LayerRange
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes, ScatterMode
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -1532,8 +1533,25 @@ class Qwen3_5ForCausalLM(ElasticPPModelMixin, nn.Module):
                 residual = pp_proxy_tensors["residual"]
 
             aux_hidden_states = []
+            if forward_batch.can_run_tbo:
+                # Current hybrid support is Decode with low-latency DeepEP.
+                # Prefill stays on the normal forward via the native LL gate.
+                assert self.config.model_type == "qwen3_5_moe_text"
+                assert not self.layers_to_capture, "TBO hidden-state capture is unsupported"
+                assert input_deepstack_embeds is None, "TBO deepstack is unsupported"
+                hidden_states, residual = model_forward_maybe_tbo(
+                    layers=self.layers[self.start_layer : self.end_layer],
+                    enable_tbo=True,
+                    input_data_scatter_mode=ScatterMode.model_input_output(),
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
             # Pass through decoder layers
-            for layer_idx in range(self.start_layer, self.end_layer):
+            for layer_idx in (
+                [] if forward_batch.can_run_tbo else range(self.start_layer, self.end_layer)
+            ):
                 layer = self.layers[layer_idx]
                 with get_global_expert_distribution_recorder().with_current_layer(
                     layer_idx

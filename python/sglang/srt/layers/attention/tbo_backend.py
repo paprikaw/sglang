@@ -257,5 +257,20 @@ def _build_tbo_child_replay_fb_view(
             if parent_out_cache_loc is not None
             else None
         ),
+        mamba_track_indices=(
+            fb_view.mamba_track_indices[seq_slice]
+            if getattr(fb_view, "mamba_track_indices", None) is not None
+            else None
+        ),
+        mamba_track_mask=(
+            fb_view.mamba_track_mask[seq_slice]
+            if getattr(fb_view, "mamba_track_mask", None) is not None
+            else None
+        ),
+        mamba_track_seqlens=(
+            fb_view.mamba_track_seqlens[seq_slice]
+            if getattr(fb_view, "mamba_track_seqlens", None) is not None
+            else None
+        ),
         spec_info=child_spec_info,
     )
