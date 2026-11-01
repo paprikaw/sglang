@@ -900,7 +900,7 @@ class SchedulerPPMixin:
             # metadata transports, while retaining native dynamic tensor schemas
             # and P2PWork buffer ownership. No fixed batch/cohort is assumed.
             self._pp_pd_tensor_channels = []
-            for _ in range(3):
+            for channel_index in range(3):
                 channel = copy(self.pp_group)
                 channel.cpu_group = torch.distributed.new_group(
                     ranks=self.pp_group.ranks, backend="gloo"
@@ -912,7 +912,23 @@ class SchedulerPPMixin:
                     group=channel.device_group,
                     device_ids=[torch.cuda.current_device()],
                 )
+                # NCCL creates a separate communicator on the first unbatched
+                # P2P call. A collective barrier does not initialize that path.
+                # Warm the exact metadata/tensor direction while both stages
+                # are here, before proxy and output messages can overtake.
+                source_rank = 1 if channel_index == 1 else 0
+                warmup = torch.zeros(1, dtype=torch.bfloat16, device="cuda")
+                if self.pp_group.rank_in_group == source_rank:
+                    work = channel.send_tensor_dict(
+                        {"warmup": warmup}, dst=1 - source_rank, async_send=True
+                    )
+                    self._pp_commit_comm_work(work)
+                else:
+                    channel.recv_tensor_dict(src=source_rank)
+                torch.cuda.current_stream().synchronize()
+                torch.distributed.barrier(group=channel.cpu_group)
                 self._pp_pd_tensor_channels.append(channel)
+            logger.info("PP_PD_TYPED_P2P_WARMUP channels=3 complete")
         logger.info(
             "PP_PD_DECODE_CONTROLS early_proxy=%s hicache_poll_steps=%s",
             self._pp_pd_early_proxy,
