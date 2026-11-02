@@ -642,6 +642,10 @@ class CommonKVManager(BaseKVManager):
         logger.debug(f"Prefill parallel info for [{bootstrap_addr}]: {info}")
         return True
 
+    def _supports_pp1_to_pp_decode(self, info: PrefillServerInfo) -> bool:
+        """Backends must opt in after implementing destination-layer slicing."""
+        return False
+
     def _resolve_rank_mapping(self, info: PrefillServerInfo) -> None:
         """Compute TP/CP/PP rank mapping and store on the PrefillServerInfo object.
         Deterministic for a given (bootstrap_addr, decode engine) pair."""
@@ -708,13 +712,19 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
-        # PP rank mapping — decode pp size should be equal to prefill pp size or 1
-        assert self.pp_size == info.pp_size or self.pp_size == 1, (
-            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1",
-        )
         if info.pp_size == self.pp_size:
             target_pp_ranks = [self.pp_rank]
+        elif info.pp_size == 1 and self._supports_pp1_to_pp_decode(info):
+            # Every decode stage pulls its own layers from the same PP1 sender.
+            # The sender must receive all stage destinations before releasing
+            # the request's KV/state, not just the first stage's registration.
+            target_pp_ranks = [0]
+            required_dst_info_num *= self.pp_size
         else:
+            assert self.pp_size == 1, (
+                f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1; "
+                "PP1 to pipelined decode requires a qualified layer-aware backend",
+            )
             target_pp_ranks = list(range(info.pp_size))
             required_prefill_response_num *= info.pp_size // self.pp_size
 

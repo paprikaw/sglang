@@ -148,6 +148,7 @@ class KVArgsRegisterInfo:
     dcp_token_item_lens: Optional[List[int]] = None
     staging_base_ptr: int = 0
     staging_total_size: int = 0
+    dst_pp_size: int = 1
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -192,11 +193,38 @@ class KVArgsRegisterInfo:
             dst_dcp_rank=(
                 int(msg[17].decode("ascii")) if len(msg) > 17 and msg[17] != b"" else 0
             ),
+            dst_pp_size=(
+                int(msg[18].decode("ascii")) if len(msg) > 18 and msg[18] != b"" else 1
+            ),
         )
 
 
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+
+    def _supports_pp1_to_pp_decode(self, info) -> bool:
+        # This path uses global per-buffer layer IDs, never a positional slice
+        # of a whole-envelope/unified pool. Other attention/TP/CP relayouts and
+        # state types retain their existing admission limits.
+        args = self.kv_args
+        return (
+            self.pp_size == 2
+            and not self.is_mla_backend
+            and not self.is_hybrid_mla_backend
+            and self.dcp_size == 1
+            and info.attn_cp_size == 1
+            and self.attn_tp_size == info.attn_tp_size == 1
+            and bool(args.kv_layer_ids)
+            and len(args.kv_layer_ids) == len(args.kv_data_ptrs)
+            and len(args.state_types) == len(args.state_layer_ids)
+            and len(args.state_types) == len(args.state_data_ptrs)
+            and all(
+                st == StateType.MAMBA and ids and len(ids) == len(ptrs)
+                for st, ids, ptrs in zip(
+                    args.state_types, args.state_layer_ids, args.state_data_ptrs
+                )
+            )
+        )
 
     def __init__(
         self,
@@ -629,6 +657,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_layer_ids: Optional[List[int]] = None,
         dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_device_data_ptrs: Optional[set[int]] = None,
+        allow_destination_subset: bool = False,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -653,7 +682,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         layers_params = None
 
-        # Decode pp size should be equal to prefill pp size or 1
         if (
             self.is_mla_backend
             or self.is_hybrid_mla_backend
@@ -673,6 +701,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     len(src_data_ptrs),
                     len(dst_data_ptrs),
                     allow_positional_fallback=self.pp_size == 1,
+                    allow_destination_subset=allow_destination_subset,
                 )
                 layers_params = [
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
@@ -846,6 +875,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
+        dst_pp_size: int = 1,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -873,6 +903,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_layer_ids=dst_layer_ids,
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
+            allow_destination_subset=self.pp_size == 1 and dst_pp_size > 1,
         )
 
     def send_kvcache_dcp(
@@ -1330,6 +1361,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             src_slice_outer_counts,
                             src_state_layer_ids,
                             dst_state_layer_ids,
+                            getattr(target_rank_registration_info, "dst_pp_size", 1),
                         )
                         or rc
                     )
@@ -1344,6 +1376,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             dst_indices,
                             src_state_layer_ids,
                             dst_state_layer_ids,
+                            getattr(target_rank_registration_info, "dst_pp_size", 1),
                         )
                         or rc
                     )
@@ -1442,6 +1475,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_mamba_index: list,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        dst_pp_size: int = 1,
     ):
         assert len(prefill_mamba_index) == 1, "Mamba should have single state index"
 
@@ -1452,6 +1486,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             len(src_state_data_ptrs),
             len(dst_state_data_ptrs),
             allow_positional_fallback=self.pp_size == 1,
+            allow_destination_subset=self.pp_size == 1 and dst_pp_size > 1,
         )
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
@@ -1479,6 +1514,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         src_state_slice_outer_counts: list[int] = None,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        dst_pp_size: int = 1,
     ):
         """Transfer Mamba states with TP slice support.
 
@@ -1510,6 +1546,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_mamba_index,
                 src_layer_ids,
                 dst_layer_ids,
+                dst_pp_size,
             )
 
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
@@ -1522,6 +1559,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             len(src_state_data_ptrs),
             len(dst_state_data_ptrs),
             allow_positional_fallback=self.pp_size == 1,
+            allow_destination_subset=self.pp_size == 1 and dst_pp_size > 1,
         )
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
@@ -1766,6 +1804,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_device_kv_indices=chunked_dst_device_kv_indice,
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                dst_pp_size=target_rank_registration_info.dst_pp_size,
                             )
                         elif (
                             self.enable_staging
@@ -2407,7 +2446,8 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 struct.pack("I", layer_id)
                 for layer_id in self.kv_mgr.kv_args.kv_layer_ids
             )
-            # Note(shangming): No need to add pp rank here since decode pp size should be equal to prefill pp size or 1
+            # Session IDs distinguish PP stages; TP rank retains its attention
+            # meaning. The explicit PP size enables layer-subset transfer.
             tp_rank = self.kv_mgr.kv_args.engine_rank
             # Some pools have no full-token contiguous KV (kv_item_lens empty)
             # and ship per-pool instead, so report 0.
@@ -2455,6 +2495,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             staging_total_size_str,
                             dst_dcp_size,
                             dst_dcp_rank,
+                            str(self.kv_mgr.pp_size).encode("ascii"),
                         ]
                     )
             except zmq.ZMQError:

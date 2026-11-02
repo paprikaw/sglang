@@ -874,8 +874,16 @@ def build_transfer_entry_pairs(
     n_src: int,
     n_dst: int,
     allow_positional_fallback: bool = False,
+    allow_destination_subset: bool = False,
 ) -> List[Tuple[int, int]]:
-    """Pair prefill-local transfer entries with decode entries by layer id."""
+    """Pair transfer entries by layer id, preserving tensor occurrences.
+
+    A PP1 sender may serve an explicitly registered PP decode stage. Only that
+    path may omit source layers outside the destination stage; every entry of
+    the destination must still be covered, including repeated K/V/state entries.
+    """
+    if allow_destination_subset and (not src_layer_ids or not dst_layer_ids):
+        raise RuntimeError("PP expansion requires layer metadata on both PD peers")
     if n_src == 0:
         return []
     if bool(src_layer_ids) != bool(dst_layer_ids):
@@ -899,11 +907,15 @@ def build_transfer_entry_pairs(
             dst_pos.setdefault(lid, deque()).append(j)
         pairs = []
         for i, lid in enumerate(src_layer_ids):
+            if allow_destination_subset and lid not in dst_pos:
+                continue
             if not dst_pos.get(lid):
                 raise RuntimeError(
                     f"Decode peer is missing a transfer entry for model layer {lid}"
                 )
             pairs.append((i, dst_pos[lid].popleft()))
+        if allow_destination_subset and any(dst_pos.values()):
+            raise RuntimeError("Prefill peer is missing a destination transfer entry")
         return pairs
     if n_dst < n_src or (n_src != n_dst and not allow_positional_fallback):
         # Without layer ids a positional pairing would silently transfer the
