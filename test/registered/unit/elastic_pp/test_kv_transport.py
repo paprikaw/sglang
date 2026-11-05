@@ -159,8 +159,10 @@ def test_sparse_transport_populates_unpublished_zero_rank_backing():
         rank=1,
     )
 
-    source_slots = source.prepare_transition(transition)
-    target_slots = target.prepare_transition(transition)
+    source.prepare_transition(transition)
+    target.prepare_transition(transition)
+    source_slots = source.fence_slots(transition)
+    target_slots = target.fence_slots(transition)
     assert source.send_phase(transition, phase="bulk", slot_ids=source_slots) == 1
     assert target_slots.tolist() == [1, 3]
     assert target.receive_phase(transition, phase="bulk") == frozenset({1})
@@ -211,8 +213,10 @@ def test_global_exchange_uses_source_slots_with_rank_skew():
         slot_chunk_size=2,
     )
 
-    source_slots = source.prepare_transition(transition)
-    target_slots = target.prepare_transition(transition)
+    source.prepare_transition(transition)
+    target.prepare_transition(transition)
+    source_slots = source.fence_slots(transition)
+    target_slots = target.fence_slots(transition)
     assert target_slots.tolist() == [2, 4]
     assert (
         source.exchange_phase(transition, phase="bulk", slot_ids=source_slots)
@@ -257,8 +261,9 @@ def test_empty_source_snapshot_still_delivers_one_chunk():
         rank=1,
     )
 
-    source_slots = source.prepare_transition(transition)
+    source.prepare_transition(transition)
     target.prepare_transition(transition)
+    source_slots = source.fence_slots(transition)
     assert (
         source.exchange_phase(transition, phase="bulk", slot_ids=source_slots)
         == frozenset()
@@ -294,7 +299,7 @@ def test_prepare_transition_rolls_back_before_coordinator_flags_exist():
     with pytest.raises(RuntimeError, match="injected failure"):
         transport.prepare_transition(transition)
 
-    assert allocator.finished
+    assert not allocator.finished
     assert not allocator.tracking
     assert pool._elastic_pp_pending_kv == {}
     assert pool._elastic_pp_residency.pending is None

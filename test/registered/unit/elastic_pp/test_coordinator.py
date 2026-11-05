@@ -15,14 +15,35 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+class _CompletedWork:
+    @staticmethod
+    def is_completed():
+        return True
+
+    @staticmethod
+    def wait():
+        return True
+
+
 class _Group:
     world_size = 2
 
-    def __init__(self, *, fail_stage=None, mismatch_stage=None, peer_fence_step=None):
+    def __init__(
+        self,
+        *,
+        fail_stage=None,
+        mismatch_stage=None,
+        peer_fence_step=None,
+        peer_drain_state=None,
+        peer_drain_microstep=None,
+    ):
         self.fail_stage = fail_stage
         self.mismatch_stage = mismatch_stage
         self.peer_fence_step = peer_fence_step
+        self.peer_drain_state = peer_drain_state
+        self.peer_drain_microstep = peer_drain_microstep
         self.stages = []
+        self.drain_reductions = []
 
     def all_gather_object(self, report):
         self.stages.append(report["stage"])
@@ -35,7 +56,30 @@ class _Group:
             peer["details"] = (999, "different")
         if report["stage"] == "arm_fence" and self.peer_fence_step is not None:
             peer["details"] = self.peer_fence_step
+        if (
+            report["stage"] == "scheduler_alignment"
+            and self.peer_drain_microstep is not None
+        ):
+            peer["details"] = (
+                self.peer_drain_microstep,
+                report["details"][1],
+            )
         return [report, peer]
+
+    def all_reduce_cpu(self, tensor, *, async_op=False):
+        assert async_op
+        local_ready, generation = tensor.tolist()
+        peer_ready = (
+            local_ready if self.peer_drain_state is None else self.peer_drain_state
+        )
+        self.drain_reductions.append((local_ready, generation))
+        tensor.add_(
+            torch.tensor(
+                [int(peer_ready), generation],
+                dtype=tensor.dtype,
+            )
+        )
+        return _CompletedWork()
 
 
 class _LayerTransport:
@@ -75,7 +119,6 @@ class _KVTransport:
 
     def prepare_transition(self, transition):
         del transition
-        return torch.tensor([1, 3], dtype=torch.long)
 
     def exchange_phase(self, transition, phase, slot_ids):
         del transition
@@ -191,7 +234,7 @@ def test_prepare_fence_commit_and_deferred_cleanup(monkeypatch, device, expected
         threading.current_thread().name,
     ]
     assert kv_transport.applied
-    assert kv_transport.finished
+    assert not kv_transport.finished
 
     coordinator.start_cleanup()
     done = coordinator.wait_for_phase(ElasticPPMigrationPhase.DONE, timeout=2)
@@ -221,6 +264,22 @@ def test_prepare_arms_one_future_fence_from_the_slowest_scheduler_rank():
     assert ready.fence_microstep == 25
 
 
+def test_scheduler_fence_waits_for_every_resident_rank_to_drain():
+    group = _Group(peer_drain_state=False, peer_drain_microstep=11)
+    coordinator, transition, _, _ = _coordinator(group)
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+
+    assert not coordinator.poll_all_ranks_drained_at_fence(True)
+    assert not coordinator.poll_all_ranks_drained_at_fence(True)
+    group.peer_drain_state = True
+    assert not coordinator.poll_all_ranks_drained_at_fence(True)
+    assert coordinator.poll_all_ranks_drained_at_fence(True)
+    assert group.drain_reductions == [(1, 1), (1, 1)]
+    assert coordinator.aligned_resume_microstep(10, 4) == 12
+    assert group.stages[-1] == "scheduler_alignment"
+
+
 def test_prepare_peer_failure_aborts_without_changing_source_generation():
     group = _Group(fail_stage="prepare_allocations")
     coordinator, transition, runner, kv_transport = _coordinator(group)
@@ -231,7 +290,7 @@ def test_prepare_peer_failure_aborts_without_changing_source_generation():
     assert coordinator.current_topology == transition.source
     assert runner.aborted_layers
     assert runner.aborted_kv
-    assert kv_transport.finished
+    assert not kv_transport.finished
 
 
 def test_fence_slot_failure_reaches_consensus_before_abort():
@@ -258,7 +317,7 @@ def test_fence_slot_failure_reaches_consensus_before_abort():
     assert coordinator.snapshot().source_usable
     assert runner.aborted_layers
     assert runner.aborted_kv
-    assert kv_transport.finished
+    assert not kv_transport.finished
 
 
 def test_rank_skewed_bulk_and_delta_snapshots_are_allowed():
@@ -302,3 +361,28 @@ def test_peer_commit_failure_is_reported_as_nonrecoverable_partial_commit():
         raise AssertionError("peer commit failure unexpectedly succeeded")
     assert runner.committed
     assert not coordinator.snapshot().source_usable
+
+
+def test_pp2_pp4_pp2_reuses_coordinator_without_slot_tracker_lifecycle():
+    group = _Group()
+    group.world_size = 4
+    group.all_gather_object = lambda report: [
+        dict(report, rank=rank) for rank in range(4)
+    ]
+    coordinator, _, _, kv_transport = _coordinator(group)
+    coordinator.current_topology = PPTopology.from_layer_counts(
+        [2, 2, 0, 0], generation=0
+    )
+    for generation, counts in enumerate(([1, 1, 1, 1], [2, 2, 0, 0]), start=1):
+        transition = DynamicPPTransition.build(
+            coordinator.current_topology,
+            PPTopology.from_layer_counts(counts, generation=generation),
+        )
+        coordinator.begin(transition)
+        coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+        coordinator.finalize_at_fence(lambda topology: None)
+        assert not kv_transport.finished
+        coordinator.start_cleanup()
+        coordinator.wait_for_phase(ElasticPPMigrationPhase.DONE, timeout=2)
+        assert coordinator.current_topology == transition.target
+    assert kv_transport.phases == [("bulk", (1, 3, 5)), ("delta", ())] * 2

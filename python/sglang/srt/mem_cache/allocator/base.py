@@ -65,9 +65,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.free_group = []
 
     def free_group_end(self):
+        pending_frees = self.free_group
+        self.free_group = []
         self.is_not_in_free_group = True
-        if self.free_group:
-            self.free(torch.cat(self.free_group))
+        if pending_frees:
+            self.free(torch.cat(pending_frees))
 
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:

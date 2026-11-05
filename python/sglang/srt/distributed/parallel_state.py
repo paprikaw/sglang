@@ -35,7 +35,17 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from multiprocessing import shared_memory
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Collection,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 from unittest.mock import patch
 
 import torch
@@ -590,12 +600,12 @@ class GroupCoordinator:
 
     @property
     def first_rank(self):
-        """Return the global rank of the first process in the group"""
+        """Return the global rank of the first process in the logical route."""
         return self.routing_ranks[0]
 
     @property
     def last_rank(self):
-        """Return the global rank of the last process in the group"""
+        """Return the global rank of the last process in the logical route."""
         return self.routing_ranks[-1]
 
     @property
@@ -1555,6 +1565,24 @@ class GroupCoordinator:
         torch.distributed.all_gather_object(objs, obj, group=self.cpu_group)
         return objs
 
+    def all_reduce_cpu(
+        self,
+        tensor: torch.Tensor,
+        *,
+        async_op: bool = False,
+    ) -> Optional[torch.distributed.Work]:
+        """Reduce a CPU control tensor on this coordinator's CPU group."""
+
+        if not tensor.is_cpu:
+            raise ValueError("all_reduce_cpu requires a CPU tensor")
+        if self.world_size == 1:
+            return None
+        return torch.distributed.all_reduce(
+            tensor,
+            group=self.cpu_group,
+            async_op=async_op,
+        )
+
     def send_object(
         self,
         obj: Any,
@@ -1732,8 +1760,16 @@ class GroupCoordinator:
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
+        use_pynccl: bool = False,
+        metadata_tag: int = 0,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
+
+        ``use_pynccl`` keeps GPU payloads on this coordinator's full-group
+        PyNCCL communicator while metadata continues to use the CPU group.
+        Elastic PP uses this to isolate skipped-rank activation edges from the
+        reverse ProcessGroupNCCL output-token ring.
+
         NOTE: `dst` is the local rank of the source rank.
         """
         # Bypass the function if we are using only 1 GPU.
@@ -1764,7 +1800,21 @@ class GroupCoordinator:
         # Thus the net performance gain justifies this approach.
 
         send_func = torch.distributed.isend if async_send else torch.distributed.send
-        p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
+        p2p_works = self.send_object(
+            metadata_list,
+            dst=dst,
+            async_send=async_send,
+            tag=metadata_tag,
+        )
+
+        pynccl_comm = self.pynccl_comm if use_pynccl else None
+        if use_pynccl and (
+            pynccl_comm is None or not getattr(pynccl_comm, "available", False)
+        ):
+            raise RuntimeError(
+                "PyNCCL tensor-dict send requested without an available "
+                f"communicator for group {self.unique_name}"
+            )
 
         for tensor in tensor_list:
             if tensor.numel() == 0:
@@ -1775,18 +1825,43 @@ class GroupCoordinator:
             if all_gather_group is not None and tensor.numel() % all_gather_size == 0:
                 tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
-            comm_group = metadata_group if tensor.is_cpu else group
-            work = send_func(tensor, self.ranks[dst], group=comm_group)
-            if async_send:
-                p2p_works.append(P2PWork(work, tensor))
+            if pynccl_comm is not None and not tensor.is_cpu:
+                with pynccl_comm.change_state(enable=True):
+                    pynccl_comm.send(tensor, dst)
+                # PyNCCL enqueues directly on the current CUDA stream and
+                # returns no ProcessGroup work handle.  Keep the allocation
+                # alive until that stream retires the send.
+                tensor.record_stream(self.device_module.current_stream())
+            else:
+                comm_group = metadata_group if tensor.is_cpu else group
+                send_kwargs = {"tag": metadata_tag} if tensor.is_cpu else {}
+                work = send_func(
+                    tensor,
+                    self.ranks[dst],
+                    group=comm_group,
+                    **send_kwargs,
+                )
+                if async_send:
+                    p2p_works.append(P2PWork(work, tensor))
         return p2p_works
 
     def recv_tensor_dict(
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        use_pynccl: bool = False,
+        pynccl_message_types: Optional[Collection[str]] = None,
+        metadata_tag: int = 0,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
+
+        With ``use_pynccl``, every GPU receive uses the full-group PyNCCL
+        communicator.  ``pynccl_message_types`` instead selects PyNCCL from
+        the ``__msg_type__`` value in the metadata that was actually received.
+        The latter is required when multiple typed protocols share one CPU
+        metadata queue.  Callers must keep the usual stream dependency before
+        consuming the tensors elsewhere.
+
         NOTE: `src` is the local rank of the source rank.
         """
         # Bypass the function if we are using only 1 GPU.
@@ -1805,7 +1880,29 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        recv_metadata_list = self.recv_object(src=src)
+        recv_metadata_list = self.recv_object(src=src, tag=metadata_tag)
+        received_message_type = next(
+            (
+                value
+                for key, value in recv_metadata_list
+                if key == "__msg_type__" and isinstance(value, str)
+            ),
+            None,
+        )
+        message_uses_pynccl = use_pynccl or (
+            pynccl_message_types is not None
+            and received_message_type in pynccl_message_types
+        )
+        pynccl_comm = self.pynccl_comm if message_uses_pynccl else None
+        if message_uses_pynccl and (
+            pynccl_comm is None or not getattr(pynccl_comm, "available", False)
+        ):
+            raise RuntimeError(
+                "PyNCCL tensor-dict receive requested without an available "
+                f"communicator for group {self.unique_name}; "
+                f"message_type={received_message_type!r}"
+            )
+
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
@@ -1825,12 +1922,21 @@ class GroupCoordinator:
                     orig_shape = tensor.shape
                     tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
 
-                # We have to use irecv here to make it work for both isend and send.
-                comm_group = metadata_group if tensor.is_cpu else group
-                work = torch.distributed.irecv(
-                    tensor, src=self.ranks[src], group=comm_group
-                )
-                work.wait()
+                if pynccl_comm is not None and not tensor.is_cpu:
+                    with pynccl_comm.change_state(enable=True):
+                        pynccl_comm.recv(tensor, src)
+                else:
+                    # We have to use irecv here to make it work for both isend
+                    # and send.
+                    comm_group = metadata_group if tensor.is_cpu else group
+                    recv_kwargs = {"tag": metadata_tag} if tensor.is_cpu else {}
+                    work = torch.distributed.irecv(
+                        tensor,
+                        src=self.ranks[src],
+                        group=comm_group,
+                        **recv_kwargs,
+                    )
+                    work.wait()
 
                 if use_all_gather:
                     tensor = all_gather_group.all_gather(tensor, dim=0)

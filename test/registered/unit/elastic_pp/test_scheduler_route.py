@@ -1,4 +1,7 @@
 from collections import defaultdict, deque
+from contextlib import nullcontext
+import torch
+from sglang.srt.distributed.parallel_state import GroupCoordinator, TensorMetadata
 from types import SimpleNamespace
 
 import pytest
@@ -16,6 +19,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.scheduler_pp_mixin import (
     PPBatchMetadata,
     SchedulerPPMixin,
+    _ElasticPPRequestRingFence,
 )
 
 
@@ -25,6 +29,7 @@ class _FakePPGroup:
         self.size = size
         self.ranks = list(range(size))
         self.routing_rank_indices = tuple(range(size))
+        self.pynccl_comm = SimpleNamespace(available=True)
         self.sent = []
         self.received = deque()
 
@@ -97,6 +102,14 @@ class _FakeScheduler(SchedulerPPMixin):
         self.forward_ct = 0
         self._sched_idled = True
         self.future_map = None
+        self._pp_microstep = 0
+        self.pp_loop_size = size
+        self.send_req_work = []
+        self.send_proxy_work = []
+        self.send_output_handoff_work = []
+        self.send_output_work = []
+        self._elastic_pp_request_ring_fence_seen = True
+        self._elastic_pp_request_ring_drained = True
 
 
 class _FakeSender:
@@ -121,6 +134,9 @@ class _FakeMigrationCoordinator:
         self.fence_microstep = fence_microstep
         self.cleanup_event = None
         self.begun = False
+        self.all_ranks_drained = True
+        self.local_drain_reports = []
+        self.alignment_calls = []
 
     def snapshot(self):
         return SimpleNamespace(
@@ -144,6 +160,14 @@ class _FakeMigrationCoordinator:
         self.current_topology = self.transition.target
         self.phase = ElasticPPMigrationPhase.COMMITTED
         return self.transition.target
+
+    def poll_all_ranks_drained_at_fence(self, local_drained):
+        self.local_drain_reports.append(local_drained)
+        return local_drained and self.all_ranks_drained
+
+    def aligned_resume_microstep(self, microstep, ring_size):
+        self.alignment_calls.append((microstep, ring_size))
+        return (microstep // ring_size + 1) * ring_size
 
     def begin(self, transition):
         self.transition = transition
@@ -492,6 +516,7 @@ def test_common_future_microstep_arms_drain_on_the_exact_boundary():
     assert scheduler._elastic_pp_drain_due()
 
 
+
 def test_drained_fence_commits_route_replies_and_defers_cleanup():
     scheduler = _FakeScheduler(rank=0)
     source = _pp2_topology(generation=0)
@@ -512,7 +537,7 @@ def test_drained_fence_commits_route_replies_and_defers_cleanup():
     scheduler.send_proxy_work = []
     scheduler.send_output_work = []
 
-    scheduler._elastic_pp_finalize_if_drained()
+    assert scheduler._elastic_pp_finalize_if_drained()
 
     assert scheduler._pp_topology() == target
     assert not scheduler._elastic_pp_draining
@@ -522,6 +547,9 @@ def test_drained_fence_commits_route_replies_and_defers_cleanup():
     assert sender.outputs[0][0].migration_phase == "committed"
     assert coordinator.phase == ElasticPPMigrationPhase.CLEANING
     assert coordinator.cleanup_event.recorded_stream == "schedule-stream"
+    assert coordinator.alignment_calls == [(0, 4)]
+    assert scheduler._pp_microstep == 4
+
 
 
 def test_reconfigure_request_starts_prepare_without_blocking_scheduler_ring():
@@ -608,3 +636,218 @@ def test_autoscale_state_reports_topology_and_backlog():
         ).running_requests
         == 4
     )
+
+
+def test_elastic_output_ring_stays_on_process_group_nccl():
+    scheduler = _FakeScheduler(rank=3)
+    scheduler._pp_install_topology(_pp2_topology(generation=5))
+
+    scheduler._pp_send_dict_to_next_stage(
+        {"next_token_ids": "payload"}, msg_type="output"
+    )
+
+    sent = scheduler.pp_group.sent[0]
+    assert sent["dst"] is None
+    assert not sent["use_pynccl"]
+
+
+
+def test_elastic_proxy_route_rejects_missing_pynccl():
+    scheduler = _FakeScheduler(rank=0)
+    scheduler._pp_install_topology(_pp2_topology())
+    scheduler.pp_group.pynccl_comm = None
+
+    with pytest.raises(RuntimeError, match="requires the full-group PyNCCL"):
+        scheduler._pp_send_dict_to_next_stage(
+            {"hidden_states": "payload"}, msg_type="proxy"
+        )
+
+
+
+@pytest.mark.parametrize(
+    ("message_type", "expect_pynccl"),
+    [("proxy", True), ("output", False)],
+)
+def test_tensor_dict_receive_selects_transport_from_actual_metadata(
+    monkeypatch, message_type, expect_pynccl
+):
+    group = object.__new__(GroupCoordinator)
+    group.world_size = 2
+    group.rank_in_group = 1
+    group.ranks = [0, 1]
+    group.device_group = object()
+    group.cpu_group = object()
+    group.unique_name = "test-pp"
+    recv_object_calls = []
+    group.recv_object = lambda src, tag=0: (
+        recv_object_calls.append((src, tag))
+        or [
+            ("__msg_type__", message_type),
+            ("payload", TensorMetadata("meta", torch.float32, (2,))),
+        ]
+    )
+
+    pynccl_recvs = []
+    group.pynccl_comm = SimpleNamespace(
+        available=True,
+        change_state=lambda enable: nullcontext(),
+        recv=lambda tensor, src: pynccl_recvs.append((tensor, src)),
+    )
+    process_group_recvs = []
+
+    class _Work:
+        @staticmethod
+        def wait():
+            return None
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed,
+        "irecv",
+        lambda tensor, src, group: (
+            process_group_recvs.append((tensor, src, group)) or _Work()
+        ),
+    )
+
+    received = group.recv_tensor_dict(
+        src=0,
+        pynccl_message_types=("proxy",),
+    )
+
+    assert received["__msg_type__"] == message_type
+    assert tuple(received["payload"].shape) == (2,)
+    assert recv_object_calls == [(0, 0)]
+    assert bool(pynccl_recvs) is expect_pynccl
+    assert bool(process_group_recvs) is not expect_pynccl
+
+
+
+def test_reconfigure_supports_compact_pp2_to_pp4():
+    scheduler = _FakeScheduler(rank=0)
+    source = PPTopology.from_layer_counts([4, 4, 0, 0], generation=0)
+    target = PPTopology.from_layer_counts([2, 2, 2, 2], generation=1)
+    coordinator = _FakeMigrationCoordinator(
+        DynamicPPTransition.build(source, target),
+        phase=ElasticPPMigrationPhase.IDLE,
+    )
+    scheduler._pp_install_topology(source)
+    scheduler.elastic_pp_migration_coordinator = coordinator
+    scheduler._elastic_pp_pending_req = None
+
+    response = scheduler.handle_reconfigure_elastic_pp(
+        ReconfigureElasticPPReqInput(layer_counts=[2, 2, 2, 2])
+    )
+
+    assert response is None
+    assert coordinator.begun
+    assert coordinator.transition.target == target
+
+
+
+def test_downstream_rank_waits_for_in_band_request_ring_fence():
+    scheduler = _FakeScheduler(rank=1)
+    source = _pp2_topology(generation=0)
+    target = PPTopology.from_layer_counts([2, 2, 0, 4], generation=1)
+    coordinator = _FakeMigrationCoordinator(
+        DynamicPPTransition.build(source, target), fence_microstep=10
+    )
+    scheduler.elastic_pp_migration_coordinator = coordinator
+    scheduler._elastic_pp_draining = False
+    scheduler._pp_microstep = 11
+
+    assert not scheduler._elastic_pp_drain_due()
+
+    fence = _ElasticPPRequestRingFence(generation=1, fence_microstep=10)
+    assert scheduler._elastic_pp_extract_request_ring_fence([fence]) == fence
+
+
+
+def test_request_ring_fence_rejects_mixed_payload():
+    scheduler = _FakeScheduler(rank=1)
+    source = _pp2_topology(generation=0)
+    target = PPTopology.from_layer_counts([2, 2, 0, 4], generation=1)
+    scheduler.elastic_pp_migration_coordinator = _FakeMigrationCoordinator(
+        DynamicPPTransition.build(source, target), fence_microstep=10
+    )
+    fence = _ElasticPPRequestRingFence(generation=1, fence_microstep=10)
+
+    with pytest.raises(RuntimeError, match="sole downstream payload"):
+        scheduler._elastic_pp_extract_request_ring_fence([object(), fence])
+
+
+
+def test_fence_waits_until_every_rank_reports_its_ring_drained():
+    scheduler = _FakeScheduler(rank=0)
+    source = _pp2_topology(generation=0)
+    target = PPTopology.from_layer_counts([2, 2, 0, 4], generation=1)
+    coordinator = _FakeMigrationCoordinator(DynamicPPTransition.build(source, target))
+    coordinator.all_ranks_drained = False
+    scheduler._pp_install_topology(source)
+    scheduler.elastic_pp_migration_coordinator = coordinator
+    scheduler._elastic_pp_draining = True
+    scheduler._elastic_pp_pending_req = None
+    scheduler.mbs = [None, None, None, None]
+    scheduler.last_rank_comm_queue = deque()
+    scheduler.pp_outputs = None
+
+    assert not scheduler._elastic_pp_finalize_if_drained()
+
+    assert coordinator.local_drain_reports == [True]
+    assert coordinator.phase == ElasticPPMigrationPhase.BULK_READY
+    assert scheduler._pp_topology() == source
+    assert scheduler._elastic_pp_draining
+
+
+
+def test_fence_waits_for_resident_request_ring_to_drain():
+    scheduler = _FakeScheduler(rank=0)
+    source = _pp2_topology(generation=0)
+    target = PPTopology.from_layer_counts([2, 2, 0, 4], generation=1)
+    transition = DynamicPPTransition.build(source, target)
+    coordinator = _FakeMigrationCoordinator(transition)
+    scheduler._pp_install_topology(source)
+    scheduler.elastic_pp_migration_coordinator = coordinator
+    scheduler._elastic_pp_draining = True
+    scheduler._elastic_pp_pending_req = None
+    scheduler.mbs = [None, None, None, None]
+    scheduler.last_rank_comm_queue = deque()
+    scheduler.pp_outputs = None
+
+    request_work = SimpleNamespace(waited=False)
+    request_work.wait = lambda: setattr(request_work, "waited", True)
+    scheduler.send_req_work = [SimpleNamespace(work=request_work)]
+    scheduler._elastic_pp_request_ring_drained = False
+    scheduler.send_proxy_work = []
+    scheduler.send_output_handoff_work = []
+    scheduler.send_output_work = []
+
+    assert not scheduler._elastic_pp_finalize_if_drained()
+
+    assert not request_work.waited
+    assert len(scheduler.send_req_work) == 1
+    assert coordinator.local_drain_reports == [False]
+    assert scheduler._pp_topology() == source
+
+
+
+def test_fence_drain_consensus_includes_inflight_topology_sends():
+    scheduler = _FakeScheduler(rank=0)
+    source = _pp2_topology(generation=0)
+    target = PPTopology.from_layer_counts([2, 2, 0, 4], generation=1)
+    coordinator = _FakeMigrationCoordinator(DynamicPPTransition.build(source, target))
+    scheduler._pp_install_topology(source)
+    scheduler.elastic_pp_migration_coordinator = coordinator
+    scheduler._elastic_pp_draining = True
+    scheduler._elastic_pp_pending_req = None
+    scheduler.mbs = [None, None, None, None]
+    scheduler.last_rank_comm_queue = deque()
+    scheduler.pp_outputs = None
+    scheduler.send_proxy_work = [SimpleNamespace()]
+    scheduler.send_output_handoff_work = []
+    scheduler.send_output_work = []
+
+    assert not scheduler._elastic_pp_finalize_if_drained()
+
+    assert coordinator.local_drain_reports == [False]
+    assert coordinator.phase == ElasticPPMigrationPhase.BULK_READY
+    assert scheduler._pp_topology() == source

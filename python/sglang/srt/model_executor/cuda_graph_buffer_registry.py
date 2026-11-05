@@ -424,8 +424,10 @@ class CudaGraphBufferRegistry:
         # Phase 2: collect (dst, src) pairs and dispatch a grouped copy.
         gpu_dsts: List[torch.Tensor] = []
         gpu_srcs: List[torch.Tensor] = []
+        gpu_slot_names: List[str] = []
         cpu_dsts: List[torch.Tensor] = []
         cpu_srcs: List[torch.Tensor] = []
+        cpu_slot_names: List[str] = []
         for slot in self._slots.values():
             if not slot.enabled or slot.buffer is None or not slot.copy_from_fb:
                 continue
@@ -457,13 +459,40 @@ class CudaGraphBufferRegistry:
             if dst.device.type == "cpu":
                 cpu_dsts.append(dst)
                 cpu_srcs.append(src)
+                cpu_slot_names.append(slot.name)
             else:
                 gpu_dsts.append(dst)
                 gpu_srcs.append(src)
+                gpu_slot_names.append(slot.name)
         if gpu_dsts:
-            _grouped_foreach_copy_(gpu_dsts, gpu_srcs)
-        for dst, src in zip(cpu_dsts, cpu_srcs):
-            dst.copy_(src)
+            try:
+                _grouped_foreach_copy_(gpu_dsts, gpu_srcs)
+            except RuntimeError as exc:
+                mismatches = [
+                    f"{name}: dst={tuple(dst.shape)} src={tuple(src.shape)}"
+                    for name, dst, src in zip(gpu_slot_names, gpu_dsts, gpu_srcs)
+                    if tuple(dst.shape) != tuple(src.shape)
+                ]
+                if mismatches:
+                    raise RuntimeError(
+                        "Forward input buffer copy shape mismatch "
+                        f"(mode={getattr(forward_batch, 'forward_mode', None)}, "
+                        f"raw_bs={raw_bs}, raw_num_tokens={raw_num_tokens}): "
+                        + "; ".join(mismatches)
+                    ) from exc
+                raise
+        for name, dst, src in zip(cpu_slot_names, cpu_dsts, cpu_srcs):
+            try:
+                dst.copy_(src)
+            except RuntimeError as exc:
+                if tuple(dst.shape) != tuple(src.shape):
+                    raise RuntimeError(
+                        "Forward input buffer copy shape mismatch "
+                        f"(mode={getattr(forward_batch, 'forward_mode', None)}, "
+                        f"raw_bs={raw_bs}, raw_num_tokens={raw_num_tokens}): "
+                        f"{name}: dst={tuple(dst.shape)} src={tuple(src.shape)}"
+                    ) from exc
+                raise
 
         # Phase 3: post-fill hooks (compute-then-write slots).
         for slot in self._slots.values():

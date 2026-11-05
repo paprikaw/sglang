@@ -62,3 +62,28 @@ def test_token_allocator_rejects_unstable_snapshot_and_clear():
         allocator.clear()
     allocator.finish_elastic_pp_slot_tracking(generation=1)
     allocator.clear()
+
+
+def test_token_allocator_snapshot_after_committed_free_group():
+    allocator = TokenToKVPoolAllocator(
+        size=8,
+        dtype=torch.float32,
+        device="cpu",
+        kvcache=object(),
+        need_sort=False,
+    )
+    allocated = allocator.alloc(2)
+    allocator.free_group_begin()
+    allocator.free(allocated[:1])
+
+    with pytest.raises(RuntimeError, match="closed allocator free group"):
+        allocator.begin_elastic_pp_slot_tracking(generation=1)
+
+    allocator.free_group_end()
+    assert allocator.is_not_in_free_group
+    assert allocator.free_group == []
+    assert torch.equal(
+        allocator.begin_elastic_pp_slot_tracking(generation=1),
+        allocated[1:],
+    )
+    allocator.finish_elastic_pp_slot_tracking(generation=1)
