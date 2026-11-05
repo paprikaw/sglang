@@ -1667,6 +1667,25 @@ class TritonAttnBackend(AttentionBackend):
         Unified 1-stage extend attention for deterministic inference.
         Both prefix and extend KV are accessed through unified kv_indices.
         """
+        if envs.SGLANG_SM80_CAUSAL_VERIFY_DECODE.get():
+            from sglang.kernels.ops.attention.verify_as_decode import (
+                try_verify_as_decode,
+            )
+
+            result = try_verify_as_decode(
+                self,
+                q,
+                o,
+                layer,
+                forward_batch,
+                causal,
+                logits_soft_cap,
+                sinks,
+                score_mod,
+            )
+            if result is not None:
+                return result
+
         bs = forward_batch.batch_size
 
         # Determine sliding window settings
