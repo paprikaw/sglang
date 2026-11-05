@@ -1,19 +1,24 @@
 """Unit tests for UnifiedRadixCache"""
 
+import gc
 import json
+import os
 import shutil
 import sys
 import tempfile
 import time
 import unittest
+import weakref
 from array import array
 from collections import defaultdict
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
 import torch
 
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.kv_events import (
@@ -21,6 +26,7 @@ from sglang.srt.disaggregation.kv_events import (
     BlockStored,
     StorageMedium,
 )
+from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
@@ -48,7 +54,10 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import alloc_mmap
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
@@ -7385,6 +7394,339 @@ class TestUnifiedRadixCacheStorageAttachBackfill(CustomTestCase):
             all(h for h in self._hashes_by_token_ids(cache).values()),
             "every node must carry a hash chain once storage is enabled",
         )
+
+
+class TestHiCachePPPrefetchGroups(CustomTestCase):
+    def controller(self, pp_size):
+        controller = object.__new__(HiCacheController)
+        controller.tp_group = mock.sentinel.tp
+        controller.pp_group = mock.sentinel.pp if pp_size > 1 else None
+        controller.attn_cp_group = controller.attn_tp_group = None
+        return controller
+
+    def test_pp_attach_creates_group_without_other_stages(self):
+        controller = self.controller(2)
+        with (
+            mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+            mock.patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+            ),
+            mock.patch.object(
+                torch.distributed, "new_group", return_value=mock.sentinel.prefetch
+            ) as new_group,
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.create_custom_parallel_group"
+            ) as global_group,
+        ):
+            controller._create_prefetch_sync_groups()
+        new_group.assert_called_once_with(
+            ranks=[0, 1], backend="gloo", use_local_synchronization=True
+        )
+        global_group.assert_not_called()
+        self.assertEqual(controller.prefetch_sync_groups, [mock.sentinel.prefetch])
+
+    def test_pp1_retains_existing_group_creation(self):
+        controller = self.controller(1)
+        with (
+            mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+            mock.patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+            ),
+            mock.patch.object(torch.distributed, "new_group") as local_group,
+            mock.patch(
+                "sglang.srt.distributed.parallel_state.create_custom_parallel_group",
+                return_value=mock.sentinel.prefetch,
+            ) as global_group,
+        ):
+            controller._create_prefetch_sync_groups()
+        global_group.assert_called_once_with(group_ranks=[0, 1], backend="gloo")
+        local_group.assert_not_called()
+        self.assertEqual(controller.prefetch_sync_groups, [mock.sentinel.prefetch])
+
+    def test_duplicate_attention_groups_create_one_prefetch_group(self):
+        controller = self.controller(2)
+        controller.attn_cp_group, controller.attn_tp_group = (
+            mock.sentinel.cp,
+            mock.sentinel.attn_tp,
+        )
+        with (
+            mock.patch.object(torch.distributed, "get_world_size", return_value=2),
+            mock.patch.object(
+                torch.distributed, "get_process_group_ranks", return_value=[0, 1]
+            ),
+            mock.patch.object(
+                torch.distributed, "new_group", return_value=mock.sentinel.prefetch
+            ) as new_group,
+        ):
+            controller._create_prefetch_sync_groups()
+        self.assertEqual(new_group.call_count, 1)
+        self.assertEqual(controller.prefetch_sync_groups, [mock.sentinel.prefetch])
+
+
+class TestPPPrefetchAdmission(CustomTestCase):
+    def cache(self, rank=0, size=2):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.pp_rank, cache.pp_size = rank, size
+        cache.pp_group = mock.sentinel.pp if size > 1 else None
+        cache.ongoing_prefetch = {}
+        return cache
+
+    def primary_decision(self, cache, ready, request_key=None):
+        def sync(data, *, tag):
+            self.assertEqual(tag, P2PTag.HIRADIX_PP_PREFETCH_ADMISSION)
+            data[1] = int(ready)
+            if request_key is not None:
+                data[0] = request_key
+
+        return mock.patch.object(cache, "_pp_sync", side_effect=sync)
+
+    def test_primary_can_publish_pending_without_downstream_readiness(self):
+        cache = self.cache()
+        with (
+            mock.patch.object(
+                cache, "_check_prefetch_progress_local", return_value=False
+            ),
+            mock.patch.object(cache, "_pp_sync") as sync,
+        ):
+            self.assertFalse(cache.check_prefetch_progress("req"))
+        self.assertEqual(
+            sync.call_args.args[0].tolist(), [cache._pp_request_key("req"), 0]
+        )
+        self.assertEqual(
+            sync.call_args.kwargs["tag"], P2PTag.HIRADIX_PP_PREFETCH_ADMISSION
+        )
+
+    def test_downstream_finished_io_still_follows_primary_pending(self):
+        cache = self.cache(rank=1)
+        with (
+            self.primary_decision(cache, False),
+            mock.patch.object(
+                cache, "_check_prefetch_progress_local", return_value=True
+            ) as local,
+            mock.patch.object(cache, "drain_storage_control_queues") as drain,
+        ):
+            self.assertFalse(cache.check_prefetch_progress("req"))
+        local.assert_not_called()
+        drain.assert_not_called()
+
+    def test_positive_decision_waits_local_io_and_drains_query_hits(self):
+        cache = self.cache(rank=1)
+        with (
+            self.primary_decision(cache, True),
+            mock.patch.object(
+                cache,
+                "_check_prefetch_progress_local",
+                side_effect=[False, False, True],
+            ),
+            mock.patch.object(cache, "drain_storage_control_queues") as drain,
+            mock.patch("sglang.srt.mem_cache.unified_radix_cache.time.sleep"),
+        ):
+            self.assertTrue(cache.check_prefetch_progress("req"))
+        self.assertEqual(drain.call_count, 2)
+
+    def test_missing_local_prefetch_still_receives_admission_decision(self):
+        cache = self.cache(rank=1)
+        with self.primary_decision(cache, True) as sync:
+            self.assertTrue(cache.check_prefetch_progress("cached"))
+        self.assertEqual(sync.call_count, 1)
+
+    def test_request_order_mismatch_fails_before_admission(self):
+        cache = self.cache(rank=1)
+        with self.primary_decision(cache, True, cache._pp_request_key("other")):
+            with self.assertRaisesRegex(RuntimeError, "request order mismatch"):
+                cache.check_prefetch_progress("req")
+
+    def test_prefix_mismatch_is_rejected_before_proxy_compute(self):
+        cache = self.cache(rank=1)
+
+        def sync(data, *, tag):
+            self.assertEqual(tag, P2PTag.HIRADIX_PP_PREFIX_ALIGNMENT)
+            data[1] = 128
+
+        with mock.patch.object(cache, "_pp_sync", side_effect=sync):
+            with self.assertRaisesRegex(RuntimeError, "prefix mismatch"):
+                cache.check_pp_prefix_alignment("req", 64)
+
+    def test_pp1_keeps_local_readiness_without_extra_communication(self):
+        cache = self.cache(size=1)
+        with (
+            mock.patch.object(
+                cache, "_check_prefetch_progress_local", return_value=False
+            ),
+            mock.patch.object(cache, "_pp_sync") as sync,
+        ):
+            self.assertFalse(cache.check_prefetch_progress("req"))
+            cache.check_pp_prefix_alignment("req", 64)
+        sync.assert_not_called()
+
+
+class TestHiCacheHostSleepLifecycle(unittest.TestCase):
+    def _cache(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        host_pool = mock.Mock()
+        controller = mock.Mock()
+        component = mock.Mock()
+        component._full_kv_pool_host = host_pool
+        cache._hicache_host_suspended = False
+        cache._hicache_init_server_args = object()
+        cache._hicache_init_params = object()
+        cache.cache_controller = controller
+        cache.host_pool_group = host_pool
+        cache.tree_core = mock.Mock()
+        cache.enable_storage = False
+        cache.components = {ComponentType.FULL: component}
+        cache.full_kv_pool_host = host_pool
+        cache.buffer_pipeline = object()
+        cache.sidecar_pool_specs = [object()]
+        cache._storage_attachment = object()
+        cache._drain_async_work = mock.Mock()
+        cache._reset_full = mock.Mock()
+        return cache, host_pool, component
+
+    def test_suspend_drops_every_host_stack_reference(self):
+        cache, host_pool, component = self._cache()
+        device_module = mock.Mock()
+        with (
+            mock.patch("torch.get_device_module", return_value=device_module),
+            mock.patch(
+                "sglang.srt.mem_cache.unified_radix_cache.gc.collect"
+            ) as collect,
+        ):
+            cache.suspend_hicache_host_memory()
+
+        cache._drain_async_work.assert_called_once_with()
+        cache._reset_full.assert_called_once_with()
+        device_module.synchronize.assert_called_once_with()
+        host_pool.destroy.assert_called_once_with()
+        self.assertIsNone(cache.cache_controller)
+        self.assertIsNone(cache.host_pool_group)
+        self.assertIsNone(cache.full_kv_pool_host)
+        self.assertIsNone(component._full_kv_pool_host)
+        self.assertTrue(cache._hicache_host_suspended)
+        collect.assert_called_once_with()
+
+    def test_suspend_rejects_attached_storage(self):
+        cache, host_pool, _ = self._cache()
+        cache.enable_storage = True
+        with self.assertRaisesRegex(RuntimeError, "L3 storage backend"):
+            cache.suspend_hicache_host_memory()
+        host_pool.destroy.assert_not_called()
+
+    def _mmap_cache(self):
+        cache, _, _ = self._cache()
+        # Use the real pool/group and the controller's real bound callbacks,
+        # but skip CUDA initialization: the bug concerns CPU object ownership.
+        host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        with envs.SGLANG_HUGEPAGE_SIZE.override(""):
+            host_pool.kv_buffer = alloc_mmap((2, 1, 131072), torch.float32)
+        host_pool.k_data_refs = [host_pool.k_buffer[0]]
+        host_pool.v_data_refs = [host_pool.v_buffer[0]]
+        host_pool.host_kv_data_refs = host_pool.k_data_refs + host_pool.v_data_refs
+        host_pool.layout = "layer_first"
+        host_pool.page_size = 1
+        host_pool.device = "cpu"
+        host_pool.size = 131072
+        host_pool.dcp_size = 1
+        host_pool.pin_memory = False
+        host_pool.can_use_write_back_jit = False
+        group = HostPoolGroup(
+            [
+                PoolEntry(
+                    name=PoolName.KV,
+                    host_pool=host_pool,
+                    device_pool=None,
+                    layer_mapper=lambda layer: layer,
+                    is_primary_index_anchor=True,
+                )
+            ]
+        )
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.mem_pool_host = group
+        controller.page_get_func = controller._generic_page_get
+        controller.page_set_func = controller._generic_page_set
+        cache.cache_controller = controller
+        cache.host_pool_group = group
+        cache.full_kv_pool_host = host_pool
+        cache.components = {
+            ComponentType.FULL: SimpleNamespace(_full_kv_pool_host=host_pool)
+        }
+        refs = tuple(
+            weakref.ref(value)
+            for value in (controller, group, host_pool, host_pool.k_data_refs[0])
+        )
+        return cache, refs, host_pool.k_data_refs[0].data_ptr()
+
+    @unittest.skipUnless(os.path.exists("/proc/self/maps"), "Linux mmap accounting")
+    def test_suspend_reclaims_frozen_controller_cycle_and_anonymous_mmap(self):
+        was_frozen = gc.is_tracked(self) and not any(
+            obj is self for obj in gc.get_objects()
+        )
+        was_enabled = gc.isenabled()
+        callbacks = list(gc.callbacks)
+        cache, refs, address = self._mmap_cache()
+
+        def address_is_mapped():
+            with open("/proc/self/maps") as mappings:
+                for mapping in mappings:
+                    start, end = mapping.split()[0].split("-")
+                    if int(start, 16) <= address < int(end, 16):
+                        return True
+            return False
+
+        try:
+            gc.freeze()
+            self.assertTrue(address_is_mapped())
+            with mock.patch("torch.get_device_module", return_value=mock.Mock()):
+                cache.suspend_hicache_host_memory()
+            self.assertTrue(all(ref() is None for ref in refs))
+            self.assertFalse(address_is_mapped())
+            self.assertGreater(gc.get_freeze_count(), 0)
+            self.assertEqual(gc.isenabled(), was_enabled)
+            self.assertEqual(gc.callbacks, callbacks)
+        finally:
+            gc.unfreeze()
+            gc.collect()
+            if was_frozen:
+                gc.freeze()
+
+    def test_suspend_keeps_unfrozen_disabled_gc_state(self):
+        was_frozen = gc.is_tracked(self) and not any(
+            obj is self for obj in gc.get_objects()
+        )
+        was_enabled = gc.isenabled()
+        try:
+            gc.unfreeze()
+            gc.disable()
+            sentinel = SimpleNamespace()
+            cache, refs, _ = self._mmap_cache()
+            with mock.patch("torch.get_device_module", return_value=mock.Mock()):
+                cache.suspend_hicache_host_memory()
+            self.assertTrue(all(ref() is None for ref in refs))
+            self.assertTrue(any(obj is sentinel for obj in gc.get_objects()))
+            self.assertFalse(gc.isenabled())
+        finally:
+            if was_enabled:
+                gc.enable()
+            else:
+                gc.disable()
+            if was_frozen:
+                gc.freeze()
+
+    def test_resume_rebuilds_stack_and_returns_new_counter(self):
+        cache, _, _ = self._cache()
+        cache._hicache_host_suspended = True
+        counter = object()
+
+        def rebuild(server_args, params):
+            cache.cache_controller = mock.Mock(layer_done_counter=counter)
+            cache.host_pool_group = object()
+
+        cache.init_hicache = mock.Mock(side_effect=rebuild)
+        self.assertIs(cache.resume_hicache_host_memory(), counter)
+        cache.init_hicache.assert_called_once_with(
+            cache._hicache_init_server_args, cache._hicache_init_params
+        )
+        self.assertFalse(cache._hicache_host_suspended)
 
 
 if __name__ == "__main__":

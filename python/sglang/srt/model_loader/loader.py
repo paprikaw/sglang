@@ -4292,6 +4292,20 @@ def get_model_loader(
             raise ValueError("canonical RAM bank requires normal safetensors loading")
         return CanonicalCpuModelLoader(load_config, DefaultModelLoader(load_config))
 
+    if os.environ.get("SGLANG_CPU_WEIGHT_CACHE_SOCKET"):
+        from sglang.srt.weight_cache.cpu_loader import CpuDaemonModelLoader
+
+        if load_config.load_format not in (
+            LoadFormat.AUTO,
+            LoadFormat.PT,
+            LoadFormat.SAFETENSORS,
+            LoadFormat.FASTSAFETENSORS,
+        ):
+            raise ValueError(
+                "CPU daemon snapshots require the default checkpoint loader"
+            )
+        return CpuDaemonModelLoader(load_config, DefaultModelLoader(load_config))
+
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
 

@@ -712,21 +712,13 @@ class CommonKVManager(BaseKVManager):
             else:
                 required_prefill_response_num *= info.attn_cp_size // self.attn_cp_size
 
-        if info.pp_size == self.pp_size:
-            target_pp_ranks = [self.pp_rank]
-        elif info.pp_size == 1 and self._supports_pp1_to_pp_decode(info):
-            # Every decode stage pulls its own layers from the same PP1 sender.
-            # The sender must receive all stage destinations before releasing
-            # the request's KV/state, not just the first stage's registration.
-            target_pp_ranks = [0]
-            required_dst_info_num *= self.pp_size
-        else:
-            assert self.pp_size == 1, (
-                f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1; "
-                "PP1 to pipelined decode requires a qualified layer-aware backend",
-            )
-            target_pp_ranks = list(range(info.pp_size))
-            required_prefill_response_num *= info.pp_size // self.pp_size
+        # Count both destinations per sender and senders per receiver. A backend
+        # that splits a prefill stage must wait for every destination's KV.
+        target_pp_ranks, pp_dst_count, pp_response_count = (
+            self._resolve_pp_rank_mapping(info)
+        )
+        required_dst_info_num *= pp_dst_count
+        required_prefill_response_num *= pp_response_count
 
         info.target_tp_rank = target_tp_rank
         info.target_tp_ranks = target_tp_ranks
@@ -734,6 +726,20 @@ class CommonKVManager(BaseKVManager):
         info.target_pp_ranks = target_pp_ranks
         info.required_dst_info_num = required_dst_info_num
         info.required_prefill_response_num = required_prefill_response_num
+
+    def _resolve_pp_rank_mapping(
+        self, info: PrefillServerInfo
+    ) -> Tuple[List[int], int, int]:
+        """Return target prefill ranks, destination fan-out, and response fan-in."""
+        if info.pp_size == self.pp_size:
+            return [self.pp_rank], 1, 1
+        if info.pp_size == 1 and self._supports_pp1_to_pp_decode(info):
+            return [0], self.pp_size, 1
+        assert self.pp_size == 1, (
+            f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1; "
+            "PP1 to pipelined decode requires a qualified layer-aware backend",
+        )
+        return list(range(info.pp_size)), 1, info.pp_size
 
     def _sync_bootstrap_port_across_nodes(self, local_port: int) -> int:
         """Broadcast world-rank-0's bootstrap port to all prefill ranks.

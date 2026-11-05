@@ -285,6 +285,11 @@ def load_model_with_memory_saver(
         is_draft_worker and get_exec().features.enable_draft_weights_cpu_backup
     )
 
+    # The independent daemon owns the CPU snapshot. Do not also make an
+    # engine-private CPU shadow when releasing these GPU allocations.
+    if os.environ.get("SGLANG_CPU_WEIGHT_CACHE_SOCKET"):
+        enable_cpu_backup = False
+
     # In zero-copy IPC mode, the weights are shared with the daemon via
     # CUDA IPC and must not be offloaded/reloaded by the memory saver.
     is_ipc_zero_copy = get_model().weight_cache_mode != "off"

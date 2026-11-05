@@ -22,6 +22,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
     KVTransferError,
+    PrefillServerInfo,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
@@ -225,6 +226,49 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
             )
         )
+
+    def _resolve_pp_rank_mapping(
+        self, info: PrefillServerInfo
+    ) -> Tuple[List[int], int, int]:
+        if info.pp_size != 1 or self.pp_size != 2:
+            return super()._resolve_pp_rank_mapping(info)
+
+        # TP1 uses the newer hybrid/GDN capability check, including its explicit
+        # layer-registration requirements. Never fall back to native TP slicing
+        # when that metadata is absent or incomplete.
+        if self.attn_tp_size == info.attn_tp_size == 1:
+            return super()._resolve_pp_rank_mapping(info)
+
+        # Initial decode-PP fan-out support: native MHA/GQA KV, equal TP, no
+        # context sharding or auxiliary state. Other layouts stay unsupported.
+        layer_ids = self.kv_args.kv_layer_ids
+        n_entries = len(self.kv_args.kv_data_ptrs)
+        n_layers = n_entries // 2
+        if (
+            self.is_mla_backend
+            or self.is_hybrid_mla_backend
+            or self.attn_tp_size != info.attn_tp_size
+            or self.attn_cp_size != 1
+            or info.attn_cp_size != 1
+            or self.dcp_size != 1
+            # Retained decode prefixes can differ by stage. Their lengths
+            # must be reconciled before one sender can trim a shared transfer.
+            or self.server_args.disaggregation_decode_enable_radix_cache
+            or self.kv_args.state_types
+            or n_entries == 0
+            or n_entries % 2
+            or len(layer_ids) != n_entries
+            or layer_ids[:n_layers] != layer_ids[n_layers:]
+        ):
+            raise RuntimeError(
+                "Mooncake P PP1 -> D PP2 requires equal TP, CP/DCP=1, "
+                "decode chunk cache, native MHA/GQA K/V buffers with global layer ids, "
+                "no speculative or auxiliary-state buffers."
+            )
+
+        # Both decode stages contact P stage 0. The sender must receive both
+        # registrations and finish both transfers before reporting success.
+        return [0], 2, 1
 
     def __init__(
         self,

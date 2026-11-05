@@ -12,4 +12,6 @@ class P2PTag(IntEnum):
 
     DEFAULT = 0
     HIRADIX_PP_SYNC = int.from_bytes(b"PpHi", byteorder="big")
+    HIRADIX_PP_PREFETCH_ADMISSION = int.from_bytes(b"PpPa", byteorder="big")
+    HIRADIX_PP_PREFIX_ALIGNMENT = int.from_bytes(b"PpMa", byteorder="big")
     GRAMMAR_PP_SYNC = int.from_bytes(b"PpGr", byteorder="big")

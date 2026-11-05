@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import inspect
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Iterable, Optional, Union
@@ -1149,6 +1150,11 @@ class ModelRunner:
             tp_rank=self.ps.tp_rank,
             load_format=draft_load_format,
         )
+
+        if os.environ.get("SGLANG_CPU_WEIGHT_CACHE_SOCKET"):
+            # Replica rank lives on the worker state, not the read-through
+            # runtime topology. Keep same-node DP replicas on distinct keys.
+            self.load_config._cpu_weight_cache_dp_rank = self.ps.dp_rank
 
         with self._load_format_scope(draft_load_format):
             loaded = load_model_with_memory_saver(

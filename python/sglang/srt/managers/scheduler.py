@@ -3478,6 +3478,12 @@ class Scheduler(
                     req.storage_hit_length = loaded_tokens
 
             req.init_next_round_input(self.tree_cache)
+            if self.enable_hicache_storage and self.ps.pp_size > 1:
+                align_prefix = getattr(
+                    self.tree_cache, "check_pp_prefix_alignment", None
+                )
+                if align_prefix is not None:
+                    align_prefix(req.rid, len(req.prefix_indices) + req.host_hit_length)
             if (
                 self.enable_hicache_storage
                 and self.server_args.hicache_host_memory_mode == "buffer_only"

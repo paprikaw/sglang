@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import atexit
+import gc
+import hashlib
 import logging
 import threading
 import time
@@ -231,6 +233,10 @@ class UnifiedRadixCache(BasePrefixCache):
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
         self.host_pool_group = None  # set by attach_hybrid_pool_to_unified_cache
+        self._hicache_init_server_args: Optional[ServerArgs] = None
+        self._hicache_init_params: Optional[CacheInitParams] = None
+        self._hicache_host_suspended = False
+        self._hicache_shutdown_registered = False
         # Owns the storage backend lifecycle; built by init_hicache.
         self._storage_attachment: Optional[StorageAttachment] = None
         self.prefetch_stop_policy = "best_effort"
@@ -316,7 +322,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._all_reduce_attn_groups(data, tp_reduce_op)
         self._pp_sync(data)
 
-    def _pp_sync(self, data: torch.Tensor) -> None:
+    def _pp_sync(self, data: torch.Tensor, tag: int = P2PTag.HIRADIX_PP_SYNC) -> None:
         """
         Synchronize data across the PP pipeline, where PPn (n>0) will receive PP0's data.
         """
@@ -327,7 +333,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 data,
                 group_src=self.pp_rank - 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=tag,
             )
         if self.pp_rank + 1 < self.pp_size:
             copy_of_data = data.clone()
@@ -335,7 +341,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 copy_of_data,
                 group_dst=self.pp_rank + 1,
                 group=self.pp_group,
-                tag=P2PTag.HIRADIX_PP_SYNC,
+                tag=tag,
             )
             self.work_list.append(send_work)
 
@@ -367,6 +373,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def init_hicache(self, server_args: ServerArgs, params: CacheInitParams) -> None:
         """Initialize HiCache infrastructure."""
+        self._hicache_init_server_args = server_args
+        self._hicache_init_params = params
         self.host_memory_mode = server_args.hicache_host_memory_mode
         if self.host_memory_mode == "buffer_only":
             # FULL and FULL+SWA only: Mamba has no state-handoff channel on
@@ -466,7 +474,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         self._storage_attachment = StorageAttachment(self)
-        atexit.register(self.shutdown)
+        if not self._hicache_shutdown_registered:
+            atexit.register(self.shutdown)
+            self._hicache_shutdown_registered = True
 
         if storage_backend is not None:
             self._storage_attachment.apply_runtime_config(
@@ -495,6 +505,87 @@ class UnifiedRadixCache(BasePrefixCache):
     def release_host_resources(self) -> None:
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
+
+    def suspend_hicache_host_memory(self) -> None:
+        """Release an idle server's CPU HiCache buffers without exiting.
+
+        This lifecycle is intentionally limited to the L2-only configuration.
+        Runtime-attached L3 backends own worker threads and registrations whose
+        reconstruction needs backend-specific recovery; refusing that case is
+        safer than leaving stale host pointers behind.
+        """
+        if self._hicache_host_suspended:
+            return
+        if self.cache_controller is None or self.host_pool_group is None:
+            raise RuntimeError("HiCache host memory is not initialized.")
+        if self.enable_storage:
+            raise RuntimeError(
+                "Cannot suspend HiCache host memory while an L3 storage backend "
+                "is attached; detach it first."
+            )
+        if self._hicache_init_server_args is None or self._hicache_init_params is None:
+            raise RuntimeError("HiCache reconstruction parameters are unavailable.")
+
+        # The scheduler has already established idleness.  Resetting here drains
+        # logical host ownership before any backing tensor is unregistered.
+        self._drain_async_work()
+        self._reset_full()
+        torch.get_device_module().synchronize()
+        self.release_host_resources()
+
+        # A frozen, GC-tracked controller is absent from get_objects().  The
+        # permanent-generation count alone cannot identify an explicitly frozen
+        # heap: Python 3.12 also puts immortal objects in that generation.
+        controller_was_frozen = gc.is_tracked(self.cache_controller) and not any(
+            obj is self.cache_controller for obj in gc.get_objects()
+        )
+
+        # Drop every strong reference to the old pools/controller.  Host pool
+        # subclasses retain tensor views in addition to kv_buffer; destroying the
+        # now-unreachable pool object releases those aliases as one unit.
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            _COMPONENT_HOST_ATTR,
+        )
+
+        for component_type, (cache_attr, component_attr) in _COMPONENT_HOST_ATTR.items():
+            if component_type in self.components:
+                setattr(self, cache_attr, None)
+                setattr(self.components[component_type], component_attr, None)
+        self.cache_controller = None
+        self.host_pool_group = None
+        self.buffer_pipeline = None
+        self.sidecar_pool_specs.clear()
+        self._storage_attachment = None
+        self._hicache_host_suspended = True
+        # The controller stores bound methods on itself (page_get_func and
+        # page_set_func), so dropping its last external reference leaves a
+        # cycle that still owns the host pools and their tensor views.  Servers
+        # freeze the heap after warmup; ordinary collect() ignores those frozen
+        # cycles.  Temporarily thaw during this idle-only lifecycle, then restore
+        # the server's frozen-heap convention without changing GC enablement or
+        # callbacks.
+        try:
+            if controller_was_frozen:
+                gc.unfreeze()
+            gc.collect()
+        finally:
+            if controller_was_frozen:
+                gc.freeze()
+
+    def resume_hicache_host_memory(self):
+        """Rebuild CPU HiCache buffers released by suspend_hicache_host_memory."""
+        if not self._hicache_host_suspended:
+            if self.cache_controller is None:
+                raise RuntimeError("HiCache host memory is not initialized.")
+            return self.cache_controller.layer_done_counter
+        if self._hicache_init_server_args is None or self._hicache_init_params is None:
+            raise RuntimeError("HiCache reconstruction parameters are unavailable.")
+
+        self.init_hicache(self._hicache_init_server_args, self._hicache_init_params)
+        if self.cache_controller is None or self.host_pool_group is None:
+            raise RuntimeError("HiCache host-memory reconstruction failed.")
+        self._hicache_host_suspended = False
+        return self.cache_controller.layer_done_counter
 
     @rank_consensus(
         same_params=["params"],
@@ -1769,6 +1860,58 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=True, same_results=True)
     def check_prefetch_progress(self, req_id: str) -> bool:
+        if self.pp_size <= 1:
+            return self._check_prefetch_progress_local(req_id)
+
+        # A scheduler microstep cannot perform a blocking PP collective:
+        # downstream may still be receiving the previous output from PP0.
+        # Publish PP0's admission decision through the existing one-way cache
+        # channel. A downstream stage must follow a negative decision even
+        # when its own IO finished earlier; a positive decision allows it to
+        # wait for its local IO without preventing PP0's output relay.
+        assert self.pp_group is not None
+        primary_ready = (
+            self._check_prefetch_progress_local(req_id) if self.pp_rank == 0 else False
+        )
+        request_key = self._pp_request_key(req_id)
+        decision = torch.tensor([request_key, int(primary_ready)], dtype=torch.int64)
+        self._pp_sync(decision, tag=P2PTag.HIRADIX_PP_PREFETCH_ADMISSION)
+        if int(decision[0]) != request_key:
+            raise RuntimeError(
+                f"PP HiCache admission request order mismatch for {req_id}"
+            )
+        if not bool(decision[1]):
+            return False
+        if self.pp_rank > 0:
+            while not self._check_prefetch_progress_local(req_id):
+                # Query hits allocate host staging only when the scheduler
+                # drains this queue. IO threads do not need an upstream
+                # model-output receive, so this wait preserves ring progress.
+                self.drain_storage_control_queues()
+                time.sleep(0.001)
+        return True
+
+    @staticmethod
+    def _pp_request_key(req_id: str) -> int:
+        return int.from_bytes(
+            hashlib.sha256(req_id.encode()).digest()[:8], "little"
+        ) & ((1 << 63) - 1)
+
+    def check_pp_prefix_alignment(self, req_id: str, matched_tokens: int) -> None:
+        """Reject different logical KV prefixes before proxy tensor computation."""
+        if self.pp_size <= 1:
+            return
+        assert self.pp_group is not None
+        request_key = self._pp_request_key(req_id)
+        prefix = torch.tensor([request_key, matched_tokens], dtype=torch.int64)
+        self._pp_sync(prefix, tag=P2PTag.HIRADIX_PP_PREFIX_ALIGNMENT)
+        if int(prefix[0]) != request_key or int(prefix[1]) != matched_tokens:
+            raise RuntimeError(
+                f"PP HiCache prefix mismatch for {req_id}: "
+                f"PP0 matched {int(prefix[1])}, PP{self.pp_rank} matched {matched_tokens}"
+            )
+
+    def _check_prefetch_progress_local(self, req_id: str) -> bool:
         if req_id not in self.ongoing_prefetch:
             return True
 

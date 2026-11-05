@@ -2128,6 +2128,11 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             "DRAM (L2) to GPU, by host pool (kv, swa, mamba, ...).",
             labelnames=list(labels.keys()) + ["pool"],
         )
+        # Multiprocess export omits labeled counters until a child exists.
+        # A GPU-resident prefill run may never load back any KV. Publish its
+        # real zero baseline so monitoring can distinguish zero transfers
+        # from an unavailable metric; later transfers update this same child.
+        self.load_back_num_tokens.labels(**self.labels, pool="kv").inc(0)
 
         self.backup_duration_seconds = Histogram(
             name="sglang:hicache_backup_duration_seconds",
