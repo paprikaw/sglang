@@ -64,6 +64,7 @@ def install():
             return self.quant_method.apply(self,dispatch_output)
         return old_core(self,dispatch_output)
     DeepEPMoE.run_moe_core=run_moe_core
+    DeepEPMoE._bf16_triton_normal_adapter_installed = True
     def combine_a(self,hidden_states,topk_ids,topk_weights):
         return hidden_states,de.Buffer.capture() if self.async_finish else None
     de._DeepEPDispatcherImplNormal.combine_a=combine_a

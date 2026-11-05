@@ -141,13 +141,21 @@ class DeepEPMoE(FusedMoE):
             and not _is_npu
             and not _is_hip
         ):
-            if not get_deepep_mode().is_low_latency():
+            mode = get_deepep_mode()
+            normal_adapter = (
+                getattr(type(self), "_bf16_triton_normal_adapter_installed", False)
+                is True
+                and mode.is_normal()
+            )
+            if not mode.is_low_latency() and not normal_adapter:
                 raise NotImplementedError(
                     "Unquantized Triton DeepEP currently requires "
-                    "--deepep-mode low_latency"
+                    "--deepep-mode low_latency or an explicitly installed "
+                    "BF16 normal-mode adapter"
                 )
             # BF16 expert compute does not require native FP8 instructions or
-            # DeepGEMM. Only the LL expert-major layout bridge is implemented here.
+            # DeepGEMM. The built-in bridge handles LL; an explicit normal-mode
+            # adapter must install its own token-major compute/combine bridge.
             self.dispatcher.set_quant_config({"dispatcher_output_dtype": "bf16"})
             self.deprecate_flag = True
         elif (

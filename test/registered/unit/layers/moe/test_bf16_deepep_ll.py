@@ -136,7 +136,9 @@ def moe_class(mode):
         FusedMoE=Base,
         get_moe_runner_backend=lambda: runner,
         get_moe_a2a_backend=lambda: SimpleNamespace(is_deepep=lambda: True),
-        get_deepep_mode=lambda: SimpleNamespace(is_low_latency=lambda: mode == "ll"),
+        get_deepep_mode=lambda: SimpleNamespace(
+            is_low_latency=lambda: mode == "ll", is_normal=lambda: mode == "normal"
+        ),
         _use_aiter=False,
         _is_npu=False,
         _is_hip=False,
@@ -171,6 +173,21 @@ class TestBF16DeepEPLL(unittest.TestCase):
             moe_class("normal")(
                 num_experts=8, top_k=2, hidden_size=16, intermediate_size=8, layer_id=1
             )
+
+    def test_explicit_normal_adapter_retains_bf16_dispatch(self):
+        cls = moe_class("normal")
+        cls._bf16_triton_normal_adapter_installed = True
+        layer = cls(num_experts=8, top_k=2, hidden_size=16, intermediate_size=8, layer_id=1)
+        self.assertTrue(layer.deprecate_flag)
+        layer.dispatcher.set_quant_config.assert_called_once_with(
+            {"dispatcher_output_dtype": "bf16"}
+        )
+
+    def test_normal_adapter_does_not_admit_unimplemented_auto_mode(self):
+        cls = moe_class("auto")
+        cls._bf16_triton_normal_adapter_installed = True
+        with self.assertRaisesRegex(NotImplementedError, "low_latency"):
+            cls(num_experts=8, top_k=2, hidden_size=16, intermediate_size=8, layer_id=1)
 
     def test_local_expert_ids_and_nan_padding(self):
         hidden = torch.full((3, 4, 2), float("nan"), dtype=torch.bfloat16)

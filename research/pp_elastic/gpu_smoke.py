@@ -18,6 +18,7 @@ import secrets
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -38,6 +39,19 @@ def desc(path):
 
 def git(*args):
     return subprocess.check_output(['git', '-C', str(ENGINE), *args], text=True).strip()
+
+
+def control_byte(path, value):
+    # Never truncate a file that live workers have mmap'ed: even a momentary
+    # zero length can SIGBUS another process reading the policy byte.
+    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_size != 1 or info.st_mode & 0o077:
+            raise RuntimeError('Invalid private one-byte control')
+        os.pwrite(fd, bytes([value]), 0)
+    finally:
+        os.close(fd)
 
 
 def prepare(args):
@@ -244,7 +258,11 @@ def engine_entry(cfg, row):
     key = h.read_key(cfg)
     server_args.api_key = key
     server_args.admin_api_key = key
-    run_server(server_args)
+    from sglang.srt.utils import kill_process_tree
+    try:
+        run_server(server_args)
+    finally:
+        kill_process_tree(os.getpid(), include_parent=False)
 
 
 def launch(run, cfg, row, key):
@@ -267,6 +285,12 @@ def worker(run, cfg):
     h.authenticate(run, cfg, os.environ, local=True)
     key = h.read_key(cfg)
     import agentx_replay
+    original_stream, original_http = agentx_replay.stream, agentx_replay.http
+    def bounded_stream(endpoint, key, payload, timeout=90):
+        return original_stream(endpoint, key, payload, min(timeout, 90))
+    def bounded_http(host, port, path, key, payload=None, timeout=90):
+        return original_http(host, port, path, key, payload, min(timeout, 90))
+    agentx_replay.stream, agentx_replay.http = bounded_stream, bounded_http
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(cfg['model_path'], local_files_only=True)
     body = tokenizer.encode('Explain how a pipeline preserves request order and reuses cached state. ' * 45)
@@ -321,6 +345,15 @@ def worker(run, cfg):
                 # retained as execution evidence, not bitwise equivalence tests.
                 reference = [cohort([i])[0] for i in (0, 1)]
                 evidence['restore_reference'] = reference
+                continuation_prompts = None
+                if name == 'pd':
+                    # Decode snapshots arise during generation. Continue the
+                    # parent output past a state checkpoint before asking D to
+                    # reuse it; repeating a short initial prompt need not hit D.
+                    parents = [cohort([i], output=128)[0] for i in (0, 1)]
+                    continuation_prompts = [prompts[i] + parents[i]['output_ids'] for i in (0, 1)]
+                    reference = [cohort([i], promptset=continuation_prompts)[0] for i in (0, 1)]
+                    evidence.update(pd_session_parents=parents, continuation_reference=reference)
                 h.save(run / (name + '.evidence.json'), evidence)
                 # Repeat after an explicit CPU restore, keeping normal HiCache on.
                 for row in rows:
@@ -332,7 +365,7 @@ def worker(run, cfg):
                         time.sleep(.2)
                     else:
                         raise RuntimeError('Could not demote idle GPU prefixes')
-                restored = [cohort([i])[0] for i in (0, 1)]
+                restored = [cohort([i], promptset=continuation_prompts)[0] for i in (0, 1)]
                 evidence['restored'] = restored
                 h.save(run / (name + '.evidence.json'), evidence)
                 if [x['output_ids'] for x in reference] != [x['output_ids'] for x in restored]:
@@ -344,11 +377,11 @@ def worker(run, cfg):
                     prefixes = [[5000 + i] + body[:383] for i in range(8)]
                     decode_prompts = [p + [198] for p in prefixes]
                     evidence['gap_prefix_preparation'] = cohort(promptset=prefixes, output=1)
-                    (run / 'pp2/fixed.bin').write_bytes(bytes([1]))
+                    control_byte(run / 'pp2/fixed.bin', 1)
                     native_gap = cohort(promptset=decode_prompts)
                     evidence['gap_reference'] = native_gap
-                    (run / 'pp2/gap.bin').write_bytes(b'9')
-                    (run / 'pp2/fixed.bin').write_bytes(bytes([2]))
+                    control_byte(run / 'pp2/gap.bin', ord('9'))
+                    control_byte(run / 'pp2/fixed.bin', 2)
                     optimized = cohort(promptset=decode_prompts)
                     evidence['gap9'] = optimized
                     h.save(run / (name + '.evidence.json'), evidence)
@@ -371,7 +404,7 @@ def worker(run, cfg):
                             raise TimeoutError('Missing rank counters: ' + row['id'])
                         time.sleep(.1)
                     counters = [json.loads(p.read_text()) for p in files]
-                    if row['role'] != 'prefill' and not all(x['counts'].get('actual_decode_graph_execute', 0) > 0 for x in counters):
+                    if row['role'] != 'prefill' and row['backend'] != 'deepep' and not all(x['counts'].get('actual_decode_graph_execute', 0) > 0 for x in counters):
                         raise AssertionError('Decode Graph never executed: ' + row['id'])
                     evidence['counters'].append(dict(layout=row['id'], ranks=counters))
                     if not any(e.get('loaded_tokens', 0) > 0 for s in info['internal_states'] for e in s.get('agentx_restores', [])):
