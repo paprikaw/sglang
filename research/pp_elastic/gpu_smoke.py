@@ -281,13 +281,14 @@ def worker(run, cfg):
                             time.sleep(1)
                 def endpoint(row):
                     return dict(host='127.0.0.1', port=row['port'], ep=row['ep'], bootstrap_port=24980)
-                def cohort():
+                def cohort(indices=None):
+                    indices = list(range(8)) if indices is None else indices
                     def one(i):
                         return agentx_replay.request_one(endpoint(rows[0]),
                             endpoint(rows[1]) if name == 'pd' else None,
                             key, prompts[i], 24, i, return_logprob=True)
                     with cf.ThreadPoolExecutor(max_workers=8) as pool:
-                        replies = list(pool.map(one, range(8)))
+                        replies = list(pool.map(one, indices))
                     for reply in replies:
                         if len(reply.get('output_ids') or []) != 24:
                             raise AssertionError('Missing generated token IDs')
@@ -295,6 +296,13 @@ def worker(run, cfg):
                 cold = cohort()
                 warm = cohort()
                 evidence = dict(cold=cold, warm=warm)
+                h.save(run / (name + '.evidence.json'), evidence)
+                # Cache correctness uses the same one-request forward shape on
+                # each side. Concurrent cohorts may batch differently and are
+                # retained as execution evidence, not bitwise equivalence tests.
+                reference = [cohort([i])[0] for i in (0, 1)]
+                evidence['restore_reference'] = reference
+                h.save(run / (name + '.evidence.json'), evidence)
                 # Repeat after an explicit CPU restore, keeping normal HiCache on.
                 for row in rows:
                     for _ in range(60):
@@ -305,15 +313,17 @@ def worker(run, cfg):
                         time.sleep(.2)
                     else:
                         raise RuntimeError('Could not demote idle GPU prefixes')
-                restored = cohort()
+                restored = [cohort([i])[0] for i in (0, 1)]
                 evidence['restored'] = restored
-                if [x['output_ids'] for x in warm] != [x['output_ids'] for x in restored]:
+                h.save(run / (name + '.evidence.json'), evidence)
+                if [x['output_ids'] for x in reference] != [x['output_ids'] for x in restored]:
                     raise AssertionError('Output changed after CPU cache restore')
                 if name == 'pp2':
                     (run / 'pp2/gap.bin').write_bytes(b'9')
-                    optimized = cohort()
+                    optimized = [cohort([i])[0] for i in (0, 1)]
                     evidence['gap9'] = optimized
-                    if [x['output_ids'] for x in warm] != [x['output_ids'] for x in optimized]:
+                    h.save(run / (name + '.evidence.json'), evidence)
+                    if [x['output_ids'] for x in reference] != [x['output_ids'] for x in optimized]:
                         raise AssertionError('Output changed with PP lookahead')
                 evidence['server_info'] = []
                 evidence['counters'] = []
