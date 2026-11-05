@@ -330,7 +330,8 @@ def worker(run, cfg):
                 for row in rows:
                     info = h.http_json(row['port'], '/get_server_info', key, timeout=30)
                     evidence['server_info'].append(info)
-                    (run / row['id'] / 'counters.bin').write_bytes(b'\1')
+                    from snapshot_transport import write_control
+                    write_control(str(run / row['id'] / 'counters.bin'), 1)
                     expected = row['ep'] * row['pp']
                     deadline = time.monotonic() + 20
                     while True:
@@ -351,11 +352,18 @@ def worker(run, cfg):
                 h.save(run / 'results.json', results)
                 h.save(run / 'worker_progress.json', dict(completed=len(results), current=name, timestamp=time.time()))
                 print(json.dumps(dict(layout=name, passed=True)), flush=True)
+            except Exception as error:
+                results[name] = dict(passed=False, error=type(error).__name__ + ': ' + str(error),
+                    evidence=str(run / (name + '.evidence.json')))
+                h.save(run / 'results.json', results)
+                print(json.dumps(dict(layout=name, passed=False, error=str(error))), flush=True)
             finally:
                 final_cleanup = h.cleanup(children)
                 h.save(run / (name + '.cleanup.json'), final_cleanup)
                 if not final_cleanup['cleanup_verified']:
                     raise RuntimeError('Owned model cleanup could not be verified')
+        if not all(x.get('passed') for x in results.values()):
+            raise RuntimeError('One or more GPU regressions failed; per-layout evidence preserved')
     finally:
         if final_cleanup:
             h.save(run / 'worker_cleanup.json', final_cleanup)
