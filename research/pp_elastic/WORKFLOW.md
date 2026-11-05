@@ -1,0 +1,17 @@
+# GitHub 分支与 PR 协作
+
+2026-11-05。后续按这份约定开发，GitHub 上的分支和 PR 是查看实现进度的入口。
+
+**共同基线。** `codex/pp-elastic-integration` 是已经整理并做过有限范围回归的共同分支，冻结标签为 `baseline/sglang/ep-pp-pd-20261105`。原来的 `codex/autoscaling-kvcached` 和实验 worktree 保留历史，不作为新任务默认合并目标；上游 `sgl-project/sglang` 也不是本项目的提交目标。
+
+**本轮总 PR。** 从共同基线建立 `codex/pp-hicache-autoscaling`，以 Draft PR 指向共同基线。主 agent 负责这个项目分支，自己也可以直接实现任务；不要求为了使用这套流程而启动 sub-agent。总 PR 当前建立协作入口，后续按[当前方案](https://github.com/paprikaw/paper-repo/blob/786c35d2cb49fb84f65d6b9c502a9f1de6bbdf89/reading/pd-inplace-grow-split-outline-20261103/CONFIG_TRANSITIONS.md)实现单实例 naive PP＋HiCache，P/D 接入保留在后续。项目入口的建立不代表动态功能已实现。
+
+**子任务。** 需要并行时，每位 agent 从明确的项目提交建立独立的 `codex/` 任务分支和 worktree，并向项目分支开一个 Draft PR。按可独立检查的任务划分 PR，而不是每个 commit 都开 PR。依赖其他子任务时写清依赖链接和起始 SHA；优先等依赖合入项目分支后再开展，确需堆叠时明确标注。主 agent 在总 PR 里用列表维护任务、负责人、子 PR、依赖、已合入状态和测试结果。
+
+**提交频率。** 完成一个可检查的修改点、开始长实验前、交接或结束工作前，均提交并推送。持续实现时尽量每 30–60 分钟形成一次有意义的检查点；未完成内容如实标注，PR 保持 Draft。一次 PR 可以持续增加提交。只提交本任务文件，不把历史脏工作区、其他人的修改、权重、密钥和大量结果一并加入。
+
+**评审与合并。** 主 agent 检查子 PR 的代码、相关测试和依赖，逐个合入项目分支并处理冲突；共享分支使用 merge commit 保留祖先关系，避免强推改写已经评审或正在被依赖的提交。子 PR 通过只说明各自变化通过检查，总 PR 还必须验证组合后的提交。总 PR 准备完成后，统一合入 `codex/pp-elastic-integration`；保留有历史用途或未提交内容的 worktree。
+
+**验证与实验。** PR 说明具体改动、实际运行的检查、失败及未验证项，不把旧基线的 537 项 CPU 回归和静态 A100 检查当作新机制已通过。实验使用已推送的 SHA、不可移动标签和依赖／运行适配记录；开始 GPU 实验前走 Experiment Guard。原始大结果在实验目录保存，PR 链接到精简报告及可核验记录。
+
+**如何查看。** 日常看总 PR 的任务列表和最新提交；需要审查一个实现时进入对应子 PR；需要复现实验时使用报告中的准确 SHA 与标签。完成状态以 GitHub 实际推送和测试记录为准。

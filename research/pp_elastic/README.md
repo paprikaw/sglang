@@ -13,3 +13,5 @@
 **测试。** `gpu_smoke.py` 在 canonical Experiment Guard 下运行真实 A100 35B 模型，覆盖 EP2、EP4、PP2、EP2 Prefill→PP2 Decode，启用 HiCache，计数实际 Decode Graph 执行，并检查 CPU 恢复后的输出。该脚本是回归检查，不用于发布性能结论。CPU 回归及实际硬件验证结果见项目的 `VALIDATION.md`；未覆盖的模型、通信后端和在线扩缩路径需单独验证。
 
 **开发方式。** 从此分支创建任务分支和独立 worktree；任务完成后带测试合回此分支。实验固定 commit、annotated tag、运行适配及依赖；冻结后不移动实验标签。不删除承载历史实验或未提交工作的旧 worktree。实验结果和密钥保存在 Git 之外。
+
+**GitHub 协作。** PP＋HiCache 当前项目在 `codex/pp-hicache-autoscaling` 上通过 Draft 总 PR 集成；子任务各用独立分支和 worktree，先合入项目分支，组合验证后再整体合回共同基线。按可检查的小步提交并推送，任务关系和验证状态记录在 PR 中，详见[协作约定](WORKFLOW.md)。
