@@ -1,0 +1,152 @@
+{
+  "schema_version": 1,
+  "deepep": {
+    "wrapper_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/.third_party/deepep-token-routing-ep4-20261004",
+    "wrapper_commit": "7d1ebddc49649fe06d6b8ccd2f77876e2ba9b4ce",
+    "native_path": "/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/runtime/deepep_ce_ep8_admission_20261010_r1/candidate/python/deep_ep_cpp.cpython-312-x86_64-linux-gnu.so",
+    "native_sha256": "c3405cad906f56aeaebfa4f947bdb09e1d5505248f146879ee9fdacc4bbb2da3",
+    "ll_cuda_commit": "81a1b5960f5fc73bce33045a56e5b6970e2bcb3c",
+    "archived_variants": [
+      {
+        "branch": "codex/dependency-deepep/deepep-ce-dispatch-dedup-20261008",
+        "commit": "6ecef7b428acb1fcb72df4fd971db07702bb886c"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-ce-fixed3-topology-20261007",
+        "commit": "ab455cec47350ad1c1aa5594f9d3dedd28614623"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-ce-fixed4-topology-20261007",
+        "commit": "60e6c68fa959b79cb88d44f360182e98a77042c2"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-ce-glm-ep8-20261010",
+        "commit": "81a1b5960f5fc73bce33045a56e5b6970e2bcb3c"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-ce-payload-sweep-20261007",
+        "commit": "eef6a2ff3efda75b5e3d4afce282addd4d716c54"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-ce-prefill160-20261010",
+        "commit": "cb694cb83d9448aac2b10e5e589f9d7b42b41ecb"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-ce-prefill160-local-20261010",
+        "commit": "4be2bee619b52a239b124c827d09fa478c6abba8"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-ce-prefill160-matched-20261010",
+        "commit": "5cd4550d009f7a60b6f24928dff96096f646cc7f"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-ce-prefill160-notify-20261010",
+        "commit": "24ebbeb6b35431685dded4ab3bf09ef18de274d9"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-ce-prefill160-notify-safe-20261010",
+        "commit": "da39774bb838e55cc2b915549edac49838ae3bdd"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-dynamic-copy-engine-20261007",
+        "commit": "64573a718111cedc0772bf547c49ebab9962b1c5"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-fixed-qp-selector-20261007",
+        "commit": "cd8df4efec613c1aef66171d976c1634c89e1c1e"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-late-stage-trace-20261007",
+        "commit": "88968a2fc40f056d3656e708d9a374e6710a11fb"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-nvlink-pair-frozen-20261003",
+        "commit": "77e365dd488f42fab8e0ef0cfe00430989c5882f"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-nvlink-pair-opt-20261003",
+        "commit": "31b72f9ce9bba7e38c03fc03e46950d9dbad8af5"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-nvshmem345-cpu-postsend",
+        "commit": "af5177cefd41e61b77df02d791a84bbdeaccd466"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-padded-pcie-control-20261007",
+        "commit": "10558bc9c08ceae02bfa1ec8beb7b2c29fde438c"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-pcie-balanced-warps-20261007",
+        "commit": "3b698aedfa71458319ea2b451d75d2a05b10f8ae"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-pcie-coalesced-20261006",
+        "commit": "05d46157c7ccfa0784b59a5198253a701215c4d3"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-pcie-copy-engine-probe-20261007",
+        "commit": "c0fd5753a5c2f48780246404a984e4fa56f38165"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-pcie-cpu-post-batch-20261007",
+        "commit": "8df17c6862df782fc64a1a31f583ec1342be5740"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-pcie-fused-post-batch-20261007",
+        "commit": "4a48b5f93f879eff177499a1c8f3bf578ec46b8c"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-pcie-inline-flags-20261007",
+        "commit": "c190d6047e2cc9b6dd3345f3ecf5592c4f881b2d"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-pcie-payload-phase-20261007",
+        "commit": "9ed3d3fb3538de8794b1eaeaae3c2be555f32f74"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-pcie-rdma-control-20261007",
+        "commit": "e32c583fc996b6b283bb74b29700fb78d2a7223f"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-pcie-rotated-warps-20261007",
+        "commit": "e9f6e3ba7fc456211504dea083930cd686fdd39f"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-pcie-tail-flush-ablation-20261007",
+        "commit": "2a8f748335615bc10787c2059a1be2c827b55522"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-rdma-drain-before-pcie-20261007",
+        "commit": "f1be4b91551b27a97ac9cecc627c45a280550435"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-rdma-first-pcie-20261007",
+        "commit": "7d2bc3f402b3ee6316651b166b086960619852c3"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-token-routing-ep16-20261003",
+        "commit": "4d0c54734927be88b24e73f64078cddc4173feef"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-token-routing-ep4-20261004",
+        "commit": "7d1ebddc49649fe06d6b8ccd2f77876e2ba9b4ce"
+      },
+      {
+        "branch": "codex/dependency-deepep/deepep-token-routing-frozen-20261003",
+        "commit": "31b72f9ce9bba7e38c03fc03e46950d9dbad8af5"
+      },
+      {
+        "branch": "codex/dependency-deepep/ep12-low-latency-20261006",
+        "commit": "50be6136eea4c1e4fe57d79dbbe9527f52e9f41c"
+      }
+    ],
+    "limits": "CE eager GLM Prefill only; Decode Graph needs qualified RDMA/SM path. This lock does not enable CE APIs."
+  },
+  "python": {
+    "path": "/data/gpfs/projects/punim2715/vllm_workbench/sglang_overlap_compare/venv-dd15fb57-cu12/bin/python"
+  },
+  "mooncake": {
+    "python_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_feasibility_20261030/deps/mooncake_only",
+    "source": "PD tests must record actual loaded extension path and hash."
+  }
+}

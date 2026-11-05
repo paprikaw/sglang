@@ -1,0 +1,588 @@
+{
+  "schema_version": 1,
+  "files": [
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/a100_runtime_adapter.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/a100_runtime_adapter.py",
+      "sha256": "03884a8f6c303c7bd67eca10c64b285095da5872b17524f778775c932780ade3"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/agentx_branch_timing.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/agentx_branch_timing.py",
+      "sha256": "7e23b107d7f3405e0a128066ea4259b5993a590ea222fb996bb28435e0070edf"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/agentx_replay.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/agentx_replay.py",
+      "sha256": "dc2a3aa38ecda49809345d8c469d70a38c552b4eb084e30c569eea99fa2c5e39"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/artifact_visibility.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/artifact_visibility.py",
+      "sha256": "bd86db35bbf825fcf20c1b6c1c0aa4383ea2a779e6eb6071c33b147d00776b15"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/base_runner.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/base_runner.py",
+      "sha256": "c6fc196c7b23d18edc9e1f733ece84b41b11cc2cbe26747480a5a8856840e71f"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/benchmark.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/benchmark.py",
+      "sha256": "d7c763807e7228eb352d72d65ec11f42a8431c02a4a64a6fb47add82bfccd1e1"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/cache_analysis.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/cache_analysis.py",
+      "sha256": "cfce92d36ad83fc50d09fe471899f32dc8a113c1c0c3cde72d497b148df95603"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/cache_probe.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/cache_probe.py",
+      "sha256": "51e3f4bedbc6943f9318f3d3a3f9a837841b7dc14d56f1fb07f877cff0c77900"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/cluster_runner.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/cluster_runner.py",
+      "sha256": "5e2d94841f420f201105b86ed15d3da872ba446225f5cb4a288478fc14c9d586"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/dataset_preflight.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/dataset_preflight.py",
+      "sha256": "d1f62551b60100647504d1a356ab1a7e09fff61631678e39739508c5781a9590"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/diagnostic_switch.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/diagnostic_switch.py",
+      "sha256": "e2b915b29b89b1adc5e40c30efe7fe70bb026e0ffe8dc356237d25ac7419de96"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/ep_fragmentation.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/ep_fragmentation.py",
+      "sha256": "e72627ccd0517904849b9354e462c1cf44729b5564cc9ae862d8239a065f462f"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/ep_triton.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/ep_triton.py",
+      "sha256": "bb62d6fd21b82a4a29e42f67f8e40d5cf9ac733fc8224f98f3b69c4ef39736e0"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/episode_capture.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/episode_capture.py",
+      "sha256": "44ad35a4df8ba54e06d42ded31683aa7a2da5e531a0d2b65182e8f67930682e1"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/experiment_plan.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/experiment_plan.py",
+      "sha256": "ab79b95c1d2a6acd0d9622cc79a5ed811049e6d49e2bde0fa7bb41eaa4a618ad"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/export_ready.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/export_ready.py",
+      "sha256": "2125e1e0d817bcdbb7946f7805a0516287919c2135315c61310c5b977cc0c4fa"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/fair_validation.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/fair_validation.py",
+      "sha256": "e3c0d72d3f80c2bf34962e94463e76f0a5f7efde3e67fc92d59323519acfbd68"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/forward_observer.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/forward_observer.py",
+      "sha256": "a0444118a96fc12fa535bf78ea65471286e96357ee4245f71d5fc6a68a41f105"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/fp8_marlin_adapter.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/fp8_marlin_adapter.py",
+      "sha256": "26b5ec48d8d58aff39149f89933e3be47ca6c61a6db94c75de15f8fbf0b4ac08"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/fragmentation.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/fragmentation.py",
+      "sha256": "241a74aa9c2fb83859fd0e9506f7172c7c3e485bc180b696a5ae907e506ccb05"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/gap_schedule.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/gap_schedule.py",
+      "sha256": "e3ed94b3f74268a0ed58fcb3667691c0ea0dd25a505b985d02805e6a2b3c895b"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/h100_runtime_adapter.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/h100_runtime_adapter.py",
+      "sha256": "2baba275860873d3b1f5a16273b3d42a83b3138d2053e22e721063d38713932e"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/heterogeneous_owner_routing.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/heterogeneous_owner_routing.py",
+      "sha256": "b369fe4affaaff2b60561c6f8a5e0c86c36f363423488f1c7031d76773f45cb9"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/hicache_audit.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/hicache_audit.py",
+      "sha256": "0794bf8ffe2a607e5a24ef084d2a2f6c538f8100228e0f6c650ee0c053c90519"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/hopper_reference.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/hopper_reference.py",
+      "sha256": "774653ca9777b2bc0e18f05df33c8de1cd8330d6e89829a26aad662b6fb59873"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/lookahead_workloads.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/lookahead_workloads.py",
+      "sha256": "ee58908c834128e709570e86535dffff6ae3eeb3d211213439ea897e7a82f2c0"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/matrix_hardware.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/matrix_hardware.py",
+      "sha256": "0e45de68dc8ae4b939fa3c93ecd4380dfbfc98953b3f40079f84218ebd7a8e68"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/matrix_memory.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/matrix_memory.py",
+      "sha256": "192feae0e0c05b3e58e35f0b0b38d43fd24424b8712122e0723a61f471d11c4e"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/matrix_node.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/matrix_node.py",
+      "sha256": "a2106371184591f36755b40cd51cfccc57d8f308d846cba6d2b8a8d7183444e3"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/matrix_observer.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/matrix_observer.py",
+      "sha256": "928913df1e1db9bb3a9fb4584d79fc9ba1af08133b324b59715bd3db134af722"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/matrix_report.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/matrix_report.py",
+      "sha256": "ac24790494b6877103a0301d29a091983380925fdc33d4d89730d596e473a97d"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/matrix_workload.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/matrix_workload.py",
+      "sha256": "21db9a070f9933041a9d5903306f7cbab94caa8791d2bc1df5543b74cf781129"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/mixed_workload.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/mixed_workload.py",
+      "sha256": "15a64b0ea22f387fb67081a1473a915659c8c70c1ae81fc5a0f8ef77b401e7f0"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/official_workload.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/official_workload.py",
+      "sha256": "b21e31de02d8a55be48f16786a1db1e64589099e17a19028da05661b4330a8c6"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/optimization_report.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/optimization_report.py",
+      "sha256": "a57c1c6d4f0c08fb1d1e30ea4f6a4ce6d67641dbd75bc6aca04141db72cd5feb"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/pd_workload.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/pd_workload.py",
+      "sha256": "2da474f25acea7d8394daf23aac85e908e9b11423af061a866a4ac3db57c769e"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/phase_timing.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/phase_timing.py",
+      "sha256": "2beba7f34596b4351842f7c6095cadf96486023789751fc6ac3650cdb78028d6"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/pp_fixed_cohort.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/pp_fixed_cohort.py",
+      "sha256": "10e828a1a3891e74b83da549f52f036b9aadb16d8b3065279cd7fe38d76ba22e"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/pp_ready_send.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/pp_ready_send.py",
+      "sha256": "a90e56294562488030584d2bee25361d6da0d158c683f26ccb6e191f0c07f400"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/pp_schedule_opt.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/pp_schedule_opt.py",
+      "sha256": "609e74ac1677e1273ef7ae26b95cef6aaa3c1acf7a96b3b267922cfcd310c6e4"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/pp_transfer_audit.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/pp_transfer_audit.py",
+      "sha256": "a4ebd51aab876b3a798724a6b8469c5939b7c109600d522adc265f39c96cd39c"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/prefill_followup.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/prefill_followup.py",
+      "sha256": "91acd22b3876f491a2033fff2fda97311c690836830c675127964c492297221a"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/previous_workloads.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/previous_workloads.py",
+      "sha256": "f6745231f74011b6387c127412c4fd0a1ea9c61657e6bd1d68ec5a95e5c33370"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/process_helpers.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/process_helpers.py",
+      "sha256": "8c49c78444790f67406ec9beea14fe2e56118bb72bbe3c57cfd762a522119e80"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/protocol.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/protocol.py",
+      "sha256": "760ce97fe6fe049e2b49bd745abc82500dbad8e2818d4a99d0e4229445741202"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/route_gemv.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/route_gemv.py",
+      "sha256": "b77463e1d795729843915678508cea4086512c025cb665650d4dd6577ec30ef6"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/runner.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/runner.py",
+      "sha256": "a05ca265c37e1e76dd5dc92b90487b4696071986bc09c4217759592e6e58b023"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/runtime_adapter.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/runtime_adapter.py",
+      "sha256": "47bfa012c2b96742798681f3b6e9190a02ccd0c275fe4e560b40fc3096e29141"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/runtime_setup.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/runtime_setup.py",
+      "sha256": "42efff7c0b80f114c1d019ccd028c256ef6760078dc01a4966c49d345493916f"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/sampling.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/sampling.py",
+      "sha256": "d9075810ed90b3ca92bc203ca499f584663d10ef3429a9865291e96dcdbdae6c"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/snapshot_transport.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/snapshot_transport.py",
+      "sha256": "8101353d5b948f0c4a699e8427891a3f353b44326708b7c8cb684e502fc8050a"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/verify_workload.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/verify_workload.py",
+      "sha256": "6a726d9b1d85e35c8eb659a9df154c994fa8d0a8a4777e7ae9e4bcf74cc60be1"
+    },
+    {
+      "profile": "agentx_a100",
+      "path": "runtime_profiles/agentx_a100/workload_benchmark.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_a100_matrix_20261102/runs/a100_e10_r7/code/workload_benchmark.py",
+      "sha256": "f6745231f74011b6387c127412c4fd0a1ea9c61657e6bd1d68ec5a95e5c33370"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/a100_runtime_adapter.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/a100_runtime_adapter.py",
+      "sha256": "145413bf298e9e56d9fcf186f38e17e2353884b99d9603ba71ba687309a576a5"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/artifact_visibility.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/artifact_visibility.py",
+      "sha256": "bd86db35bbf825fcf20c1b6c1c0aa4383ea2a779e6eb6071c33b147d00776b15"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/diagnostic.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/diagnostic.py",
+      "sha256": "f37c45d24dd43018c9747334544a6677398a96a872ab2bf0a267c6e7b1e22ba3"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/experiment_plan.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/experiment_plan.py",
+      "sha256": "ab79b95c1d2a6acd0d9622cc79a5ed811049e6d49e2bde0fa7bb41eaa4a618ad"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/export_ready.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/export_ready.py",
+      "sha256": "2125e1e0d817bcdbb7946f7805a0516287919c2135315c61310c5b977cc0c4fa"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/matched.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/matched.py",
+      "sha256": "51a310b368c675b45755c42d3046db943377dabf8f7ad71aa61d554177adc68a"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/pp_schedule_opt.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/pp_schedule_opt.py",
+      "sha256": "609e74ac1677e1273ef7ae26b95cef6aaa3c1acf7a96b3b267922cfcd310c6e4"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/prefill_admission.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/prefill_admission.py",
+      "sha256": "6b579ca106c206137802ebc42ddcf40a47f4971c8f177ea9934bda5cdd023fa8"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/prepare.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/prepare.py",
+      "sha256": "c3411fe8988f798aaf5138ae43eff973f0aac215fe52d3cf081a86ba305ff056"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/prepare_graph.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/prepare_graph.py",
+      "sha256": "c4d8dd8eb68c6113c18f681d43cb9d1ab3ff78a4009053bbccf43a091e1d8097"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/prepare_matched.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/prepare_matched.py",
+      "sha256": "7556bba6dd324ca0aa4ad596d02da87a63b5b77e23b2d1b2ecd9d12546cf3863"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/previous_workloads.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/previous_workloads.py",
+      "sha256": "f6745231f74011b6387c127412c4fd0a1ea9c61657e6bd1d68ec5a95e5c33370"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/process_helpers.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/process_helpers.py",
+      "sha256": "8cbe24a4243c9a907422d350c4eaad3ff26c90f2a46fb52c061d02986f10e13e"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/runner.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/runner.py",
+      "sha256": "e4779bb225c0e0e9a8606c1a4097c0b36e015fe5240c0fc7547a28166b165b7e"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/runtime_adapter.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/runtime_adapter.py",
+      "sha256": "f808c4287772cba049327a48b5cc6a86d806375246d665fc504dbe6c995045d9"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/runtime_setup.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/runtime_setup.py",
+      "sha256": "42efff7c0b80f114c1d019ccd028c256ef6760078dc01a4966c49d345493916f"
+    },
+    {
+      "profile": "a100_native_ep",
+      "path": "runtime_profiles/a100_native_ep/sampling.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/a100_ep2_ep4_matched_20261103/runs/optimized_native_r1/code/sampling.py",
+      "sha256": "d9075810ed90b3ca92bc203ca499f584663d10ef3429a9865291e96dcdbdae6c"
+    },
+    {
+      "profile": "qwen122b_balance",
+      "path": "runtime_profiles/qwen122b_balance/runtime_adapter.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/h100_qwen122b_pp_refine_20261027/balance_source/runtime_adapter.py",
+      "sha256": "c8bc55f436e210caad6f26db82ea03d770bf75986e902425595effab4bbfa39a"
+    },
+    {
+      "profile": "qwen122b_warm",
+      "path": "runtime_profiles/qwen122b_warm/gap_schedule.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/h100_qwen122b_pp_refine_20261027/balance_warm_source/gap_schedule.py",
+      "sha256": "e7b5e4c09eaee851a9d2efb1aa5b78d426cb4e74271575e45345f15642f7f2ca"
+    },
+    {
+      "profile": "qwen122b_warm",
+      "path": "runtime_profiles/qwen122b_warm/runtime_adapter.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/h100_qwen122b_pp_refine_20261027/balance_warm_source/runtime_adapter.py",
+      "sha256": "c8bc55f436e210caad6f26db82ea03d770bf75986e902425595effab4bbfa39a"
+    },
+    {
+      "profile": "qwen122b_warm",
+      "path": "runtime_profiles/qwen122b_warm/test_feedback.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/h100_qwen122b_pp_refine_20261027/balance_warm_source/test_feedback.py",
+      "sha256": "c5328c4af1356306eebc63433a441f0e108522e7e14b40c1e1203db9bc80dc17"
+    },
+    {
+      "profile": "qwen122b_feedback",
+      "path": "runtime_profiles/qwen122b_feedback/gap_schedule.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/h100_qwen122b_pp_refine_20261027/source/gap_schedule.py",
+      "sha256": "713fc4ce2c1af8de8aaec4358232120c104c3c2b75161e9fed0347e8296a3268"
+    },
+    {
+      "profile": "qwen122b_feedback",
+      "path": "runtime_profiles/qwen122b_feedback/refine_benchmark.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/h100_qwen122b_pp_refine_20261027/source/refine_benchmark.py",
+      "sha256": "e0f55c4cb0760c0ac7679ea93c0bc0c871e324afeb2217ad5db52af787de3492"
+    },
+    {
+      "profile": "qwen122b_feedback",
+      "path": "runtime_profiles/qwen122b_feedback/test_feedback.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/h100_qwen122b_pp_refine_20261027/source/test_feedback.py",
+      "sha256": "38967312093d60bf201ae3f8d07b5d5e91ac70af98ff589e457ea876a0a4367d"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/analyze.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/analyze.py",
+      "sha256": "5a98e568811d50b76611c6d8363a2a2d520f75569036fcc3fa723ac63b17c663"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/cache_guard.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/cache_guard.py",
+      "sha256": "c1627c0755ec5a2d4b3694835e6be3f71b79945346d22d756fc03e5f290d95bd"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/ce_receipts.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/ce_receipts.py",
+      "sha256": "7b24b8312472c08bd409f75d59488e17587cecdb1a03fb7d5106b924684cc7b0"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/ce_serving.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/ce_serving.py",
+      "sha256": "75e677b1833ee515506885c7f7e8234f19f6999325bfb61b223a6f80af262f72"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/client.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/client.py",
+      "sha256": "81624c9f4b32a7957ccfca84f0bf740826a3827f016323ce6eb2936d8f185237"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/comm_validation.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/comm_validation.py",
+      "sha256": "3800be59a50164daf75f834385c9f6afcaf4ab836f4503bdbd815d8d60af80ea"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/common.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/common.py",
+      "sha256": "5fa9119deee0cda95000fe7618b8f4b682a04f051bf05137978c9544b31aa5ac"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/controller.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/controller.py",
+      "sha256": "1ad94244b1bc45ab5178b8e9f44877864336f319ec4f1f994a221db66987b6a6"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/counter_socket.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/counter_socket.py",
+      "sha256": "e1467921eb75a440f7b4667e405c0a993fc14b67985daa2a8223892e7360dd3c"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/expert_preload.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/expert_preload.py",
+      "sha256": "ce46eb975848f1423eb1943a86c4c9d771b6322b20bed999b52a1bf130db920f"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/guard_authorization.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/guard_authorization.py",
+      "sha256": "d38cea7fb8c71f17f3ef8362ade381dc01622b714039c0358dfa23d7ec1d7dde"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/model_node.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/model_node.py",
+      "sha256": "14a0ddbe15469d6db7f8142993249150fbda7282b65e12f099a336e2d128bf1a"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/package_result.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/package_result.py",
+      "sha256": "6e1060ea8716b0183ce0076d4e25e14455c22342b14405918ff3758d35e8924a"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/pp_boundary.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/pp_boundary.py",
+      "sha256": "e67dab8ad0d501ef565109332f3fefcf7506bbf48cbe91b39bbc46395f48cd65"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/prepare.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/prepare.py",
+      "sha256": "c3b08c7c867dbce208901e4f5b660c190ceca1f8cfd6fd75e246a525ac1dc92b"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/scheduler_bootstrap.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/scheduler_bootstrap.py",
+      "sha256": "ee52e9baa7c6d81bdd5e00c7985bad9005e036eb27763ef58778b8cd04c21729"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/server_entry.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/server_entry.py",
+      "sha256": "393eb05b394172bb3f4cb3ae954c4b2aba46e9ecb96100ab517411f4ddb19f0e"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/startup_hooks.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/startup_hooks.py",
+      "sha256": "e97b8f96a60cc8087d75bd3dee038ad21e0e4f4cbf19d00eb64c656801620fdd"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/test_ce_receipts.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/test_ce_receipts.py",
+      "sha256": "91796c41ddcc354754e56240a6979632f38be8b850a5446343da52303c7fa669"
+    },
+    {
+      "profile": "glm47_ce_prefill",
+      "path": "runtime_profiles/glm47_ce_prefill/test_comm_topology.py",
+      "source_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/glm47_a100_ep8_pp2ep4_ce_prefill_20261010/test_comm_topology.py",
+      "sha256": "bb6f331e85a64e9d4f068d5caf9305f9bb2591d8bd31ec1f3a13872704a1b6f3"
+    }
+  ],
+  "automatic_install": false
+}

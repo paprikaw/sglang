@@ -102,6 +102,7 @@ class _FakeScheduler(SchedulerPPMixin):
         self.forward_ct = 0
         self._sched_idled = True
         self.future_map = None
+        self._pp_slot_affinity = None
         self._pp_microstep = 0
         self.pp_loop_size = size
         self.send_req_work = []

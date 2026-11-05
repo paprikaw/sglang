@@ -1,0 +1,534 @@
+{
+  "schema_version": 1,
+  "base": "b862312ce314c707a7e88e82a785956990a66850",
+  "branches": [
+    {
+      "branch": "agentx-hicache-restore-retry-r7-20261031",
+      "commit": "797f6488cf5fea2f88e38ccaeb1703443deec537",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/agentx-decode-service-20261101",
+      "commit": "1163e41f11c5f3ae5be58523fec0b9540bf85a50",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/agentx-decode-service-r10-20261101",
+      "commit": "9f666f63d8a146b97d2a2517a979de535d7002f0",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/agentx-gdn-pd-hicache-20261030",
+      "commit": "4dbd0ae28f0e5e66271d2711f99d671a1cf32f2a",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/agentx-gdn-pd-hicache-r2-20261030",
+      "commit": "c4802f0a3bc76c1f2778fe6249ba98b0a6579b23",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/agentx-gdn-pd-hicache-r3-20261030",
+      "commit": "f5f599725795e8ce03e0f1797ad7e96cb0bb2811",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/agentx-gdn-pd-hicache-r4-20261030",
+      "commit": "f8237955ef141d6e8c9e78c7d7ad93854671e81b",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/agentx-gdn-pd-hicache-r5-20261031",
+      "commit": "37e0828c642ce4f3795c4c4394f4ce913bcd1a35",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/agentx-gdn-pd-hicache-r6-20261031",
+      "commit": "fc014e3553c4d234f38f3088a3158c0333e64830",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/agentx-hicache-restore-retry-r7-20261031",
+      "commit": "797f6488cf5fea2f88e38ccaeb1703443deec537",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/agentx-mha-pp-kv-layer-map-20261031",
+      "commit": "fa52c3cd95d2c171c9eac9a8bfdc32296aa8c75f",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/agentx-pp1-to-pp2-r11-20261102",
+      "commit": "b862312ce314c707a7e88e82a785956990a66850",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/archive/elastic-pp-fence-20261031",
+      "commit": "f8a0c6edcd58367414d9d01e2845606a972416d9",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/archive/experiment-dashboard-source-20261031",
+      "commit": "5f866b70446f8e443a754d8f8d44b05921ff6d8a",
+      "integration": "reference",
+      "note": "Dashboard helper source, no unique engine optimization; preserve existing worktree."
+    },
+    {
+      "branch": "codex/archive/qwen35-ep2-tbo-wip-20261031",
+      "commit": "746240bfa944d175b96695045813a1fc5b9ed00e",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/archive/sglang-development-20261031",
+      "commit": "f7a876241b98f611a157ba0c8061543030b43fcf",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/autoscaling-kvcached",
+      "commit": "74734b15fbfd96681b07663243309fef2b24bee5",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-ce-dispatch-dedup-20261008",
+      "commit": "6ecef7b428acb1fcb72df4fd971db07702bb886c",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-ce-fixed3-topology-20261007",
+      "commit": "ab455cec47350ad1c1aa5594f9d3dedd28614623",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-ce-fixed4-topology-20261007",
+      "commit": "60e6c68fa959b79cb88d44f360182e98a77042c2",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-ce-glm-ep8-20261010",
+      "commit": "81a1b5960f5fc73bce33045a56e5b6970e2bcb3c",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-ce-payload-sweep-20261007",
+      "commit": "eef6a2ff3efda75b5e3d4afce282addd4d716c54",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-ce-prefill160-20261010",
+      "commit": "cb694cb83d9448aac2b10e5e589f9d7b42b41ecb",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-ce-prefill160-local-20261010",
+      "commit": "4be2bee619b52a239b124c827d09fa478c6abba8",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-ce-prefill160-matched-20261010",
+      "commit": "5cd4550d009f7a60b6f24928dff96096f646cc7f",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-ce-prefill160-notify-20261010",
+      "commit": "24ebbeb6b35431685dded4ab3bf09ef18de274d9",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-ce-prefill160-notify-safe-20261010",
+      "commit": "da39774bb838e55cc2b915549edac49838ae3bdd",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-dynamic-copy-engine-20261007",
+      "commit": "64573a718111cedc0772bf547c49ebab9962b1c5",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-fixed-qp-selector-20261007",
+      "commit": "cd8df4efec613c1aef66171d976c1634c89e1c1e",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-late-stage-trace-20261007",
+      "commit": "88968a2fc40f056d3656e708d9a374e6710a11fb",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-nvlink-pair-frozen-20261003",
+      "commit": "77e365dd488f42fab8e0ef0cfe00430989c5882f",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-nvlink-pair-opt-20261003",
+      "commit": "31b72f9ce9bba7e38c03fc03e46950d9dbad8af5",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-nvshmem345-cpu-postsend",
+      "commit": "af5177cefd41e61b77df02d791a84bbdeaccd466",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-padded-pcie-control-20261007",
+      "commit": "10558bc9c08ceae02bfa1ec8beb7b2c29fde438c",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-pcie-balanced-warps-20261007",
+      "commit": "3b698aedfa71458319ea2b451d75d2a05b10f8ae",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-pcie-coalesced-20261006",
+      "commit": "05d46157c7ccfa0784b59a5198253a701215c4d3",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-pcie-copy-engine-probe-20261007",
+      "commit": "c0fd5753a5c2f48780246404a984e4fa56f38165",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-pcie-cpu-post-batch-20261007",
+      "commit": "8df17c6862df782fc64a1a31f583ec1342be5740",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-pcie-fused-post-batch-20261007",
+      "commit": "4a48b5f93f879eff177499a1c8f3bf578ec46b8c",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-pcie-inline-flags-20261007",
+      "commit": "c190d6047e2cc9b6dd3345f3ecf5592c4f881b2d",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-pcie-payload-phase-20261007",
+      "commit": "9ed3d3fb3538de8794b1eaeaae3c2be555f32f74",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-pcie-rdma-control-20261007",
+      "commit": "e32c583fc996b6b283bb74b29700fb78d2a7223f",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-pcie-rotated-warps-20261007",
+      "commit": "e9f6e3ba7fc456211504dea083930cd686fdd39f",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-pcie-tail-flush-ablation-20261007",
+      "commit": "2a8f748335615bc10787c2059a1be2c827b55522",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-rdma-drain-before-pcie-20261007",
+      "commit": "f1be4b91551b27a97ac9cecc627c45a280550435",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-rdma-first-pcie-20261007",
+      "commit": "7d2bc3f402b3ee6316651b166b086960619852c3",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-token-routing-ep16-20261003",
+      "commit": "4d0c54734927be88b24e73f64078cddc4173feef",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-token-routing-ep4-20261004",
+      "commit": "7d1ebddc49649fe06d6b8ccd2f77876e2ba9b4ce",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/deepep-token-routing-frozen-20261003",
+      "commit": "31b72f9ce9bba7e38c03fc03e46950d9dbad8af5",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/dependency-deepep/ep12-low-latency-20261006",
+      "commit": "50be6136eea4c1e4fe57d79dbbe9527f52e9f41c",
+      "integration": "dependency_lock",
+      "note": "Independent DeepEP history, retained in dependencies.lock.json and original branch."
+    },
+    {
+      "branch": "codex/elastic-pp-active-route-fix",
+      "commit": "8482ec93f139a6b85886d1645e627810515b176e",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/experiment-dashboard-guard",
+      "commit": "74734b15fbfd96681b07663243309fef2b24bee5",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-canonical-weight-cache-20261003",
+      "commit": "92e1823d518603bd9b1fb802503739f7370b68fa",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-deepep-local-opt-20261002",
+      "commit": "42c42a700dc4f9e8c139f3c4e3474a7cbc8ad262",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-ep16-canonical-profile-20261004",
+      "commit": "870269702285d94bdd926a50cc29ad1a20bcf60c",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-humming-deepep-full-20261001",
+      "commit": "e19e7fed83fc8a5b736372abff10e12bfb86c53a",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-native-ep8-wna16-20260921",
+      "commit": "ca790b3f53915cee3d88ae16d1ae3000cbb638e1",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-pp-hicache-admission-20261002",
+      "commit": "e53c15ddf98341238dcb15331fcf70d542f8922d",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-pp-hicache-attach-scope-20261002",
+      "commit": "2261fec4aea737975da05c80c7e2f8641b51bbaa",
+      "integration": "reference",
+      "note": "Equivalent native patches already merged through canonical weight cache branch."
+    },
+    {
+      "branch": "codex/glm47-pp-hicache-consensus-20261002",
+      "commit": "85725e8665ce675e55bc66afeca1be4e36dd0658",
+      "integration": "reference",
+      "note": "Older synchronous storage-progress consensus superseded by upstream 92580291f0 and integration PP polling protocol."
+    },
+    {
+      "branch": "codex/glm47-pp-hicache-metrics-20261002",
+      "commit": "40870a66c2bf648506819af6bc18f2b21fb610ca",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-pp-slot-affinity-20261009",
+      "commit": "61a8a9f40aa53c68599aa97bf9c5c6acd0ef40f4",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-pp-spec-20261023",
+      "commit": "a0940c4c011804cab0334c9ad37aa8f02445688a",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-pp-spec-bankfix-20261023",
+      "commit": "752bc6876ef3449ea32526a639ed5b7bd480bfb5",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-pp-spec-graphfix-20261023",
+      "commit": "c14e375f6b832cf084a41e20bcb2e4495fc36cba",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-pp-spec-memfix-20261023",
+      "commit": "a9c4b5566f78ba7ea6469c944954fd9908cadb40",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-pp-spec-microbatch-20261023",
+      "commit": "f415858311c0d7646b368b30b64b371dca3427e4",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-pp-spec-microbatch-invariant-20261023",
+      "commit": "9e48f876a8eb2d7460317bc713bfa8680d78aea5",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-pp-spec-tokenbuf-20261023",
+      "commit": "751f3c4f863394c6da7ef500ab3ae4076d0da0ef",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/glm47-pp2ep4-ep8-heavy-20261004",
+      "commit": "0803db84f19836a366498bc11826ee5e55a42d51",
+      "integration": "reference",
+      "note": "All three unique patches are exact duplicates already merged."
+    },
+    {
+      "branch": "codex/heterogeneous-tp-pp",
+      "commit": "44ce47e296d740b39f26223acdbb276a6280a3d7",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/hy3-a100-qualification-20261018",
+      "commit": "77b6177a9dc963d791116e133b70b8755f8711c9",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/pd-decode-pp2-smoke-20260927",
+      "commit": "041ce35b5e0d01bce84af1240d39dbb4368a768f",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/pd-hetero-staging-fix-20260927",
+      "commit": "041ce35b5e0d01bce84af1240d39dbb4368a768f",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/pd-hicache-loadback-sync",
+      "commit": "785225702f1f2f0bc36d6a40b018cea5883920c3",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/pp4-hicache-l3-replay",
+      "commit": "92580291f087ffbeb3439714a360b7ff3a99e369",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/qwen122b-pp-balance",
+      "commit": "51f0c569184b04d4f7f39df3776feadf72910cf7",
+      "integration": "reference",
+      "note": "Separate helper repository; relevant runtime source is preserved in runtime_profiles."
+    },
+    {
+      "branch": "codex/qwen122b-pp-balance-warm",
+      "commit": "10372426b45d3d99b3e8a12eaa4de684ddadef03",
+      "integration": "reference",
+      "note": "Separate helper repository; relevant runtime source is preserved in runtime_profiles."
+    },
+    {
+      "branch": "codex/qwen122b-pp-feedback-refine",
+      "commit": "9dc22d22deb09522fe49033e8d11d8b2582e635a",
+      "integration": "reference",
+      "note": "Separate helper repository; relevant runtime source is preserved in runtime_profiles."
+    },
+    {
+      "branch": "codex/qwen35-ep2-tbo-20261027",
+      "commit": "870269702285d94bdd926a50cc29ad1a20bcf60c",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/qwen35b-decode-ep-overlap-20261027",
+      "commit": "0f2f1990994774472b1089d2b0682f0bf926a6b4",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/qwen35b-prefill-ep-overlap-20261027",
+      "commit": "2a0df104beb7449da319378b8e3fb84238036d36",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/qwen35b-prefill-ep-overlap-r2-20261027",
+      "commit": "c0b720a993a76db2b2fe2da84fbfe98462d48012",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/qwen35b-prefill-ep-overlap-r3-20261027",
+      "commit": "7960005f41afe0d3b2bad9d69b0433f9f885c088",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    },
+    {
+      "branch": "codex/qwen38-codex-integration",
+      "commit": "c2101ddac7af5451cc102ee1ceb37d982d0adc4e",
+      "integration": "reference",
+      "note": "Ordinary model-serving branch; no unique research engine optimization required."
+    },
+    {
+      "branch": "codex/sglang-optimization-records-20261031",
+      "commit": "e82925c107914140bb411abade31360376a1d940",
+      "integration": "reference",
+      "note": "Experiment archive; selected runtime sources tracked in runtime_profiles instead of copying measurements into engine Git."
+    },
+    {
+      "branch": "codex/sglang-serving",
+      "commit": "2c7fb9a02ceabe4165d804b423c331c2c290e6b1",
+      "integration": "reference",
+      "note": "Independent upstream serving version, not an optimization patch set; do not upgrade the research baseline wholesale."
+    },
+    {
+      "branch": "main",
+      "commit": "95f5ecd3d26665423d3e6577a2a00c04f5cde733",
+      "integration": "ancestor",
+      "note": "Included by ancestry; conflict resolutions are recorded in merge commits."
+    }
+  ]
+}
