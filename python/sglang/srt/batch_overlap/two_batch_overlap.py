@@ -699,6 +699,10 @@ class TboForwardBatchPreparer:
             "extend_logprob_start_lens_cpu",
             "lora_ids",
             "rids",
+            # Hybrid GDN tracks state snapshots per request, not per token.
+            "mamba_track_indices",
+            "mamba_track_mask",
+            "mamba_track_seqlens",
         ]:
             old_value = getattr(batch, key)
             if old_value is None:
@@ -793,7 +797,11 @@ class TboForwardBatchPreparer:
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,
                 original_global_num_tokens_cpu=None,
-                _original_batch_size=None,
+                _original_batch_size=(
+                    max(0, min(end_seq_index, batch._original_batch_size) - start_seq_index)
+                    if batch._original_batch_size is not None
+                    else None
+                ),
                 _original_forward_mode=None,
                 _original_num_tokens=None,
                 global_num_tokens_gpu=None,
