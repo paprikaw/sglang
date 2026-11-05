@@ -1236,6 +1236,10 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self._pp_slot_affinity = None
+        self._pp_current_slot = None
+        if envs.SGLANG_PP_SLOT_AFFINITY.get() and self.ps.pp_size < 2:
+            raise ValueError("SGLANG_PP_SLOT_AFFINITY requires ordinary PP size >=2")
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -3446,6 +3450,12 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if (
+                affinity := getattr(self, "_pp_slot_affinity", None)
+            ) is not None and not (affinity.can_admit(req, self._pp_current_slot)):
+                # A retracted request retains its owner and existing identity.
+                # It can only restart prefill when that slot is scheduled.
+                continue
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 
@@ -4366,6 +4376,10 @@ class Scheduler(
     def _pp_microbatches_drained(self) -> bool:
         if self.ps.pp_size == 1:
             return True
+        if (
+            affinity := getattr(self, "_pp_slot_affinity", None)
+        ) is not None and not affinity.is_drained():
+            return False
         return all(x.is_empty() for x in self.running_mbs) and all(
             mb is None or mb.is_empty() for mb in self.mbs
         )
@@ -4669,7 +4683,9 @@ class Scheduler(
         return RpcReqOutput(success=success, message="" if not exec else str(exec))
 
     def abort_request(self, recv_req: AbortReq):
-        if (chunked_req := self.chunked_req) is not None:
+        if (affinity := getattr(self, "_pp_slot_affinity", None)) is not None:
+            affinity.queue_abort(self, recv_req)
+        elif (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
 
@@ -4830,6 +4846,12 @@ class Scheduler(
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
+        if getattr(self, "_pp_slot_affinity", None) is not None:
+            # The ordinary PP event loop has no ring-wide pause/drain protocol.
+            # Reject before changing paused state or releasing any slot's KV.
+            raise NotImplementedError(
+                "pause_generation is unsupported with SGLANG_PP_SLOT_AFFINITY"
+            )
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
