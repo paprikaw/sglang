@@ -191,8 +191,9 @@ if os.environ.get('INTEGRATION_SERVER') == '1':
 
 
 def engine_entry(cfg, row):
-    from sglang.srt.server_args import ServerArgs
-    from sglang.srt.entrypoints.http_server import launch_server
+    from sglang.srt.server_args import prepare_server_args
+    from sglang.launch_server import run_server
+    from sglang.srt.plugins import load_plugins
     ep, pp = row['ep'], row['pp']
     args = ['--model-path', cfg['model_path'], '--host', '127.0.0.1', '--port', str(row['port']),
         '--dist-init-addr', f"127.0.0.1:{row['dist_port']}", '--tp-size', str(ep),
@@ -220,11 +221,12 @@ def engine_entry(cfg, row):
             '--disaggregation-bootstrap-port', '24980', '--disaggregation-ib-device', 'mlx5_bond_0']
         if row['role'] == 'decode':
             args += ['--disaggregation-decode-enable-radix-cache', '--disaggregation-decode-extra-slots', '8']
-    server_args = ServerArgs.from_cli_args(args)
+    load_plugins()
+    server_args = prepare_server_args(args)
     key = h.read_key(cfg)
     server_args.api_key = key
     server_args.admin_api_key = key
-    launch_server(server_args)
+    run_server(server_args)
 
 
 def launch(run, cfg, row, key):
