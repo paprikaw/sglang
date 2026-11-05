@@ -23,6 +23,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -156,19 +157,23 @@ class HummingRunnerCore(MoeRunnerCore):
         if humming_gemm_type.value in self.humming_gemm_configs:
             return self.humming_gemm_configs[humming_gemm_type.value]
 
+        use_batch_invariant = get_exec().deterministic.enable_deterministic_inference
         compute_config = {
             "use_f16_accum": envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
+            "use_batch_invariant": use_batch_invariant,
             "gemm_type": humming_gemm_type.value,
         }
         w13_tuning_config = HummingMethod.get_default_tuning_configs(
             layer=self.layer,
             use_f16_accum=envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
+            use_batch_invariant=use_batch_invariant,
             gemm_type=humming_gemm_type,
             sublayer_name="w13",
         )
         w2_tuning_config = HummingMethod.get_default_tuning_configs(
             layer=self.layer,
             use_f16_accum=envs.SGLANG_HUMMING_USE_F16_ACCUM.get(),
+            use_batch_invariant=use_batch_invariant,
             gemm_type=humming_gemm_type,
             sublayer_name="w2",
         )

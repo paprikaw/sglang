@@ -1141,6 +1141,10 @@ class Envs:
     # Speculative decoding
     # ===================================================================
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    # Opt-in upstream PP EAGLE/MTP relay; non-overlap, no DP Attention.
+    SGLANG_ENABLE_PP_SPEC = EnvBool(False)
+    # Two explicit PP2 slots, early activation submission, independent feedback.
+    SGLANG_PP_SPEC_MICROBATCH = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
