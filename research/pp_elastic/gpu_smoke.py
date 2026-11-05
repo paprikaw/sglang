@@ -323,13 +323,13 @@ def worker(run, cfg):
                             time.sleep(1)
                 def endpoint(row):
                     return dict(host='127.0.0.1', port=row['port'], ep=row['ep'], bootstrap_port=24980)
-                def cohort(indices=None, promptset=None, output=24):
+                def cohort(indices=None, promptset=None, output=24, logprob=True):
                     indices = list(range(8)) if indices is None else indices
                     promptset = prompts if promptset is None else promptset
                     def one(i):
                         return agentx_replay.request_one(endpoint(rows[0]),
                             endpoint(rows[1]) if name == 'pd' else None,
-                            key, promptset[i], output, i, return_logprob=True)
+                            key, promptset[i], output, i, return_logprob=logprob)
                     with cf.ThreadPoolExecutor(max_workers=8) as pool:
                         replies = list(pool.map(one, indices))
                     for reply in replies:
@@ -352,7 +352,12 @@ def worker(run, cfg):
                     # reuse it; repeating a short initial prompt need not hit D.
                     parents = [cohort([i], output=128)[0] for i in (0, 1)]
                     continuation_prompts = [prompts[i] + parents[i]['output_ids'] for i in (0, 1)]
+                    first_continuation = [cohort([i], promptset=continuation_prompts)[0] for i in (0, 1)]
+                    # The first continuation adds a P-side checkpoint. Compare
+                    # the next GPU-hot run against CPU restore at that same
+                    # prefix length, rather than different GDN forward shapes.
                     reference = [cohort([i], promptset=continuation_prompts)[0] for i in (0, 1)]
+                    evidence['first_continuation'] = first_continuation
                     evidence.update(pd_session_parents=parents, continuation_reference=reference)
                 h.save(run / (name + '.evidence.json'), evidence)
                 # Repeat after an explicit CPU restore, keeping normal HiCache on.
@@ -376,13 +381,15 @@ def worker(run, cfg):
                     # warm the same B8/two-B4 geometry before selecting it.
                     prefixes = [[5000 + i] + body[:383] for i in range(8)]
                     decode_prompts = [p + [198] for p in prefixes]
-                    evidence['gap_prefix_preparation'] = cohort(promptset=prefixes, output=1)
+                    evidence['gap_prefix_preparation'] = cohort(promptset=prefixes, output=1, logprob=False)
                     control_byte(run / 'pp2/fixed.bin', 1)
-                    native_gap = cohort(promptset=decode_prompts)
+                    # Cached fast-wire schemas exclude variable logprob
+                    # metadata; general requests continue to use native PP.
+                    native_gap = cohort(promptset=decode_prompts, logprob=False)
                     evidence['gap_reference'] = native_gap
                     control_byte(run / 'pp2/gap.bin', ord('9'))
                     control_byte(run / 'pp2/fixed.bin', 2)
-                    optimized = cohort(promptset=decode_prompts)
+                    optimized = cohort(promptset=decode_prompts, logprob=False)
                     evidence['gap9'] = optimized
                     h.save(run / (name + '.evidence.json'), evidence)
                     if [x['output_ids'] for x in native_gap] != [x['output_ids'] for x in optimized]:

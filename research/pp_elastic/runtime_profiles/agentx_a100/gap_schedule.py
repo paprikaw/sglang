@@ -326,7 +326,14 @@ def install_schema(cls, torch, read_mode, P2PWork):
         payload["__msg_type__"] = msg_type
         schema = describe(torch, payload)
         if schema is None or schema != remembered.get(("send", msg_type)):
-            raise RuntimeError("Fast PP send schema differs from warmed native message")
+            # Shapes and metadata keys only: never include token IDs or tensors
+            # in an error from this experimental fixed-schema transport.
+            shapes = {k: (tuple(v.shape), str(v.dtype)) for k, v in payload.items() if torch.is_tensor(v)}
+            raise RuntimeError(
+                f"Fast PP send schema differs from warmed native message: {msg_type}, "
+                f"shapes={shapes}, value_keys={[k for k, v in payload.items() if not torch.is_tensor(v)]}, "
+                f"warmed={remembered.get(('send', msg_type)) is not None}"
+            )
         group = self.pp_group
         peer = group.ranks[(group.rank_in_group + 1) % 2]
         channel = group.device_group
