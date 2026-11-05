@@ -136,15 +136,30 @@ class SchedulerRequestReceiver:
                 recv_reqs = None
         else:
             if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
-                dp_offset = (
-                    self.ps.attn_dp_rank * self.ps.attn_cp_size * self.ps.attn_tp_size
-                )
+                if getattr(self.server_args, "pp_stage_tp_sizes", None) is not None:
+                    from sglang.srt.distributed.heterogeneous_pp import (
+                        HeterogeneousPPTopology,
+                    )
+
+                    topology = HeterogeneousPPTopology.parse(
+                        getattr(self.server_args, "pp_stage_tp_sizes")
+                    )
+                    rank = topology.stage_leader_ranks[self.ps.pp_rank]
+                    src = topology.previous_stage_leader(self.ps.pp_rank)
+                else:
+                    dp_offset = (
+                        self.ps.attn_dp_rank
+                        * self.ps.attn_cp_size
+                        * self.ps.attn_tp_size
+                    )
+                    rank = self.ps.pp_rank * self.ps.tp_size + dp_offset
+                    src = (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset
                 recv_reqs = point_to_point_pyobj(
                     [],
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    rank,
                     self.world_group.cpu_group,
-                    (self.ps.pp_rank - 1) * self.ps.tp_size + dp_offset,
-                    self.ps.pp_rank * self.ps.tp_size + dp_offset,
+                    src,
+                    rank,
                 )
             else:
                 recv_reqs = None
