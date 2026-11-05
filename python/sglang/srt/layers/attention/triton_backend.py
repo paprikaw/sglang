@@ -59,6 +59,7 @@ from sglang.srt.utils import (
     is_xpu,
     next_power_of_2,
 )
+from sglang.srt.utils.common import get_eager_max_batch_size
 
 _is_cuda = is_cuda()
 _is_gfx942 = is_gfx942_supported()
@@ -143,8 +144,8 @@ class TritonAttnBackend(AttentionBackend):
     # buffers; it never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = False
 
-    # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
-    # can never carry more seqs than the pool.
+    # Extend dummy sequences are capped at the real request-pool capacity.
+    # Decode metadata also accommodates the MLP-sync padded batch rows below.
     extend_dummy_seqs_capped_by_req_pool: bool = True
 
     def __init__(
@@ -184,7 +185,12 @@ class TritonAttnBackend(AttentionBackend):
 
         # Parse args
         self.skip_prefill = skip_prefill
-        max_bs = model_runner.req_to_token_pool.size
+        # DP/MLP sync pads decode rows to the Attention TP/CP alignment, even
+        # when that exceeds the real request pool. Match the eager registry's
+        # bound; dummy rows reuse request index 0 rather than allocate requests.
+        max_bs = get_eager_max_batch_size(
+            model_runner.server_args, model_runner.req_to_token_pool.size
+        )
         self.sliding_window_size = model_runner.sliding_window_size
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool

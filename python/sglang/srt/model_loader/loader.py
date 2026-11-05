@@ -478,6 +478,14 @@ class DefaultModelLoader(BaseModelLoader):
         """Prepare weights for the model.
 
         If the model is not local, it will be downloaded."""
+        if os.environ.get("SGLANG_NODE_LOCAL_WEIGHT_CACHE_SOCKET"):
+            view = getattr(self.load_config, "_node_local_weight_cache_view", None)
+            if not view or os.path.realpath(model_name_or_path) != os.path.realpath(
+                view
+            ):
+                raise ValueError(
+                    "node-local CPU bank forbids external/disk weight sources"
+                )
         if os.environ.get("SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET"):
             view = getattr(self.load_config, "_canonical_weight_cache_view", None)
             if not view or os.path.realpath(model_name_or_path) != os.path.realpath(
@@ -4282,6 +4290,21 @@ def get_model_loader(
     load_config: LoadConfig, model_config: Optional[ModelConfig] = None
 ) -> BaseModelLoader:
     """Get a model loader based on the load format."""
+
+    if os.environ.get("SGLANG_NODE_LOCAL_WEIGHT_CACHE_SOCKET"):
+        from sglang.srt.weight_cache.cpu_node_local_loader import (
+            NodeLocalCpuModelLoader,
+        )
+
+        if os.environ.get("SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET") or os.environ.get(
+            "SGLANG_CPU_WEIGHT_CACHE_SOCKET"
+        ):
+            raise ValueError(
+                "node-local, canonical and prepared CPU weight caches cannot be mixed"
+            )
+        if load_config.load_format not in (LoadFormat.AUTO, LoadFormat.SAFETENSORS):
+            raise ValueError("node-local RAM bank requires normal safetensors loading")
+        return NodeLocalCpuModelLoader(load_config, DefaultModelLoader(load_config))
 
     if os.environ.get("SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET"):
         from sglang.srt.weight_cache.cpu_canonical_loader import CanonicalCpuModelLoader

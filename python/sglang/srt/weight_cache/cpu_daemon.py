@@ -193,7 +193,7 @@ class CpuWeightCacheDaemon:
                     "source_commit": self.source_commit,
                     "max_bytes": self.max_bytes,
                     "headroom_bytes": self.headroom_bytes,
-                    "features": ["canonical_groups_v1"],
+                    "features": ["canonical_groups_v1", "node_local_no_eviction_v1"],
                     "used_bytes": used,
                     "reserved_bytes": reserved,
                     "current_bytes": used + reserved,
@@ -295,13 +295,21 @@ class CpuWeightCacheDaemon:
                     raise CacheFailure("size", "positive integer reservation required")
                 if expected > self.max_bytes:
                     raise CacheFailure("capacity", "model exceeds daemon byte limit")
+                allow_eviction = request.get("allow_eviction", True)
+                if type(allow_eviction) is not bool:
+                    raise CacheFailure("protocol", "allow_eviction must be boolean")
+                if not allow_eviction and self._total() + expected > self.max_bytes:
+                    raise CacheFailure(
+                        "capacity",
+                        "node-local bank requires free capacity; eviction forbidden",
+                    )
                 # Evict only complete, unborrowed snapshots. A reader or build
                 # cannot be silently sacrificed to admit another model.
                 victims = sorted(
                     (
                         e
                         for e in self.entries.values()
-                        if e.state == "ready" and not e.readers
+                        if allow_eviction and e.state == "ready" and not e.readers
                     ),
                     key=lambda e: e.last_access,
                 )

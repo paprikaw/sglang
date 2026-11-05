@@ -175,7 +175,13 @@ class CpuWeightCacheClient:
         return self._request("status")
 
     def acquire(
-        self, key: str, expected_bytes: int, fingerprint: Any, wait_s: float = 0
+        self,
+        key: str,
+        expected_bytes: int,
+        fingerprint: Any,
+        wait_s: float = 0,
+        *,
+        allow_eviction: bool = True,
     ) -> dict:
         return self._request(
             "acquire",
@@ -183,6 +189,7 @@ class CpuWeightCacheClient:
             expected_bytes=expected_bytes,
             fingerprint=fingerprint,
             wait_s=wait_s,
+            allow_eviction=allow_eviction,
         )
 
     def get(self, key: str, fingerprint: Any, wait_s: float = 0) -> dict:
