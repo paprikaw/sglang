@@ -108,7 +108,10 @@ def prepare(args):
         max_active_nodes=1, gpu_lease_ttl_s=30,
         gpu_registry_dir='/data/gpfs/projects/punim2715/vllm_workbench/.experiment_guard/gpu_registry',
         model_cache=cache, frozen_inputs=frozen,
-        sources=[dict(role='inference_engine', worktree=str(ENGINE), commit=commit, tag=args.tag)],
+        sources=[dict(role='inference_engine', worktree=str(ENGINE), commit=commit, tag=args.tag),
+            dict(role='persistent_cpu_weight_daemon', worktree=node_spec['engine_root'],
+                commit=node_spec['source_commit'],
+                tag='experiment/sglang/glm47-ep16-canonical-profile-20261004-cpu-validated')],
         tasks=[dict(id='regression', label='EP2, EP4, PP2 and EP2-P to PP2-D',
             nodes=[args.node], root=str(run / 'task'), controller_script=str(Path(__file__)), expected=4)])
     h.save(run / 'dashboard_spec.json', spec)
