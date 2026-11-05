@@ -4,7 +4,7 @@
 
 **共同基线。** `codex/pp-elastic-integration` 是已经整理并做过有限范围回归的共同分支，冻结标签为 `baseline/sglang/ep-pp-pd-20261105`。原来的 `codex/autoscaling-kvcached` 和实验 worktree 保留历史，不作为新任务默认合并目标；上游 `sgl-project/sglang` 也不是本项目的提交目标。
 
-**本轮总 PR。** 从共同基线建立 `codex/pp-hicache-autoscaling`，以 Draft PR 指向共同基线。主 agent 负责这个项目分支，自己也可以直接实现任务；不要求为了使用这套流程而启动 sub-agent。总 PR 当前建立协作入口，后续按[当前方案](https://github.com/paprikaw/paper-repo/blob/786c35d2cb49fb84f65d6b9c502a9f1de6bbdf89/reading/pd-inplace-grow-split-outline-20261103/CONFIG_TRANSITIONS.md)实现单实例 naive PP＋HiCache，P/D 接入保留在后续。项目入口的建立不代表动态功能已实现。
+**本轮总 PR。** 从共同基线建立 `codex/pp-hicache-autoscaling`，以 [Draft PR #1](https://github.com/paprikaw/sglang/pull/1) 指向共同基线。主 agent 负责这个项目分支，自己也可以直接实现任务；不要求为了使用这套流程而启动 sub-agent。总 PR 当前建立协作入口，后续按[当前方案](https://github.com/paprikaw/paper-repo/blob/786c35d2cb49fb84f65d6b9c502a9f1de6bbdf89/reading/pd-inplace-grow-split-outline-20261103/CONFIG_TRANSITIONS.md)实现单实例 naive PP＋HiCache，P/D 接入保留在后续。项目入口的建立不代表动态功能已实现。
 
 **子任务。** 需要并行时，每位 agent 从明确的项目提交建立独立的 `codex/` 任务分支和 worktree，并向项目分支开一个 Draft PR。按可独立检查的任务划分 PR，而不是每个 commit 都开 PR。依赖其他子任务时写清依赖链接和起始 SHA；优先等依赖合入项目分支后再开展，确需堆叠时明确标注。主 agent 在总 PR 里用列表维护任务、负责人、子 PR、依赖、已合入状态和测试结果。
 
