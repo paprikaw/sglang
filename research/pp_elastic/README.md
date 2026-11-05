@@ -4,7 +4,7 @@
 
 **引擎中的优化。** 包含 EP overlap、BF16 Expert runner、AWQ/Humming 专家切分、PP tensor channel 和调度、HiCache/GDN 恢复及 P→D 层映射、CPU canonical/node-local 权重缓存，以及排空与恢复 PP 的控制面。冲突优先保留较新的层映射、逻辑输出回传和 PP loadback 轮询协议，未将旧协议叠加到新协议上。
 
-**显式选择的运行适配。** `runtime_profiles/` 保存原实验的源码，`runtime_sources.json` 记录来源及原始哈希。A100 BF16、PP2 producer-ready/typed-channel/lookahead、AgentX 观察和缓存诊断、122B 流水均衡，以及 GLM CE Prefill 都有对应源码。它们不是全局默认补丁；运行者必须选择模型、硬件和执行路径。旧 `prepare.py` 等脚本保留历史目录假设，不能当作新基线的通用启动器直接使用。
+**显式选择的运行适配。** `runtime_profiles/` 保存原实验的源码，`runtime_sources.json` 的 `source_sha256` 记录取档时原始哈希，`sha256` 记录基线中的当前文件；后续兼容修复有 Git 提交。A100 BF16、PP2 producer-ready/typed-channel/lookahead、AgentX 观察和缓存诊断、122B 流水均衡，以及 GLM CE Prefill 都有对应源码。它们不是全局默认补丁；运行者必须选择模型、硬件和执行路径。旧 `prepare.py` 等脚本保留历史目录假设，不能当作新基线的通用启动器直接使用。PP2 快速协议仅验证固定合批、无 logprob 的负载，不能直接用于任意请求。
 
 **外部依赖。** DeepEP 的 CUDA/通信实现属于独立仓库，按 `dependencies.lock.json` 固定版本和原生扩展哈希，不将其 Git 根合并进 SGLang。CE Prefill 与 Decode Graph 的适用范围不同。依赖锁保存部署来源；它不表示所有组合均已通过 GPU 验证。
 
