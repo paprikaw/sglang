@@ -56,6 +56,7 @@ def test_non_pp_restore_readiness_retires_completed_load():
         cache_controller=SimpleNamespace(layer_done_counter=SimpleNamespace(
             events=[SimpleNamespace(finish_event=event)])),
         loading_check=Mock(),
+        _all_reduce=Mock(),
     )
     assert UnifiedRadixCache.is_load_back_event_done(cache, 0)
     cache.loading_check.assert_called_once_with()
