@@ -48,7 +48,10 @@ def prepare(args):
     commit = git('rev-parse', 'HEAD')
     if git('rev-parse', args.tag + '^{commit}') != commit or git('cat-file', '-t', args.tag) != 'tag':
         raise RuntimeError('An annotated tag at current HEAD is required')
-    guard = Path('/home/bxb1/experiment-guard/skills/llm-experiment-guard/scripts')
+    # Reuse the audited Qwen-capable Guard bundle used by AgentX; the installed
+    # generic entry point still only admits GLM and must not be bypassed by
+    # relabelling a Qwen cache as GLM. This bundle uses the same shared registry.
+    guard = Path(args.guard_scripts).resolve()
     state = json.loads(Path(args.backfill_state).read_text())
     old = Path(state['nodes'][args.node]['run']) / 'cache_node_spec.json'
     node_spec = json.loads(old.read_text())
@@ -96,6 +99,7 @@ def prepare(args):
              ROOT / 'dependencies.lock.json', ROOT / 'runtime_sources.json']
     files += sorted(PROFILE.glob('*.py')) + sorted(NATIVE.glob('*.py'))
     frozen += [desc(p) for p in files]
+    frozen += [desc(p) for p in sorted(guard.glob('*.py'))]
     (run / 'task').mkdir()
     spec = dict(schema_version=1, id=run.name, title='Integrated SGLang: A100 EP / PP / P-D regression',
         engine='sglang', protocol='task-events-v2', template='parallel-tasks-v5', port=24760,
@@ -393,6 +397,7 @@ def main():
     ap.add_argument('--layout')
     ap.add_argument('--node', default='spartan-gpgpu168')
     ap.add_argument('--job', default='33463293')
+    ap.add_argument('--guard-scripts', default='/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/h100_small_batch_layout_verify_20261029/guard_bundle_posix_v1/skills/llm-experiment-guard/scripts')
     ap.add_argument('--tag', default='experiment/sglang/pp-elastic-integration-20261105-r1')
     ap.add_argument('--python', default='/data/gpfs/projects/punim2715/vllm_workbench/sglang_overlap_compare/venv-dd15fb57-cu12/bin/python')
     ap.add_argument('--backfill-state', default='/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/cluster_backfill_20261020/all_nodes_state.json')
