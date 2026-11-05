@@ -62,14 +62,20 @@ def prepare(args):
     (run / 'cache').mkdir()
     h.save(run / 'cache/node.json', node_spec)
     layouts = []
+    cases = args.cases.split(',')
+    if len(cases) != len(set(cases)) or set(cases) - {'ep2', 'ep4', 'pp2', 'pd', 'ep2_deepep'}:
+        raise ValueError('Unknown or duplicate regression case')
     definitions = [('ep2', 2, 1, [0, 1], None), ('ep4', 4, 1, [0, 1, 2, 3], None),
                    ('pp2', 1, 2, [0, 1], None), ('pd_p', 2, 1, [0, 1], 'prefill'),
-                   ('pd_d', 1, 2, [2, 3], 'decode')]
+                   ('pd_d', 1, 2, [2, 3], 'decode'), ('ep2_deepep', 2, 1, [0, 1], None)]
     for i, (name, ep, pp, gpus, role) in enumerate(definitions):
+        if ('pd' if name.startswith('pd_') else name) not in cases:
+            continue
         path = run / name
         path.mkdir()
         (path / 'pp2').mkdir()
-        for file, value in [('ready.bin', b'1'), ('gap.bin', b'0'), ('counters.bin', b'\0')]:
+        for file, value in [('ready.bin', b'1'), ('gap.bin', b'0'), ('counters.bin', b'\0'),
+                            ('fixed.bin', b'\0'), ('fixed_size.bin', bytes([8]))]:
             (path / file).write_bytes(value)
             (path / file).chmod(0o600)
         ranks = [f'PP{p} TP{t}' if pp > 1 else f'TP{t}'
@@ -77,7 +83,8 @@ def prepare(args):
         use = dict(id=run.name + '.' + name, path=str(run / 'cache' / (name + '.log')),
                    expected_ranks=ranks)
         layouts.append(dict(id=name, ep=ep, tp=ep, dp=ep, pp=pp, gpus=gpus,
-                            role=role, port=24761 + i, dist_port=24861 + i,
+                            role=role, port=24761 + 10 * i, dist_port=24861 + 20 * i,
+                            backend='deepep' if name == 'ep2_deepep' else 'none',
                             usage_logs=[use]))
     sys.path.insert(0, str(guard))
     import cpu_memory_budget
@@ -91,7 +98,7 @@ def prepare(args):
     cfg = dict(id=run.name, node=args.node, job_id=args.job, guard_scripts=str(guard),
         engine_root=str(ENGINE), engine_commit=commit, engine_tag=args.tag,
         python=args.python, model_path=node_spec['model_path'],
-        layouts=layouts, admin_key_file=str(run / 'admin.key'), model_cache=cache)
+        layouts=layouts, cases=cases, admin_key_file=str(run / 'admin.key'), model_cache=cache)
     h.save(run / 'config.json', cfg)
     (run / 'admin.key').write_text(secrets.token_urlsafe(32))
     (run / 'admin.key').chmod(0o600)
@@ -113,10 +120,10 @@ def prepare(args):
                 commit=node_spec['source_commit'],
                 tag='experiment/sglang/glm47-ep16-canonical-profile-20261004-cpu-validated')],
         tasks=[dict(id='regression', label='EP2, EP4, PP2 and EP2-P to PP2-D',
-            nodes=[args.node], root=str(run / 'task'), controller_script=str(Path(__file__)), expected=4)])
+            nodes=[args.node], root=str(run / 'task'), controller_script=str(Path(__file__)), expected=len(cases))])
     h.save(run / 'dashboard_spec.json', spec)
     h.save(run / 'task/progress.json', dict(experiment_id=run.name, task_id='regression',
-        stage='queued', valid_points=0, expected=4, timestamp=time.time()))
+        stage='queued', valid_points=0, expected=len(cases), timestamp=time.time()))
     print(json.dumps(dict(run=str(run), guard=str(guard / 'dashboard_guard.py'))))
 
 
@@ -141,8 +148,16 @@ def environment(cfg, row, run):
         PP_GAP_POLICY_PATH=str(run / row['id'] / 'gap.bin'),
         PP_GAP_SEPARATE_CHANNELS='1' if row['id'] == 'pp2' else '0',
         BENCH_FORWARD_COUNTER_CONTROL=str(run / row['id'] / 'counters.bin'),
+        PP_FIXED_COHORT_CONTROL=str(run / row['id'] / 'fixed.bin'),
+        PP_FIXED_COHORT_SIZE=str(run / row['id'] / 'fixed_size.bin'), BENCH_REPLICAS='1',
         EP2_PP2_RUN=str(run / row['id']), EP2_PP2_ARM='pp2' if row['pp'] > 1 else 'ep2',
         INTEGRATION_SERVER='1', INTEGRATION_RUN=str(run), INTEGRATION_LAYOUT=row['id'])
+    if row['backend'] == 'deepep':
+        env.update(SGLANG_DEEPEP_BF16_DISPATCH='1', SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK='32',
+            NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME='bond0.3027', NVSHMEM_HCA_LIST='mlx5_bond_0:1',
+            NVSHMEM_IB_ADDR_FAMILY='AF_INET', NVSHMEM_IB_ADDR_RANGE='172.26.92.0/22',
+            NVSHMEM_DISABLE_P2P='0', NVSHMEM_IBGDA_NIC_HANDLER='cpu_host_memory',
+            NVSHMEM_QP_DEPTH='4096', DEEPEP_AH_ZERO_STATIC_RATE='1')
     return env
 
 
@@ -182,8 +197,9 @@ def server_hooks():
             return result
         SchedulerPPMixin._pp_send_dict_to_next_stage = send
         if os.environ['INTEGRATION_LAYOUT'] == 'pp2':
-            import gap_schedule
+            import gap_schedule, pp_fixed_cohort
             gap_schedule.install()
+            pp_fixed_cohort.install()
 
 
 if os.environ.get('INTEGRATION_SERVER') == '1':
@@ -204,7 +220,7 @@ def engine_entry(cfg, row):
         '--mamba-max-states-per-path', '1', '--max-total-tokens', '32768',
         '--chunked-prefill-size', str(2048 * ep), '--max-prefill-tokens', str(4096 * ep),
         '--attention-backend', 'triton', '--linear-attn-backend', 'triton',
-        '--moe-runner-backend', 'triton', '--moe-a2a-backend', 'none',
+        '--moe-runner-backend', 'triton', '--moe-a2a-backend', row['backend'],
         '--cuda-graph-bs-decode', '1', '2', '4', '8', '16',
         '--cuda-graph-backend-prefill', 'disabled', '--disable-custom-all-reduce',
         '--skip-server-warmup', '--json-model-override-args', '{"language_model_only":true}',
@@ -214,6 +230,8 @@ def engine_entry(cfg, row):
         '--hicache-mem-layout', 'page_first']
     if ep > 1:
         args += ['--enable-dp-attention']
+    if row['backend'] == 'deepep':
+        args += ['--deepep-mode', 'normal']
     if pp > 1:
         args += ['--pp-max-micro-batch-size', '4', '--pp-async-batch-depth', '0']
     if row['role']:
@@ -260,7 +278,7 @@ def worker(run, cfg):
     signal.signal(signal.SIGINT, stopped)
     final_cleanup = None
     try:
-        for name in ['ep2', 'ep4', 'pp2', 'pd']:
+        for name in cfg['cases']:
             rows = [x for x in cfg['layouts'] if x['id'] in (['pd_p', 'pd_d'] if name == 'pd' else [name])]
             children = []
             try:
@@ -281,16 +299,17 @@ def worker(run, cfg):
                             time.sleep(1)
                 def endpoint(row):
                     return dict(host='127.0.0.1', port=row['port'], ep=row['ep'], bootstrap_port=24980)
-                def cohort(indices=None):
+                def cohort(indices=None, promptset=None, output=24):
                     indices = list(range(8)) if indices is None else indices
+                    promptset = prompts if promptset is None else promptset
                     def one(i):
                         return agentx_replay.request_one(endpoint(rows[0]),
                             endpoint(rows[1]) if name == 'pd' else None,
-                            key, prompts[i], 24, i, return_logprob=True)
+                            key, promptset[i], output, i, return_logprob=True)
                     with cf.ThreadPoolExecutor(max_workers=8) as pool:
                         replies = list(pool.map(one, indices))
                     for reply in replies:
-                        if len(reply.get('output_ids') or []) != 24:
+                        if len(reply.get('output_ids') or []) != output:
                             raise AssertionError('Missing generated token IDs')
                     return replies
                 cold = cohort()
@@ -319,11 +338,21 @@ def worker(run, cfg):
                 if [x['output_ids'] for x in reference] != [x['output_ids'] for x in restored]:
                     raise AssertionError('Output changed after CPU cache restore')
                 if name == 'pp2':
+                    # The historical fast wire protocol is qualified only for
+                    # fixed-shape Decode cohorts. Prime an aligned prefix and
+                    # warm the same B8/two-B4 geometry before selecting it.
+                    prefixes = [[5000 + i] + body[:383] for i in range(8)]
+                    decode_prompts = [p + [198] for p in prefixes]
+                    evidence['gap_prefix_preparation'] = cohort(promptset=prefixes, output=1)
+                    (run / 'pp2/fixed.bin').write_bytes(bytes([1]))
+                    native_gap = cohort(promptset=decode_prompts)
+                    evidence['gap_reference'] = native_gap
                     (run / 'pp2/gap.bin').write_bytes(b'9')
-                    optimized = [cohort([i])[0] for i in (0, 1)]
+                    (run / 'pp2/fixed.bin').write_bytes(bytes([2]))
+                    optimized = cohort(promptset=decode_prompts)
                     evidence['gap9'] = optimized
                     h.save(run / (name + '.evidence.json'), evidence)
-                    if [x['output_ids'] for x in reference] != [x['output_ids'] for x in optimized]:
+                    if [x['output_ids'] for x in native_gap] != [x['output_ids'] for x in optimized]:
                         raise AssertionError('Output changed with PP lookahead')
                 evidence['server_info'] = []
                 evidence['counters'] = []
@@ -350,7 +379,7 @@ def worker(run, cfg):
                 evidence['passed'] = True
                 results[name] = evidence
                 h.save(run / 'results.json', results)
-                h.save(run / 'worker_progress.json', dict(completed=len(results), current=name, timestamp=time.time()))
+                h.save(run / 'worker_progress.json', dict(completed=sum(x.get('passed', False) for x in results.values()), current=name, timestamp=time.time()))
                 print(json.dumps(dict(layout=name, passed=True)), flush=True)
             except Exception as error:
                 results[name] = dict(passed=False, error=type(error).__name__ + ': ' + str(error),
@@ -388,7 +417,7 @@ def controller(run, cfg):
             h.authenticate(run, cfg, os.environ)
             progress = json.loads((run / 'worker_progress.json').read_text()) if (run / 'worker_progress.json').exists() else {}
             h.save(run / 'task/progress.json', dict(experiment_id=cfg['id'], task_id='regression',
-                stage='running', valid_points=progress.get('completed', 0), expected=4,
+                stage='running', valid_points=progress.get('completed', 0), expected=len(cfg['cases']),
                 timestamp=time.time(), controller_pid=os.getpid(), process_start_ticks=identity['start_ticks']))
             time.sleep(2)
         code = proc.returncode
@@ -400,10 +429,10 @@ def controller(run, cfg):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
-        completed = len(json.loads((run / 'results.json').read_text())) if (run / 'results.json').exists() else 0
+        completed = sum(x.get('passed', False) for x in json.loads((run / 'results.json').read_text()).values()) if (run / 'results.json').exists() else 0
         h.save(run / 'task/progress.json', dict(experiment_id=cfg['id'], task_id='regression',
-            stage='complete' if code == 0 and completed == 4 else 'failed', valid_points=completed,
-            expected=4, timestamp=time.time()))
+            stage='complete' if code == 0 and completed == len(cfg['cases']) else 'failed', valid_points=completed,
+            expected=len(cfg['cases']), timestamp=time.time()))
         cleanup = json.loads((run / 'worker_cleanup.json').read_text()) if (run / 'worker_cleanup.json').exists() else {}
         h.save(run / 'task/cleanup.json', dict(experiment_id=cfg['id'], task_id='regression', timestamp=time.time(),
             passed=cleanup.get('cleanup_verified', False), gpu_idle=cleanup.get('node_gpu_idle_observed', False),
@@ -418,6 +447,7 @@ def main():
     ap.add_argument('--worker', action='store_true')
     ap.add_argument('--engine-entry', action='store_true')
     ap.add_argument('--layout')
+    ap.add_argument('--cases', default='ep2,ep4,pp2,pd')
     ap.add_argument('--node', default='spartan-gpgpu168')
     ap.add_argument('--job', default='33463293')
     ap.add_argument('--guard-scripts', default='/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/h100_small_batch_layout_verify_20261029/guard_bundle_posix_v1/skills/llm-experiment-guard/scripts')
