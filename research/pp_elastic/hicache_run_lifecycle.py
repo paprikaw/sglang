@@ -492,6 +492,18 @@ def controller(run, cfg, helpers, entrypoint):
         and results.get("transition", {}).get("passed") is True
         and completed == ack.get("work_completed_at")
     )
+    # Canonical Guard requires cleanup evidence newer than final progress.
+    atomic_json(
+        run / "task/progress.json",
+        {
+            "experiment_id": cfg["id"],
+            "task_id": "regression",
+            "timestamp": time.time(),
+            "stage": "complete" if passed else "failed",
+            "valid_points": int(passed),
+            "expected": 1,
+        },
+    )
     atomic_json(
         run / "task/cleanup.json",
         {
@@ -505,17 +517,6 @@ def controller(run, cfg, helpers, entrypoint):
             "remote_acknowledgement": ack,
             "ssh_returncode": child.returncode,
             "error_type": error,
-        },
-    )
-    atomic_json(
-        run / "task/progress.json",
-        {
-            "experiment_id": cfg["id"],
-            "task_id": "regression",
-            "timestamp": time.time(),
-            "stage": "complete" if passed else "failed",
-            "valid_points": int(passed),
-            "expected": 1,
         },
     )
     return 0 if passed else 1

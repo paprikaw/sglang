@@ -842,6 +842,7 @@ def worker(run, cfg):
         if lifecycle is not None:
             evidence["work_completed_at"] = lifecycle.complete_work()
     except BaseException as exc:
+        evidence["passed"] = False
         evidence["failed_stage"] = evidence.get("stage", "startup")
         evidence["error"] = f"{type(exc).__name__}: {exc}"
     finally:

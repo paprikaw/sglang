@@ -100,8 +100,11 @@ def test_worker_retains_published_control_when_continuation_fails(
                 if not cleanup_started.wait(1):
                     cleanup_was_late.set()
                 raise RuntimeError("active HTTP closed by owned-child cleanup")
-            assert control_seen.wait(2), "active request must fail after publication"
-            raise RuntimeError("post-publication finish failure")
+            if failure != "completion":
+                assert control_seen.wait(
+                    2
+                ), "active request must fail after publication"
+                raise RuntimeError("post-publication finish failure")
         payload = {
             "input_ids": tokens,
             "stream": True,
@@ -113,7 +116,10 @@ def test_worker_retains_published_control_when_continuation_fails(
         }
         sys.modules["agentx_replay"].stream(endpoint, key, payload)
         return {
-            "output_ids": [2 if cached_class and len(requests) == 4 else 1] * output,
+            "output_ids": [
+                2 if cached_class and output == 256 and len(requests) >= 4 else 1
+            ]
+            * output,
             "meta_info": {"cached_tokens": 512, "num_retractions": 0},
         }
 
@@ -122,7 +128,7 @@ def test_worker_retains_published_control_when_continuation_fails(
             return [True] * 3
         if path == "/reconfigure_elastic_pp":
             control_seen.set()
-            return {"success": True, "generation": 1}
+            return {"success": True, "generation": payload["generation"]}
         assert path == "/get_server_info"
         if saved.get("worker_stage.json", {}).get("stage") == "transition_1":
             assert active_started.wait(2), "real executor must start the request"
@@ -134,6 +140,7 @@ def test_worker_retains_published_control_when_continuation_fails(
                 {
                     "transition_rank": rank,
                     "transition_active_output_lengths": [4],
+                    "elastic_pp_state": {"migration_phase": "done"},
                     "enable_hierarchical_cache": True,
                     "disable_cuda_graph": True,
                     "api_key": "must-not-save-state-key",
@@ -232,6 +239,25 @@ def test_worker_retains_published_control_when_continuation_fails(
             return original_save(self, name, value)
 
         monkeypatch.setattr(lifecycle.LocalEvidence, "save", local_save)
+        if failure == "completion":
+            original_complete = lifecycle.WorkerLifecycle.complete_work
+
+            def cancelled_completion(self):
+                self.cancelled.set()
+                return original_complete(self)
+
+            monkeypatch.setattr(
+                lifecycle.WorkerLifecycle, "complete_work", cancelled_completion
+            )
+            # Isolate the final deadline verdict. State validators have their
+            # own cases; this CPU HTTP fixture supplies no real GPU evidence.
+            for name in (
+                "validate_transition_states",
+                "validate_uninterrupted_decode",
+                "validate_fenced_decode",
+                "fresh_prefix_restores",
+            ):
+                monkeypatch.setitem(acceptance, name, lambda *args: {})
     qualification_calls = []
     if cached_class:
         config.update(
@@ -263,6 +289,11 @@ def test_worker_retains_published_control_when_continuation_fails(
         if failure == "post_publication"
         else "RuntimeError: control authentication failed"
     )
+    if failure == "completion":
+        expected_stage = "final_prefix_restore"
+        expected_error = (
+            "TimeoutError: Work did not finish within the Guard-relative budget"
+        )
     assert evidence["failed_stage"] == expected_stage
     assert evidence["error"] == expected_error
     assert evidence["cleanup_verified"] is True
@@ -282,7 +313,7 @@ def test_worker_retains_published_control_when_continuation_fails(
         "shared_stage_writes_before_cleanup", len(shared_diagnostics_before_cleanup)
     )
     record_property("shared_contract_writes_before_cleanup", 0 if supervised else 4)
-    assert len(requests) == 5
+    assert len(requests) == (7 if failure == "completion" else 5)
     assert not cleanup_was_late.is_set(), "cleanup waited for the in-flight HTTP"
     expected_transitions = (
         [
@@ -298,7 +329,11 @@ def test_worker_retains_published_control_when_continuation_fails(
         if failure == "post_publication"
         else []
     )
-    assert evidence["transitions"] == expected_transitions
+    if failure == "completion":
+        assert [row["generation"] for row in evidence["transitions"]] == [1, 2]
+        assert all(row["continuation_verified"] for row in evidence["transitions"])
+    else:
+        assert evidence["transitions"] == expected_transitions
     if expected_transitions:
         assert evidence["transitions"][0]["control_returned_at"] > 0
     assert saved["worker_progress.json"] == {"completed": 0}
@@ -308,7 +343,7 @@ def test_worker_retains_published_control_when_continuation_fails(
     assert "must-not-save" not in repr(saved)
     contract = json.loads((tmp_path / "reference_request_contract.json").read_text())
     assert contract["capture"] == "actual pre-serialization stream payload"
-    assert len(contract["requests"]) == 4
+    assert len(contract["requests"]) == (7 if failure == "completion" else 4)
     assert (
         tmp_path / "reference_request_contract.json"
     ).stat().st_mode & 0o777 == 0o600
@@ -322,6 +357,21 @@ def test_worker_retains_published_control_when_continuation_fails(
             evidence["reference_state_review"]["evidence_sha256"]["raw_results"]
             == "bound-proof"
         )
+
+
+def test_worker_rejects_completion_cancelled_after_assertions(
+    acceptance, monkeypatch, tmp_path, record_property
+):
+    test_worker_retains_published_control_when_continuation_fails(
+        acceptance,
+        monkeypatch,
+        tmp_path,
+        cached_class=True,
+        failure="completion",
+        first_cleanup="verified",
+        supervised=True,
+        record_property=record_property,
+    )
 
 
 def states():

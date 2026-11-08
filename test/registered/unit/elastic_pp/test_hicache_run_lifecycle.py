@@ -382,6 +382,7 @@ def terminate_cpu_child(run):
         "guard_hang",
         "guard_ignore",
         "guard_exit",
+        "final_read_delay",
     ],
 )
 def test_supervisor_real_process_and_atomic_registry(tmp_path, monkeypatch, mode):
@@ -398,6 +399,15 @@ def test_supervisor_real_process_and_atomic_registry(tmp_path, monkeypatch, mode
     guard = tmp_path / "cpu_guard.py"
     worker.write_text(WORKER)
     guard.write_text(GUARD_FIXTURE)
+    if mode == "final_read_delay":
+        original_ack = supervisor.remote_ack
+
+        def delayed_final_ack(*args):
+            result = original_ack(*args)
+            time.sleep(cfg["lifecycle"]["total_s"] + 0.1)
+            return result
+
+        monkeypatch.setattr(supervisor, "remote_ack", delayed_final_ack)
     if mode == "cancel_write":
 
         def failed_cancel(*_args):
@@ -409,13 +419,29 @@ def test_supervisor_real_process_and_atomic_registry(tmp_path, monkeypatch, mode
         code = supervisor.supervise(
             tmp_path,
             cfg,
-            [sys.executable, str(guard), str(SCRIPTS), str(tmp_path), mode, str(delay)],
+            [
+                sys.executable,
+                str(guard),
+                str(SCRIPTS),
+                str(tmp_path),
+                "complete" if mode == "final_read_delay" else mode,
+                str(delay),
+            ],
         )
         outcome = lifecycle.private_json(tmp_path / "supervisor_outcome.json")
-        assert time.monotonic() - before < cfg["lifecycle"]["total_s"]
+        if mode != "final_read_delay":
+            assert time.monotonic() - before < cfg["lifecycle"]["total_s"]
+        else:
+            assert outcome["elapsed_s"] > cfg["lifecycle"]["total_s"]
         assert outcome["passed"] == (mode == "complete")
         assert code == (0 if mode == "complete" else 1)
-        if mode in {"complete", "cancel", "cancel_write", "guard_exit"}:
+        if mode in {
+            "complete",
+            "cancel",
+            "cancel_write",
+            "guard_exit",
+            "final_read_delay",
+        }:
             assert outcome["normal_lease_release_verified"]
             ack = outcome["remote_acknowledgement"]
             if mode != "guard_exit":
@@ -539,6 +565,17 @@ def test_controller_requires_remote_ack_even_when_ssh_exits(
         )
         cleanup = lifecycle.private_json(tmp_path / "task/cleanup.json")
         assert cleanup["passed"]
+        # Exercise the canonical release gate, not a fixture interpretation of it.
+        import dashboard_guard
+
+        authorization = dashboard_guard.cleanup_authorization(
+            {
+                "id": cfg["id"],
+                "runtime_dir": str(tmp_path / "dashboard_guard"),
+                "tasks": [{"id": "regression", "root": str(tmp_path / "task")}],
+            }
+        )
+        assert authorization == [{"task_id": "regression", "mode": "exited"}]
         assert (
             cleanup["remote_acknowledgement"]["worker"]["pid"]
             == wait_file(tmp_path / "transport.json")["pid"]

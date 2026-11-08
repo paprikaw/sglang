@@ -185,8 +185,8 @@ def supervise(run, cfg, command, *, poll_s=0.1):
         log.close()
     outcome.update(
         guard_returncode=child.returncode,
-        ended_at=time.time(),
-        elapsed_s=time.time() - origin,
+        guard_reaped_at=time.time(),
+        guard_elapsed_s=time.time() - origin,
     )
     try:
         verified, ack = remote_ack(run, cfg, budget)
@@ -204,6 +204,8 @@ def supervise(run, cfg, command, *, poll_s=0.1):
         outcome.get("lease", {}).get("state") == "released"
         and outcome.get("lease", {}).get("cleanup_verified") is True
     )
+    # Final acknowledgement and registry verification belong to the budget.
+    outcome.update(ended_at=time.time(), elapsed_s=time.time() - origin)
     outcome["passed"] = bool(
         child.returncode == 0
         and outcome["remote_cleanup_verified"]
