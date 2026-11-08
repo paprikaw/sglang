@@ -24,9 +24,10 @@ source rollback. Retired host resources are released only after publication.
 Dormant rank cache-node handles may be rebuilt from a canonical active tree,
 but request token progress and allocator identity must match before rebinding.
 
-This remains a draft integration checkpoint. The Qwen hybrid HiCache guard stays
-in force until the adapter, dormant host pools, canonical metadata and combined
-state recovery are validated. Existing static PP + HiCache runs do not qualify
+This remains a draft integration checkpoint. The Qwen hybrid HiCache guard permits only native L2 cache mode with page-first
+layout and kernel I/O; storage, session-radix and unsupported recurrent modes
+remain rejected. CPU checks qualify this narrow configuration only; dynamic
+GPU state recovery remains unvalidated. Existing static PP + HiCache runs do not qualify
 this dynamic path. The short real-model acceptance must include startup, warmup,
 PP2 -> PP3 -> PP2, active KV/GDN/progress, CPU-only prefix loadback, and cleanup
 within 300 seconds; successful server startup alone is not acceptance.

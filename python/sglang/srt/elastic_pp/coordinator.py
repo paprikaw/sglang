@@ -814,6 +814,11 @@ class ElasticPPMigrationCoordinator:
                 )
                 if self.cache_transition is not None:
                     self.cache_transition.release_retired()
+                release_snapshot = getattr(
+                    self.kv_transport, "release_fence_snapshot", None
+                )
+                if release_snapshot is not None:
+                    release_snapshot()
                 if cuda_cleanup:
                     logger.info(
                         "Elastic PP generation=%d rank=%d cleanup CUDA allocated "

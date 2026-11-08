@@ -204,7 +204,9 @@ def test_project_pending_hybrid_does_not_publish(hybrid_pool_factory):
     pool = hybrid_pool_factory(start_layer=0, end_layer=2)
     original_state = pool.mamba_pool.mamba_cache
     original_map = dict(pool.req_to_token_pool.mamba_map)
-    pool.prepare_elastic_pp_kv_layers(target=LayerRange(0, 4), generation=1)
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(0, 4), generation=1, total_num_layers=4
+    )
     view, req = project_target_device_pool(pool, target=LayerRange(0, 4), generation=1)
     assert pool.end_layer == 2
     assert pool.mamba_pool.mamba_cache is original_state
@@ -268,3 +270,43 @@ def test_publish_rebinds_batches_policy_and_sessions():
     assert all(
         holder.tree_cache is new for holder in (scheduler, batch, policy, session)
     )
+
+
+def test_allocator_shrink_clips_only_free_high_capacity():
+    from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+    from sglang.srt.elastic_pp.hicache_transition import clone_host_allocator
+
+    source = LogicalHostPool(8, 1)
+    source.alloc(2)
+    target = LogicalHostPool(4, 1)
+    clone_host_allocator(source, target)
+    assert target.free_slots.tolist() == [2, 3]
+    source.alloc(4)
+    with pytest.raises(RuntimeError, match="live high host slots"):
+        clone_host_allocator(source, target)
+
+
+def test_native_work_wrapper_is_waited():
+    class Handle:
+        waited = False
+
+        def wait(self):
+            self.waited = True
+
+    handle = Handle()
+
+    class NativeWire(Wire):
+        def send_tensor_dict(self, payload, **kwargs):
+            self.payload = payload
+            return [NS(work=handle, payload=payload)]
+
+    src = HiCacheTransitionAdapter(
+        cache=cache(),
+        pools={0: {3: {"k": torch.ones(5, 4)}}},
+        group=NativeWire(),
+        rank=0,
+    )
+    tx = transition()
+    src.prepare_transition(tx)
+    src.exchange_at_fence(tx)
+    assert handle.waited
