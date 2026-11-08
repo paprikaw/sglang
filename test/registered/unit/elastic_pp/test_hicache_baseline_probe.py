@@ -81,12 +81,18 @@ def installed(probe, tmp_path):
     class Runner:
         pass
 
-    Runner._maybe_execute_deferred_mamba_cow_and_clear = production_method(
+    real_cow = production_method(
         "python/sglang/srt/model_executor/model_runner.py",
         "ModelRunner",
         "_maybe_execute_deferred_mamba_cow_and_clear",
         {"HybridReqToTokenPool": ReqPool},
     )
+
+    def counted_cow(self, batch):
+        calls.append(("cow", batch))
+        return real_cow(self, batch)
+
+    Runner._maybe_execute_deferred_mamba_cow_and_clear = counted_cow
 
     class Sampler:
         def _preprocess_logits(self, logits, sampling_info):
@@ -109,6 +115,7 @@ def installed(probe, tmp_path):
         Runner,
         Sampler,
         Cache,
+        ReqPool,
         get_collector=lambda: collector,
         get_chunk_size=lambda: 64,
     )
@@ -233,6 +240,41 @@ def test_real_cow_method_clears_fields_after_probe_keeps_addresses(probe, instal
         torch.load(source["tensor_file"], weights_only=True)["temporal"],
         torch.load(target["tensor_file"], weights_only=True)["temporal"],
     )
+
+
+@pytest.mark.parametrize(
+    "skip",
+    ["non_hybrid", "draft_worker", "decode", "target_verify", "draft_extend_v2"],
+)
+def test_real_cow_early_return_with_stale_indices_has_no_observations(
+    probe, installed, skip
+):
+    installed.collector.identify(req(probe, "cold"))
+    warm = req(probe, "warm")
+    if skip == "decode":
+        warm.output_ids = [11]
+    installed.Scheduler()._record_batch_launch(NS(reqs=[warm]))
+    runner = installed.Runner()
+    # No pool storage is supplied: the real method must return before copying,
+    # and an observer of a no-op must not attempt to inspect nonexistent state.
+    runner.req_to_token_pool = object() if skip == "non_hybrid" else installed.ReqPool()
+    runner.is_draft_worker = skip == "draft_worker"
+    source, destination = torch.tensor([2]), torch.tensor([1])
+    batch = NS(
+        forward_mode=NS(
+            is_extend=lambda: skip != "decode",
+            is_target_verify=lambda: skip == "target_verify",
+            is_draft_extend_v2=lambda: skip == "draft_extend_v2",
+        ),
+        mamba_clear_indices=None,
+        mamba_cow_src_indices=source,
+        mamba_cow_dst_indices=destination,
+    )
+    runner._maybe_execute_deferred_mamba_cow_and_clear(batch)
+    assert batch.mamba_cow_src_indices is source
+    assert batch.mamba_cow_dst_indices is destination
+    assert len([call for call in installed.calls if call[0] == "cow"]) == 1
+    assert not (installed.collector.directory / "events.jsonl").exists()
 
 
 def test_actual_preprocessed_logits_are_copied_without_changing_return(

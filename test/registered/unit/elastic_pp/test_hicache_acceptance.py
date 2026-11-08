@@ -4,6 +4,8 @@ import ast
 import concurrent.futures as cf
 import copy
 import functools
+import json
+import os
 import sys
 import threading
 import time
@@ -63,8 +65,9 @@ def test_cold_warm_reference_qualification_requires_nonempty_exact_ids(acceptanc
     assert not qualify({}, {})["qualified"]
 
 
+@pytest.mark.parametrize("cached_class", [False, True])
 def test_worker_retains_published_control_when_continuation_fails(
-    acceptance, monkeypatch, tmp_path
+    acceptance, monkeypatch, tmp_path, cached_class
 ):
     """Exercise the actual worker's HTTP, future, failure and cleanup sequence."""
     control_seen = threading.Event()
@@ -75,7 +78,20 @@ def test_worker_retains_published_control_when_continuation_fails(
         if len(requests) == 5:
             assert control_seen.wait(2), "active request must fail after publication"
             raise RuntimeError("post-publication finish failure")
-        return {"output_ids": [1] * output}
+        payload = {
+            "input_ids": tokens,
+            "stream": True,
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": output,
+                "ignore_eos": True,
+            },
+        }
+        sys.modules["agentx_replay"].stream(endpoint, key, payload)
+        return {
+            "output_ids": [2 if cached_class and len(requests) == 4 else 1] * output,
+            "meta_info": {"cached_tokens": 512, "num_retractions": 0},
+        }
 
     def http_json(port, path, key, payload, *, timeout):
         if path == "/set_internal_state":
@@ -117,7 +133,8 @@ def test_worker_retains_published_control_when_continuation_fails(
     )
     for key, value in {
         "cf": cf,
-        "os": NS(environ={}),
+        "os": os,
+        "json": json,
         "signal": NS(SIGALRM=14, signal=lambda *args: None, alarm=lambda *args: None),
         "launch": lambda *args: {"process": NS(poll=lambda: None)},
         "h": NS(
@@ -136,6 +153,24 @@ def test_worker_retains_published_control_when_continuation_fails(
         "initial_counts": [20, 0, 20],
         "grown_counts": [13, 13, 14],
     }
+    qualification_calls = []
+    if cached_class:
+        config.update(
+            acceptance_class="cached_execution_continuity",
+            cached_reference_evidence={
+                "unit_test": "independently tested proof validator"
+            },
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "hicache_reference_qualification",
+            NS(
+                qualify_cached_reference_evidence=lambda receipt, cfg: qualification_calls.append(
+                    (receipt, cfg)
+                )
+                or {"evidence_sha256": {"raw_results": "bound-proof"}}
+            ),
+        )
     with pytest.raises(SystemExit) as exited:
         acceptance["worker"](tmp_path, config)
     assert exited.value.code == 1
@@ -160,6 +195,22 @@ def test_worker_retains_published_control_when_continuation_fails(
         assert state["enable_hierarchical_cache"] is True
         assert state["disable_cuda_graph"] is True
     assert "must-not-save" not in repr(saved)
+    contract = json.loads((tmp_path / "reference_request_contract.json").read_text())
+    assert contract["capture"] == "actual pre-serialization stream payload"
+    assert len(contract["requests"]) == 4
+    assert (
+        tmp_path / "reference_request_contract.json"
+    ).stat().st_mode & 0o777 == 0o600
+    if cached_class:
+        assert len(qualification_calls) == 1
+        assert evidence["observed_cold_warm_exact_ids_equal"] is False
+        assert evidence["cold_vs_warm_generation_qualified"] is False
+        assert evidence["generation_qualified"] is False
+        assert evidence["cached_execution_continuity_qualified"] is False
+        assert (
+            evidence["reference_state_review"]["evidence_sha256"]["raw_results"]
+            == "bound-proof"
+        )
 
 
 def states():

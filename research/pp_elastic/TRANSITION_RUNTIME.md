@@ -7,8 +7,12 @@ then stalled during the shrink host-cache preparation. The failed run took
 gen0 requests with identical input and greedy settings already diverged at
 output index six; warmed-reference agreement alone does not qualify generation.
 The private acceptance now rejects unequal cold/warmed references before any
-transition. A separate static cold256/warm8 observation is the next diagnostic;
-it does not establish a numerical tolerance or a dynamic pass.
+transition. The static r10 cold256/warm8 diagnostic has completed in 85.345 seconds with
+verified cleanup and a released lease. Its raw result remains failed because
+the observer counted Decode CoW no-ops. Separately classified offline tensors
+show checkpoint/CoW/kernel-input bitwise preservation across 30 GDN layers;
+cold/warm output still diverges. Continuous FP32 state at512 is unobserved,
+and no numerical tolerance or dynamic pass is established.
 
 The three explicit policies share the model/KV transports and one coordinator.
 `sync` drains before host/active-state snapshots, capacity admission and target
@@ -131,3 +135,22 @@ construction. It uses real host constructors with a stubbed I/O controller and
 zero CUDA devices. Separate stage logs distinguish KV/GDN bulk, delta and import
 from host exchange and host preparation/import. GPU shrink, full-cycle request
 equivalence and CPU-spill CUDA owner release remain unqualified.
+
+The private CoW observer now applies the real method's complete target-worker,
+hybrid-pool and forward-mode guards before recording an actual initial warm
+Extend. It still delegates every original call exactly once. Real-method CPU
+checks retain stale Decode indices and verify no false observation; the current
+four-file selection passes 103 checks with no failures or skips. This changes
+future diagnostics only. r10's original failed result is immutable, and its
+offline classification is explicitly separate. Source/tag at launch were local
+and frozen; remote synchronization remained pending after a bounded transport
+push timed out. No further GPU run or strategy sweep has been launched. The next authorized
+private acceptance class is exact continuity at the same 512-token warmed
+boundary, with cold/warm generation qualification permanently false. Its fixed
+r10 raw/classification/independent state evidence and production state-path
+hashes are checked before preparation and again by the worker. It grants no
+tolerance and preserves all existing active-state, host-transfer and final
+loadback assertions. The five-file CPU selection passes 125 checks without
+failures or skips; the actual 30-layer receipt also validates. The next run is
+one sync/overlap grow/shrink with a 225-second work deadline and 75 seconds
+reserved for cleanup, retaining the 300-second total bound.

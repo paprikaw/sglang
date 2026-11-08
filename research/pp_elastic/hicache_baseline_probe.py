@@ -186,6 +186,7 @@ def install_observers(
     ModelRunner,
     Sampler,
     UnifiedRadixCache,
+    HybridReqToTokenPool,
     *,
     get_collector=collector,
     get_chunk_size=track_chunk_size,
@@ -370,8 +371,14 @@ def install_observers(
         source = forward_batch.mamba_cow_src_indices
         destination = forward_batch.mamba_cow_dst_indices
         observed = (
-            probe.current is not None
+            isinstance(self.req_to_token_pool, HybridReqToTokenPool)
+            and not self.is_draft_worker
+            and forward_batch.forward_mode.is_extend()
+            and not forward_batch.forward_mode.is_target_verify()
+            and not forward_batch.forward_mode.is_draft_extend_v2()
+            and probe.current is not None
             and probe.current["label"] == "warm_active"
+            and probe.current["output_length"] == 0
             and source is not None
             and source.numel() > 0
         )
@@ -426,6 +433,7 @@ def install_hooks():
     )
     from sglang.srt.layers.sampler import Sampler
     from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -437,6 +445,7 @@ def install_hooks():
         ModelRunner,
         Sampler,
         UnifiedRadixCache,
+        HybridReqToTokenPool,
     )
 
 

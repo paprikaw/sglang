@@ -1,12 +1,20 @@
 # HiCache resident PP transition validation, 2026-11-08
 
-The complete dynamic acceptance remains unqualified. At clean aa93b5188c8a,
-r9 completed generation one and its uninterrupted active request, then stalled
-while preparing generation two's host cache. It failed after 176.100 seconds
-including verified cleanup, and Guard released its lease. The exact resumed
-IDs matched the warmed reference. The same prompt and greedy sampling had
-already produced different cold and warmed gen0 IDs at output index six, so
-that match does not establish generation correctness.
+Dynamic acceptance and generation qualification remain unqualified. The single
+static-gen0 r10 diagnostic at clean ac0a73525f6a completed cold256/warm8 and
+verified cleanup in 85.345 seconds; Guard released its lease. Its online analyzer
+rejected eight apparent CoW observations because the observer missed the real
+method's Decode early return. The original result remains failed. Separately
+classified offline evidence finds bitwise checkpoint and CoW preservation on all
+30 GDN layers through the actual warm kernel input, while cold/warm output still
+differs. No numerical tolerance or generation pass follows.
+
+At clean aa93b5188c8a, r9 completed generation one and its uninterrupted active
+request, then stalled while preparing generation two's host cache. It failed
+after 176.100 seconds including verified cleanup, and Guard released its lease.
+The exact resumed IDs matched the warmed reference. The same prompt and greedy
+sampling had already produced different cold and warmed gen0 IDs at output
+index six, so that match does not establish generation correctness.
 
 The shrink stall has a CPU/Gloo reproduction: the migration-specific dormant
 host constructor skipped FULL/MAMBA MIN reductions while the physical ranks
@@ -194,3 +202,51 @@ four-file CPU selection passes 98 checks in 5.627 seconds, with zero failures,
 errors or skips and zero visible CUDA devices. The source hashes are unchanged
 across that run. Its first failed run, caused by an
 undefined variable in newly added phase logging, is preserved separately.
+
+r10 used the unchanged original GDN kernel and static 20/0/20 layout, with no
+transition. All four reference requests completed; both warmed requests reused
+512 tokens and every response reported zero retractions. Actual k and kernel h
+were BF16, with FP32 pooled temporal state. The first eight cold/warm output IDs
+still diverged at index six. Actual request payloads, output IDs and full logits
+remain in private run artifacts rather than this report.
+
+The raw observer recorded a genuine initial Extend CoW plus seven Decode
+no-ops per active rank because Decode retains old source/destination fields.
+The strict uniqueness check rejected that evidence. Offline classification
+selects only the output-length-zero pair before the first warm GDN Extend;
+it preserves and hashes the original results, events and tensors. The exact
+frozen analyzer then verifies the derived metadata separately. Independent CPU
+review confirms all 30 layers: checkpoint birth equals cold completion, warm
+CoW source and destination, bitwise for conv and SSM; the destination SSM equals
+the actual warm kernel initial state and every physical address agrees. The
+first local layer has identical last-token q/k/v/g/beta, but the original
+cold513 and warm512+1 calls leave different temporal state. At the common-history
+output divergence the captured cold greedy candidates tie, while the warm
+candidates differ. Continuous FP32 state at512 remains unobserved; these facts
+do not uniquely identify the cause or qualify a numerical tolerance.
+
+The future observer now mirrors every real CoW early-return condition and
+observes only the initial warm Extend. Five tests execute the real method with
+stale indices and require exactly one delegation with no observation. The
+four-file CPU selection passes 103 checks in 6.805 seconds, with no failures,
+errors or skips, zero visible CUDA devices and unchanged source hashes. Its
+first run had five fixture-only failures because an intentionally absent event
+file was read; both runs are preserved. No additional GPU run followed r10.
+
+The [r10 evidence directory](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/gpu-hicache-r10)
+keeps raw failed results and cleanup receipts, central lease-release proof,
+separate offline-classification provenance, independent review and CPU records.
+The local immutable r10 tag identifies ac0a73525f6a. Remote synchronization was
+pending at launch: one bounded push timed out during the receive-pack transport,
+before any hook or pack-objects event. Local source eligibility was explicitly
+authorized; no GitHub synchronization or remote tag is claimed. The next explicitly authorized class is cached execution continuity at the same
+512-token warmed boundary. It permanently records
+`cold_vs_warm_generation_qualified=false`, binds the original failed r10 result
+and independent state proof by hash, and keeps every exact-ID, active-fence,
+no-retraction/no-re-prefill, bidirectional host transfer and fresh loadback
+requirement. It does not grant cold/warm generation equality or a tolerance.
+The private gate and unchanged acceptance boundaries pass 125 CPU checks across
+five files in 8.175 seconds, with no failures, errors or skips and unchanged
+source hashes. Actual r10 receipt validation covers all 30 global GDN layers.
+A single sync/overlap grow/shrink is authorized after source and peer freeze;
+CPU-spill CUDA release remains a subsequent independent check.

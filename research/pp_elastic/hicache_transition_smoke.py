@@ -534,19 +534,39 @@ def worker(run, cfg):
         "performance_sample": False,
         "cuda_graph_enabled": False,
         "diagnostic_reply_scope": "private one-node PP3/TP1/DP1 get/set state replies",
+        "acceptance_class": cfg.get("acceptance_class", "cold_warm_exact_generation"),
+        "cold_vs_warm_generation_qualified": False,
+        "generation_qualified": False,
+        "cached_execution_continuity_qualified": False,
     }
     original_stream = agentx_replay.stream
-    agentx_replay.stream = lambda endpoint, key, payload, timeout=600: original_stream(
-        endpoint, key, payload, min(timeout, 45)
-    )
+    request_contracts = []
+
+    def captured_stream(endpoint, key, payload, timeout=600):
+        request_contracts.append(
+            {"stage": evidence.get("stage"), "payload": json.loads(json.dumps(payload))}
+        )
+        target = run / "reference_request_contract.json"
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w") as stream:
+            json.dump(
+                {
+                    "capture": "actual pre-serialization stream payload",
+                    "requests": request_contracts,
+                },
+                stream,
+            )
+        return original_stream(endpoint, key, payload, min(timeout, 45))
+
+    agentx_replay.stream = captured_stream
 
     def expired(*_):
         raise TimeoutError(
-            "165-second workload deadline; cleanup reserved inside 300 seconds"
+            "225-second transition deadline; 75 seconds reserved for cleanup"
         )
 
     signal.signal(signal.SIGALRM, expired)
-    signal.alarm(165)
+    signal.alarm(225)
 
     def checkpoint(stage):
         evidence["stage"] = stage
@@ -577,6 +597,16 @@ def worker(run, cfg):
         return state_evidence(result) if path == "/get_server_info" else result
 
     try:
+        if evidence["acceptance_class"] == "cached_execution_continuity":
+            from hicache_reference_qualification import (
+                qualify_cached_reference_evidence,
+            )
+
+            evidence["reference_state_review"] = qualify_cached_reference_evidence(
+                cfg["cached_reference_evidence"], cfg
+            )
+        elif evidence["acceptance_class"] != "cold_warm_exact_generation":
+            raise AssertionError("unknown reference acceptance class")
         checkpoint("startup")
         children.append(launch(run, cfg, row, key))
         while True:
@@ -613,12 +643,26 @@ def worker(run, cfg):
             "prefix": reference_qualification(cold_prefix, reference),
             "active": reference_qualification(cold_active, active_reference),
         }
-        if not all(
+        cold_warm_equal = all(
             item["qualified"] for item in evidence["reference_qualification"].values()
-        ):
+        )
+        evidence["observed_cold_warm_exact_ids_equal"] = cold_warm_equal
+        if evidence["acceptance_class"] == "cached_execution_continuity":
+            for warmed_reference in (reference, active_reference):
+                if (
+                    warmed_reference.get("meta_info", {}).get("cached_tokens") != 512
+                    or warmed_reference.get("meta_info", {}).get("num_retractions") != 0
+                ):
+                    raise AssertionError(
+                        "warmed reference did not use the reviewed boundary"
+                    )
+        elif not cold_warm_equal:
             raise AssertionError(
                 "cold/warm reference output IDs differ before transition"
             )
+        else:
+            evidence["cold_vs_warm_generation_qualified"] = True
+            evidence["generation_qualified"] = True
 
         checkpoint("initial_cpu_demotion")
         evidence["initial_demotion"] = demote_cpu_prefixes(http)
@@ -712,6 +756,7 @@ def worker(run, cfg):
         evidence["failed_stage"] = evidence.get("stage", "startup")
         evidence["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        agentx_replay.stream = original_stream
         signal.alarm(0)
         checkpoint("cleanup")
         cleanup = h.cleanup(children)
@@ -724,6 +769,10 @@ def worker(run, cfg):
             evidence["passed"]
             and cleanup.get("cleanup_verified", False)
             and elapsed <= 300
+        )
+        evidence["cached_execution_continuity_qualified"] = (
+            evidence["passed"]
+            and evidence["acceptance_class"] == "cached_execution_continuity"
         )
         evidence["stage"] = "done" if evidence["passed"] else "failed"
         h.save(run / "worker_cleanup.json", cleanup)
@@ -760,7 +809,19 @@ def prepare(args):
         grown_counts=grown,
         engine_entrypoint=str(Path(__file__).resolve()),
         baseline_probe=args.baseline_probe,
+        acceptance_class=(
+            "cached_execution_continuity"
+            if args.cached_reference_evidence
+            else "cold_warm_exact_generation"
+        ),
     )
+    if args.cached_reference_evidence:
+        from hicache_reference_qualification import qualify_cached_reference_evidence
+
+        cfg["cached_reference_evidence"] = json.loads(
+            args.cached_reference_evidence.read_text()
+        )
+        qualify_cached_reference_evidence(cfg["cached_reference_evidence"], cfg)
     cfg["model_cache"]["usage_logs"] = {args.node: [use]}
     h.save(run / "config.json", cfg)
     spec = json.loads((run / "dashboard_spec.json").read_text())
@@ -781,6 +842,26 @@ def prepare(args):
         spec["title"] = "Qwen HiCache static generation-zero qualification diagnostic"
         spec["tasks"][0]["label"] = "Static cold256/warm8 state and sampler diagnostic"
         spec["frozen_inputs"].append(base.desc(ROOT / "hicache_baseline_probe.py"))
+    if args.cached_reference_evidence:
+        spec["title"] = (
+            "Qwen HiCache PP transitions: exact warmed-cache execution continuity"
+        )
+        spec["tasks"][0][
+            "label"
+        ] = "512-token warmed boundary; cold/warm generation unqualified"
+        spec["frozen_inputs"] += [
+            base.desc(ROOT / "hicache_reference_qualification.py"),
+            base.desc(args.cached_reference_evidence),
+            *(
+                base.desc(Path(item["path"]))
+                for item in cfg["cached_reference_evidence"]["evidence"].values()
+            ),
+            *(
+                base.desc(ENGINE / item)
+                for item in cfg["cached_reference_evidence"]["production_sources"]
+            ),
+            base.desc(Path(cfg["model_path"]) / "config.json"),
+        ]
     h.save(run / "dashboard_spec.json", spec)
 
 
@@ -792,6 +873,7 @@ def main():
     parser.add_argument("--engine-entry", action="store_true")
     parser.add_argument("--layout")
     parser.add_argument("--baseline-probe", action="store_true")
+    parser.add_argument("--cached-reference-evidence", type=Path)
     parser.add_argument("--tag")
     parser.add_argument("--node", default="spartan-gpgpu168")
     parser.add_argument("--job", default="33463293")
@@ -818,6 +900,10 @@ def main():
         "--backing", choices=["overlap", "cpu_spill"], default="overlap"
     )
     args = parser.parse_args()
+    if args.baseline_probe and args.cached_reference_evidence:
+        parser.error(
+            "static diagnostic and cached execution continuity are separate classes"
+        )
     if args.backing == "cpu_spill" and args.strategy == "background":
         parser.error("CPU-spill backing requires sync or batched transition")
     if args.prepare:
