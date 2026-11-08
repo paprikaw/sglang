@@ -394,3 +394,50 @@ def test_hybrid_codec_requires_explicit_sparse_attention_subset():
     decoded_slots, decoded = unflatten_kv_chunk(payload, **args, layer_ids=(1, 3))
     assert torch.equal(slots, decoded_slots)
     assert set(decoded) == {1, 3}
+
+
+def test_active_kv_cpu_snapshot_is_independent_and_released_on_abort():
+    transition = DynamicPPTransition.build(
+        PPTopology.from_layer_counts([2, 2], generation=0),
+        PPTopology.from_layer_counts([1, 3], generation=1),
+    )
+    pool = _make_pool(start_layer=0, layer_num=2)
+    pool.k_buffer[1].fill_(7)
+    transport = ElasticPPKVTransport(
+        group=_Group(_Mailbox(), 0),
+        model_runner=_Runner(pool),
+        allocator=_Allocator(torch.tensor([1, 3])),
+        rank=0,
+    )
+    assert transport.snapshot_at_fence(transition) > 0
+    snapshot = transport._fence_snapshot
+    assert set(snapshot["layers"]) == {1}
+    assert snapshot["slots"].tolist() == [1, 3]
+    pool.k_buffer[1].zero_()
+    assert snapshot["layers"][1][0].eq(7).all()
+    transport.abort_staged(transition)
+    assert transport._fence_snapshot is None
+
+
+def test_active_gdn_cpu_snapshot_uses_allocated_state_slots(hybrid_pool_factory):
+    transition = DynamicPPTransition.build(
+        PPTopology.from_layer_counts([2, 2], generation=0),
+        PPTopology.from_layer_counts([0, 4], generation=1),
+    )
+    pool = hybrid_pool_factory(start_layer=0, end_layer=2)
+    allocated = pool.req_to_token_pool.mamba_allocator.alloc(1)
+    slot = int(allocated[0])
+    pool.mamba_pool.mamba_cache.conv[0][0, slot].fill_(9)
+    transport = ElasticPPHybridKVTransport(
+        group=_Group(_Mailbox(), 0),
+        model_runner=_Runner(pool),
+        allocator=_Allocator(torch.tensor([1, 3])),
+        rank=0,
+    )
+    assert transport.snapshot_at_fence(transition) > 0
+    snapshot = transport._fence_snapshot
+    assert snapshot["recurrent_slots"].tolist() == [0, slot]
+    pool.mamba_pool.mamba_cache.conv[0].zero_()
+    assert snapshot["recurrent"][0]["conv_0"][1].eq(9).all()
+    transport.release_fence_snapshot(transition)
+    assert transport._fence_snapshot is None

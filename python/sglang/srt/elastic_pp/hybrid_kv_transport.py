@@ -55,6 +55,45 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
             ),
         }
 
+    def snapshot_at_fence(self, transition):
+        size = super().snapshot_at_fence(transition)
+        free = set(
+            int(i) for i in self.pool.req_to_token_pool.mamba_allocator.free_slots
+        )
+        slots = torch.tensor(
+            [i for i in range(self.pool.recurrent_slot_count) if i not in free],
+            dtype=torch.int64,
+        )
+        layers = {
+            layer
+            for edge in self.outbound_transfers(transition)
+            for layer in self.pool.recurrent_layer_ids(edge.layer_range)
+        }
+        states = {}
+        for layer in sorted(layers):
+            tensors = self.pool.export_recurrent_slots(
+                layer_id=layer, slot_ids=slots.to(self.pool.device)
+            )
+            states[layer] = {
+                name: t.detach().cpu().clone() for name, t in tensors.items()
+            }
+        req_pool = self.pool.req_to_token_pool
+        self._fence_snapshot["request_state"] = {
+            "free_slots": list(req_pool.free_slots),
+            "recurrent_free_slots": req_pool.mamba_allocator.free_slots.detach()
+            .cpu()
+            .clone(),
+            "mapping": req_pool.req_index_to_mamba_index_mapping.detach().cpu().clone(),
+            "generation": req_pool.req_generation.detach().cpu().clone(),
+        }
+        self._fence_snapshot["recurrent_slots"] = slots
+        self._fence_snapshot["recurrent"] = states
+        return size + sum(
+            t.numel() * t.element_size()
+            for tensors in states.values()
+            for t in tensors.values()
+        )
+
     def send_phase(self, *args, **kwargs):
         raise NotImplementedError("hybrid PP migration requires fenced exchange_phase")
 
@@ -64,14 +103,17 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
         # serving: its free group and live-page set may be changing here.
         try:
             self.prepare_target(transition)
-        except BaseException:
+            self._preflight_cpu_staging(transition)
+        except BaseException as exc:
             try:
                 self.model_runner.abort_elastic_pp_kv_layers(
                     generation=transition.target.generation
                 )
             except BaseException:
                 pass
-            raise
+            from sglang.srt.elastic_pp.backing_spill import discard_tensor_tracebacks
+
+            raise discard_tensor_tracebacks(exc)
         return torch.empty(0, dtype=torch.int64, device="cpu")
 
     def finish_slot_tracking(self, transition):
@@ -115,14 +157,31 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
                             "slot_count": self.pool.recurrent_slot_count,
                         }
                         if sender:
-                            tensors = self.pool.export_recurrent_slots(
-                                layer_id=layer_id, slot_ids=slots
-                            )
+                            spill = getattr(self, "_spill", None)
+                            if spill is None:
+                                tensors = self.pool.export_recurrent_slots(
+                                    layer_id=layer_id, slot_ids=slots
+                                )
+                            else:
+                                index = spill.source_ids.index(layer_id)
+                                names = [
+                                    f"conv_{i}" for i in range(len(spill.backup) - 1)
+                                ] + ["temporal"]
+                                tensors = {
+                                    name: t[index]
+                                    .index_select(0, slots.cpu())
+                                    .to(self.pool.device)
+                                    for name, t in zip(names, spill.backup)
+                                }
+                                spill.metrics["outbound_staging_bytes"] += sum(
+                                    t.nbytes for t in tensors.values()
+                                )
                             payload = {_MANIFEST: header, _SLOTS: slots, **tensors}
                             works = self.group.send_tensor_dict(
                                 payload, dst=transfer.dst_rank, async_send=True
                             )
                             ElasticPPLayerTransport.wait(works or ())
+                            del payload, tensors, works
                         else:
                             payload = self.group.recv_tensor_dict(src=transfer.src_rank)
                             if (
@@ -152,6 +211,7 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
                                 slot_ids=source_slots,
                                 tensors=tensors,
                             )
+                            del payload, tensors
                     if not sender:
                         if layer_id in received:
                             raise RuntimeError(f"duplicate recurrent layer {layer_id}")

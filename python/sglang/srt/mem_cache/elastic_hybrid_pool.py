@@ -177,7 +177,11 @@ class ElasticHybridLinearKVPool(HybridLinearKVPool):
         if total_num_layers != self._total_num_layers:
             raise ValueError("elastic hybrid model-layer count changed")
         with self._elastic_lock:
-            current = set(range(self.start_layer, self.end_layer))
+            current = (
+                set()
+                if getattr(self, "_elastic_pp_cpu_spill", None)
+                else set(range(self.start_layer, self.end_layer))
+            )
             pending = self._residency.begin_prepare(
                 generation=generation, target=target, resident_layer_ids=current
             )
@@ -191,7 +195,9 @@ class ElasticHybridLinearKVPool(HybridLinearKVPool):
                 )
                 ids = self.recurrent_layer_ids(target)
                 old = self.mamba_pool.mamba_cache
-                if ids == tuple(self.req_to_token_pool.mamba_map):
+                if ids == tuple(self.req_to_token_pool.mamba_map) and not getattr(
+                    self, "_elastic_pp_cpu_spill", None
+                ):
                     state = old
                 else:
                     # Retained layers are copied only at commit, after every
@@ -300,7 +306,11 @@ class ElasticHybridLinearKVPool(HybridLinearKVPool):
                 raise RuntimeError("hybrid attention/state generation is not ready")
             old = self.mamba_pool.mamba_cache
             new = self._pending_state
-            if new is not old:
+            spill = getattr(self, "_elastic_pp_cpu_spill", None)
+            # Fenced spill preparation already copied retained GDN from its
+            # complete CPU authority. Only the overlap path still reads old GPU
+            # state here, after serving has drained.
+            if spill is None and new is not old:
                 for new_index, layer_id in enumerate(self._pending_mamba_ids):
                     old_index = self.req_to_token_pool.mamba_map.get(layer_id)
                     if old_index is None:
@@ -331,15 +341,21 @@ class ElasticHybridLinearKVPool(HybridLinearKVPool):
             self.layer_transfer_counter = None
             self._pending_state = None
             self._pending_mamba_ids = ()
+            self.__dict__.pop("_elastic_pp_cpu_spill", None)
             k_bytes, v_bytes = self.full_kv_pool.get_kv_size_bytes()
             self.mem_usage = (k_bytes + v_bytes) / 2**30
             return target
 
     def abort_elastic_pp_kv_layers(self, *, generation):
         with self._elastic_lock:
+            if generation <= self._residency.generation:
+                raise RuntimeError("cannot abort hybrid KV after topology publication")
             released = self.full_kv_pool.abort_elastic_pp_kv_layers(
                 generation=generation
             )
+            if self._residency.pending is None:
+                # The inner prepare may already have aborted both components.
+                return released
             self._residency.abort(generation)
             state = self._pending_state
             self._pending_state = None

@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
     PoolEntry,
 )
+from sglang.srt.mem_cache.pool_host.base import sync_fixed_hicache_size
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -74,6 +75,19 @@ def _with_mtp_layer_mapping(
     }
 
 
+def _logical_host_pool_size(device_size: int, page_size: int) -> int:
+    memory = get_memory()
+    raw_size = int(device_size * memory.hicache_ratio)
+    if memory.hicache_size > 0:
+        # A zero-layer resident rank must participate in exactly the same PP
+        # MIN as a physical host pool, without constraining the active ranks.
+        neutral = 2**63 - 1
+        synced = sync_fixed_hicache_size(neutral, memory.hicache_size)
+        if synced != neutral:
+            raw_size = synced
+    return (raw_size // page_size + 1) * page_size
+
+
 def build_kv_host_pool(
     *,
     kv_pool: Any,
@@ -85,6 +99,11 @@ def build_kv_host_pool(
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
 ):
+    if kv_pool.layer_num == 0:
+        from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+
+        size = _logical_host_pool_size(kv_pool.size, page_size)
+        return LogicalHostPool(size, page_size, get_memory().hicache_mem_layout)
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
     )
@@ -701,7 +720,9 @@ def build_hybrid_mamba_stack(
         pool.full_kv_pool for pool in params.mtp_draft_device_pools
     )
     kv_host_size, mamba_host_size = None, 0
-    if get_memory().hicache_size > 0:
+    if get_memory().hicache_size > 0 and (
+        kv_pool.layer_num or mamba_pool.num_mamba_layers
+    ):
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
@@ -720,13 +741,26 @@ def build_hybrid_mamba_stack(
             target_device_layer_num=kv_pool.layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
-    mamba_host_pool = MambaPoolHost(
-        mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(server_args),
-        layout=get_memory().hicache_mem_layout,
-    )
+    try:
+        if mamba_pool.num_mamba_layers == 0:
+            from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+
+            mamba_host_pool = LogicalHostPool(
+                _logical_host_pool_size(mamba_pool.size, 1),
+                1,
+                get_memory().hicache_mem_layout,
+            )
+        else:
+            mamba_host_pool = MambaPoolHost(
+                mamba_pool,
+                get_memory().hicache_ratio,
+                mamba_host_size,
+                allocator_type=_get_allocator_type(server_args),
+                layout=get_memory().hicache_mem_layout,
+            )
+    except BaseException:
+        kv_host_pool.destroy()
+        raise
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -749,27 +783,31 @@ def build_hybrid_mamba_stack(
         ),
     ]
     host_pool_group = HostPoolGroup(entries)
-    cache_controller = HybridCacheController(
-        params.token_to_kv_pool_allocator,
-        host_pool_group,
-        params.page_size,
-        params.tp_cache_group,
-        load_cache_event=load_cache_event,
-        attn_cp_group=params.attn_cp_cache_group,
-        attn_tp_group=params.attn_tp_cache_group,
-        pp_group=params.pp_cache_group,
-        write_policy=get_memory().hicache_write_policy,
-        io_backend=get_memory().hicache_io_backend,
-        storage_backend=storage_backend,
-        prefetch_threshold=prefetch_threshold,
-        model_name=model_name,
-        storage_backend_extra_config=storage_backend_extra_config,
-        transfer_layer_num=transfer_layer_num,
-        enable_storage_metrics=enable_storage_metrics,
-        host_memory_mode=server_args.hicache_host_memory_mode,
-    )
-    if mtp_draft_device_pools:
-        cache_controller.set_mtp_draft_pools(mtp_draft_device_pools)
+    try:
+        cache_controller = HybridCacheController(
+            params.token_to_kv_pool_allocator,
+            host_pool_group,
+            params.page_size,
+            params.tp_cache_group,
+            load_cache_event=load_cache_event,
+            attn_cp_group=params.attn_cp_cache_group,
+            attn_tp_group=params.attn_tp_cache_group,
+            pp_group=params.pp_cache_group,
+            write_policy=get_memory().hicache_write_policy,
+            io_backend=get_memory().hicache_io_backend,
+            storage_backend=storage_backend,
+            prefetch_threshold=prefetch_threshold,
+            model_name=model_name,
+            storage_backend_extra_config=storage_backend_extra_config,
+            transfer_layer_num=transfer_layer_num,
+            enable_storage_metrics=enable_storage_metrics,
+            host_memory_mode=server_args.hicache_host_memory_mode,
+        )
+        if mtp_draft_device_pools:
+            cache_controller.set_mtp_draft_pools(mtp_draft_device_pools)
+    except BaseException:
+        host_pool_group.destroy()
+        raise
     return host_pool_group, cache_controller
 
 
@@ -1296,9 +1334,13 @@ class _MambaStrategy(StackStrategy):
         # iterates stage-local IDs (as do the per-layer completion counters).
         # Without this offset, later PP stages silently skip their restores.
         start_layer = kvcache.start_layer
+        # Mapping values used by model execution can be global attention
+        # ordinals (elastic pools). Host buffers are always densely local.
         full_layer_mapping = {
             layer - start_layer: local
-            for layer, local in kvcache.full_attention_layer_id_mapping.items()
+            for local, layer in enumerate(
+                sorted(kvcache.full_attention_layer_id_mapping)
+            )
         }
         mamba_layer_mapping = {
             layer - start_layer: local

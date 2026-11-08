@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
 from typing import Any, Literal
 
@@ -260,6 +261,40 @@ class ElasticPPKVTransport:
             )
         )
 
+    def snapshot_at_fence(self, transition: DynamicPPTransition):
+        """Independent CPU backup of live outgoing KV before target allocation.
+
+        Source tensors are retained too. This backup does not imply physical
+        source-pool release or support for token-capacity resizing.
+        """
+        slots = self.allocator.elastic_pp_live_slots().detach().cpu().clone()
+        layers = {
+            layer
+            for edge in self.outbound_transfers(transition)
+            for layer in self._kv_layer_ids(edge)
+        }
+        backup = {}
+        for layer in sorted(layers):
+            tensors = self._export_source_kv(layer_id=layer, slot_ids=slots)
+            backup[layer] = tuple(t.detach().cpu().clone() for t in tensors)
+        self._fence_snapshot = {
+            "generation": transition.target.generation,
+            "slots": slots,
+            "layers": backup,
+        }
+        return sum(
+            t.numel() * t.element_size() for pair in backup.values() for t in pair
+        )
+
+    def release_fence_snapshot(self, transition):
+        snapshot = getattr(self, "_fence_snapshot", None)
+        if (
+            snapshot is not None
+            and snapshot["generation"] != transition.target.generation
+        ):
+            raise RuntimeError("elastic PP KV snapshot generation mismatch")
+        self._fence_snapshot = None
+
     def prepare_transition(self, transition: DynamicPPTransition) -> None:
         """Prepare backing without reading or tracking the serving allocator.
 
@@ -271,7 +306,8 @@ class ElasticPPKVTransport:
 
         try:
             self.prepare_target(transition)
-        except BaseException:
+            self._preflight_cpu_staging(transition)
+        except BaseException as exc:
             # The coordinator cannot set its prepared flag until this
             # method returns. Roll back locally so a failure after backing
             # allocation cannot leak a pending generation.
@@ -281,9 +317,178 @@ class ElasticPPKVTransport:
                 )
             except BaseException:
                 pass
-            raise
+            from sglang.srt.elastic_pp.backing_spill import discard_tensor_tracebacks
+
+            raise discard_tensor_tracebacks(exc)
+
+    def release_source_backing(self, transition):
+        """Opt-in sync-only spill. Caller must fence producers and invalidate graphs.
+
+        Source CPU authority survives failed target allocation. This method never
+        resumes scheduling; abort must restore_source_backing before doing so.
+        """
+        from sglang.srt.elastic_pp.backing_spill import HybridKVSpill, NativeKVSpill
+
+        if getattr(self, "_spill", None) is not None:
+            raise RuntimeError("source backing is already spilled")
+        if hasattr(self.pool, "full_kv_pool"):
+            spill = HybridKVSpill(self.pool)
+        else:
+            spill = NativeKVSpill(
+                self.pool, total_num_layers=transition.source.num_layers
+            )
+        spill.snapshot()
+        self._spill = spill
+        self._spill_generation = transition.target.generation
+        spill.release_source_backing()
+        return self.backing_spill_metrics()
+
+    def restore_source_backing(self, transition):
+        spill = getattr(self, "_spill", None)
+        if spill is not None:
+            if self._spill_generation != transition.target.generation:
+                raise RuntimeError("source spill generation mismatch")
+            spill.restore_source()
+            self._last_spill_metrics = self.backing_spill_metrics()
+            self._spill = None
+        return self.backing_spill_metrics()
+
+    def restore_target_from_snapshot(self, transition):
+        # prepare_target restores retained layers before receiving new owners.
+        spill = getattr(self, "_spill", None)
+        if (
+            spill is None
+            or spill.state != "target_prepared"
+            or spill.generation != transition.target.generation
+        ):
+            raise RuntimeError("no prepared spilled target")
+        return self.backing_spill_metrics()
+
+    def backing_spill_metrics(self):
+        import copy
+
+        spill = getattr(self, "_spill", None)
+        metrics = (
+            spill.metrics
+            if spill is not None
+            else getattr(self, "_last_spill_metrics", {})
+        )
+        result = copy.deepcopy(metrics)
+        if spill is not None:
+            result["state"] = spill.state
+        return result
+
+    def metrics(self):
+        return {"backing_spill": self.backing_spill_metrics()}
+
+    def _preflight_cpu_staging(self, transition):
+        spill = getattr(self, "_spill", None)
+        if spill is None:
+            return
+        from sglang.srt.elastic_pp.backing_spill import _require_cpu_space
+
+        full = getattr(self.pool, "full_kv_pool", self.pool)
+        k_shape, v_shape = full._kv_buffer_shapes()
+        per_layer = (math.prod(k_shape) + math.prod(v_shape)) * torch.empty(
+            0, dtype=full.store_dtype
+        ).element_size()
+        edges = [
+            edge
+            for edge in self.inbound_transfers(transition)
+            if self._kv_layer_ids(edge)
+        ]
+        # Source owners select their rows only at the fence. Admit the full
+        # token capacity rather than assuming receiver-local live slots match.
+        required = sum(len(self._kv_layer_ids(edge)) for edge in edges) * per_layer
+        required += len(edges) * k_shape[0] * 8  # one int64 slot stream per edge
+        available = _require_cpu_space(required)
+        spill.metrics["required_cpu_staging_bytes"] = required
+        spill.metrics["cpu_staging_available_bytes"] = available
+        spill.metrics["cpu_staging_budget_bytes"] = available
+
+    @staticmethod
+    def _chunk_bytes(slot_ids, layer_kv):
+        return slot_ids.nbytes + sum(
+            t.nbytes for pair in layer_kv.values() for t in pair
+        )
+
+    def _stage_received_cpu_chunk(self, generation, slot_ids, layer_kv):
+        spill = getattr(self, "_spill", None)
+        if spill is None:
+            return slot_ids, layer_kv
+        from sglang.srt.elastic_pp.backing_spill import _cpu_copy, _require_cpu_space
+
+        full = getattr(self.pool, "full_kv_pool", self.pool)
+        for layer_id, pair in layer_kv.items():
+            ordinal = (
+                self.pool._full_id_to_ordinal[layer_id]
+                if full is not self.pool
+                else layer_id
+            )
+            target_pair = full.get_elastic_pp_pending_kv_buffer(
+                generation=generation, layer_id=ordinal
+            )
+            for tensor, target in zip(pair, target_pair):
+                expected = (slot_ids.numel(), *target.shape[1:])
+                if tuple(tensor.shape) != expected or tensor.dtype != target.dtype:
+                    raise ValueError("CPU-staged KV shape/dtype differs from target")
+                if slot_ids.numel() and (
+                    slot_ids.min().item() < 0
+                    or slot_ids.max().item() >= target.shape[0]
+                ):
+                    raise ValueError("CPU-staged KV slots exceed target capacity")
+        size = self._chunk_bytes(slot_ids, layer_kv)
+        available = _require_cpu_space(size)
+        slots = _cpu_copy(slot_ids)
+        layers = {
+            layer_id: tuple(_cpu_copy(t) for t in pair)
+            for layer_id, pair in layer_kv.items()
+        }
+        spill.metrics["cpu_staging_budget_bytes"] = min(
+            available, spill.metrics.get("cpu_staging_budget_bytes", available)
+        )
+        spill.metrics["received_staging_bytes"] += size
+        spill.metrics["cpu_staging_live_bytes"] += size
+        spill.metrics["cpu_staging_peak_bytes"] = max(
+            spill.metrics["cpu_staging_peak_bytes"],
+            spill.metrics["cpu_staging_live_bytes"],
+        )
+        return slots, layers
+
+    def finalize_source_backing(self, transition):
+        """Discard CPU rollback authority only after all-rank publication."""
+        spill = getattr(self, "_spill", None)
+        if spill is not None:
+            spill.finalize(generation=transition.target.generation)
+            self._last_spill_metrics = self.backing_spill_metrics()
+            self._spill = None
+        return self.backing_spill_metrics()
+
+    def _export_source_kv(self, *, layer_id, slot_ids):
+        spill = getattr(self, "_spill", None)
+        if spill is None:
+            return self.pool.export_elastic_pp_kv_slots(
+                layer_id=layer_id, slot_ids=slot_ids
+            )
+        if hasattr(spill, "attention"):
+            pair = spill.attention.backup[self.pool._full_id_to_ordinal[layer_id]]
+        else:
+            pair = spill.backup[layer_id]
+        result = tuple(
+            t.index_select(0, slot_ids.cpu()).to(self.pool.device) for t in pair
+        )
+        spill.metrics["outbound_staging_bytes"] += sum(t.nbytes for t in result)
+        return result
 
     def prepare_target(self, transition: DynamicPPTransition) -> frozenset[int]:
+        spill = getattr(self, "_spill", None)
+        if spill is not None:
+            return frozenset(
+                spill.prepare_target(
+                    target=transition.target.layer_range(self.rank),
+                    generation=transition.target.generation,
+                )
+            )
         with self._stream_context(self._receive_stream):
             prepared = self.model_runner.prepare_elastic_pp_kv_layers(
                 target=transition.target.layer_range(self.rank),
@@ -331,7 +536,7 @@ class ElasticPPKVTransport:
                 )
                 for chunk_index, chunk in enumerate(chunks):
                     layer_kv = {
-                        layer_id: self.pool.export_elastic_pp_kv_slots(
+                        layer_id: self._export_source_kv(
                             layer_id=layer_id, slot_ids=chunk
                         )
                         for layer_id in layer_ids
@@ -350,6 +555,7 @@ class ElasticPPKVTransport:
                         payload, dst=transfer.dst_rank, async_send=True
                     )
                     ElasticPPLayerTransport.wait(works or ())
+                    del payload, layer_kv, works
                     sent += 1
             ready_event = self._record_ready_event(self._send_stream)
         if ready_event is not None:
@@ -463,8 +669,15 @@ class ElasticPPKVTransport:
             )
             if key in self._staged_chunks:
                 raise RuntimeError(f"duplicate staged elastic PP KV chunk: {key!r}")
+            slot_ids, layer_kv = self._stage_received_cpu_chunk(
+                transition.target.generation, slot_ids, layer_kv
+            )
             self._staged_chunks[key] = (slot_ids, layer_kv)
             loaded.update(layer_kv)
+            # A CPU-staged transfer must not retain the first CUDA payload
+            # until every subsequent chunk has arrived.
+            first_payload = None
+            del payload
         return frozenset(loaded)
 
     def _kv_layer_ids(self, transfer: LayerTransfer) -> tuple[int, ...]:
@@ -510,7 +723,7 @@ class ElasticPPKVTransport:
                     )
                     for chunk_index, source_chunk in enumerate(chunks):
                         layer_kv = {
-                            layer_id: self.pool.export_elastic_pp_kv_slots(
+                            layer_id: self._export_source_kv(
                                 layer_id=layer_id, slot_ids=source_chunk
                             )
                             for layer_id in layer_ids
@@ -531,6 +744,7 @@ class ElasticPPKVTransport:
                             async_send=True,
                         )
                         ElasticPPLayerTransport.wait(works or ())
+                        del payload, layer_kv, works
                 else:
                     loaded.update(self._receive_transfer(transition, transfer, phase))
                 ready_event = self._record_ready_event(stream)
@@ -608,6 +822,11 @@ class ElasticPPKVTransport:
                         cache_k=cache_k,
                         cache_v=cache_v,
                     )
+                    spill = getattr(self, "_spill", None)
+                    if spill is not None:
+                        spill.metrics["restored_bytes"] += (
+                            cache_k.nbytes + cache_v.nbytes
+                        )
                     loaded.add(layer_id)
             ready_event = self._record_ready_event(self._receive_stream)
         if ready_event is not None:
@@ -617,12 +836,25 @@ class ElasticPPKVTransport:
                 generation=generation,
                 layer_ids=loaded,
             )
-        for key, _ in staged:
+        spill = getattr(self, "_spill", None)
+        for key, (slot_ids, layer_kv) in staged:
+            if spill is not None:
+                spill.metrics["cpu_staging_live_bytes"] -= self._chunk_bytes(
+                    slot_ids, layer_kv
+                )
             del self._staged_chunks[key]
         return frozenset(loaded)
 
     def abort_staged(self, transition: DynamicPPTransition) -> None:
+        self.release_fence_snapshot(transition)
         generation = transition.target.generation
+        spill = getattr(self, "_spill", None)
+        if spill is not None:
+            spill.metrics["cpu_staging_live_bytes"] -= sum(
+                self._chunk_bytes(*value)
+                for key, value in self._staged_chunks.items()
+                if key[0] == generation
+            )
         self._staged_chunks = {
             key: value
             for key, value in self._staged_chunks.items()
