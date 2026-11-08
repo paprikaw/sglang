@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.memory_pool_host import (
     LogicalHostPool,
     PoolEntry,
 )
+from sglang.srt.mem_cache.pool_host.base import sync_fixed_hicache_size
 from sglang.srt.mem_cache.pool_host.common import get_allocator_type
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
@@ -74,6 +75,19 @@ def _with_mtp_layer_mapping(
     }
 
 
+def _logical_host_pool_size(device_size: int, page_size: int) -> int:
+    memory = get_memory()
+    raw_size = int(device_size * memory.hicache_ratio)
+    if memory.hicache_size > 0:
+        # A zero-layer resident rank must participate in exactly the same PP
+        # MIN as a physical host pool, without constraining the active ranks.
+        neutral = 2**63 - 1
+        synced = sync_fixed_hicache_size(neutral, memory.hicache_size)
+        if synced != neutral:
+            raw_size = synced
+    return (raw_size // page_size + 1) * page_size
+
+
 def build_kv_host_pool(
     *,
     kv_pool: Any,
@@ -88,9 +102,7 @@ def build_kv_host_pool(
     if kv_pool.layer_num == 0:
         from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 
-        size = (
-            int(kv_pool.size * get_memory().hicache_ratio) // page_size + 1
-        ) * page_size
+        size = _logical_host_pool_size(kv_pool.size, page_size)
         return LogicalHostPool(size, page_size, get_memory().hicache_mem_layout)
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
@@ -734,7 +746,7 @@ def build_hybrid_mamba_stack(
             from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 
             mamba_host_pool = LogicalHostPool(
-                int(mamba_pool.size * get_memory().hicache_ratio) + 1,
+                _logical_host_pool_size(mamba_pool.size, 1),
                 1,
                 get_memory().hicache_mem_layout,
             )

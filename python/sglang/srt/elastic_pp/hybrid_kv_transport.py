@@ -103,6 +103,7 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
         # serving: its free group and live-page set may be changing here.
         try:
             self.prepare_target(transition)
+            self._preflight_cpu_staging(transition)
         except BaseException as exc:
             try:
                 self.model_runner.abort_elastic_pp_kv_layers(
@@ -172,11 +173,15 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
                                     .to(self.pool.device)
                                     for name, t in zip(names, spill.backup)
                                 }
+                                spill.metrics["outbound_staging_bytes"] += sum(
+                                    t.nbytes for t in tensors.values()
+                                )
                             payload = {_MANIFEST: header, _SLOTS: slots, **tensors}
                             works = self.group.send_tensor_dict(
                                 payload, dst=transfer.dst_rank, async_send=True
                             )
                             ElasticPPLayerTransport.wait(works or ())
+                            del payload, tensors, works
                         else:
                             payload = self.group.recv_tensor_dict(src=transfer.src_rank)
                             if (
@@ -206,6 +211,7 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
                                 slot_ids=source_slots,
                                 tensors=tensors,
                             )
+                            del payload, tensors
                     if not sender:
                         if layer_id in received:
                             raise RuntimeError(f"duplicate recurrent layer {layer_id}")
