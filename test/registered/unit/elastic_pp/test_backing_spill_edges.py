@@ -177,6 +177,60 @@ def test_hybrid_frontier_authority_rejects_scheduler_progress(hybrid_pool_factor
     spill.restore_source()
 
 
+@pytest.mark.parametrize("fail_attention", [False, True])
+def test_hybrid_failed_restore_counts_completed_copies_and_releases_owners(
+    hybrid_pool_factory, monkeypatch, fail_attention
+):
+    pool = hybrid_pool_factory(start_layer=0, end_layer=4)
+    spill = HybridKVSpill(pool)
+    spill.snapshot()
+    spill.release_source_backing()
+    witnesses = []
+    original_to = torch.Tensor.to
+    original_allocate = pool.full_kv_pool._allocate_elastic_pp_kv_pair
+    completed_gdn_bytes = 0
+
+    def fail_copy(tensor, *args, **kwargs):
+        nonlocal completed_gdn_bytes
+        is_source = any(tensor is source for source in spill.backup)
+        if is_source and completed_gdn_bytes and not fail_attention:
+            raise MemoryError("GDN rebuild OOM")
+        result = original_to(tensor, *args, **kwargs)
+        if is_source:
+            completed_gdn_bytes += tensor.nbytes
+            witnesses.append(weakref.ref(result.untyped_storage()))
+        return result
+
+    def fail_second_attention(*, layer_id):
+        if layer_id == 1:
+            raise MemoryError("attention rebuild OOM")
+        pair = original_allocate(layer_id=layer_id)
+        witnesses.extend(weakref.ref(t.untyped_storage()) for t in pair)
+        return pair
+
+    monkeypatch.setattr(torch.Tensor, "to", fail_copy)
+    if fail_attention:
+        monkeypatch.setattr(
+            pool.full_kv_pool, "_allocate_elastic_pp_kv_pair", fail_second_attention
+        )
+    with pytest.raises(MemoryError) as retained_error:
+        spill.restore_source()
+    gc.collect()
+    assert retained_error.value is not None and witnesses
+    assert all(w() is None for w in witnesses)
+    failed_bytes = completed_gdn_bytes + spill.attention.metrics["restored_bytes"]
+    assert spill.metrics["restored_bytes"] == failed_bytes > 0
+    monkeypatch.setattr(torch.Tensor, "to", original_to)
+    monkeypatch.setattr(
+        pool.full_kv_pool, "_allocate_elastic_pp_kv_pair", original_allocate
+    )
+    spill.restore_source()
+    assert (
+        spill.metrics["restored_bytes"]
+        == failed_bytes + spill.metrics["snapshot_bytes"]
+    )
+
+
 def _host_cache(pool):
     full = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
     full.device_pool = pool.full_kv_pool
