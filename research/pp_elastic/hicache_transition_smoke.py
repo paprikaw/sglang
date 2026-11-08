@@ -324,6 +324,13 @@ def main():
     parser.add_argument("--guard-scripts", required=False)
     parser.add_argument("--backfill-state", required=False)
     parser.add_argument(
+        "--node-spec",
+        type=Path,
+        default=Path(
+            "/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/gpu-r9/cache/node.json"
+        ),
+    )
+    parser.add_argument(
         "--strategy", choices=["sync", "background", "batched"], default="sync"
     )
     args = parser.parse_args()

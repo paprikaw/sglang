@@ -9,14 +9,29 @@ QWEN35_ELASTIC_ARCHITECTURES = (
 def validate_qwen35_elastic_args(args):
     """Fail before loading weights for cache modes not covered by migration."""
     unsupported = []
-    if not args.disable_radix_cache:
-        unsupported.append("prefix caching (pass --disable-radix-cache)")
+    hicache = getattr(args, "enable_hierarchical_cache", False)
+    if not args.disable_radix_cache and not hicache:
+        unsupported.append(
+            "prefix caching without HiCache (pass --disable-radix-cache)"
+        )
+    if hicache:
+        if getattr(args, "elastic_pp_kv_backend", "native") != "native":
+            unsupported.append("HiCache requires native elastic KV backing")
+        if getattr(args, "hicache_storage_backend", None):
+            unsupported.append("HiCache L3 storage")
+        if getattr(args, "hicache_host_memory_mode", "cache") != "cache":
+            unsupported.append("HiCache buffer-only host mode")
+        if getattr(args, "hicache_mem_layout", "page_first") != "page_first":
+            unsupported.append("hybrid HiCache requires page_first host layout")
+        if getattr(args, "hicache_io_backend", "kernel") != "kernel":
+            unsupported.append("hybrid HiCache requires kernel I/O")
+        if getattr(args, "enable_session_radix_cache", False):
+            unsupported.append("session radix cache frontier migration")
     if not args.max_running_requests or args.max_running_requests <= 0:
         unsupported.append("automatic request capacity (set --max-running-requests)")
     for flag in (
         "enable_unified_memory",
         "enable_page_major_kv_layout",
-        "enable_hierarchical_cache",
         "enable_int8_mamba_checkpoint",
         "enable_linear_replayssm",
         "enable_linear_replayssm_spec",

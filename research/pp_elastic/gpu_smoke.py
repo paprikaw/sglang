@@ -66,8 +66,14 @@ def prepare(args):
     # generic entry point still only admits GLM and must not be bypassed by
     # relabelling a Qwen cache as GLM. This bundle uses the same shared registry.
     guard = Path(args.guard_scripts).resolve()
-    state = json.loads(Path(args.backfill_state).read_text())
-    old = Path(state['nodes'][args.node]['run']) / 'cache_node_spec.json'
+    explicit_node_spec = getattr(args, 'node_spec', None)
+    if explicit_node_spec is not None:
+        # Guard still authenticates this frozen daemon identity against live
+        # state under the lease; a saved spec is never a live cache attestation.
+        old = Path(explicit_node_spec).resolve()
+    else:
+        state = json.loads(Path(args.backfill_state).read_text())
+        old = Path(state['nodes'][args.node]['run']) / 'cache_node_spec.json'
     node_spec = json.loads(old.read_text())
     if node_spec['node'] != args.node or str(node_spec['expected_job_id']) != args.job:
         raise RuntimeError('Existing CPU bank differs from requested booked node/job')
