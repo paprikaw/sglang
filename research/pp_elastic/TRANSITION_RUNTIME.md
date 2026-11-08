@@ -17,8 +17,8 @@ The opt-in `cpu_spill` backing contract is wired through the same coordinator
 for `sync` and `batched`: drain host I/O, snapshot mutable state, detach source
 device owners, collectively confirm release, admit against physical free memory,
 allocate target backing, restore retained state and transfer moved layers. It
-requires the cache branch's spill/alias APIs and fails closed when they are
-absent. Native eager execution is required; background preparation still needs
+includes the cache branch's spill/alias APIs (dependency d252af8c41). Native
+eager execution is required; background preparation still needs
 source-plus-target capacity. Admission after spill counts all target KV/GDN,
 including retained layers whose source device owners were released. The runtime
 records CUDA allocated/reserved/free bytes around release. The short acceptance
@@ -35,6 +35,8 @@ aliases on every resident rank; any unverified restore prevents serving and
 retry. Partial target allocations are included in abort. Successful rollback
 resumes from the collectively agreed PP ring boundary. CPU source authority and
 retired host resources are released only after publication.
+Failed weight construction drops traceback references across exception chains
+before source restoration, including partial constructors with loader cycles.
 Dormant rank cache-node handles may be rebuilt from a canonical active tree,
 but request token progress and allocator identity must match before rebinding.
 
@@ -49,3 +51,11 @@ Existing static PP + HiCache runs do not qualify
 this dynamic path. The short real-model acceptance must include startup, warmup,
 PP2 -> PP3 -> PP2, active KV/GDN/progress, CPU-only prefix loadback, and cleanup
 within 300 seconds; successful server startup alone is not acceptance.
+
+The 2026-11-08 combined checkpoint passed 184 CPU checks across 14 focused files
+in 28.27 seconds. This covers multi-generation three-rank native KV/GDN backing
+rebuilds, host transactions, allocator fences, source recovery, OOM exception
+ownership and adversarial acceptance evidence. The exact file list and JUnit
+are preserved at
+`/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/hicache-runtime-combined-20261108-r4`.
+CPU checks do not prove CUDA ownership release or a successful dynamic GPU run.

@@ -163,7 +163,10 @@ def test_aborted_layer_releases_loader_reference_cycle(model_class):
             gc.enable()
 
 
-def test_retained_weight_oom_drops_target_owners_and_allows_source_retry(model_class):
+@pytest.mark.parametrize("chain", [None, "cause", "context"])
+def test_retained_weight_oom_drops_target_owners_and_allows_source_retry(
+    model_class, chain
+):
     model = _model([10.0, None, None], LayerRange(0, 1), model_class)
     allocated = []
 
@@ -172,7 +175,15 @@ def test_retained_weight_oom_drops_target_owners_and_allows_source_retry(model_c
         layer.weight.weight_loader = layer.forward
         allocated.append(weakref.ref(layer.weight))
         if layer_id == 2:
-            raise torch.OutOfMemoryError("injected target weight allocation failure")
+            message = "injected target weight allocation failure"
+            if chain is None:
+                raise torch.OutOfMemoryError(message)
+            try:
+                raise RuntimeError("constructor allocation failed")
+            except RuntimeError as cause:
+                if chain == "cause":
+                    raise torch.OutOfMemoryError(message) from cause
+                raise torch.OutOfMemoryError(message)
         return layer
 
     model._elastic_layer_factory = fail_second_layer
@@ -185,6 +196,9 @@ def test_retained_weight_oom_drops_target_owners_and_allows_source_retry(model_c
         )
     # Keep the exception alive, as the coordinator does during source restore.
     assert caught.value is not None
+    if chain is not None:
+        assert str(caught.value.__context__) == "constructor allocation failed"
+        assert caught.value.__context__.__traceback__ is None
     assert len(allocated) == 2
     assert all(weight() is None for weight in allocated)
     assert model.abort_elastic_pp_layers(1) == ()

@@ -88,11 +88,13 @@ class ElasticPPModelMixin:
                 target=target, generation=generation, device=device, dtype=dtype
             )
         except BaseException as error:
+            from sglang.srt.elastic_pp.backing_spill import discard_tensor_tracebacks
+
             # A retained OOM exception must not pin a partially constructed
             # target layer while the coordinator restores source KV backing.
             # Constructor frames can also contain loader-reference cycles;
             # collect these new, unfrozen objects after dropping the frames.
-            error.__traceback__ = None
+            discard_tensor_tracebacks(error)
             gc.collect()
             raise error from None
 
