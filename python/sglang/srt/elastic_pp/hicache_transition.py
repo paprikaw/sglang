@@ -913,6 +913,7 @@ def build_dormant_host_stack(clone, *, source, projected, params):
     )
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _COMPONENT_HOST_ATTR,
+        _logical_host_pool_size,
     )
     from sglang.srt.mem_cache.hicache_storage import PoolName
     from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -920,9 +921,6 @@ def build_dormant_host_stack(clone, *, source, projected, params):
     entries = []
     for old in source.host_pool_group.entries:
         entry = copy.copy(old)
-        entry.host_pool = LogicalHostPool(
-            old.host_pool.logical_size, old.host_pool.page_size, old.host_pool.layout
-        )
         entry.layer_mapper = lambda _: None
         if entry.name == PoolName.KV:
             entry.device_pool = getattr(projected, "full_kv_pool", projected)
@@ -930,6 +928,15 @@ def build_dormant_host_stack(clone, *, source, projected, params):
             entry.device_pool = projected.mamba_pool
         else:
             raise NotImplementedError("dormant HiCache supports FULL and MAMBA only")
+        # Physical target constructors enter one PP MIN per component when
+        # --hicache-size is fixed. The dormant target must join the same
+        # collectives with a neutral value and adopt the new topology's
+        # capacity, rather than retaining the source topology's capacity.
+        entry.host_pool = LogicalHostPool(
+            _logical_host_pool_size(entry.device_pool.size, old.host_pool.page_size),
+            old.host_pool.page_size,
+            old.host_pool.layout,
+        )
         entries.append(entry)
     clone.host_pool_group = HostPoolGroup(entries)
     clone.load_cache_event = threading.Event()
