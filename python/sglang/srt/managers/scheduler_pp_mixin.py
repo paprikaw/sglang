@@ -466,12 +466,17 @@ class SchedulerPPMixin:
 
     def _elastic_pp_live_requests(self):
         """All retained request objects, including dormant scheduler ranks."""
-        batches = [getattr(self, name, None) for name in
-                   ("running_batch", "last_batch")]
+        batches = [
+            getattr(self, name, None) for name in ("running_batch", "last_batch")
+        ]
         for name in ("running_mbs", "last_mbs", "mbs"):
             batches.extend(getattr(self, name, ()))
-        requests = [req for batch in batches if batch is not None
-                    for req in getattr(batch, "reqs", ())]
+        requests = [
+            req
+            for batch in batches
+            if batch is not None
+            for req in getattr(batch, "reqs", ())
+        ]
         requests.extend(getattr(self, "waiting_queue", ()))
         chunked = getattr(self, "chunked_req", None)
         if chunked is not None:
@@ -486,30 +491,43 @@ class SchedulerPPMixin:
         """
         import copy
 
-        fields = ("last_node", "last_host_node", "best_match_node",
-                  "skip_lock_node_ids", "swa_uuid_for_lock",
-                  "swa_prefix_lock_released", "cache_protected_len")
+        fields = (
+            "last_node",
+            "last_host_node",
+            "best_match_node",
+            "skip_lock_node_ids",
+            "swa_uuid_for_lock",
+            "swa_prefix_lock_released",
+            "cache_protected_len",
+        )
         records = {}
         for req in self._elastic_pp_live_requests():
             rid = str(req.rid)
             record = {
-                "progress": (getattr(req, "req_pool_idx", None),
-                             tuple(getattr(req, "output_ids", ())),
-                             tuple(getattr(req, "origin_input_ids", ()))),
-                "handles": {name: copy.deepcopy(getattr(req, name, None))
-                            for name in fields},
+                "progress": (
+                    getattr(req, "req_pool_idx", None),
+                    tuple(getattr(req, "output_ids", ())),
+                    tuple(getattr(req, "origin_input_ids", ())),
+                ),
+                "handles": {
+                    name: copy.deepcopy(getattr(req, name, None)) for name in fields
+                },
             }
             if rid in records and records[rid] != record:
                 raise RuntimeError(f"elastic PP duplicate divergent request: {rid}")
             records[rid] = record
         return records
 
-    def _elastic_pp_rebind_request_cache_state(self, records):
+    def _elastic_pp_rebind_request_cache_state(self, records, *, validate_only=False):
         local = self._elastic_pp_request_cache_state()
         if set(local) != set(records) or any(
             local[rid]["progress"] != records[rid]["progress"] for rid in local
         ):
-            raise RuntimeError("elastic PP dormant request progress differs from canonical rank")
+            raise RuntimeError(
+                "elastic PP dormant request progress differs from canonical rank"
+            )
+        if validate_only:
+            return
         for req in self._elastic_pp_live_requests():
             for name, value in records[str(req.rid)]["handles"].items():
                 setattr(req, name, value)
@@ -690,12 +708,19 @@ class SchedulerPPMixin:
         transition = DynamicPPTransition.build(current, target)
         self._elastic_pp_pending_req = recv_req
         try:
-            if self.enable_hierarchical_cache and coordinator.cache_transition is None:
-                from sglang.srt.elastic_pp.hicache_transition import SchedulerHiCacheTransition
+            if (
+                getattr(self, "enable_hierarchical_cache", False)
+                and coordinator.cache_transition is None
+            ):
+                from sglang.srt.elastic_pp.hicache_transition import (
+                    SchedulerHiCacheTransition,
+                )
 
                 coordinator.cache_transition = SchedulerHiCacheTransition(
-                    scheduler=self, model_runner=self.tp_worker.model_runner,
-                    group=coordinator.group, rank=self.ps.pp_rank,
+                    scheduler=self,
+                    model_runner=self.tp_worker.model_runner,
+                    group=coordinator.group,
+                    rank=self.ps.pp_rank,
                 )
             coordinator.begin(transition)
         except BaseException as exc:
@@ -905,9 +930,11 @@ class SchedulerPPMixin:
                 if self._pp_spec_microbatch:
                     result, (next_pp_outputs, next_batch_result, d2h_event) = (
                         self._pp_run_ready_microbatch(
-                            mb_id, cur_batch,
+                            mb_id,
+                            cur_batch,
                             pp_proxy_tensors if cur_batch else None,
-                            next_first_rank_mb_id, next_mb_id,
+                            next_first_rank_mb_id,
+                            next_mb_id,
                         )
                     )
                 elif exchange_outputs_before_forward:
@@ -936,10 +963,7 @@ class SchedulerPPMixin:
                     self._pp_send_launched_proxy(
                         cur_batch, result if cur_batch else None
                     )
-                if (
-                    not exchange_outputs_before_forward
-                    and not self._pp_spec_microbatch
-                ):
+                if not exchange_outputs_before_forward and not self._pp_spec_microbatch:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
                             next_first_rank_mb_id,
@@ -978,7 +1002,12 @@ class SchedulerPPMixin:
                 self.on_idle()
 
     def _pp_run_ready_microbatch(
-        self: Scheduler, mb_id, batch, proxy, next_first_rank_mb_id, next_mb_id,
+        self: Scheduler,
+        mb_id,
+        batch,
+        proxy,
+        next_first_rank_mb_id,
+        next_mb_id,
     ):
         # Only reuse a graph/proxy slot after its previous send has completed.
         # Never wait for the OTHER slot's feedback before submitting this one.
@@ -987,7 +1016,11 @@ class SchedulerPPMixin:
         def launch():
             with torch.profiler.record_function(f"pp_microbatch_launch.slot{mb_id}"):
                 result, self.launch_event = self._pp_launch_or_skip_batch(
-                    mb_id, batch, proxy, self.mb_metadata, self.last_rank_comm_queue,
+                    mb_id,
+                    batch,
+                    proxy,
+                    self.mb_metadata,
+                    self.last_rank_comm_queue,
                 )
             return result
 
@@ -995,7 +1028,8 @@ class SchedulerPPMixin:
             launch if batch is not None else None,
             lambda result: self._pp_send_launched_proxy(batch, result),
             lambda: self._pp_commit_send_output_work_and_preprocess_output_tensors(
-                next_first_rank_mb_id, next_mb_id,
+                next_first_rank_mb_id,
+                next_mb_id,
             ),
         )
 
@@ -2100,7 +2134,9 @@ class SchedulerPPMixin:
         channel = self.pp_group
         channels = getattr(self, "_pp_pd_tensor_channels", None)
         if channels and msg_type in ("proxy", "output"):
-            index = 0 if msg_type == "proxy" else (1 if self.pp_group.is_last_rank else 2)
+            index = (
+                0 if msg_type == "proxy" else (1 if self.pp_group.is_last_rank else 2)
+            )
             channel = channels[index]
         p2p_work = []
         transport = (
@@ -2141,7 +2177,11 @@ class SchedulerPPMixin:
         if channels and expected_kind in ("proxy", "output"):
             if any(self._pp_tensor_dict_inbox.values()):
                 raise RuntimeError("PD typed channel cannot bypass a native inbox")
-            index = 0 if expected_kind == "proxy" else (2 if self.pp_group.is_last_rank else 1)
+            index = (
+                0
+                if expected_kind == "proxy"
+                else (2 if self.pp_group.is_last_rank else 1)
+            )
             result = channels[index].recv_tensor_dict(
                 src=src, all_gather_group=all_gather_group
             )

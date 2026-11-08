@@ -387,6 +387,7 @@ def test_pp2_pp4_pp2_reuses_coordinator_without_slot_tracker_lifecycle():
         assert coordinator.current_topology == transition.target
     assert kv_transport.phases == [("bulk", (1, 3, 5)), ("delta", ())] * 2
 
+
 @pytest.mark.parametrize("strategy", ["sync", "batched"])
 def test_synchronous_policies_snapshot_before_target_allocation(strategy):
     coordinator, transition, runner, kv = _coordinator()
@@ -395,7 +396,8 @@ def test_synchronous_policies_snapshot_before_target_allocation(strategy):
     kv.snapshot_at_fence = lambda transition: events.append("snapshot")
     old_prepare = coordinator.layer_transport.prepare_target
     coordinator.layer_transport.prepare_target = lambda transition: (
-        events.append("allocate"), old_prepare(transition)
+        events.append("allocate"),
+        old_prepare(transition),
     )[-1]
     coordinator.begin(transition)
     coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
@@ -457,7 +459,11 @@ def test_background_precopy_uses_cpu_payload_and_leaves_live_model_unpublished()
 
         def send_tensor_dict(self, payload, *, dst, async_send):
             assert dst == 1 and async_send
-            assert all(t.device.type == "cpu" for t in payload.values() if isinstance(t, torch.Tensor))
+            assert all(
+                t.device.type == "cpu"
+                for t in payload.values()
+                if isinstance(t, torch.Tensor)
+            )
             payloads.put(payload)
             return ()
 
@@ -480,9 +486,15 @@ def test_background_precopy_uses_cpu_payload_and_leaves_live_model_unpublished()
         _stream_context = staticmethod(contextlib.nullcontext)
 
     def make(rank):
-        return ElasticPPMigrationCoordinator(rank=rank, current_topology=source,
-            group=Group(), model_runner=Runner(), layer_transport=Layers(),
-            kv_transport=_KVTransport(), strategy="background")
+        return ElasticPPMigrationCoordinator(
+            rank=rank,
+            current_topology=source,
+            group=Group(),
+            model_runner=Runner(),
+            layer_transport=Layers(),
+            kv_transport=_KVTransport(),
+            strategy="background",
+        )
 
     sender, receiver = make(0), make(1)
     sender._precopy_immutable_weights(transition)

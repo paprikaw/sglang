@@ -15,7 +15,8 @@ import torch
 
 from sglang.srt.elastic_pp.topology import DynamicPPTransition, PPTopology
 from sglang.srt.elastic_pp.layer_transport import (
-    flatten_layer_states, unflatten_layer_states,
+    flatten_layer_states,
+    unflatten_layer_states,
 )
 from sglang.srt.elastic_pp.topology import LayerRange, LayerTransfer
 
@@ -74,7 +75,9 @@ class ElasticPPMigrationCoordinator:
         # Test doubles without server_args retain the pre-existing allocation-only
         # protocol. Real runners select one of the three explicit policies.
         args = getattr(model_runner, "server_args", None)
-        self.strategy = strategy or getattr(args, "elastic_pp_transition_strategy", "legacy")
+        self.strategy = strategy or getattr(
+            args, "elastic_pp_transition_strategy", "legacy"
+        )
         if self.strategy not in {"sync", "background", "batched", "legacy"}:
             raise ValueError(f"unknown elastic PP transition strategy: {self.strategy}")
         self.cache_transition = cache_transition
@@ -360,15 +363,20 @@ class ElasticPPMigrationCoordinator:
     def _preflight_capacity(self, transition):
         local_error, details = None, None
         try:
-            method = getattr(self.model_runner, "elastic_pp_transition_capacity_report", None)
+            method = getattr(
+                self.model_runner, "elastic_pp_transition_capacity_report", None
+            )
             if method is not None:
                 details = method(transition)
         except BaseException as exc:
             local_error = f"{type(exc).__name__}: {exc}"
-        reports = self._consensus("capacity", success=local_error is None,
-                                  error=local_error, details=details)
+        reports = self._consensus(
+            "capacity", success=local_error is None, error=local_error, details=details
+        )
         self._raise_peer_failures("capacity", reports)
-        logger.info("Elastic PP strategy=%s capacity reports=%s", self.strategy, reports)
+        logger.info(
+            "Elastic PP strategy=%s capacity reports=%s", self.strategy, reports
+        )
 
     def _prepare_backing(self, transition: DynamicPPTransition) -> None:
         """Shared target allocation; sync policies call only after draining."""
@@ -386,24 +394,45 @@ class ElasticPPMigrationCoordinator:
         """
         for edge in sorted(transition.kv_transfers, key=self.layer_transport._sort_key):
             for layer_id in range(edge.layer_range.start, edge.layer_range.end):
-                transfer = LayerTransfer(edge.src_rank, edge.dst_rank, LayerRange(layer_id, layer_id + 1))
+                transfer = LayerTransfer(
+                    edge.src_rank, edge.dst_rank, LayerRange(layer_id, layer_id + 1)
+                )
                 if self.rank == edge.src_rank:
                     state = self.model_runner.export_elastic_pp_layer_state([layer_id])
-                    cpu_state = {layer_id: {name: tensor.detach().to("cpu", copy=True)
-                                           for name, tensor in state[layer_id].items()}}
-                    payload = flatten_layer_states(generation=transition.target.generation,
-                                                   transfer=transfer, layer_states=cpu_state)
-                    works = self.group.send_tensor_dict(payload, dst=edge.dst_rank, async_send=True)
+                    cpu_state = {
+                        layer_id: {
+                            name: tensor.detach().to("cpu", copy=True)
+                            for name, tensor in state[layer_id].items()
+                        }
+                    }
+                    payload = flatten_layer_states(
+                        generation=transition.target.generation,
+                        transfer=transfer,
+                        layer_states=cpu_state,
+                    )
+                    works = self.group.send_tensor_dict(
+                        payload, dst=edge.dst_rank, async_send=True
+                    )
                     self.layer_transport.wait(works or ())
                 elif self.rank == edge.dst_rank:
                     payload = self.group.recv_tensor_dict(src=edge.src_rank)
-                    state = unflatten_layer_states(payload, generation=transition.target.generation,
-                                                   transfer=transfer)
-                    if any(t.device.type != "cpu" for values in state.values() for t in values.values()):
-                        raise RuntimeError("background weight transport requires CPU payloads")
+                    state = unflatten_layer_states(
+                        payload,
+                        generation=transition.target.generation,
+                        transfer=transfer,
+                    )
+                    if any(
+                        t.device.type != "cpu"
+                        for values in state.values()
+                        for t in values.values()
+                    ):
+                        raise RuntimeError(
+                            "background weight transport requires CPU payloads"
+                        )
                     with self.layer_transport._stream_context():
                         self.model_runner.import_elastic_pp_layer_state(
-                            generation=transition.target.generation, layer_states=state)
+                            generation=transition.target.generation, layer_states=state
+                        )
                         if self.layer_transport._migration_stream is not None:
                             self.layer_transport._migration_stream.synchronize()
 
@@ -441,7 +470,9 @@ class ElasticPPMigrationCoordinator:
                     self._layers_precopied = True
                 except BaseException as exc:
                     local_error = f"{type(exc).__name__}: {exc}"
-                reports = self._consensus("background_copy", success=local_error is None, error=local_error)
+                reports = self._consensus(
+                    "background_copy", success=local_error is None, error=local_error
+                )
                 self._raise_peer_failures("background copy", reports)
             logger.info(
                 "Elastic PP generation=%d rank=%d allocation consensus complete",
@@ -529,7 +560,9 @@ class ElasticPPMigrationCoordinator:
                     # Snapshot completion and peak admission precede allocation.
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
-            reports = self._consensus("fence_snapshot", success=local_error is None, error=local_error)
+            reports = self._consensus(
+                "fence_snapshot", success=local_error is None, error=local_error
+            )
             self._raise_peer_failures("fence snapshot", reports)
             if self.strategy in {"sync", "batched"}:
                 self._preflight_capacity(transition)
@@ -539,7 +572,9 @@ class ElasticPPMigrationCoordinator:
                     self._prepare_backing(transition)
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
-            reports = self._consensus("fence_prepare", success=local_error is None, error=local_error)
+            reports = self._consensus(
+                "fence_prepare", success=local_error is None, error=local_error
+            )
             self._raise_peer_failures("fence prepare", reports)
             local_error = None
             fence_slots = None
@@ -611,12 +646,16 @@ class ElasticPPMigrationCoordinator:
                     self.rank,
                     int(fence_slots.numel()),
                 )
-                previous_chunk_size = getattr(self.kv_transport, "slot_chunk_size", None)
+                previous_chunk_size = getattr(
+                    self.kv_transport, "slot_chunk_size", None
+                )
                 if self.strategy == "sync" and previous_chunk_size is not None:
                     self.kv_transport.slot_chunk_size = max(1, int(fence_slots.numel()))
                 try:
                     self.kv_transport.exchange_phase(
-                        transition, phase="bulk", slot_ids=fence_slots,
+                        transition,
+                        phase="bulk",
+                        slot_ids=fence_slots,
                     )
                 finally:
                     if previous_chunk_size is not None:
