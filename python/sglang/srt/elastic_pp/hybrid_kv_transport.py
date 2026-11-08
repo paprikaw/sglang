@@ -103,14 +103,16 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
         # serving: its free group and live-page set may be changing here.
         try:
             self.prepare_target(transition)
-        except BaseException:
+        except BaseException as exc:
             try:
                 self.model_runner.abort_elastic_pp_kv_layers(
                     generation=transition.target.generation
                 )
             except BaseException:
                 pass
-            raise
+            from sglang.srt.elastic_pp.backing_spill import discard_tensor_tracebacks
+
+            raise discard_tensor_tracebacks(exc)
         return torch.empty(0, dtype=torch.int64, device="cpu")
 
     def finish_slot_tracking(self, transition):
@@ -154,9 +156,22 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
                             "slot_count": self.pool.recurrent_slot_count,
                         }
                         if sender:
-                            tensors = self.pool.export_recurrent_slots(
-                                layer_id=layer_id, slot_ids=slots
-                            )
+                            spill = getattr(self, "_spill", None)
+                            if spill is None:
+                                tensors = self.pool.export_recurrent_slots(
+                                    layer_id=layer_id, slot_ids=slots
+                                )
+                            else:
+                                index = spill.source_ids.index(layer_id)
+                                names = [
+                                    f"conv_{i}" for i in range(len(spill.backup) - 1)
+                                ] + ["temporal"]
+                                tensors = {
+                                    name: t[index]
+                                    .index_select(0, slots.cpu())
+                                    .to(self.pool.device)
+                                    for name, t in zip(names, spill.backup)
+                                }
                             payload = {_MANIFEST: header, _SLOTS: slots, **tensors}
                             works = self.group.send_tensor_dict(
                                 payload, dst=transfer.dst_rank, async_send=True

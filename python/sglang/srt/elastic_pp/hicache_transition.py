@@ -382,16 +382,14 @@ def project_target_device_pool(pool, *, target, generation):
         )
         view.k_buffer = [p[0] for p in pairs]
         view.v_buffer = [p[1] for p in pairs]
-        view.k_data_ptrs = torch.tensor(
-            [t.data_ptr() for t in view.k_buffer],
-            dtype=torch.uint64,
-            device=source.device,
+        (view.k_data_ptrs, view.v_data_ptrs, view.data_ptrs, view.data_strides) = (
+            source._build_elastic_pp_pointer_tables(view.k_buffer, view.v_buffer)
         )
-        view.v_data_ptrs = torch.tensor(
-            [t.data_ptr() for t in view.v_buffer],
-            dtype=torch.uint64,
-            device=source.device,
-        )
+        # copy.copy must not retain source-generation descriptors/transactions.
+        view._kv_buffer_descs = []
+        view._kv_copy_config = None
+        view._elastic_pp_pending_kv = {}
+        view._elastic_pp_retired_kv = {}
         return view
 
     if not isinstance(pool, ElasticHybridLinearKVPool):
@@ -407,6 +405,8 @@ def project_target_device_pool(pool, *, target, generation):
     req = copy.copy(pool.req_to_token_pool)
     mamba = copy.copy(req.mamba_pool)
     mamba.mamba_cache = pool._pending_state
+    mamba.__dict__.pop("_conv_slot_desc", None)
+    mamba.__dict__.pop("_conv_fuse_ok", None)
     mamba.mamba_layer_ids = list(pool._pending_mamba_ids)
     mamba.num_mamba_layers = len(pool._pending_mamba_ids)
     req.mamba_pool = mamba
@@ -439,6 +439,18 @@ def cache_host_views(cache, device_pool=None):
 
 
 def prepare_target_host_cache(cache, *, device_pool, target, generation):
+    """Build target L2 while keeping allocation failures safe for GPU rollback."""
+    try:
+        return _prepare_target_host_cache(
+            cache, device_pool=device_pool, target=target, generation=generation
+        )
+    except BaseException as exc:
+        from sglang.srt.elastic_pp.backing_spill import discard_tensor_tracebacks
+
+        raise discard_tensor_tracebacks(exc)
+
+
+def _prepare_target_host_cache(cache, *, device_pool, target, generation):
     """Build replacement L2 backing without resetting the live radix tree.
 
     Returns a private cache clone. Runtime publishes it only with the topology,
@@ -517,6 +529,58 @@ def prepare_target_host_cache(cache, *, device_pool, target, generation):
     return clone
 
 
+def rebind_cache_device_pools(cache, device_pool, *, refresh_recurrent_pointers=False):
+    """Replace construction-only views by the committed/rolled-back real pools."""
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+    from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+    from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+    bindings = []
+    for entry in cache.host_pool_group.entries:
+        host = entry.host_pool
+        if not isinstance(host, (LogicalHostPool, MambaPoolHost, MHATokenToKVPoolHost)):
+            raise NotImplementedError(
+                f"elastic backing rebuild cannot rebind {type(host).__name__}"
+            )
+        if getattr(host, "mtp_draft_device_pools", ()):
+            raise NotImplementedError("elastic backing rebuild does not support MTP")
+        if entry.name == PoolName.KV:
+            real = getattr(device_pool, "full_kv_pool", device_pool)
+        elif entry.name == PoolName.MAMBA:
+            real = device_pool.mamba_pool
+        else:
+            raise NotImplementedError(
+                "elastic backing rebuild supports FULL/MAMBA only"
+            )
+        bindings.append((entry, host, real))
+    for entry, host, real in bindings:
+        entry.device_pool = real
+        if hasattr(host, "device_pool"):
+            host.device_pool = real
+        if isinstance(host, MambaPoolHost) and refresh_recurrent_pointers:
+            host.temporal_device_ptrs = torch.tensor(
+                [
+                    real.mamba_cache.temporal[i].data_ptr()
+                    for i in range(real.num_mamba_layers)
+                ],
+                dtype=torch.uint64,
+                device=real.device,
+            )
+            host.conv_device_ptrs = [
+                torch.tensor(
+                    [tensor[i].data_ptr() for i in range(real.num_mamba_layers)],
+                    dtype=torch.uint64,
+                    device=real.device,
+                )
+                for tensor in real.mamba_cache.conv
+            ]
+    cache.cache_controller.mem_pool_device = getattr(
+        device_pool, "full_kv_pool", device_pool
+    )
+    cache.__dict__.pop("_elastic_pp_projected_pool", None)
+
+
 class SchedulerHiCacheTransition:
     """Coordinator-facing transaction; source remains owned through publish."""
 
@@ -529,6 +593,54 @@ class SchedulerHiCacheTransition:
         self._request_state = None
         self._source_cache = None
         self._last_metrics = {}
+        self._released_device_aliases_generation = None
+
+    def release_source_device_aliases(self, transition):
+        """Fence-only: retire projected owners and invalidate raw GDN addresses."""
+        generation = transition.target.generation
+        if self._released_device_aliases_generation is not None:
+            if self._released_device_aliases_generation != generation:
+                raise RuntimeError("HiCache device binding generation mismatch")
+            return
+        cache = self._source_cache or self.scheduler.tree_cache
+        self._source_cache = cache
+        assert_host_quiescent(cache)
+        rebind_cache_device_pools(cache, self.model_runner.token_to_kv_pool)
+        # Validation/rebinding preserves serving addresses. Register before the
+        # first invalidation so abort can repair a partially invalidated table.
+        self._released_device_aliases_generation = generation
+        from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+
+        for entry in cache.host_pool_group.entries:
+            if isinstance(entry.host_pool, MambaPoolHost):
+                entry.host_pool.temporal_device_ptrs = None
+                entry.host_pool.conv_device_ptrs = []
+
+    def restore_source_device_aliases(self, transition):
+        if self._released_device_aliases_generation is None:
+            return
+        if self._released_device_aliases_generation != transition.target.generation:
+            raise RuntimeError("HiCache device binding generation mismatch")
+        cache = self._source_cache or self.scheduler.tree_cache
+        if self.scheduler.tree_cache is not cache:
+            raise RuntimeError(
+                "cannot restore source HiCache bindings after publication"
+            )
+        rebind_cache_device_pools(
+            cache, self.model_runner.token_to_kv_pool, refresh_recurrent_pointers=True
+        )
+        self._released_device_aliases_generation = None
+
+    def finalize_source_device_aliases(self, transition):
+        if self._released_device_aliases_generation is None:
+            return
+        if self._released_device_aliases_generation != transition.target.generation:
+            raise RuntimeError("HiCache device binding generation mismatch")
+        if self.scheduler.tree_cache is self._source_cache:
+            raise RuntimeError(
+                "cannot finalize source HiCache bindings before publication"
+            )
+        self._released_device_aliases_generation = None
 
     def prepare_transition(self, transition):
         import copy
@@ -649,6 +761,7 @@ class SchedulerHiCacheTransition:
         clone.token_to_kv_pool_allocator = real_allocator
         clone.req_to_token_pool = self.adapter.cache.req_to_token_pool
         clone.cache_controller.mem_pool_device_allocator = real_allocator
+        rebind_cache_device_pools(clone, self.model_runner.token_to_kv_pool)
         clone._hicache_init_params = dataclasses.replace(
             clone._hicache_init_params,
             token_to_kv_pool_allocator=real_allocator,
@@ -915,6 +1028,10 @@ def discard_host_cache(cache):
     if controller is not None:
         controller.mem_pool_host = None
         controller.mem_pool_host_draft = None
+        controller.mem_pool_device = None
+        controller.mem_pool_device_draft = None
+        controller.mem_pool_device_allocator = None
+        controller.mtp_draft_device_pools = ()
     for ct, (cache_attr, component_attr) in _COMPONENT_HOST_ATTR.items():
         setattr(cache, cache_attr, None)
         if ct in cache.components:
@@ -922,3 +1039,7 @@ def discard_host_cache(cache):
     cache.token_to_kv_pool_host = None
     cache.host_pool_group = None
     cache.cache_controller = None
+    cache.__dict__.pop("_elastic_pp_projected_pool", None)
+    cache.token_to_kv_pool_allocator = None
+    cache.req_to_token_pool = None
+    cache._hicache_init_params = None

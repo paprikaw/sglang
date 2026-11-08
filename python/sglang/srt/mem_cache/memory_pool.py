@@ -2003,6 +2003,7 @@ class MHATokenToKVPool(KVCache):
                 ):
                     self._elastic_pp_residency.abort(generation)
                 self._elastic_pp_pending_kv = {}
+            allocated.clear()
             raise
         return preparation.new_layer_ids
 
@@ -2173,7 +2174,12 @@ class MHATokenToKVPool(KVCache):
     ) -> tuple[torch.Tensor, ...]:
         with self._elastic_pp_lock:
             if self._elastic_pp_residency is None:
-                raise RuntimeError("elastic PP KV residency is not initialized")
+                return ()
+            if generation <= self._elastic_pp_residency.generation:
+                raise RuntimeError("cannot abort KV backing after topology publication")
+            if self._elastic_pp_residency.pending is None:
+                # prepare may already have rolled back a partial allocation.
+                return ()
             new_layer_ids = self._elastic_pp_residency.abort(generation)
             released = tuple(
                 tensor
@@ -2192,15 +2198,19 @@ class MHATokenToKVPool(KVCache):
             if self._elastic_pp_residency is None:
                 raise RuntimeError("elastic PP KV residency is not initialized")
             cleanup_ids = self._elastic_pp_residency.cleanup_candidates(
-                generation, set(self._elastic_pp_retired_kv)
+                generation,
+                set(self._elastic_pp_retired_kv)
+                | set(getattr(self, "_elastic_pp_detached_layer_ids", ())),
             )
             released = tuple(
                 tensor
                 for layer_id in sorted(cleanup_ids)
+                if layer_id in self._elastic_pp_retired_kv
                 for tensor in self._elastic_pp_retired_kv[layer_id]
             )
             self._elastic_pp_residency.finish_cleanup(generation, set(cleanup_ids))
             self._elastic_pp_retired_kv = {}
+            self.__dict__.pop("_elastic_pp_detached_layer_ids", None)
             return released
 
     def _init_kv_copy_and_warmup(self):
