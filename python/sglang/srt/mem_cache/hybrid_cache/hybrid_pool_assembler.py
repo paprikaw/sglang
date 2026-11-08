@@ -85,6 +85,13 @@ def build_kv_host_pool(
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
 ):
+    if kv_pool.layer_num == 0:
+        from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+
+        size = (
+            int(kv_pool.size * get_memory().hicache_ratio) // page_size + 1
+        ) * page_size
+        return LogicalHostPool(size, page_size, get_memory().hicache_mem_layout)
     kv_host_pool_cls = (
         MLATokenToKVPoolHost if use_mla else get_mha_host_pool_cls(kv_pool)
     )
@@ -701,7 +708,9 @@ def build_hybrid_mamba_stack(
         pool.full_kv_pool for pool in params.mtp_draft_device_pools
     )
     kv_host_size, mamba_host_size = None, 0
-    if get_memory().hicache_size > 0:
+    if get_memory().hicache_size > 0 and (
+        kv_pool.layer_num or mamba_pool.num_mamba_layers
+    ):
         kv_host_size, mamba_host_size = _split_hicache_size(
             get_memory().hicache_size, (kv_pool, mamba_pool)
         )
@@ -720,13 +729,22 @@ def build_hybrid_mamba_stack(
             target_device_layer_num=kv_pool.layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
-    mamba_host_pool = MambaPoolHost(
-        mamba_pool,
-        get_memory().hicache_ratio,
-        mamba_host_size,
-        allocator_type=_get_allocator_type(server_args),
-        layout=get_memory().hicache_mem_layout,
-    )
+    if mamba_pool.num_mamba_layers == 0:
+        from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+
+        mamba_host_pool = LogicalHostPool(
+            int(mamba_pool.size * get_memory().hicache_ratio) + 1,
+            1,
+            get_memory().hicache_mem_layout,
+        )
+    else:
+        mamba_host_pool = MambaPoolHost(
+            mamba_pool,
+            get_memory().hicache_ratio,
+            mamba_host_size,
+            allocator_type=_get_allocator_type(server_args),
+            layout=get_memory().hicache_mem_layout,
+        )
     entries = [
         build_pool_entry(
             name=PoolName.KV,

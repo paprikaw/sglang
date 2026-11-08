@@ -61,11 +61,15 @@ class LayerLoadingEvent:
         self.load_events[layer_index].record()
 
     def wait(self, layer_index: int):
+        if self._num_layers == 0:
+            return
         device_module.current_stream().wait_event(self.load_events[layer_index])
 
     @property
     def finish_event(self):
-        return self.load_events[-1]
+        # A resident zero-layer PP rank participates in cache metadata only.
+        # Its producer event is the complete no-payload dependency.
+        return self.load_events[-1] if self.load_events else self.start_event
 
 
 class LayerDoneCounter:
