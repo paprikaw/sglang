@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 
 import gpu_smoke as base
 
@@ -521,7 +522,8 @@ def worker(run, cfg):
         return baseline_worker(run, cfg)
     import agentx_replay
 
-    h.authenticate(run, cfg, os.environ, local=True)
+    authentication_started = time.time()
+    authentication = h.authenticate(run, cfg, os.environ, local=True)
     key = h.read_key(cfg)
     row = cfg["layouts"][0]
     started = time.monotonic()
@@ -542,25 +544,58 @@ def worker(run, cfg):
     original_stream = agentx_replay.stream
     request_contracts = []
     owned_cleanup = None
+    lifecycle = diagnostics = None
+    phase_timings = [
+        {
+            "phase": "initial_authentication",
+            "started_at": authentication_started,
+            "elapsed_s": time.time() - authentication_started,
+        }
+    ]
+    if cfg.get("lifecycle"):
+        from hicache_run_lifecycle import LocalEvidence, WorkerLifecycle, atomic_json
+
+        diagnostics = LocalEvidence(run)
+        lifecycle = WorkerLifecycle(run, cfg, authentication, children, h.cleanup)
+        atomic_json(
+            run / "local_evidence_location.json",
+            {
+                "experiment_id": cfg["id"],
+                "nonce": cfg["lifecycle"]["nonce"],
+                "worker": lifecycle.worker["worker"],
+                "path": str(diagnostics.root),
+            },
+        )
+
+    def check_cancelled():
+        if lifecycle is not None and lifecycle.cancelled.is_set():
+            raise RuntimeError("This run was cancelled; owned cleanup is in progress")
 
     def cleanup_owned():
         nonlocal owned_cleanup
         if owned_cleanup is None or not owned_cleanup.get("cleanup_verified", False):
-            owned_cleanup = h.cleanup(children)
+            owned_cleanup = (
+                lifecycle.cleanup() if lifecycle is not None else h.cleanup(children)
+            )
         return owned_cleanup
 
     def captured_stream(endpoint, key, payload, timeout=600):
+        check_cancelled()
         request_contracts.append(
             {"stage": evidence.get("stage"), "payload": json.loads(json.dumps(payload))}
         )
+        contract = {
+            "capture": "actual pre-serialization stream payload",
+            "requests": request_contracts,
+        }
+        if diagnostics is not None:
+            diagnostics.save("reference_request_contract.json", contract)
+            return original_stream(endpoint, key, payload, min(timeout, 45))
         target = run / "reference_request_contract.json"
         descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w") as stream:
             json.dump(
-                {
-                    "capture": "actual pre-serialization stream payload",
-                    "requests": request_contracts,
-                },
+                contract,
                 stream,
             )
         return original_stream(endpoint, key, payload, min(timeout, 45))
@@ -572,25 +607,29 @@ def worker(run, cfg):
             "225-second transition deadline; 75 seconds reserved for cleanup"
         )
 
-    signal.signal(signal.SIGALRM, expired)
-    signal.alarm(225)
+    if lifecycle is None:
+        signal.signal(signal.SIGALRM, expired)
+        signal.alarm(225)
 
     def checkpoint(stage):
         evidence["stage"] = stage
+        phase_timings.append({"phase": stage, "started_at": time.time()})
         try:
-            h.save(
-                run / "worker_stage.json",
-                {
-                    "stage": stage,
-                    "timestamp": time.time(),
-                    "elapsed_seconds": time.monotonic() - started,
-                },
-            )
+            value = {
+                "stage": stage,
+                "timestamp": time.time(),
+                "elapsed_seconds": time.monotonic() - started,
+            }
+            if diagnostics is not None:
+                diagnostics.save("worker_stage.json", value)
+            else:
+                h.save(run / "worker_stage.json", value)
         except OSError:
             # Diagnostic output must never prevent owned-process cleanup.
             pass
 
     def request(tokens, output):
+        check_cancelled()
         result = agentx_replay.request_one(
             dict(host="127.0.0.1", port=row["port"], ep=1), None, key, tokens, output, 0
         )
@@ -599,7 +638,17 @@ def worker(run, cfg):
         return result
 
     def http(path, payload=None, timeout=30):
+        check_cancelled()
+        auth_started = time.time()
         h.authenticate(run, cfg, os.environ, local=True)
+        phase_timings.append(
+            {
+                "phase": "control_authentication",
+                "path": path,
+                "started_at": auth_started,
+                "elapsed_s": time.time() - auth_started,
+            }
+        )
         result = h.http_json(row["port"], path, key, payload, timeout=timeout)
         return state_evidence(result) if path == "/get_server_info" else result
 
@@ -609,13 +658,24 @@ def worker(run, cfg):
                 qualify_cached_reference_evidence,
             )
 
+            qualification_started = time.time()
             evidence["reference_state_review"] = qualify_cached_reference_evidence(
                 cfg["cached_reference_evidence"], cfg
+            )
+            phase_timings.append(
+                {
+                    "phase": "complete_reference_qualification",
+                    "started_at": qualification_started,
+                    "elapsed_s": time.time() - qualification_started,
+                }
             )
         elif evidence["acceptance_class"] != "cold_warm_exact_generation":
             raise AssertionError("unknown reference acceptance class")
         checkpoint("startup")
-        children.append(launch(run, cfg, row, key))
+        if lifecycle is None:
+            children.append(launch(run, cfg, row, key))
+        else:
+            lifecycle.launch(lambda: launch(run, cfg, row, key))
         while True:
             if children[0]["process"].poll() is not None:
                 raise RuntimeError("engine exited during startup")
@@ -632,6 +692,8 @@ def worker(run, cfg):
             "active_input_tokens": len(active_prompt),
             "reference_cache_state": "warmed at the same prefix-match boundary",
         }
+        if lifecycle is not None:
+            lifecycle.admit("references", 105)
         checkpoint("prefix_warmup")
         cold_prefix = request(prefix, 24)
         checkpoint("prefix_reference")
@@ -679,6 +741,10 @@ def worker(run, cfg):
             (cfg["grown_counts"], cfg["initial_counts"]), 1
         ):
             checkpoint(f"transition_{generation}")
+            if lifecycle is not None:
+                lifecycle.admit(
+                    f"transition_{generation}", 60 if generation == 1 else 32
+                )
             with cf.ThreadPoolExecutor(max_workers=1) as pool:
                 try:
                     active = pool.submit(request, active_prompt, 256)
@@ -773,14 +839,19 @@ def worker(run, cfg):
         )
         evidence["final_prefix_restore_events"] = restores
         evidence.update(passed=True, restored=restored, after=info)
+        if lifecycle is not None:
+            evidence["work_completed_at"] = lifecycle.complete_work()
     except BaseException as exc:
         evidence["failed_stage"] = evidence.get("stage", "startup")
         evidence["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         agentx_replay.stream = original_stream
-        signal.alarm(0)
+        if lifecycle is None:
+            signal.alarm(0)
         checkpoint("cleanup")
         cleanup = cleanup_owned()
+        if lifecycle is not None:
+            evidence["stage_admissions"] = list(lifecycle.admissions)
         elapsed = time.monotonic() - started
         evidence.update(
             elapsed_seconds=elapsed,
@@ -796,9 +867,22 @@ def worker(run, cfg):
             and evidence["acceptance_class"] == "cached_execution_continuity"
         )
         evidence["stage"] = "done" if evidence["passed"] else "failed"
-        h.save(run / "worker_cleanup.json", cleanup)
+        if diagnostics is not None:
+            diagnostics.save("phase_timings.json", phase_timings)
+            try:
+                evidence["local_diagnostic_sha256"] = diagnostics.archive()
+            except BaseException as exc:
+                evidence.update(passed=False, archive_error=type(exc).__name__)
+        else:
+            h.save(run / "worker_cleanup.json", cleanup)
+        evidence["cached_execution_continuity_qualified"] = (
+            evidence["passed"]
+            and evidence["acceptance_class"] == "cached_execution_continuity"
+        )
         h.save(run / "results.json", {"transition": evidence})
         h.save(run / "worker_progress.json", {"completed": int(evidence["passed"])})
+        if lifecycle is not None:
+            lifecycle.close()
     raise SystemExit(0 if evidence["passed"] else 1)
 
 
@@ -836,6 +920,19 @@ def prepare(args):
             else "cold_warm_exact_generation"
         ),
     )
+    if getattr(args, "supervised_lifecycle", False):
+        if args.baseline_probe:
+            raise ValueError(
+                "Supervised cancellation is for the transition acceptance run"
+            )
+        cfg["lifecycle"] = dict(
+            version=1,
+            nonce=uuid.uuid4().hex,
+            work_s=args.work_seconds,
+            cleanup_s=args.cleanup_seconds,
+            guard_stop_s=args.guard_stop_seconds,
+            total_s=300,
+        )
     if args.cached_reference_evidence:
         from hicache_reference_qualification import qualify_cached_reference_evidence
 
@@ -859,6 +956,11 @@ def prepare(args):
         x for x in spec["frozen_inputs"] if x["path"] != str(run / "config.json")
     ]
     spec["frozen_inputs"] += [base.desc(run / "config.json"), base.desc(__file__)]
+    if getattr(args, "supervised_lifecycle", False):
+        spec["frozen_inputs"] += [
+            base.desc(ROOT / name)
+            for name in ("hicache_run_lifecycle.py", "hicache_guard_run.py")
+        ]
     if args.baseline_probe:
         spec["title"] = "Qwen HiCache static generation-zero qualification diagnostic"
         spec["tasks"][0]["label"] = "Static cold256/warm8 state and sampler diagnostic"
@@ -895,6 +997,10 @@ def main():
     parser.add_argument("--layout")
     parser.add_argument("--baseline-probe", action="store_true")
     parser.add_argument("--cached-reference-evidence", type=Path)
+    parser.add_argument("--supervised-lifecycle", action="store_true")
+    parser.add_argument("--work-seconds", type=float, default=250)
+    parser.add_argument("--cleanup-seconds", type=float, default=285)
+    parser.add_argument("--guard-stop-seconds", type=float, default=290)
     parser.add_argument("--tag")
     parser.add_argument("--node", default="spartan-gpgpu168")
     parser.add_argument("--job", default="33463293")
@@ -936,8 +1042,17 @@ def main():
     elif args.worker:
         worker(args.run, cfg)
     else:
-        base.__file__ = __file__
-        base.controller(args.run, cfg)
+        if cfg.get("lifecycle"):
+            from hicache_run_lifecycle import controller
+
+            if base.git("rev-parse", "HEAD") != cfg["engine_commit"] or base.git(
+                "status", "--porcelain", "--untracked-files=no"
+            ):
+                raise RuntimeError("Frozen source changed")
+            raise SystemExit(controller(args.run, cfg, h, __file__))
+        else:
+            base.__file__ = __file__
+            base.controller(args.run, cfg)
 
 
 if __name__ == "__main__":

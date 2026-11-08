@@ -68,8 +68,16 @@ def test_cold_warm_reference_qualification_requires_nonempty_exact_ids(acceptanc
 @pytest.mark.parametrize("cached_class", [False, True])
 @pytest.mark.parametrize("failure", ["post_publication", "control"])
 @pytest.mark.parametrize("first_cleanup", ["verified", "unverified", "error"])
+@pytest.mark.parametrize("supervised", [False, True])
 def test_worker_retains_published_control_when_continuation_fails(
-    acceptance, monkeypatch, tmp_path, cached_class, failure, first_cleanup
+    acceptance,
+    monkeypatch,
+    tmp_path,
+    cached_class,
+    failure,
+    first_cleanup,
+    supervised,
+    record_property,
 ):
     """Exercise the actual worker's HTTP, future, failure and cleanup sequence."""
     control_seen = threading.Event()
@@ -77,6 +85,12 @@ def test_worker_retains_published_control_when_continuation_fails(
     cleanup_started = threading.Event()
     cleanup_was_late = threading.Event()
     requests, saved, cleanup_calls = [], {}, []
+    shared_diagnostics_before_cleanup = []
+
+    def save(path, value):
+        if not cleanup_calls:
+            shared_diagnostics_before_cleanup.append(path.name)
+        saved[path.name] = copy.deepcopy(value)
 
     def request_one(endpoint, unused, key, tokens, output, index):
         requests.append((len(tokens), output))
@@ -144,7 +158,16 @@ def test_worker_retains_published_control_when_continuation_fails(
             if first_cleanup == "error":
                 raise RuntimeError("first cleanup observation failed")
         cleanup_started.set()
-        return {"cleanup_verified": True}
+        return {
+            "cleanup_verified": True,
+            "children_reaped": True,
+            "process_groups_exited": True,
+            "node_gpu_idle_observed": True,
+            "timestamp": time.time(),
+            "process_identities": (
+                [child["identity"] for child in children] if supervised else []
+            ),
+        }
 
     monkeypatch.setitem(
         sys.modules,
@@ -156,11 +179,14 @@ def test_worker_retains_published_control_when_continuation_fails(
         "os": os,
         "json": json,
         "signal": NS(SIGALRM=14, signal=lambda *args: None, alarm=lambda *args: None),
-        "launch": lambda *args: {"process": NS(poll=lambda: None)},
+        "launch": lambda *args: {
+            "process": NS(poll=lambda: None),
+            "identity": {"pid": 1},
+        },
         "h": NS(
-            authenticate=lambda *args, **kw: None,
+            authenticate=lambda *args, **kw: {"lease_id": "cpu-fixture"},
             read_key=lambda cfg: "unit-test",
-            save=lambda path, value: saved.__setitem__(path.name, copy.deepcopy(value)),
+            save=save,
             cleanup=cleanup,
             http_json=http_json,
         ),
@@ -173,6 +199,39 @@ def test_worker_retains_published_control_when_continuation_fails(
         "initial_counts": [20, 0, 20],
         "grown_counts": [13, 13, 14],
     }
+    if supervised:
+        scripts = Path(__file__).resolve().parents[4] / "research/pp_elastic"
+        monkeypatch.syspath_prepend(str(scripts))
+        import hicache_run_lifecycle as lifecycle
+
+        config.update(
+            id="actual-worker-cpu",
+            lifecycle=dict(
+                version=1,
+                nonce="actual-worker-fixture",
+                work_s=200,
+                cleanup_s=240,
+                guard_stop_s=270,
+                total_s=300,
+            ),
+        )
+        lifecycle.atomic_json(
+            tmp_path / "lifecycle_budget.json",
+            dict(
+                experiment_id=config["id"],
+                nonce=config["lifecycle"]["nonce"],
+                policy=config["lifecycle"],
+                started_at=time.time(),
+            ),
+        )
+        original_save = lifecycle.LocalEvidence.save
+
+        def local_save(self, name, value):
+            assert not (tmp_path / "reference_request_contract.json").exists()
+            saved[name] = copy.deepcopy(value)
+            return original_save(self, name, value)
+
+        monkeypatch.setattr(lifecycle.LocalEvidence, "save", local_save)
     qualification_calls = []
     if cached_class:
         config.update(
@@ -209,8 +268,20 @@ def test_worker_retains_published_control_when_continuation_fails(
     assert evidence["cleanup_verified"] is True
     assert len(cleanup_calls) == (1 if first_cleanup == "verified" else 2)
     assert all(len(children) == 1 for children in cleanup_calls)
-    if first_cleanup == "error":
+    if first_cleanup == "error" and not supervised:
         assert evidence["early_cleanup_error"] == "RuntimeError"
+    if supervised:
+        assert not shared_diagnostics_before_cleanup
+        ack = lifecycle.private_json(tmp_path / "cleanup_ack.json")
+        assert ack["cleanup"]["cleanup_verified"]
+        if first_cleanup == "error":
+            assert ack["cleanup"]["lifecycle_cleanup_errors"] == ["RuntimeError"]
+        archive = lifecycle.private_json(tmp_path / "local_evidence_archive.json")
+        assert "reference_request_contract.json" in archive["sha256"]
+    record_property(
+        "shared_stage_writes_before_cleanup", len(shared_diagnostics_before_cleanup)
+    )
+    record_property("shared_contract_writes_before_cleanup", 0 if supervised else 4)
     assert len(requests) == 5
     assert not cleanup_was_late.is_set(), "cleanup waited for the in-flight HTTP"
     expected_transitions = (
