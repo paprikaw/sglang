@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -82,6 +83,8 @@ class ElasticPPMigrationCoordinator:
             raise ValueError(f"unknown elastic PP transition strategy: {self.strategy}")
         self.cache_transition = cache_transition
         self._layers_precopied = False
+        self._background_weight_bytes_sent = 0
+        self._observed_cuda_allocated_peak = 0
         self.rank = int(rank)
         self.current_topology = current_topology
         self.group = group
@@ -194,6 +197,8 @@ class ElasticPPMigrationCoordinator:
             self._layer_prepared = False
             self._kv_prepared = False
             self._layers_precopied = False
+            self._background_weight_bytes_sent = 0
+            self._observed_cuda_allocated_peak = 0
             self._drain_consensus_tensor = None
             self._drain_consensus_work = None
             self._thread = Thread(
@@ -360,6 +365,38 @@ class ElasticPPMigrationCoordinator:
         max_microstep = max(peer_microsteps)
         return (max_microstep // ring_size + 1) * ring_size
 
+    def _observe_memory(self):
+        device = torch.device(getattr(self.model_runner, "device", "cpu"))
+        if device.type == "cuda":
+            self._observed_cuda_allocated_peak = max(
+                self._observed_cuda_allocated_peak,
+                torch.cuda.memory_allocated(device),
+            )
+
+    def transition_metrics(self):
+        snapshot = self.snapshot()
+        metrics = {
+            "generation": snapshot.generation,
+            "rank": self.rank,
+            "strategy": self.strategy,
+            "phase": snapshot.phase.value,
+            "prepare_seconds": snapshot.prepare_seconds,
+            "fence_seconds": snapshot.fence_seconds,
+            "total_seconds": snapshot.total_seconds,
+            "background_weight_bytes_sent": self._background_weight_bytes_sent,
+            "observed_cuda_allocated_peak_bytes": self._observed_cuda_allocated_peak,
+            "peak_scope": "sampled at prepare/copy/commit; not allocator peak proof",
+            "gpu_released": False,
+        }
+        for name, component in (
+            ("kv", self.kv_transport),
+            ("host", self.cache_transition),
+        ):
+            provider = getattr(component, "metrics", None)
+            if provider is not None:
+                metrics[name] = provider() if callable(provider) else provider
+        return metrics
+
     def _preflight_capacity(self, transition):
         local_error, details = None, None
         try:
@@ -384,6 +421,7 @@ class ElasticPPMigrationCoordinator:
         self._layer_prepared = True
         self.kv_transport.prepare_transition(transition)
         self._kv_prepared = True
+        self._observe_memory()
 
     def _precopy_immutable_weights(self, transition: DynamicPPTransition) -> None:
         """Stage immutable weights over Gloo while the old pipeline executes.
@@ -409,6 +447,11 @@ class ElasticPPMigrationCoordinator:
                         generation=transition.target.generation,
                         transfer=transfer,
                         layer_states=cpu_state,
+                    )
+                    self._background_weight_bytes_sent += sum(
+                        t.numel() * t.element_size()
+                        for values in cpu_state.values()
+                        for t in values.values()
                     )
                     works = self.group.send_tensor_dict(
                         payload, dst=edge.dst_rank, async_send=True
@@ -720,6 +763,11 @@ class ElasticPPMigrationCoordinator:
                 self._committed_at = time.monotonic()
                 self._phase = ElasticPPMigrationPhase.COMMITTED
                 self._condition.notify_all()
+            self._observe_memory()
+            logger.info(
+                "ELASTIC_PP_TRANSITION_METRICS %s",
+                json.dumps(self.transition_metrics()),
+            )
             return transition.target
         except BaseException as exc:
             if not commit_started:

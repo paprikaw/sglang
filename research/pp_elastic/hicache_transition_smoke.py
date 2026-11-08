@@ -46,6 +46,11 @@ def install_hooks():
 
     def get_state(self, *args, **kwargs):
         result = previous_get(self, *args, **kwargs)
+        coordinator = getattr(self, "elastic_pp_migration_coordinator", None)
+        if coordinator is not None:
+            result.internal_state["transition_metrics"] = (
+                coordinator.transition_metrics()
+            )
         result.internal_state["transition_active_output_lengths"] = sorted(
             len(req.output_ids)
             for req in self._elastic_pp_live_requests()
@@ -141,6 +146,9 @@ def worker(run, cfg):
         result = agentx_replay.request_one(
             dict(host="127.0.0.1", port=row["port"], ep=1), None, key, tokens, output, 0
         )
+        if len(result.get("output_ids") or ()) != output:
+            raise AssertionError("generated token IDs missing or incomplete")
+        return result
 
     def http(path, payload=None, timeout=30):
         h.authenticate(run, cfg, os.environ, local=True)

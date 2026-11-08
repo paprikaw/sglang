@@ -208,6 +208,7 @@ def test_prepare_fence_commit_and_deferred_cleanup(monkeypatch, device, expected
     runner.device = device
     runner.gpu_id = 3
     selected_devices = []
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *args: 0)
     monkeypatch.setattr(
         torch.cuda,
         "set_device",
