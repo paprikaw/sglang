@@ -214,6 +214,37 @@ def demote_cpu_prefixes(http):
         time.sleep(0.05)
 
 
+def state_evidence(info):
+    # get_server_info also exposes ServerArgs. Persist only the diagnostics
+    # needed by this check, rather than credentials or unrelated configuration.
+    fields = (
+        "transition_rank",
+        "transition_fence_records",
+        "transition_metrics",
+        "transition_request_execution_scope",
+        "transition_request_execution",
+        "transition_active_output_lengths",
+        "agentx_cache_probe",
+        "agentx_restores",
+        "elastic_pp_state",
+        "memory_usage",
+        "enable_hierarchical_cache",
+        "disable_radix_cache",
+        "disable_cuda_graph",
+        "hicache_mem_layout",
+        "hicache_io_backend",
+        "hicache_host_memory_mode",
+        "elastic_pp_transition_strategy",
+        "elastic_pp_transition_backing",
+    )
+    return {
+        "internal_states": [
+            {key: state[key] for key in fields if key in state}
+            for state in info.get("internal_states", [])
+        ]
+    }
+
+
 def install_hooks():
     spec = importlib.util.spec_from_file_location(
         "transition_native_adapter", base.NATIVE / "a100_runtime_adapter.py"
@@ -510,7 +541,8 @@ def worker(run, cfg):
 
     def http(path, payload=None, timeout=30):
         h.authenticate(run, cfg, os.environ, local=True)
-        return h.http_json(row["port"], path, key, payload, timeout=timeout)
+        result = h.http_json(row["port"], path, key, payload, timeout=timeout)
+        return state_evidence(result) if path == "/get_server_info" else result
 
     try:
         checkpoint("startup")
@@ -576,12 +608,20 @@ def worker(run, cfg):
                     {"layer_counts": counts, "generation": generation},
                     timeout=60,
                 )
+                record = {
+                    "generation": generation,
+                    "control": transition,
+                    "control_returned_at": time.time(),
+                    "continuation_verified": False,
+                }
+                evidence["transitions"].append(record)
                 if not transition.get("success"):
                     raise RuntimeError("topology transition failed")
+                checkpoint(f"transition_{generation}_resume")
                 result = active.result(timeout=45)
+                record["active"] = result
             if result["output_ids"] != active_reference["output_ids"]:
                 raise AssertionError("active output IDs changed across transition")
-            evidence["transitions"].append(dict(control=transition, active=result))
             # Commit response precedes deferred cleanup; wait until next transition is admissible.
             deadline = time.monotonic() + 15
             while True:
@@ -590,22 +630,21 @@ def worker(run, cfg):
                     state["elastic_pp_state"]["migration_phase"] == "done"
                     for state in states
                 ):
-                    evidence["transitions"][-1]["states"] = states
+                    record["states"] = states
                     validate_transition_states(
                         states,
                         generation,
                         (0, 2) if generation == 1 else (0, 1, 2),
                         cfg.get("backing", "overlap"),
                     )
-                    evidence["transitions"][-1]["continuation"] = (
-                        validate_uninterrupted_decode(
-                            states,
-                            generation,
-                            result,
-                            (0, 2) if generation == 1 else (0, 1, 2),
-                            (0, 1, 2) if generation == 1 else (0, 2),
-                        )
+                    record["continuation"] = validate_uninterrupted_decode(
+                        states,
+                        generation,
+                        result,
+                        (0, 2) if generation == 1 else (0, 1, 2),
+                        (0, 1, 2) if generation == 1 else (0, 2),
                     )
+                    record["continuation_verified"] = True
                     break
                 if time.monotonic() >= deadline:
                     raise TimeoutError("transition cleanup did not complete")

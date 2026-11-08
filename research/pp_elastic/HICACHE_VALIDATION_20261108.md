@@ -122,4 +122,33 @@ devices. The [historical CPU archive](/data/gpfs/projects/punim2715/vllm_workben
 contains raw JUnit, selection, command/environment and source audit. This is a
 separate suite from the 197 focused checks. Initial whole-file collection
 attempts were incomplete and are preserved separately; they are not baseline
-passes. The next real attempt requires a new immutable r8 SHA/tag.
+passes.
+
+r8 used clean 36069aeca07c6fc3669dcb57a02d08a7dccc8ede and immutable tag
+experiment/sglang/pp-hicache-transition-20261108-r8. The private diagnostic path
+returned all three ranks, and initial CPU demotion had three fresh positive
+acknowledgements. Generation one actually committed on all three ranks:
+rank 0 sent 49,217,536 host bytes, rank 2 sent 46,071,808 and rank 1 received
+95,289,344. The engine then resumed PP3 Decode for approximately 17 seconds.
+Request completion failed because the batch-result processor retained the old
+tree, whose request-pool reference had been cleared during retired-cache
+cleanup. The subsequent peer-closed errors were secondary. This is a
+post-publication failure, not a first-fence deadlock or a successful acceptance.
+
+The failed r8 result took 160.804 seconds including verified cleanup; Guard
+released its lease. Model-cache postcheck passed, while scientific acceptance
+failed. The original result has no transition records because its harness
+appended only after active request completion. Raw committed metrics and the
+primary traceback remain in
+[the original engine log](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/gpu-hicache-r8/cache/pp2.log).
+The immutable failed results are preserved. No complete grow/shrink cycle,
+exact resumed-output equivalence or CPU-spill CUDA-release result follows.
+
+The harness now records control return before awaiting the active request and
+marks continuation verification separately. A real worker-loop CPU regression
+injects a post-publication request failure and verifies that publication is
+retained while acceptance still fails and owned cleanup runs. Saved internal
+states use a diagnostic field allowlist rather than full ServerArgs. All 67
+acceptance and scheduler checks pass, with no failures or skips. The cache
+context/session repair needs combined CPU validation, independent review and a
+new immutable source/tag before the next real reference attempt.

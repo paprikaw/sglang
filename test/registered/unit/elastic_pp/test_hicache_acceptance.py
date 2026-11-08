@@ -1,9 +1,11 @@
 """Reject stale, rank-incomplete and metadata-only GPU acceptance evidence."""
 
 import ast
+import concurrent.futures as cf
 import copy
 import functools
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -33,6 +35,8 @@ def acceptance():
             "correctness_prompts",
             "observe_request_launch",
             "validate_uninterrupted_decode",
+            "state_evidence",
+            "worker",
         }
     ]
     namespace = {"time": time}
@@ -41,6 +45,105 @@ def acceptance():
         namespace,
     )
     return namespace
+
+
+def test_worker_retains_published_control_when_continuation_fails(
+    acceptance, monkeypatch, tmp_path
+):
+    """Exercise the actual worker's HTTP, future, failure and cleanup sequence."""
+    control_seen = threading.Event()
+    requests, saved, cleanup_calls = [], {}, []
+
+    def request_one(endpoint, unused, key, tokens, output, index):
+        requests.append((len(tokens), output))
+        if len(requests) == 5:
+            assert control_seen.wait(2), "active request must fail after publication"
+            raise RuntimeError("post-publication finish failure")
+        return {"output_ids": [1] * output}
+
+    def http_json(port, path, key, payload, *, timeout):
+        if path == "/set_internal_state":
+            return [True] * 3
+        if path == "/reconfigure_elastic_pp":
+            control_seen.set()
+            return {"success": True, "generation": 1}
+        assert path == "/get_server_info"
+        return {
+            "api_key": "must-not-save-top-level",
+            "internal_states": [
+                {
+                    "transition_rank": rank,
+                    "transition_active_output_lengths": [4],
+                    "enable_hierarchical_cache": True,
+                    "disable_cuda_graph": True,
+                    "api_key": "must-not-save-state-key",
+                    "admin_api_key": "must-not-save-admin-key",
+                    "server_args": {"other_secret": "must-not-save-nested-config"},
+                    "agentx_cache_probe": {
+                        "command": 2,
+                        "time": time.time(),
+                        "ongoing_writes": 0,
+                        "after": {"full": 0, "mamba": 0},
+                    },
+                }
+                for rank in range(3)
+            ],
+        }
+
+    def cleanup(children):
+        cleanup_calls.append(children)
+        return {"cleanup_verified": True}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "agentx_replay",
+        NS(stream=lambda *args: None, request_one=request_one),
+    )
+    for key, value in {
+        "cf": cf,
+        "os": NS(environ={}),
+        "signal": NS(SIGALRM=14, signal=lambda *args: None, alarm=lambda *args: None),
+        "launch": lambda *args: {"process": NS(poll=lambda: None)},
+        "h": NS(
+            authenticate=lambda *args, **kw: None,
+            read_key=lambda cfg: "unit-test",
+            save=lambda path, value: saved.__setitem__(path.name, copy.deepcopy(value)),
+            cleanup=cleanup,
+            http_json=http_json,
+        ),
+    }.items():
+        monkeypatch.setitem(acceptance, key, value)
+    config = {
+        "layouts": [{"port": 1}],
+        "strategy": "sync",
+        "backing": "overlap",
+        "initial_counts": [20, 0, 20],
+        "grown_counts": [13, 13, 14],
+    }
+    with pytest.raises(SystemExit) as exited:
+        acceptance["worker"](tmp_path, config)
+    assert exited.value.code == 1
+    evidence = saved["results.json"]["transition"]
+    assert evidence["passed"] is False
+    assert evidence["failed_stage"] == "transition_1_resume"
+    assert evidence["error"] == "RuntimeError: post-publication finish failure"
+    assert evidence["cleanup_verified"] is True
+    assert len(cleanup_calls) == 1 and len(cleanup_calls[0]) == 1
+    assert len(requests) == 5
+    assert evidence["transitions"] == [
+        {
+            "generation": 1,
+            "control": {"success": True, "generation": 1},
+            "control_returned_at": evidence["transitions"][0]["control_returned_at"],
+            "continuation_verified": False,
+        }
+    ]
+    assert evidence["transitions"][0]["control_returned_at"] > 0
+    assert saved["worker_progress.json"] == {"completed": 0}
+    for state in evidence["before"]["internal_states"]:
+        assert state["enable_hierarchical_cache"] is True
+        assert state["disable_cuda_graph"] is True
+    assert "must-not-save" not in repr(saved)
 
 
 def states():

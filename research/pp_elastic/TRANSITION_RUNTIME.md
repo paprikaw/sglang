@@ -96,3 +96,17 @@ and existing acceptance checks pass 66 CPU cases. An independent exact historica
 537-case CPU baseline also passed at clean `4c331bcfa249`; these are distinct
 suites. See the validation report and its linked JUnit/source archives. Actual
 dynamic GPU preservation and CPU-spill CUDA release still require acceptance.
+
+r8 at clean `36069aeca07c` reached a real generation-one commit on all three
+ranks and moved 95,289,344 host-prefix bytes to the newly active rank. PP3
+Decode resumed, but request completion later used the batch-result processor's
+retired tree and failed on its cleared request-pool reference. The full run
+failed in 160.804 seconds with verified cleanup and a released lease. Its
+original result lacks transition records because the harness waited for the
+active request before recording control success; committed engine metrics are
+preserved separately. Control success is now saved immediately and continuation
+is verified separately. A real worker-loop failure regression plus the existing
+acceptance/IPC/scheduler checks pass 67 cases. Saved state is limited to the
+diagnostics required for acceptance. The cache context/session fix requires a
+combined checkpoint and a new real attempt; grow/shrink recovery, exact output
+equivalence and CPU-spill CUDA owner release remain unqualified.
