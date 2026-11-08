@@ -818,7 +818,7 @@ class ElasticPPMigrationCoordinator:
                     self.kv_transport, "release_fence_snapshot", None
                 )
                 if release_snapshot is not None:
-                    release_snapshot()
+                    release_snapshot(transition)
                 if cuda_cleanup:
                     logger.info(
                         "Elastic PP generation=%d rank=%d cleanup CUDA allocated "
@@ -842,8 +842,8 @@ class ElasticPPMigrationCoordinator:
                 self._condition.notify_all()
         except BaseException as exc:
             # The target generation remains the committed serving generation;
-            # cleanup failure is a leak/retry condition, not a rollback.
-            self._fail(exc, source_usable=True)
+            # cleanup failure cannot make the retired source generation usable.
+            self._fail(exc, source_usable=False)
 
     def _abort_prepared_generation(self) -> None:
         transition = self._transition

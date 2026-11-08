@@ -115,7 +115,12 @@ class _KVTransport:
         self.finished = False
         self.applied = False
         self.aborted_staged = False
+        self.snapshot_released = False
         self.exchange_threads = []
+
+    def release_fence_snapshot(self, transition):
+        assert transition.target.generation > 0
+        self.snapshot_released = True
 
     def prepare_transition(self, transition):
         del transition
@@ -240,6 +245,7 @@ def test_prepare_fence_commit_and_deferred_cleanup(monkeypatch, device, expected
     coordinator.start_cleanup()
     done = coordinator.wait_for_phase(ElasticPPMigrationPhase.DONE, timeout=2)
     assert runner.cleaned
+    assert kv_transport.snapshot_released
     assert done.prepare_seconds is not None
     assert done.fence_seconds is not None
     assert done.total_seconds is not None
@@ -503,3 +509,20 @@ def test_background_precopy_uses_cpu_payload_and_leaves_live_model_unpublished()
     assert torch.equal(imported[1]["weight"], tensors["weight"])
     assert imported[1]["weight"].data_ptr() != tensors["weight"].data_ptr()
     assert not sender.model_runner.committed and not receiver.model_runner.committed
+
+
+def test_cleanup_failure_never_promises_retired_source_rollback():
+    coordinator, transition, runner, _ = _coordinator()
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    coordinator.finalize_at_fence(lambda topology: None)
+
+    def fail_cleanup(**kwargs):
+        raise RuntimeError("injected retired backing cleanup failure")
+
+    runner.cleanup_elastic_pp_generation = fail_cleanup
+    coordinator.start_cleanup()
+    failed = coordinator.wait_for_phase(ElasticPPMigrationPhase.FAILED, timeout=2)
+    assert not failed.source_usable
+    assert coordinator.current_topology == transition.target
+    assert runner.committed
