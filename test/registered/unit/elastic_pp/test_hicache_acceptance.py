@@ -66,16 +66,26 @@ def test_cold_warm_reference_qualification_requires_nonempty_exact_ids(acceptanc
 
 
 @pytest.mark.parametrize("cached_class", [False, True])
+@pytest.mark.parametrize("failure", ["post_publication", "control"])
+@pytest.mark.parametrize("first_cleanup", ["verified", "unverified", "error"])
 def test_worker_retains_published_control_when_continuation_fails(
-    acceptance, monkeypatch, tmp_path, cached_class
+    acceptance, monkeypatch, tmp_path, cached_class, failure, first_cleanup
 ):
     """Exercise the actual worker's HTTP, future, failure and cleanup sequence."""
     control_seen = threading.Event()
+    active_started = threading.Event()
+    cleanup_started = threading.Event()
+    cleanup_was_late = threading.Event()
     requests, saved, cleanup_calls = [], {}, []
 
     def request_one(endpoint, unused, key, tokens, output, index):
         requests.append((len(tokens), output))
         if len(requests) == 5:
+            active_started.set()
+            if failure == "control":
+                if not cleanup_started.wait(1):
+                    cleanup_was_late.set()
+                raise RuntimeError("active HTTP closed by owned-child cleanup")
             assert control_seen.wait(2), "active request must fail after publication"
             raise RuntimeError("post-publication finish failure")
         payload = {
@@ -100,6 +110,10 @@ def test_worker_retains_published_control_when_continuation_fails(
             control_seen.set()
             return {"success": True, "generation": 1}
         assert path == "/get_server_info"
+        if saved.get("worker_stage.json", {}).get("stage") == "transition_1":
+            assert active_started.wait(2), "real executor must start the request"
+            if failure == "control":
+                raise RuntimeError("control authentication failed")
         return {
             "api_key": "must-not-save-top-level",
             "internal_states": [
@@ -124,6 +138,12 @@ def test_worker_retains_published_control_when_continuation_fails(
 
     def cleanup(children):
         cleanup_calls.append(children)
+        if len(cleanup_calls) == 1:
+            if first_cleanup == "unverified":
+                return {"cleanup_verified": False}
+            if first_cleanup == "error":
+                raise RuntimeError("first cleanup observation failed")
+        cleanup_started.set()
         return {"cleanup_verified": True}
 
     monkeypatch.setitem(
@@ -176,20 +196,40 @@ def test_worker_retains_published_control_when_continuation_fails(
     assert exited.value.code == 1
     evidence = saved["results.json"]["transition"]
     assert evidence["passed"] is False
-    assert evidence["failed_stage"] == "transition_1_resume"
-    assert evidence["error"] == "RuntimeError: post-publication finish failure"
+    expected_stage = (
+        "transition_1_resume" if failure == "post_publication" else "transition_1"
+    )
+    expected_error = (
+        "RuntimeError: post-publication finish failure"
+        if failure == "post_publication"
+        else "RuntimeError: control authentication failed"
+    )
+    assert evidence["failed_stage"] == expected_stage
+    assert evidence["error"] == expected_error
     assert evidence["cleanup_verified"] is True
-    assert len(cleanup_calls) == 1 and len(cleanup_calls[0]) == 1
+    assert len(cleanup_calls) == (1 if first_cleanup == "verified" else 2)
+    assert all(len(children) == 1 for children in cleanup_calls)
+    if first_cleanup == "error":
+        assert evidence["early_cleanup_error"] == "RuntimeError"
     assert len(requests) == 5
-    assert evidence["transitions"] == [
-        {
-            "generation": 1,
-            "control": {"success": True, "generation": 1},
-            "control_returned_at": evidence["transitions"][0]["control_returned_at"],
-            "continuation_verified": False,
-        }
-    ]
-    assert evidence["transitions"][0]["control_returned_at"] > 0
+    assert not cleanup_was_late.is_set(), "cleanup waited for the in-flight HTTP"
+    expected_transitions = (
+        [
+            {
+                "generation": 1,
+                "control": {"success": True, "generation": 1},
+                "control_returned_at": evidence["transitions"][0][
+                    "control_returned_at"
+                ],
+                "continuation_verified": False,
+            }
+        ]
+        if failure == "post_publication"
+        else []
+    )
+    assert evidence["transitions"] == expected_transitions
+    if expected_transitions:
+        assert evidence["transitions"][0]["control_returned_at"] > 0
     assert saved["worker_progress.json"] == {"completed": 0}
     for state in evidence["before"]["internal_states"]:
         assert state["enable_hierarchical_cache"] is True

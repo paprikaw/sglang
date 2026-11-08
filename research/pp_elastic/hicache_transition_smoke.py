@@ -541,6 +541,13 @@ def worker(run, cfg):
     }
     original_stream = agentx_replay.stream
     request_contracts = []
+    owned_cleanup = None
+
+    def cleanup_owned():
+        nonlocal owned_cleanup
+        if owned_cleanup is None or not owned_cleanup.get("cleanup_verified", False):
+            owned_cleanup = h.cleanup(children)
+        return owned_cleanup
 
     def captured_stream(endpoint, key, payload, timeout=600):
         request_contracts.append(
@@ -673,39 +680,53 @@ def worker(run, cfg):
         ):
             checkpoint(f"transition_{generation}")
             with cf.ThreadPoolExecutor(max_workers=1) as pool:
-                active = pool.submit(request, active_prompt, 256)
-                deadline = time.monotonic() + 15
-                while True:
-                    active_info = http("/get_server_info", timeout=3)
-                    lengths = [
-                        length
-                        for state in active_info["internal_states"]
-                        for length in state.get("transition_active_output_lengths", [])
-                    ]
-                    if any(length >= 4 for length in lengths):
-                        break
-                    if active.done() or time.monotonic() >= deadline:
-                        raise RuntimeError(
-                            "no live Decode progress observed before transition"
-                        )
-                    time.sleep(0.02)
-                transition = http(
-                    "/reconfigure_elastic_pp",
-                    {"layer_counts": counts, "generation": generation},
-                    timeout=60,
-                )
-                record = {
-                    "generation": generation,
-                    "control": transition,
-                    "control_returned_at": time.time(),
-                    "continuation_verified": False,
-                }
-                evidence["transitions"].append(record)
-                if not transition.get("success"):
-                    raise RuntimeError("topology transition failed")
-                checkpoint(f"transition_{generation}_resume")
-                result = active.result(timeout=45)
-                record["active"] = result
+                try:
+                    active = pool.submit(request, active_prompt, 256)
+                    deadline = time.monotonic() + 15
+                    while True:
+                        active_info = http("/get_server_info", timeout=3)
+                        lengths = [
+                            length
+                            for state in active_info["internal_states"]
+                            for length in state.get(
+                                "transition_active_output_lengths", []
+                            )
+                        ]
+                        if any(length >= 4 for length in lengths):
+                            break
+                        if active.done() or time.monotonic() >= deadline:
+                            raise RuntimeError(
+                                "no live Decode progress observed before transition"
+                            )
+                        time.sleep(0.02)
+                    transition = http(
+                        "/reconfigure_elastic_pp",
+                        {"layer_counts": counts, "generation": generation},
+                        timeout=60,
+                    )
+                    record = {
+                        "generation": generation,
+                        "control": transition,
+                        "control_returned_at": time.time(),
+                        "continuation_verified": False,
+                    }
+                    evidence["transitions"].append(record)
+                    if not transition.get("success"):
+                        raise RuntimeError("topology transition failed")
+                    checkpoint(f"transition_{generation}_resume")
+                    result = active.result(timeout=45)
+                    record["active"] = result
+                except BaseException:
+                    # Executor exit waits for HTTP: stop this run's model first.
+                    for _ in range(2):
+                        try:
+                            if cleanup_owned().get("cleanup_verified", False):
+                                break
+                        except BaseException as cleanup_error:
+                            evidence["early_cleanup_error"] = type(
+                                cleanup_error
+                            ).__name__
+                    raise
             if result["output_ids"] != active_reference["output_ids"]:
                 raise AssertionError("active output IDs changed across transition")
             # Commit response precedes deferred cleanup; wait until next transition is admissible.
@@ -759,7 +780,7 @@ def worker(run, cfg):
         agentx_replay.stream = original_stream
         signal.alarm(0)
         checkpoint("cleanup")
-        cleanup = h.cleanup(children)
+        cleanup = cleanup_owned()
         elapsed = time.monotonic() - started
         evidence.update(
             elapsed_seconds=elapsed,
