@@ -321,6 +321,121 @@ def test_discarded_frozen_cache_drops_projected_device_owners():
     assert witness() is None
 
 
+def _native_spill_pair(*, prepare=True):
+    source = PPTopology.from_layer_counts([2, 2], generation=0)
+    target = PPTopology.from_layer_counts([1, 3], generation=1)
+    tx = DynamicPPTransition.build(source, target)
+    mailbox = _Mailbox()
+    slots = torch.tensor([1, 3], dtype=torch.int64)
+    pools = [
+        _make_pool(start_layer=0, layer_num=2),
+        _make_pool(start_layer=2, layer_num=2),
+    ]
+    pools[0].k_buffer[1].fill_(11)
+    pools[0].v_buffer[1].fill_(21)
+    transports = [
+        ElasticPPKVTransport(
+            group=_Group(mailbox, rank),
+            model_runner=_Runner(pool),
+            allocator=_Allocator(slots),
+            rank=rank,
+            slot_chunk_size=1,
+        )
+        for rank, pool in enumerate(pools)
+    ]
+    for transport in transports:
+        transport.release_source_backing(tx)
+        if prepare:
+            transport.prepare_transition(tx)
+    return tx, transports, mailbox, slots
+
+
+def test_spill_receives_independent_cpu_staging_and_releases_wire_owners():
+    tx, (sender, receiver), mailbox, slots = _native_spill_pair()
+    sender.exchange_phase(tx, phase="bulk", slot_ids=slots)
+    witnesses = [
+        weakref.ref(t.untyped_storage())
+        for payload in mailbox.payloads[(0, 1)]
+        for key, t in payload.items()
+        if key.startswith("elastic_pp_kv_tensor_")
+    ]
+    receiver.exchange_phase(tx, phase="bulk", slot_ids=slots)
+    gc.collect()
+    assert witnesses and all(w() is None for w in witnesses)
+    metrics = receiver.backing_spill_metrics()
+    assert metrics["received_staging_bytes"] == 48
+    assert metrics["cpu_staging_live_bytes"] == metrics["cpu_staging_peak_bytes"] == 48
+    assert metrics["required_cpu_staging_bytes"] > metrics["received_staging_bytes"]
+    assert (
+        metrics["cpu_staging_available_bytes"] > metrics["required_cpu_staging_bytes"]
+    )
+    assert (
+        metrics["hostname"]
+        and "no node-wide reservation" in metrics["host_admission_scope"]
+    )
+    assert all(
+        t.device.type == "cpu"
+        for staged_slots, layer_kv in receiver._staged_chunks.values()
+        for t in (staged_slots, *(t for pair in layer_kv.values() for t in pair))
+    )
+    for transport in (sender, receiver):
+        transport.exchange_phase(tx, phase="delta", slot_ids=slots[:0])
+    before = receiver.backing_spill_metrics()["restored_bytes"]
+    receiver.apply_staged(tx)
+    assert receiver.backing_spill_metrics()["restored_bytes"] == before + 32
+    assert receiver.backing_spill_metrics()["cpu_staging_live_bytes"] == 0
+    assert (
+        receiver.pool.get_elastic_pp_pending_kv_buffer(generation=1, layer_id=1)[0][
+            slots
+        ]
+        .eq(11)
+        .all()
+    )
+    assert receiver.metrics()["backing_spill"]["received_staging_bytes"] == 48
+
+
+def test_spill_staging_abort_keeps_source_authority_and_is_repeatable():
+    tx, (sender, receiver), mailbox, slots = _native_spill_pair()
+    sender.exchange_phase(tx, phase="bulk", slot_ids=slots)
+    receiver.exchange_phase(tx, phase="bulk", slot_ids=slots)
+    receiver.abort_staged(tx)
+    receiver.abort_staged(tx)
+    assert receiver.backing_spill_metrics()["cpu_staging_live_bytes"] == 0
+    assert receiver._spill.backup and not receiver._staged_chunks
+    receiver.restore_source_backing(tx)
+    assert receiver.pool.start_layer == 2 and len(receiver.pool.k_buffer) == 2
+    assert not mailbox.payloads[(0, 1)]
+
+
+def test_spill_cpu_staging_admission_fails_before_collective_copy(monkeypatch):
+    from sglang.srt.mem_cache.pool_host import base
+
+    tx, (_, receiver), _, _ = _native_spill_pair(prepare=False)
+    monkeypatch.setattr(base, "host_memory_budget_bytes", lambda: 1)
+    with pytest.raises(MemoryError, match="current HiCache host budget"):
+        receiver.prepare_transition(tx)
+    assert receiver.pool._elastic_pp_residency.pending is None
+    assert not receiver._staged_chunks and receiver._spill.backup
+    receiver.restore_source_backing(tx)
+    assert len(receiver.pool.k_buffer) == 2
+
+
+@pytest.mark.parametrize("invalid", ["shape", "dtype", "slot"])
+def test_spill_staging_rejects_invalid_rows_before_cpu_allocation(monkeypatch, invalid):
+    from sglang.srt.mem_cache.pool_host import base
+
+    _, (_, receiver), _, _ = _native_spill_pair()
+    slots = torch.tensor([1000 if invalid == "slot" else 1])
+    tensor = torch.ones(
+        (1, 1, 3 if invalid == "shape" else 2),
+        dtype=torch.float64 if invalid == "dtype" else torch.float32,
+    )
+    monkeypatch.setattr(base, "host_memory_budget_bytes", lambda: 0)
+    with pytest.raises(ValueError, match="CPU-staged KV"):
+        receiver._stage_received_cpu_chunk(1, slots, {1: (tensor, tensor)})
+    assert receiver.backing_spill_metrics()["received_staging_bytes"] == 0
+
+
 def test_three_rank_hybrid_spill_grow_shrink_preserves_live_kv_and_all_gdn(
     hybrid_pool_factory,
 ):

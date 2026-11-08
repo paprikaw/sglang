@@ -9,6 +9,7 @@ the caching allocator released. Neither implies that a GPU was returned.
 from __future__ import annotations
 
 import gc
+import socket
 import weakref
 
 import torch
@@ -20,10 +21,16 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 def _metrics():
     return dict(
+        hostname=socket.gethostname(),
+        host_admission_scope="per-rank HiCache budget; no node-wide reservation",
         snapshot_bytes=0,
         frontier_snapshot_bytes=0,
         detached_bytes=0,
         restored_bytes=0,
+        outbound_staging_bytes=0,
+        received_staging_bytes=0,
+        cpu_staging_live_bytes=0,
+        cpu_staging_peak_bytes=0,
         source_storage_bytes_alive=0,
         cuda_memory={},
     )
