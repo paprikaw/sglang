@@ -5,6 +5,12 @@ For this fork's EP, PP, HiCache and P/D research, read
 before changing code. Preserve their distinctions between available code and
 validated execution paths.
 
+Read `research/pp_elastic/TODO.md` for current priorities and acceptance status.
+Every agent must update its task entry before delivery, including evidence and
+remaining limits. Submit the update in its task PR, or supply an explicit entry
+patch for the coordinator to apply sequentially; do not write concurrently to
+the coordinator's worktree. Keep code completion separate from GPU acceptance.
+
 - The shared baseline is `codex/pp-elastic-integration`. The PP + HiCache project
   integrates on `codex/pp-hicache-autoscaling` through its draft umbrella PR.
 - Use one task branch and one worktree per contributor. A worktree alone does

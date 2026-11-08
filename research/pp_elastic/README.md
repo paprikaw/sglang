@@ -1,5 +1,7 @@
 # SGLang 研究基线
 
+当前 PP＋HiCache 实现、验收和后续优化统一追踪于[任务清单](TODO.md)。每个 agent 交付时更新对应条目，规则见[协作约定](WORKFLOW.md)。
+
 后续开发统一合入 `codex/pp-elastic-integration`。上游基点沿用已做 AgentX P/D 验证的 R11，新增功能通过合并保留原分支历史。原实验 worktree、冻结标签和尚未提交的工作均保留。
 
 **引擎中的优化。** 包含 EP overlap、BF16 Expert runner、AWQ/Humming 专家切分、PP tensor channel 和调度、HiCache/GDN 恢复及 P→D 层映射、CPU canonical/node-local 权重缓存，以及排空与恢复 PP 的控制面。冲突优先保留较新的层映射、逻辑输出回传和 PP loadback 轮询协议，未将旧协议叠加到新协议上。
