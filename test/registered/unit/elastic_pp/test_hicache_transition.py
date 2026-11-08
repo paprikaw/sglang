@@ -181,6 +181,7 @@ def test_real_tree_snapshot_preserves_arena_lru_and_private_components():
     tree.root_node.children[1] = node
     tree.lru_lists[ct].insert_mru(node)
     tree.component_evictable_size_[ct] = 2
+    node.last_access_time = 1e12
     source = NS(tree_core=tree)
     payload = snapshot_tree_metadata(source)
     target_component = NS()
@@ -191,6 +192,11 @@ def test_real_tree_snapshot_preserves_arena_lru_and_private_components():
     assert restored.lru_lists[ct].cache[node.id] is restored._node_arena[node.id]
     assert restored.component_evictable_size_[ct] == 2
     assert restored.components == (target_component,)
+    from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+        get_and_increase_time_counter,
+    )
+
+    assert get_and_increase_time_counter() > node.last_access_time
     assert target_component.tree_core is restored
     assert restored._empty_match_result.device_indices.device == torch.device("cpu")
     restored._node_arena[node.id].component_data[ct].host_value.zero_()
@@ -399,3 +405,63 @@ def test_discard_drops_frozen_controller_host_aliases():
         is None
     )
     assert component._full_kv_pool_host is controller.mem_pool_host is None
+
+
+def test_fence_host_drain_keeps_idle_rank_in_all_rounds():
+    from sglang.srt.elastic_pp.hicache_transition import drain_host_io_at_fence
+
+    calls = []
+    cache = NS(
+        cache_controller=NS(load_queue=[], write_queue=[]),
+        check_hicache_events=lambda: calls.append("check"),
+        _drain_async_work=lambda: calls.append("retire"),
+    )
+
+    class Group:
+        rounds = 0
+
+        def all_gather_object(self, local):
+            self.rounds += 1
+            return [local, {"pending": self.rounds == 1, "expired": False}]
+
+    group = Group()
+    drain_host_io_at_fence(cache, group)
+    assert group.rounds == 2
+    assert calls == ["check", "retire", "check", "retire"]
+
+
+def test_canonical_snapshot_failure_is_delivered_to_dormant_peer(monkeypatch):
+    from sglang.srt.elastic_pp import hicache_transition as module
+    from sglang.srt.elastic_pp.topology import DynamicPPTransition, PPTopology
+
+    tx = DynamicPPTransition.build(
+        PPTopology.from_layer_counts([2, 2, 0], generation=0),
+        PPTopology.from_layer_counts([1, 2, 1], generation=1),
+    )
+    cache = NS(
+        cache_controller=NS(load_queue=[], write_queue=[]),
+        host_pool_group=NS(entries=[]),
+        check_hicache_events=lambda: None,
+        _drain_async_work=lambda: None,
+    )
+
+    class Group(Wire):
+        def all_gather_object(self, local):
+            return [local]
+
+    wire = Group()
+
+    def fail(cache):
+        raise RuntimeError("injected snapshot failure")
+
+    monkeypatch.setattr(module, "snapshot_tree_metadata", fail)
+    source = module.SchedulerHiCacheTransition(
+        scheduler=NS(tree_cache=cache), model_runner=None, group=wire, rank=0
+    )
+    target = module.SchedulerHiCacheTransition(
+        scheduler=NS(tree_cache=cache), model_runner=None, group=wire, rank=2
+    )
+    with pytest.raises(RuntimeError, match="injected snapshot failure"):
+        source.prepare_transition(tx)
+    with pytest.raises(RuntimeError, match="canonical HiCache snapshot failed"):
+        target.prepare_transition(tx)

@@ -735,6 +735,7 @@ def snapshot_tree_metadata(cache):
 def restore_tree_metadata(payload, cache):
     import pickle
     from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+    from sglang.srt.mem_cache.unified_cache.components import tree_component
 
     tree = pickle.loads(payload)
     tree.device = cache.tree_core.device
@@ -757,6 +758,16 @@ def restore_tree_metadata(payload, cache):
         ids.extend(
             n.id for n in (lru.head, lru.tail, lru.mid, lru.cursor) if n is not None
         )
+    newest = max(
+        (
+            max(node.last_access_time, node.creation_time)
+            for node in tree._node_arena.values()
+        ),
+        default=0,
+    )
+    tree_component._LAST_ACCESS_TIME_COUNTER_FLOAT = max(
+        tree_component._LAST_ACCESS_TIME_COUNTER_FLOAT, newest + 1
+    )
     UnifiedTreeNode.counter = max(UnifiedTreeNode.counter, max(ids, default=-1) + 1)
     return tree
 
