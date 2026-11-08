@@ -136,8 +136,16 @@ class HiCacheTransitionAdapter:
         """Capture immutable CPU rows before allocating target backing."""
         assert_host_quiescent(self.cache)
         snapshot = {}
+        outgoing = {
+            layer
+            for edge in transition.kv_transfers
+            if edge.src_rank == self.rank
+            for layer in range(edge.layer_range.start, edge.layer_range.end)
+        }
         for (identity, component), node in host_nodes(self.cache).items():
             for layer, tensors in self.pools.get(component, {}).items():
+                if layer not in outgoing:
+                    continue
                 snapshot[(identity, component, layer)] = {
                     name: t.index_select(0, node.slots.to(t.device)).cpu().clone()
                     for name, t in tensors.items()

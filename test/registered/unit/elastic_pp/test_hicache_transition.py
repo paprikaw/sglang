@@ -204,7 +204,9 @@ def test_project_pending_hybrid_does_not_publish(hybrid_pool_factory):
     pool = hybrid_pool_factory(start_layer=0, end_layer=2)
     original_state = pool.mamba_pool.mamba_cache
     original_map = dict(pool.req_to_token_pool.mamba_map)
-    pool.prepare_elastic_pp_kv_layers(target=LayerRange(0, 4), generation=1)
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(0, 4), generation=1, total_num_layers=4
+    )
     view, req = project_target_device_pool(pool, target=LayerRange(0, 4), generation=1)
     assert pool.end_layer == 2
     assert pool.mamba_pool.mamba_cache is original_state
