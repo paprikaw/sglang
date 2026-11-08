@@ -85,3 +85,14 @@ token and requires fresh loadback of all 512. Warm references and original cold
 outputs are retained. Exact request IDs, cumulative retractions and active
 model-launch modes now distinguish continued Decode from re-prefill; 57 focused
 harness/scheduler checks pass. This does not qualify the pending GPU run.
+
+
+r7 completed four cold/warmed requests at clean `4c331bcfa249`, then rejected
+DP-only diagnostic evidence before CPU demotion; no transition occurred. Its
+87.423-second failure has verified cleanup and a released Guard lease. Private
+PP3/TP1/DP1 diagnostic replies now collect each resident worker without changing
+general DP control semantics. The real IPC/communicator/resource-release boundary
+and existing acceptance checks pass 66 CPU cases. An independent exact historical
+537-case CPU baseline also passed at clean `4c331bcfa249`; these are distinct
+suites. See the validation report and its linked JUnit/source archives. Actual
+dynamic GPU preservation and CPU-spill CUDA release still require acceptance.

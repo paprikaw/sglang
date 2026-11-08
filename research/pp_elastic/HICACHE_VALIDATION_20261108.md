@@ -29,8 +29,8 @@ for FULL and MAMBA capacity. The zero-layer logical branches skipped those
 reductions. Cache checkpoint 3f41063832 now makes each resident rank participate
 in the same order, with neutral int64 values for the zero-layer rank. CPU tests
 exercise physical MHA/Mamba host constructors and logical pools, aligned
-capacities, the all-logical fallback and ratio sizing. A fresh tagged GPU run is
-required to validate that correction on the actual startup path.
+capacities, the all-logical fallback and ratio sizing. r5 subsequently validated
+completion of these constructors on all three actual GPU workers.
 
 r5 used source 03317bcccb816dc8dcbff79926f5fa2fed6e6470 with immutable tag
 experiment/sglang/pp-hicache-transition-20261108-r5. All three ranks completed
@@ -87,5 +87,39 @@ zero-layer passthrough is excluded. Per-request records contain only IDs and
 integers, with no retained request or tensor owners. The repaired harness and
 scheduler boundaries have 57 passing CPU checks, including real cache-probe
 hook retries, the actual Req prefix cutoff, actual ForwardMode values and
-adversarial retraction/re-prefill/request-ID evidence. A new immutable r7 is
-required before the next GPU run. None of these CPU changes is a dynamic pass.
+adversarial retraction/re-prefill/request-ID evidence. None of these CPU changes
+is a dynamic pass.
+
+
+r7 used clean 4c331bcfa24940ee751a7958bcd88309b9aaecb8 and immutable tag
+experiment/sglang/pp-hicache-transition-20261108-r7. Four cold/warmed reference
+requests completed. Both warmed requests reused 512 GPU prefix tokens and
+reported zero retractions. The initial CPU demotion then rejected incomplete
+rank evidence: normal internal-state IPC returns one reply per DP replica,
+while the check correctly requires all three resident PP workers. Zero
+transitions occurred. The run failed in 87.423 seconds including verified
+owned-process/GPU cleanup; Guard released its lease. Stable result and cleanup
+visibility receipts were verified. This is a request-stage failure, with no
+dynamic recovery or output-equivalence claim.
+
+The correction is confined to the private single-node PP3/TP1/DP1 acceptance
+hook. Non-first PP workers send only get/set internal-state replies through
+independent diagnostic sockets, and the same two tokenizer communicators wait
+for three replies. Inference and topology-control replies keep their usual DP
+semantics. A handler collective would deadlock because PP forwards the request
+after the local handler returns. The repaired hook has 66 passing acceptance
+and scheduler CPU checks. These execute the real scheduler IPC constructor,
+ZeroMQ/msgpack, tokenizer communicator initialization/dispatcher and graceful
+resource-release method; two replies cannot complete a three-rank request.
+Socket construction/publication failures close the new context even when the
+exception is retained. Independent review found no blocker in this narrow
+scope. Abnormal-process cleanup still requires Guard evidence on each real run.
+
+An independent run recovered the exact historical 537 CPU node IDs across 52
+files and passed every selected case, with zero failures, errors or skips.
+Source remained clean at 4c331bcfa249 before and after, with zero visible CUDA
+devices. The [historical CPU archive](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/hicache-runtime-historical-537-20261108)
+contains raw JUnit, selection, command/environment and source audit. This is a
+separate suite from the 197 focused checks. Initial whole-file collection
+attempts were incomplete and are preserved separately; they are not baseline
+passes. The next real attempt requires a new immutable r8 SHA/tag.

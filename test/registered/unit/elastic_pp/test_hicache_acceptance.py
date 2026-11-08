@@ -28,6 +28,7 @@ def acceptance():
             "validate_fenced_decode",
             "fresh_prefix_restores",
             "install_transition_hooks",
+            "install_diagnostic_fanout",
             "demote_cpu_prefixes",
             "correctness_prompts",
             "observe_request_launch",
@@ -467,3 +468,327 @@ def test_newly_active_stage_can_have_no_prefence_model_launches(acceptance):
     acceptance["validate_uninterrupted_decode"](evidence, 1, result, (0, 2), (0, 1, 2))
     evidence[1]["transition_request_execution"]["active"]["decode_batches"] = 16
     acceptance["validate_uninterrupted_decode"](evidence, 2, result, (0, 1, 2), (0, 2))
+
+
+@pytest.fixture
+def diagnostic_ipc(acceptance, tmp_path, monkeypatch):
+    """Run the production channel constructor and control communicator setup."""
+    import logging
+
+    import zmq
+
+    from sglang.srt.managers import tokenizer_control_mixin as control
+    from sglang.srt.managers.scheduler_components.ipc_channels import (
+        SchedulerIpcChannels,
+    )
+
+    root = Path(__file__).resolve().parents[4]
+    source = root / "python/sglang/srt/managers/scheduler.py"
+    scheduler_class = next(
+        node
+        for node in ast.parse(source.read_text()).body
+        if isinstance(node, ast.ClassDef) and node.name == "Scheduler"
+    )
+    method = next(
+        node
+        for node in scheduler_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "init_ipc_channels"
+    )
+    observation = NS(enable_metrics=False, load_snapshot_publish_interval=0.1)
+    namespace = {
+        "SchedulerIpcChannels": SchedulerIpcChannels,
+        "get_observability": lambda: observation,
+        "envs": NS(SGLANG_TEST_SCRIPTED_RUNTIME=NS(get=lambda: False)),
+        "create_load_snapshot_writer": lambda *args, **kwargs: None,
+        "logger": logging.getLogger(__name__),
+        "rank_consensus_checker": NS(shutdown=lambda: None),
+    }
+    release = next(
+        node
+        for node in scheduler_class.body
+        if isinstance(node, ast.FunctionDef) and node.name == "release_host_resources"
+    )
+    future = ast.ImportFrom(
+        module="__future__", names=[ast.alias(name="annotations")], level=0
+    )
+    exec(
+        compile(
+            ast.fix_missing_locations(
+                ast.Module(body=[future, method, release], type_ignores=[])
+            ),
+            str(source),
+            "exec",
+        ),
+        namespace,
+    )
+
+    class Scheduler:
+        init_ipc_channels = namespace["init_ipc_channels"]
+
+        release_host_resources = namespace["release_host_resources"]
+
+    class Tokenizer(control.TokenizerControlMixin):
+        def __init__(self):
+            self.sent = []
+            self._result_dispatcher = control.TypeBasedDispatcher([])
+            self._dispatch_to_scheduler = self.sent.append
+
+        def auto_create_handle_loop(self):
+            pass
+
+    acceptance["install_diagnostic_fanout"](Scheduler, Tokenizer)
+    monkeypatch.setattr(control, "get_parallel", lambda: NS(dp_size=1))
+    context = zmq.Context(1)
+    receiver = context.socket(zmq.PULL)
+    receiver.setsockopt(zmq.RCVTIMEO, 2000)
+    receiver_port = receiver.bind_to_random_port("tcp://127.0.0.1")
+    endpoint = f"tcp://127.0.0.1:{receiver_port}"
+    ports = NS(
+        scheduler_input_ipc_name=f"ipc://{tmp_path}/scheduler.sock",
+        rpc_ipc_name=f"ipc://{tmp_path}/rpc.sock",
+        tokenizer_ipc_name=endpoint,
+    )
+    workers = []
+    for rank in range(3):
+        scheduler = Scheduler()
+        scheduler.ps = NS(
+            pp_size=3,
+            tp_size=1,
+            dp_size=1,
+            pp_rank=rank,
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+            dp_rank=0,
+        )
+        scheduler.skip_tokenizer_init = True
+        scheduler.hisparse_coordinator = None
+        scheduler.decode_offload_manager = None
+        scheduler.tree_cache = NS(release_host_resources=lambda: None)
+        scheduler.init_ipc_channels(ports)
+        workers.append(scheduler)
+    args = NS(
+        pp_size=3,
+        tp_size=1,
+        dp_size=1,
+        nnodes=1,
+        enable_elastic_pp_autoscaling=False,
+    )
+    tokenizer = Tokenizer()
+    try:
+        tokenizer.init_communicators(args)
+        yield NS(
+            workers=workers,
+            tokenizer=tokenizer,
+            receiver=receiver,
+            args=args,
+            scheduler_class=Scheduler,
+            tokenizer_class=Tokenizer,
+            ports=ports,
+            production_init_ipc=namespace["init_ipc_channels"],
+            production_release=namespace["release_host_resources"],
+        )
+    finally:
+        contexts = set()
+        for scheduler in workers:
+            try:
+                scheduler.release_host_resources()
+            except RuntimeError:
+                pass
+            channels = scheduler.ipc_channels
+            for name in (
+                "recv_from_tokenizer",
+                "recv_from_rpc",
+                "send_to_tokenizer",
+                "send_to_detokenizer",
+            ):
+                channel = getattr(channels, name)
+                socket = getattr(channel, "socket", channel)
+                if socket is not None:
+                    contexts.add(socket.context)
+                    socket.close(linger=0)
+        for owned in contexts:
+            owned.term()
+        receiver.close(linger=0)
+        context.term()
+
+
+@pytest.mark.asyncio
+async def test_three_resident_diagnostic_replies_reach_real_communicators(
+    diagnostic_ipc,
+):
+    import asyncio
+
+    from sglang.srt.managers.io_struct import (
+        GetInternalStateReq,
+        GetInternalStateReqOutput,
+        SetInternalStateReq,
+        SetInternalStateReqOutput,
+        sock_recv,
+    )
+
+    fixture = diagnostic_ipc
+    tokenizer = fixture.tokenizer
+    # Other controls still wait for one DP reply, including topology publication.
+    assert tokenizer.reconfigure_elastic_pp_communicator._fan_out == 1
+    assert tokenizer.get_elastic_pp_state_communicator._fan_out == 1
+    assert tokenizer.get_internal_state_communicator._fan_out == 3
+    assert tokenizer.set_internal_state_communicator._fan_out == 3
+    for command in ("get", "set"):
+        if command == "get":
+            task = asyncio.create_task(tokenizer.get_internal_state())
+            request = GetInternalStateReq(http_worker_ipc="return-route")
+        else:
+            request = SetInternalStateReq(
+                server_args={"agentx_cache_cmd": 2}, http_worker_ipc="return-route"
+            )
+            task = asyncio.create_task(tokenizer.set_internal_state(request))
+        await asyncio.sleep(0)
+        assert tokenizer.sent
+        for ordinal, rank in enumerate((0, 2, 1)):
+            output = (
+                GetInternalStateReqOutput(internal_state={"transition_rank": rank})
+                if command == "get"
+                else SetInternalStateReqOutput(updated=rank != 1)
+            )
+            fixture.workers[rank].ipc_channels.send_to_tokenizer.send_output(
+                output, request
+            )
+            reply = sock_recv(fixture.receiver)
+            assert reply.http_worker_ipc == "return-route"
+            tokenizer._result_dispatcher(reply)
+            await asyncio.sleep(0)
+            if ordinal < 2:
+                assert (
+                    not task.done()
+                ), "partial PP replies must not complete the HTTP result"
+        result = await asyncio.wait_for(task, 2)
+        if command == "get":
+            assert {state["transition_rank"] for state in result} == {0, 1, 2}
+        else:
+            assert result == [True, True, False]
+
+
+def test_diagnostic_sender_keeps_other_pp_outputs_on_original_route(diagnostic_ipc):
+    from sglang.srt.managers.io_struct import (
+        AbortReq,
+        GetElasticPPStateReqOutput,
+        ReconfigureElasticPPReqOutput,
+        sock_recv,
+    )
+
+    fixture = diagnostic_ipc
+    controls = [
+        AbortReq(rid="ordinary"),
+        GetElasticPPStateReqOutput(
+            enabled=True,
+            generation=0,
+            layer_counts=[20, 0, 20],
+            migration_phase="idle",
+            source_usable=True,
+            waiting_requests=0,
+            running_requests=0,
+        ),
+        ReconfigureElasticPPReqOutput(
+            success=True,
+            message="ok",
+            old_generation=0,
+            new_generation=1,
+            old_layer_counts=[20, 0, 20],
+            new_layer_counts=[13, 13, 14],
+            migration_phase="committed",
+            source_usable=True,
+        ),
+    ]
+    for worker in fixture.workers[1:]:
+        assert worker.ipc_channels.send_to_tokenizer.normal.socket is None
+        for output in controls:
+            worker.ipc_channels.send_to_tokenizer.send_output(output)
+    assert not fixture.receiver.poll(50)
+    for output in controls:
+        fixture.workers[0].ipc_channels.send_to_tokenizer.send_output(output)
+        assert sock_recv(fixture.receiver) == output
+
+
+def test_private_reply_sockets_close_even_after_host_cleanup_failure(diagnostic_ipc):
+    worker = diagnostic_ipc.workers[1]
+    socket = worker._smoke_diagnostic_socket
+    context = worker._smoke_diagnostic_context
+
+    def failed_release():
+        raise RuntimeError("host release failed")
+
+    worker.tree_cache.release_host_resources = failed_release
+    with pytest.raises(RuntimeError, match="host release failed"):
+        worker.release_host_resources()
+    assert socket.closed and context.closed
+    assert worker._smoke_diagnostic_socket is None
+
+
+@pytest.mark.parametrize(
+    "field,value", [("pp_size", 2), ("tp_size", 2), ("dp_size", 2), ("nnodes", 2)]
+)
+def test_private_reply_fanout_rejects_unqualified_topologies(
+    diagnostic_ipc, field, value
+):
+    fixture = diagnostic_ipc
+    args = NS(**vars(fixture.args))
+    setattr(args, field, value)
+    with pytest.raises(ValueError, match="one-node PP3/TP1/DP1"):
+        fixture.tokenizer_class().init_communicators(args)
+    if field != "nnodes":
+        worker = fixture.scheduler_class()
+        worker.ps = NS(pp_size=3, tp_size=1, dp_size=1)
+        setattr(worker.ps, field, value)
+        with pytest.raises(ValueError, match="PP3/TP1/DP1"):
+            worker.init_ipc_channels(fixture.ports)
+
+
+@pytest.mark.parametrize("failure_point", ["socket", "channels"])
+def test_private_reply_construction_failure_closes_retained_context(
+    acceptance, diagnostic_ipc, monkeypatch, failure_point
+):
+    import dataclasses
+
+    from sglang.srt.utils import network
+
+    fixture = diagnostic_ipc
+    contexts = []
+    sockets = []
+    original_socket = network.get_zmq_socket
+
+    def socket(context, *args):
+        contexts.append(context)
+        if failure_point == "socket":
+            raise RuntimeError("socket construction failed")
+        result = original_socket(context, *args)
+        sockets.append(result)
+        return result
+
+    def failed_replace(*args, **kwargs):
+        raise RuntimeError("channel publication failed")
+
+    monkeypatch.setattr(network, "get_zmq_socket", socket)
+    if failure_point == "channels":
+        monkeypatch.setattr(dataclasses, "replace", failed_replace)
+
+    class Scheduler:
+        init_ipc_channels = fixture.production_init_ipc
+        release_host_resources = fixture.production_release
+
+    class Tokenizer:
+        def init_communicators(self, args):
+            pass
+
+    acceptance["install_diagnostic_fanout"](Scheduler, Tokenizer)
+    worker = Scheduler()
+    worker.ps = NS(
+        pp_size=3, tp_size=1, dp_size=1, pp_rank=1, attn_tp_rank=0, attn_cp_rank=0
+    )
+    worker.skip_tokenizer_init = True
+    with pytest.raises(RuntimeError) as retained:
+        worker.init_ipc_channels(fixture.ports)
+    assert retained.value.__traceback__ is not None
+    assert len(contexts) == 1 and contexts[0].closed
+    assert all(socket.closed for socket in sockets)
+    assert not hasattr(worker, "_smoke_diagnostic_context")
+    assert worker.ipc_channels.send_to_tokenizer.socket is None

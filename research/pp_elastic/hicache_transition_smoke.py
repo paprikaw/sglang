@@ -28,7 +28,11 @@ sys.path.insert(0, str(ROOT / "runtime_profiles/agentx_a100"))
 def rank_states(states):
     ranks = {state["transition_rank"]: state for state in states}
     if len(states) != 3 or set(ranks) != {0, 1, 2}:
-        raise AssertionError("transition evidence must contain each resident rank once")
+        raise AssertionError(
+            "transition evidence must contain each resident rank once: "
+            f"received {len(states)} replies with ranks "
+            f"{[state.get('transition_rank') for state in states]}"
+        )
     return ranks
 
 
@@ -228,8 +232,105 @@ def install_hooks():
     from sglang.srt.managers.scheduler import Scheduler
 
     from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
+    from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 
+    install_diagnostic_fanout(Scheduler, TokenizerControlMixin)
     install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator)
+
+
+def install_diagnostic_fanout(Scheduler, TokenizerControlMixin):
+    """Return private diagnostic replies from all three resident PP workers.
+
+    Normal scheduler IPC and control communicators return only the first PP
+    worker's reply per DP replica. Requests reach the next PP worker after the
+    local handler returns, so a collective inside the handler would deadlock.
+    This opt-in, single-node TP1/DP1 smoke uses independent reply sockets for
+    only get/set internal state; inference and topology control keep their
+    normal output route and fanout.
+    """
+    from dataclasses import replace
+
+    import zmq
+
+    from sglang.srt.managers.io_struct import (
+        GetInternalStateReqOutput,
+        SetInternalStateReqOutput,
+    )
+    from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
+    from sglang.srt.utils.network import get_zmq_socket
+
+    diagnostic_types = (GetInternalStateReqOutput, SetInternalStateReqOutput)
+
+    class DiagnosticSender(SenderWrapper):
+        def __init__(self, normal, diagnostic):
+            super().__init__(normal.socket)
+            self.normal = normal
+            self.diagnostic = diagnostic
+
+        def send_output(self, output, recv_obj=None):
+            sender = (
+                self.diagnostic if isinstance(output, diagnostic_types) else self.normal
+            )
+            return sender.send_output(output, recv_obj)
+
+    original_ipc = Scheduler.init_ipc_channels
+
+    def init_ipc(self, port_args):
+        if (self.ps.pp_size, self.ps.tp_size, self.ps.dp_size) != (3, 1, 1):
+            raise ValueError("private PP diagnostic replies require PP3/TP1/DP1")
+        original_ipc(self, port_args)
+        if self.ps.pp_rank == 0:
+            return
+        context = zmq.Context(1)
+        try:
+            sender = SenderWrapper(
+                get_zmq_socket(context, zmq.PUSH, port_args.tokenizer_ipc_name, False)
+            )
+            channels = replace(
+                self.ipc_channels,
+                send_to_tokenizer=DiagnosticSender(
+                    self.ipc_channels.send_to_tokenizer, sender
+                ),
+            )
+        except BaseException:
+            context.destroy(linger=0)
+            raise
+        self._smoke_diagnostic_context = context
+        self._smoke_diagnostic_socket = sender.socket
+        self.ipc_channels = channels
+
+    Scheduler.init_ipc_channels = init_ipc
+    original_release = Scheduler.release_host_resources
+
+    def release(self):
+        try:
+            return original_release(self)
+        finally:
+            socket = getattr(self, "_smoke_diagnostic_socket", None)
+            if socket is not None:
+                socket.close(linger=0)
+                self._smoke_diagnostic_context.term()
+                self._smoke_diagnostic_socket = None
+                self._smoke_diagnostic_context = None
+
+    Scheduler.release_host_resources = release
+    original_communicators = TokenizerControlMixin.init_communicators
+
+    def init_communicators(self, server_args):
+        if (
+            server_args.pp_size,
+            server_args.tp_size,
+            server_args.dp_size,
+            server_args.nnodes,
+        ) != (3, 1, 1, 1):
+            raise ValueError(
+                "private PP diagnostic replies require one-node PP3/TP1/DP1"
+            )
+        original_communicators(self, server_args)
+        self.get_internal_state_communicator.set_fan_out(3)
+        self.set_internal_state_communicator.set_fan_out(3)
+
+    TokenizerControlMixin.init_communicators = init_communicators
 
 
 def install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator):
@@ -369,6 +470,7 @@ def worker(run, cfg):
         "gpu_released": False,
         "performance_sample": False,
         "cuda_graph_enabled": False,
+        "diagnostic_reply_scope": "private one-node PP3/TP1/DP1 get/set state replies",
     }
     original_stream = agentx_replay.stream
     agentx_replay.stream = lambda endpoint, key, payload, timeout=600: original_stream(
