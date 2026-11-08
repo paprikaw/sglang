@@ -239,6 +239,21 @@ def worker(run, cfg):
     signal.signal(signal.SIGALRM, expired)
     signal.alarm(165)
 
+    def checkpoint(stage):
+        evidence["stage"] = stage
+        try:
+            h.save(
+                run / "worker_stage.json",
+                {
+                    "stage": stage,
+                    "timestamp": time.time(),
+                    "elapsed_seconds": time.monotonic() - started,
+                },
+            )
+        except OSError:
+            # Diagnostic output must never prevent owned-process cleanup.
+            pass
+
     def request(tokens, output):
         result = agentx_replay.request_one(
             dict(host="127.0.0.1", port=row["port"], ep=1), None, key, tokens, output, 0
@@ -252,6 +267,7 @@ def worker(run, cfg):
         return h.http_json(row["port"], path, key, payload, timeout=timeout)
 
     try:
+        checkpoint("startup")
         children.append(launch(run, cfg, row, key))
         while True:
             if children[0]["process"].poll() is not None:
@@ -263,8 +279,11 @@ def worker(run, cfg):
                 time.sleep(0.25)
         prefix = [1000 + i % 160 for i in range(512)]
         active_prompt = [2000 + i % 160 for i in range(512)]
+        checkpoint("prefix_reference")
         reference = request(prefix, 24)
+        checkpoint("prefix_warmup")
         request(prefix, 24)
+        checkpoint("active_reference")
         active_reference = request(active_prompt, 256)
 
         def demote():
@@ -291,12 +310,14 @@ def worker(run, cfg):
             ):
                 raise RuntimeError("idle CPU backup/demotion not acknowledged")
 
+        checkpoint("initial_cpu_demotion")
         demote()
         evidence["before"] = http("/get_server_info")
         evidence["transitions"] = []
         for generation, counts in enumerate(
             (cfg["grown_counts"], cfg["initial_counts"]), 1
         ):
+            checkpoint(f"transition_{generation}")
             with cf.ThreadPoolExecutor(max_workers=1) as pool:
                 active = pool.submit(request, active_prompt, 256)
                 deadline = time.monotonic() + 15
@@ -348,7 +369,9 @@ def worker(run, cfg):
         for generation, source_ranks in ((1, (0, 2)), (2, (0, 1, 2))):
             validate_fenced_decode(fence_states, generation, source_ranks, 256)
         evidence["fence_states"] = fence_states
+        checkpoint("final_cpu_demotion")
         demote()
+        checkpoint("final_prefix_restore")
         restore_start = time.time()
         restored = request(prefix, 24)
         if restored["output_ids"] != reference["output_ids"]:
@@ -360,9 +383,11 @@ def worker(run, cfg):
         evidence["final_prefix_restore_events"] = restores
         evidence.update(passed=True, restored=restored, after=info)
     except BaseException as exc:
+        evidence["failed_stage"] = evidence.get("stage", "startup")
         evidence["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         signal.alarm(0)
+        checkpoint("cleanup")
         cleanup = h.cleanup(children)
         elapsed = time.monotonic() - started
         evidence.update(
@@ -374,6 +399,7 @@ def worker(run, cfg):
             and cleanup.get("cleanup_verified", False)
             and elapsed <= 300
         )
+        evidence["stage"] = "done" if evidence["passed"] else "failed"
         h.save(run / "worker_cleanup.json", cleanup)
         h.save(run / "results.json", {"transition": evidence})
         h.save(run / "worker_progress.json", {"completed": int(evidence["passed"])})

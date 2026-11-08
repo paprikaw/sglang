@@ -788,7 +788,11 @@ class ElasticPPMigrationCoordinator:
                 previous_chunk_size = getattr(
                     self.kv_transport, "slot_chunk_size", None
                 )
-                if self.strategy == "sync" and previous_chunk_size is not None:
+                if (
+                    self.strategy == "sync"
+                    and self.backing == "overlap"
+                    and previous_chunk_size is not None
+                ):
                     self.kv_transport.slot_chunk_size = max(1, int(fence_slots.numel()))
                 try:
                     self.kv_transport.exchange_phase(

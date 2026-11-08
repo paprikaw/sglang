@@ -737,3 +737,22 @@ def test_background_cpu_spill_is_rejected_before_background_allocation():
             strategy="background",
             backing="cpu_spill",
         )
+
+
+@pytest.mark.parametrize("strategy", ["sync", "batched"])
+def test_cpu_spill_preserves_bounded_wire_chunks(strategy):
+    coordinator, transition, runner, kv, events = _spill_coordinator(strategy=strategy)
+    kv.slot_chunk_size = 2
+    observed = []
+    exchange = kv.exchange_phase
+
+    def observe_exchange(transition, phase, slot_ids):
+        observed.append((phase, kv.slot_chunk_size))
+        return exchange(transition, phase, slot_ids)
+
+    kv.exchange_phase = observe_exchange
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    coordinator.finalize_at_fence(lambda target: None)
+    assert observed == [("bulk", 2), ("delta", 2)]
+    assert kv.slot_chunk_size == 2

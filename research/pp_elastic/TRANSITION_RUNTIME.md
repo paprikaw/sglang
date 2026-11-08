@@ -7,6 +7,9 @@ fence and bounded transport chunks. `background` allocates unpublished target
 backing and pre-copies immutable weights through CPU/Gloo while the old pipeline
 executes; the final fence still snapshots all mutable KV/GDN and host prefixes.
 It does not claim background KV pre-copy or measured minimum pause.
+CPU-spill sync uses the shared bounded wire chunks to limit temporary source
+payloads. A strategy comparison still requires fixed backing, resources and
+request/cache state; these CPU checkpoints do not measure pause differences.
 
 The default `--elastic-pp-transition-backing overlap` retains source pools until
 commit and cleanup. Native peak admission includes incoming weights, new
@@ -45,7 +48,12 @@ layout and kernel I/O; storage, session-radix and unsupported recurrent modes
 remain rejected. CPU checks qualify this narrow configuration only; dynamic
 GPU state recovery remains unvalidated. The first three short attempts failed
 during startup (CLI host-size type, owned-layer qualification, and native paged
-allocator live-slot discovery); none reached a transition. Native paged
+allocator live-slot discovery); none reached a transition. The fourth attempt
+passed strict three-rank canonical loading and actual paged-allocator discovery,
+then timed out in HiCache initialization before requests. It completed owned
+cleanup in 166.714 seconds; Guard released its lease. The fixed-size host-pool
+MIN collective was skipped by the zero-layer logical pool. Its correction must
+be merged and checked before a newly tagged attempt. Native paged
 allocator support is now merged, with the owned-layer qualification preserved.
 Existing static PP + HiCache runs do not qualify
 this dynamic path. The short real-model acceptance must include startup, warmup,
