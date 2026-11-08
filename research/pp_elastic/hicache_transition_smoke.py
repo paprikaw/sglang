@@ -42,12 +42,35 @@ def install_hooks():
     cache_probe.install()
     from sglang.srt.managers.scheduler import Scheduler
 
+    from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
+
+    original_finalize = ElasticPPMigrationCoordinator.finalize_at_fence
+
+    def finalize(self, publish):
+        scheduler = self.cache_transition.scheduler
+        record = {
+            "generation": self._transition.target.generation,
+            "requests": [
+                {"rid": req.rid, "output_length": len(req.output_ids)}
+                for req in scheduler._elastic_pp_live_requests()
+                if not req.finished()
+            ],
+        }
+        result = original_finalize(self, publish)
+        self._smoke_fence_records = getattr(self, "_smoke_fence_records", []) + [record]
+        return result
+
+    ElasticPPMigrationCoordinator.finalize_at_fence = finalize
     previous_get = Scheduler.get_internal_state
 
     def get_state(self, *args, **kwargs):
         result = previous_get(self, *args, **kwargs)
+        result.internal_state["transition_rank"] = self.pp_rank
         coordinator = getattr(self, "elastic_pp_migration_coordinator", None)
         if coordinator is not None:
+            result.internal_state["transition_fence_records"] = getattr(
+                coordinator, "_smoke_fence_records", []
+            )
             result.internal_state["transition_metrics"] = (
                 coordinator.transition_metrics()
             )
@@ -89,7 +112,7 @@ def engine_entry(cfg, row):
                 "--context-length",
                 "2048",
                 "--hicache-size",
-                "0.5",
+                "1",
                 "--chunked-prefill-size",
                 "1024",
             ]
@@ -128,6 +151,7 @@ def worker(run, cfg):
         "resident_ranks": 3,
         "gpu_released": False,
         "performance_sample": False,
+        "cuda_graph_enabled": False,
     }
     original_stream = agentx_replay.stream
     agentx_replay.stream = lambda endpoint, key, payload, timeout=600: original_stream(
@@ -171,9 +195,22 @@ def worker(run, cfg):
         active_reference = request(active_prompt, 256)
 
         def demote():
-            answer = http(
-                "/set_internal_state", {"server_args": {"agentx_cache_cmd": 2}}
-            )
+            deadline = time.monotonic() + 15
+            while True:
+                answer = http(
+                    "/set_internal_state", {"server_args": {"agentx_cache_cmd": 2}}
+                )
+                states = http("/get_server_info")["internal_states"]
+                probes = [state.get("agentx_cache_probe", {}) for state in states]
+                if all(
+                    probe.get("ongoing_writes") == 0
+                    and probe.get("after") == {"full": 0, "mamba": 0}
+                    for probe in probes
+                ):
+                    break
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("CPU backup and GPU demotion did not finish")
+                time.sleep(0.05)
             if (
                 not isinstance(answer, list)
                 or not answer
@@ -223,22 +260,61 @@ def worker(run, cfg):
                     state["elastic_pp_state"]["migration_phase"] == "done"
                     for state in states
                 ):
+                    evidence["transitions"][-1]["states"] = states
+                    if (
+                        sum(
+                            state.get("transition_metrics", {})
+                            .get("host", {})
+                            .get("host_bytes_sent", 0)
+                            for state in states
+                        )
+                        <= 0
+                    ):
+                        raise AssertionError(
+                            "no CPU-only host payload moved during transition"
+                        )
                     break
                 if time.monotonic() >= deadline:
                     raise TimeoutError("transition cleanup did not complete")
                 time.sleep(0.05)
+        fence_states = http("/get_server_info")["internal_states"]
+        for generation, source_ranks in ((1, (0, 2)), (2, (0, 1, 2))):
+            for state in fence_states:
+                if state["transition_rank"] not in source_ranks:
+                    continue
+                record = next(
+                    r
+                    for r in state["transition_fence_records"]
+                    if r["generation"] == generation
+                )
+                if not any(0 < r["output_length"] < 256 for r in record["requests"]):
+                    raise AssertionError("no active Decode state at actual fence")
+        evidence["fence_states"] = fence_states
         demote()
+        restore_start = time.time()
         restored = request(prefix, 24)
         if restored["output_ids"] != reference["output_ids"]:
             raise AssertionError("CPU-only prefix continuation changed")
         info = http("/get_server_info")
-        restores = [
-            event
+        restores = {
+            state["transition_rank"]: [
+                event
+                for event in state.get("agentx_restores", [])
+                if event["time"] >= restore_start
+            ]
             for state in info["internal_states"]
-            for event in state.get("agentx_restores", [])
-        ]
-        if not any(event.get("loaded_tokens", 0) > 0 for event in restores):
-            raise AssertionError("no positive HiCache CPU loadback evidence")
+        }
+        if not all(
+            any(
+                event.get("loaded_tokens", 0) >= len(prefix)
+                for event in restores.get(rank, [])
+            )
+            for rank in (0, 2)
+        ):
+            raise AssertionError(
+                "final prefix lacks fresh CPU loadback on both active stages"
+            )
+        evidence["final_prefix_restore_events"] = restores
         evidence.update(passed=True, restored=restored, after=info)
     except BaseException as exc:
         evidence["error"] = f"{type(exc).__name__}: {exc}"

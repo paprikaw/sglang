@@ -594,6 +594,10 @@ class ElasticPPMigrationCoordinator:
             # Keep the source generation intact until all ranks can publish.
             local_error = None
             try:
+                device = torch.device(getattr(self.model_runner, "device", "cpu"))
+                if device.type == "cuda":
+                    # Dedicated transfer streams must observe all serving producers.
+                    torch.cuda.synchronize(device)
                 if self.cache_transition is not None:
                     self.cache_transition.prepare_transition(transition)
                 if self.strategy in {"sync", "batched"}:
