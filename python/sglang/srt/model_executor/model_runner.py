@@ -1409,9 +1409,14 @@ class ModelRunner:
         kv_per_layer = (math.prod(k_shape) + math.prod(v_shape)) * item_bytes
         if hasattr(pool, "recurrent_layer_ids"):
             attention_ids = set(pool.elastic_pp_kv_layer_ids(target))
-            kv_bytes = len(
-                attention_ids if source_backing_released else incoming & attention_ids
-            ) * kv_per_layer
+            kv_bytes = (
+                len(
+                    attention_ids
+                    if source_backing_released
+                    else incoming & attention_ids
+                )
+                * kv_per_layer
+            )
             target_ids = pool.recurrent_layer_ids(target)
             state = pool.mamba_pool.mamba_cache
             recurrent_bytes = 0
@@ -1465,8 +1470,44 @@ class ModelRunner:
             total_num_layers=self.model_config.num_hidden_layers,
         )
 
+    def invalidate_elastic_pp_attention_state_views(self):
+        """Drop lazy GDN tracking views at a drained backing change.
+
+        The tracking cache owns full conv/SSM tensors. Keeping its old tuple
+        would pin source storage during CPU spill and track into retired state
+        after an overlap commit. Rebuild it lazily from the current request pool;
+        rollback must not retain an old tuple for restoration.
+        """
+        pending = [
+            getattr(self, "attn_backend", None),
+            getattr(self, "decode_attn_backend", None),
+            *(getattr(self, "decode_attn_backend_group", None) or ()),
+        ]
+        seen = set()
+        while pending:
+            backend = pending.pop()
+            if backend is None or id(backend) in seen:
+                continue
+            seen.add(id(backend))
+            if hasattr(backend, "_track_pools_cache"):
+                del backend._track_pools_cache
+            for name in (
+                "full_attn_backend",
+                "linear_attn_backend",
+                "prefill_backend",
+                "decode_backend",
+                "primary",
+            ):
+                pending.append(getattr(backend, name, None))
+            for name in ("attn_backend_list", "children"):
+                pending.extend(getattr(backend, name, None) or ())
+
     def commit_elastic_pp_kv_layers(self, *, generation: int) -> LayerRange:
-        return self.token_to_kv_pool.commit_elastic_pp_kv_layers(generation=generation)
+        target = self.token_to_kv_pool.commit_elastic_pp_kv_layers(
+            generation=generation
+        )
+        self.invalidate_elastic_pp_attention_state_views()
+        return target
 
     def elastic_pp_kv_ready(self, *, generation: int) -> bool:
         return self.token_to_kv_pool.elastic_pp_kv_ready(generation=generation)

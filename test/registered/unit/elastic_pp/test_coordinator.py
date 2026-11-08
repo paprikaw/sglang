@@ -586,6 +586,9 @@ def _spill_coordinator(*, strategy="sync", fail_stage=None):
     kv.restore_target_from_snapshot = restore_target
     kv.restore_source_backing = lambda transition: events.append("restore_source")
     kv.finalize_source_backing = lambda transition: events.append("finalize_source")
+    runner.invalidate_elastic_pp_attention_state_views = lambda: events.append(
+        "release_backend_aliases"
+    )
     runner.elastic_pp_transition_capacity_report = capacity
     return coordinator, transition, runner, kv, events
 
@@ -597,9 +600,10 @@ def test_cpu_spill_releases_before_allocation_and_retires_only_after_publish(str
     coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
     assert events == []
     coordinator.finalize_at_fence(lambda target: events.append("publish"))
-    assert events[:6] == [
+    assert events[:7] == [
         "host_snapshot",
         "KV_snapshot",
+        "release_backend_aliases",
         "release_aliases",
         "release_backing",
         "capacity",

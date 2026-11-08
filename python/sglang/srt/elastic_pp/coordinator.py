@@ -484,6 +484,11 @@ class ElasticPPMigrationCoordinator:
         before = sample() if device.type == "cuda" else None
         # Partial release failures also require source reconstruction.
         self._source_backing_attempted = True
+        invalidate = getattr(
+            self.model_runner, "invalidate_elastic_pp_attention_state_views", None
+        )
+        if invalidate is not None:
+            invalidate()
         if self.cache_transition is not None:
             self.cache_transition.release_source_device_aliases(transition)
         self._source_backing_metrics["release"] = (
