@@ -450,6 +450,40 @@ def prepare_target_host_cache(cache, *, device_pool, target, generation):
         raise discard_tensor_tracebacks(exc)
 
 
+def clone_cache_runtime_metadata(cache):
+    """Give a target generation private collaborators pointing at its cache."""
+    import copy
+    import types
+    from sglang.srt.session.streaming_session import StreamingSession
+
+    clone = copy.copy(cache)
+    clone.tree_core = copy.copy(cache.tree_core)
+    clone.components = {
+        ct: copy.copy(component) for ct, component in cache.components.items()
+    }
+    clone._components_tuple = tuple(clone.components.values())
+    clone.tree_core.components_by_type = clone.components
+    clone.tree_core.components = clone._components_tuple
+    clone.session_refs = copy.copy(cache.session_refs)
+    clone.session_refs.tree_core = clone.tree_core
+    clone.session_refs.components = clone._components_tuple
+    # copy.copy probes special attributes on the uninitialized wrapper, whose
+    # __getattr__ delegates to inner. Construct it normally instead, retaining
+    # logical slot handles in a private mapping for this generation.
+    clone.session = StreamingSession(inner=clone)
+    clone.session.slots = dict(cache.session.slots)
+    for ct, component in clone.components.items():
+        source = cache.components[ct]
+        component.cache = clone
+        component.tree_core = clone.tree_core
+        # A component can cache one of its own bound methods as an eviction
+        # strategy. Shallow copying that callable would retain the old owner.
+        for name, value in vars(component).items():
+            if isinstance(value, types.MethodType) and value.__self__ is source:
+                setattr(component, name, types.MethodType(value.__func__, component))
+    return clone
+
+
 def _prepare_target_host_cache(cache, *, device_pool, target, generation):
     """Build replacement L2 backing without resetting the live radix tree.
 
@@ -469,18 +503,7 @@ def _prepare_target_host_cache(cache, *, device_pool, target, generation):
     # Only the construction path sees this projected pool. Allocation/free
     # continues through the original shared allocator at publication.
     allocator.get_kvcache = lambda: projected
-    clone = copy.copy(cache)
-    clone.tree_core = copy.copy(cache.tree_core)
-    clone.components = {
-        ct: copy.copy(component) for ct, component in cache.components.items()
-    }
-    clone._components_tuple = tuple(clone.components.values())
-    clone.session_refs = copy.copy(cache.session_refs)
-    clone.session_refs.tree_core = clone.tree_core
-    clone.session_refs.components = clone._components_tuple
-    for component in clone.components.values():
-        component.cache = clone
-        component.tree_core = clone.tree_core
+    clone = clone_cache_runtime_metadata(cache)
     clone.sidecar_pool_specs = []
     clone.token_to_kv_pool_allocator = allocator
     clone.req_to_token_pool = req or cache.req_to_token_pool
@@ -707,14 +730,9 @@ class SchedulerHiCacheTransition:
                     )
                     continue
                 self._request_state = records
-                shadow = copy.copy(cache)
-                shadow.components = {
-                    ct: copy.copy(component)
-                    for ct, component in cache.components.items()
-                }
-                for component in shadow.components.values():
-                    component.cache = shadow
+                shadow = clone_cache_runtime_metadata(cache)
                 shadow.tree_core = restore_tree_metadata(wire["tree"], shadow)
+                shadow.session_refs.tree_core = shadow.tree_core
                 shadow._elastic_host_allocator_metadata = {
                     name: SimpleNamespace(**data)
                     for name, data in wire["allocators"].items()
@@ -988,6 +1006,7 @@ def drain_host_io_at_fence(cache, group, timeout_s=15.0):
 def publish_scheduler_cache(scheduler, clone, model_runner):
     """Rebind retained holders before old host backing can be retired."""
     old = scheduler.tree_cache
+    _rebind_scheduler_cache_contexts(scheduler, old, clone)
     holders = [scheduler]
     for name in (
         "policy",
@@ -999,6 +1018,7 @@ def publish_scheduler_cache(scheduler, clone, model_runner):
         "last_mbs",
         "mbs",
         "cur_batch",
+        "cur_batch_for_debug",
         "batch",
     ):
         value = getattr(scheduler, name, None)
@@ -1015,6 +1035,72 @@ def publish_scheduler_cache(scheduler, clone, model_runner):
     canary = getattr(model_runner, "canary_manager", None)
     if canary is not None:
         canary.attach_radix_cache(clone)
+
+
+def _rebind_scheduler_cache_contexts(scheduler, old, clone):
+    """Rebuild frozen contexts and repair their shared mutable dependencies.
+
+    These are the production Scheduler collaborators retaining a cache or a
+    pool observer. Reinitializing mutable ones can reset counters or recreate
+    sockets/publishers, so they keep their identity. Frozen ones are replaced
+    once and all context references use the same replacement.
+    """
+    import dataclasses
+
+    names = (
+        "dp_attn_adapter",
+        "pool_stats_observer",
+        "invariant_checker",
+        "kv_events_publisher",
+        "load_inquirer",
+        "output_streamer",
+        "batch_result_processor",
+    )
+    roots = {
+        name: value
+        for name in names
+        if (value := getattr(scheduler, name, None)) is not None
+    }
+    contexts = {id(value): value for value in roots.values()}
+    replacements = {}
+    mutable_updates = []
+
+    def rebind(context):
+        identity = id(context)
+        if identity in replacements:
+            return replacements[identity]
+        # Mutable contexts may refer to each other; retain their identity.
+        replacements[identity] = context
+        fields = (
+            (field.name for field in dataclasses.fields(context))
+            if dataclasses.is_dataclass(context)
+            else ("tree_cache", "radix_cache", "pool_stats_observer", "output_streamer")
+        )
+        changes = {}
+        for name in fields:
+            value = getattr(context, name, None)
+            replacement = (
+                clone
+                if value is old
+                else rebind(value) if id(value) in contexts else value
+            )
+            if replacement is not value:
+                changes[name] = replacement
+        if changes:
+            params = getattr(type(context), "__dataclass_params__", None)
+            if params is not None and params.frozen:
+                context = dataclasses.replace(context, **changes)
+            else:
+                mutable_updates.append((context, changes))
+        replacements[identity] = context
+        return context
+
+    target_roots = {name: rebind(value) for name, value in roots.items()}
+    for context, changes in mutable_updates:
+        for name, value in changes.items():
+            setattr(context, name, value)
+    for name, value in target_roots.items():
+        setattr(scheduler, name, value)
 
 
 def discard_host_cache(cache):
