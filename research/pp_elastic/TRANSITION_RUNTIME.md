@@ -20,7 +20,11 @@ The opt-in `cpu_spill` backing contract is wired through the same coordinator
 for `sync` and `batched`: drain host I/O, snapshot mutable state, detach source
 device owners, collectively confirm release, admit against physical free memory,
 allocate target backing, restore retained state and transfer moved layers. It
-includes the cache branch's spill/alias APIs (dependency d252af8c41). Native
+includes the cache branch's spill/alias and receive-staging APIs (dependency
+3f41063832). Spill receives are validated and copied to CPU staging before the
+wire buffers are released; this adds per-rank host admission and byte accounting,
+not an atomic node-wide RAM reservation or a strict long-window peak proof.
+Overlap mode still accumulates incoming GPU rows until import. Native
 eager execution is required; background preparation still needs
 source-plus-target capacity. Admission after spill counts all target KV/GDN,
 including retained layers whose source device owners were released. The runtime
@@ -52,18 +56,19 @@ allocator live-slot discovery); none reached a transition. The fourth attempt
 passed strict three-rank canonical loading and actual paged-allocator discovery,
 then timed out in HiCache initialization before requests. It completed owned
 cleanup in 166.714 seconds; Guard released its lease. The fixed-size host-pool
-MIN collective was skipped by the zero-layer logical pool. Its correction must
-be merged and checked before a newly tagged attempt. Native paged
+MIN collective was skipped by the zero-layer logical pool. The merged fix makes
+all resident ranks join FULL then MAMBA reductions, using neutral values on
+logical pools; the corrected revision still needs a newly tagged GPU attempt. Native paged
 allocator support is now merged, with the owned-layer qualification preserved.
 Existing static PP + HiCache runs do not qualify
 this dynamic path. The short real-model acceptance must include startup, warmup,
 PP2 -> PP3 -> PP2, active KV/GDN/progress, CPU-only prefix loadback, and cleanup
 within 300 seconds; successful server startup alone is not acceptance.
 
-The 2026-11-08 combined checkpoint passed 184 CPU checks across 14 focused files
-in 28.27 seconds. This covers multi-generation three-rank native KV/GDN backing
+The 2026-11-08 combined checkpoint passed 197 CPU checks across 15 focused files
+in 48.97 seconds. This covers multi-generation three-rank native KV/GDN backing
 rebuilds, host transactions, allocator fences, source recovery, OOM exception
 ownership and adversarial acceptance evidence. The exact file list and JUnit
 are preserved at
-`/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/hicache-runtime-combined-20261108-r4`.
+`/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/hicache-runtime-combined-20261108-r5`.
 CPU checks do not prove CUDA ownership release or a successful dynamic GPU run.
