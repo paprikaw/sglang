@@ -69,3 +69,23 @@ rewritten as success after a source fix.
 The grouped [experiment snapshot](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_transition_20261108/manifest.json)
 records exact sources, launch manifests, stable result checksums and cleanup
 proof for r4 and r5. Earlier failed attempts remain at their original paths.
+
+r6 was prepared and tagged at f6d1fe27a0 but never launched. Cross-review found
+that a not-yet-idle demotion can return no probe or an old probe; demotion now
+retries until the same command has three positive acknowledgements and fresh,
+completed probes. Requests now use 512 common prefix tokens plus one fixed
+continuation token: the real Req API reserves the final input token, so a
+512-token input could not prove a full 512-token loadback. The strict loadback
+threshold remains 512. Both prefix and active references are collected after
+warmup at the same match boundary; original cold outputs are also retained.
+
+The new continuation evidence joins each response meta_info.id to the same
+request at all three resident fences. It requires zero cumulative retractions,
+zero Prefill launches after the first Decode, and an actual post-fence Decode
+launch on each target-active rank. Counts cover active model-launch batches;
+zero-layer passthrough is excluded. Per-request records contain only IDs and
+integers, with no retained request or tensor owners. The repaired harness and
+scheduler boundaries have 57 passing CPU checks, including real cache-probe
+hook retries, the actual Req prefix cutoff, actual ForwardMode values and
+adversarial retraction/re-prefill/request-ID evidence. A new immutable r7 is
+required before the next GPU run. None of these CPU changes is a dynamic pass.

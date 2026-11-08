@@ -77,3 +77,11 @@ ownership and adversarial acceptance evidence. The exact file list and JUnit
 are preserved at
 `/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/hicache-runtime-combined-20261108-r5`.
 CPU checks do not prove CUDA ownership release or a successful dynamic GPU run.
+
+The r6 source/tag was prepared but not launched. Pre-launch review corrected
+fresh all-rank idle-demotion acknowledgement and the actual request prefix
+cutoff. The next protocol uses 512 cached prefix tokens plus one fixed query
+token and requires fresh loadback of all 512. Warm references and original cold
+outputs are retained. Exact request IDs, cumulative retractions and active
+model-launch modes now distinguish continued Decode from re-prefill; 57 focused
+harness/scheduler checks pass. This does not qualify the pending GPU run.

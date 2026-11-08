@@ -95,6 +95,121 @@ def fresh_prefix_restores(states, started_at, active_ranks, prefix_length):
     return restores
 
 
+def validate_uninterrupted_decode(
+    states, generation, result, source_ranks, target_ranks
+):
+    ranks = rank_states(states)
+    meta = result.get("meta_info", {})
+    rid = meta.get("id")
+    if not isinstance(rid, str) or not rid or meta.get("num_retractions") != 0:
+        raise AssertionError(
+            "active response lacks request identity or has retractions"
+        )
+    fences = {}
+    for rank, state in ranks.items():
+        records = [
+            record
+            for record in state.get("transition_fence_records", [])
+            if record["generation"] == generation
+        ]
+        if len(records) != 1:
+            raise AssertionError("missing unique request fence for this generation")
+        requests = [req for req in records[0]["requests"] if req["rid"] == rid]
+        if len(requests) != 1:
+            raise AssertionError("active response does not match the fenced request")
+        request = requests[0]
+        if rank in source_ranks and not (
+            0 < request["output_length"] < len(result["output_ids"])
+        ):
+            raise AssertionError("matched request was not in Decode at its fence")
+        if (
+            request.get("retraction_count") != 0
+            or request.get("is_retracted") is not False
+        ):
+            raise AssertionError("fenced request has retracted")
+        execution = state.get("transition_request_execution", {}).get(rid, {})
+        if (
+            execution.get("max_retraction_count") != 0
+            or execution.get("prefill_after_decode") != 0
+        ):
+            raise AssertionError(
+                "active request retracted or re-prefilled after Decode"
+            )
+        if rank in target_ranks and execution.get("decode_batches", 0) <= request.get(
+            "execution", {}
+        ).get("decode_batches", 0):
+            raise AssertionError(
+                "target stage has no resumed Decode launch for the request"
+            )
+        fences[rank] = {"at_fence": request, "after": execution}
+    return {"rid": rid, "generation": generation, "ranks": fences}
+
+
+def observe_request_launch(scheduler, batch):
+    executions = getattr(scheduler, "_smoke_request_execution", None)
+    if executions is None:
+        executions = scheduler._smoke_request_execution = {}
+    for req in batch.reqs:
+        execution = executions.setdefault(
+            req.rid,
+            {
+                "decode_batches": 0,
+                "initial_prefill_batches": 0,
+                "prefill_after_decode": 0,
+                "max_retraction_count": 0,
+            },
+        )
+        if batch.forward_mode.is_decode():
+            execution["decode_batches"] += 1
+        elif batch.forward_mode.is_extend():
+            key = (
+                "prefill_after_decode"
+                if execution["decode_batches"]
+                else "initial_prefill_batches"
+            )
+            execution[key] += 1
+        execution["max_retraction_count"] = max(
+            execution["max_retraction_count"], req.retraction_count
+        )
+
+
+def correctness_prompts():
+    common_prefix = [1000 + i % 160 for i in range(512)]
+    active_prefix = [2000 + i % 160 for i in range(512)]
+    # Req reserves the final input token, so 513 input permits the full 512
+    # cached tokens and their aligned recurrent checkpoint to be matched.
+    return common_prefix + [1160], active_prefix + [2160], len(common_prefix)
+
+
+def demote_cpu_prefixes(http):
+    deadline = time.monotonic() + 15
+    while True:
+        commanded_at = time.time()
+        answer = http("/set_internal_state", {"server_args": {"agentx_cache_cmd": 2}})
+        states = rank_states(http("/get_server_info")["internal_states"])
+        probes = [state.get("agentx_cache_probe") or {} for state in states.values()]
+        acknowledged = (
+            isinstance(answer, list)
+            and len(answer) == len(states)
+            and all(value is True for value in answer)
+        )
+        if acknowledged and all(
+            probe.get("command") == 2
+            and probe.get("time", 0) >= commanded_at
+            and probe.get("ongoing_writes") == 0
+            and probe.get("after") == {"full": 0, "mamba": 0}
+            for probe in probes
+        ):
+            return {
+                "commanded_at": commanded_at,
+                "acknowledged": answer,
+                "probes": probes,
+            }
+        if time.monotonic() >= deadline:
+            raise TimeoutError("CPU backup and GPU demotion did not finish")
+        time.sleep(0.05)
+
+
 def install_hooks():
     spec = importlib.util.spec_from_file_location(
         "transition_native_adapter", base.NATIVE / "a100_runtime_adapter.py"
@@ -118,6 +233,14 @@ def install_hooks():
 
 
 def install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator):
+    original_launch = Scheduler._record_batch_launch
+
+    def launch(self, batch):
+        result = original_launch(self, batch)
+        observe_request_launch(self, batch)
+        return result
+
+    Scheduler._record_batch_launch = launch
     original_finalize = ElasticPPMigrationCoordinator.finalize_at_fence
 
     def finalize(self, publish):
@@ -125,7 +248,17 @@ def install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator):
         record = {
             "generation": self._transition.target.generation,
             "requests": [
-                {"rid": req.rid, "output_length": len(req.output_ids)}
+                {
+                    "rid": req.rid,
+                    "output_length": len(req.output_ids),
+                    "retraction_count": req.retraction_count,
+                    "is_retracted": req.is_retracted,
+                    "execution": dict(
+                        getattr(scheduler, "_smoke_request_execution", {}).get(
+                            req.rid, {}
+                        )
+                    ),
+                }
                 for req in scheduler._elastic_pp_live_requests()
                 if not req.finished()
             ],
@@ -148,6 +281,13 @@ def install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator):
             result.internal_state["transition_metrics"] = (
                 coordinator.transition_metrics()
             )
+        result.internal_state["transition_request_execution_scope"] = (
+            "active model-launch batches; zero-layer passthrough excluded"
+        )
+        result.internal_state["transition_request_execution"] = {
+            rid: dict(value)
+            for rid, value in getattr(self, "_smoke_request_execution", {}).items()
+        }
         result.internal_state["transition_active_output_lengths"] = sorted(
             len(req.output_ids)
             for req in self._elastic_pp_live_requests()
@@ -281,41 +421,31 @@ def worker(run, cfg):
                 break
             except (OSError, ValueError):
                 time.sleep(0.25)
-        prefix = [1000 + i % 160 for i in range(512)]
-        active_prompt = [2000 + i % 160 for i in range(512)]
+        prefix, active_prompt, common_prefix_length = correctness_prompts()
+        evidence["workload"] = {
+            "common_prefix_tokens": common_prefix_length,
+            "fixed_continuation_tokens": 1,
+            "prefix_input_tokens": len(prefix),
+            "active_input_tokens": len(active_prompt),
+            "reference_cache_state": "warmed at the same prefix-match boundary",
+        }
+        checkpoint("prefix_warmup")
+        cold_prefix = request(prefix, 24)
         checkpoint("prefix_reference")
         reference = request(prefix, 24)
-        checkpoint("prefix_warmup")
-        request(prefix, 24)
+        checkpoint("active_warmup")
+        cold_active = request(active_prompt, 256)
         checkpoint("active_reference")
         active_reference = request(active_prompt, 256)
-
-        def demote():
-            deadline = time.monotonic() + 15
-            while True:
-                answer = http(
-                    "/set_internal_state", {"server_args": {"agentx_cache_cmd": 2}}
-                )
-                states = http("/get_server_info")["internal_states"]
-                probes = [state.get("agentx_cache_probe", {}) for state in states]
-                if all(
-                    probe.get("ongoing_writes") == 0
-                    and probe.get("after") == {"full": 0, "mamba": 0}
-                    for probe in probes
-                ):
-                    break
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("CPU backup and GPU demotion did not finish")
-                time.sleep(0.05)
-            if (
-                not isinstance(answer, list)
-                or not answer
-                or not all(x is True for x in answer)
-            ):
-                raise RuntimeError("idle CPU backup/demotion not acknowledged")
+        evidence["references"] = {
+            "cold_prefix": cold_prefix,
+            "prefix": reference,
+            "cold_active": cold_active,
+            "active": active_reference,
+        }
 
         checkpoint("initial_cpu_demotion")
-        demote()
+        evidence["initial_demotion"] = demote_cpu_prefixes(http)
         evidence["before"] = http("/get_server_info")
         evidence["transitions"] = []
         for generation, counts in enumerate(
@@ -365,6 +495,15 @@ def worker(run, cfg):
                         (0, 2) if generation == 1 else (0, 1, 2),
                         cfg.get("backing", "overlap"),
                     )
+                    evidence["transitions"][-1]["continuation"] = (
+                        validate_uninterrupted_decode(
+                            states,
+                            generation,
+                            result,
+                            (0, 2) if generation == 1 else (0, 1, 2),
+                            (0, 1, 2) if generation == 1 else (0, 2),
+                        )
+                    )
                     break
                 if time.monotonic() >= deadline:
                     raise TimeoutError("transition cleanup did not complete")
@@ -374,7 +513,7 @@ def worker(run, cfg):
             validate_fenced_decode(fence_states, generation, source_ranks, 256)
         evidence["fence_states"] = fence_states
         checkpoint("final_cpu_demotion")
-        demote()
+        evidence["final_demotion"] = demote_cpu_prefixes(http)
         checkpoint("final_prefix_restore")
         restore_start = time.time()
         restored = request(prefix, 24)
@@ -382,7 +521,7 @@ def worker(run, cfg):
             raise AssertionError("CPU-only prefix continuation changed")
         info = http("/get_server_info")
         restores = fresh_prefix_restores(
-            info["internal_states"], restore_start, (0, 2), len(prefix)
+            info["internal_states"], restore_start, (0, 2), common_prefix_length
         )
         evidence["final_prefix_restore_events"] = restores
         evidence.update(passed=True, restored=restored, after=info)
