@@ -55,6 +55,45 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
             ),
         }
 
+    def snapshot_at_fence(self, transition):
+        size = super().snapshot_at_fence(transition)
+        free = set(
+            int(i) for i in self.pool.req_to_token_pool.mamba_allocator.free_slots
+        )
+        slots = torch.tensor(
+            [i for i in range(self.pool.recurrent_slot_count) if i not in free],
+            dtype=torch.int64,
+        )
+        layers = {
+            layer
+            for edge in self.outbound_transfers(transition)
+            for layer in self.pool.recurrent_layer_ids(edge.layer_range)
+        }
+        states = {}
+        for layer in sorted(layers):
+            tensors = self.pool.export_recurrent_slots(
+                layer_id=layer, slot_ids=slots.to(self.pool.device)
+            )
+            states[layer] = {
+                name: t.detach().cpu().clone() for name, t in tensors.items()
+            }
+        req_pool = self.pool.req_to_token_pool
+        self._fence_snapshot["request_state"] = {
+            "free_slots": list(req_pool.free_slots),
+            "recurrent_free_slots": req_pool.mamba_allocator.free_slots.detach()
+            .cpu()
+            .clone(),
+            "mapping": req_pool.req_index_to_mamba_index_mapping.detach().cpu().clone(),
+            "generation": req_pool.req_generation.detach().cpu().clone(),
+        }
+        self._fence_snapshot["recurrent_slots"] = slots
+        self._fence_snapshot["recurrent"] = states
+        return size + sum(
+            t.numel() * t.element_size()
+            for tensors in states.values()
+            for t in tensors.values()
+        )
+
     def send_phase(self, *args, **kwargs):
         raise NotImplementedError("hybrid PP migration requires fenced exchange_phase")
 

@@ -14,6 +14,8 @@ import json
 
 import torch
 
+from sglang.srt.elastic_pp.layer_transport import ElasticPPLayerTransport
+
 
 @dataclass(frozen=True)
 class HostNode:
@@ -225,8 +227,7 @@ class HiCacheTransitionAdapter:
                 works = self.group.send_tensor_dict(
                     wire, dst=edge.dst_rank, async_send=True
                 )
-                for work in works or ():
-                    work.wait()
+                ElasticPPLayerTransport.wait(works or ())
             elif self.rank == edge.dst_rank:
                 wire = self.group.recv_tensor_dict(src=edge.src_rank)
                 if wire.get("generation") != self._generation:
@@ -315,35 +316,32 @@ class HiCacheTransitionAdapter:
 
 
 def clone_host_allocator(source, target):
-    """Keep live host addresses and allocation order when replacing backing."""
-    if target.logical_size < source.logical_size:
-        raise RuntimeError("target host pool cannot preserve source allocator capacity")
-    for name in (
-        "free_slots",
-        "release_slots",
-        "num_release_slots",
-        "mem_state",
-        "slot_used",
-    ):
-        if not hasattr(source, name):
-            continue
-        value = getattr(source, name)
-        if isinstance(value, torch.Tensor):
-            if name in ("mem_state", "slot_used"):
-                if not hasattr(target, name):
-                    continue
-                getattr(target, name)[: source.logical_size].copy_(value)
-            else:
-                setattr(target, name, value.clone())
-        elif isinstance(value, list):
-            setattr(target, name, [v.clone() for v in value])
-        else:
-            setattr(target, name, value)
-    if hasattr(target, "slot_used") and not hasattr(source, "slot_used"):
-        target.slot_used[: source.logical_size] = True
-        target.slot_used[source.free_slots] = False
-        for released in source.release_slots:
-            target.slot_used[released] = False
+    """Preserve live addresses and free-list order; discard only free capacity."""
+    limit = min(source.logical_size, target.logical_size)
+    free = torch.as_tensor(source.free_slots, dtype=torch.int64).cpu()
+    releases = [
+        torch.as_tensor(v, dtype=torch.int64).cpu() for v in source.release_slots
+    ]
+    used = torch.ones(source.logical_size, dtype=torch.bool)
+    used[free] = False
+    for value in releases:
+        used[value] = False
+    if hasattr(source, "slot_used") and not torch.equal(used, source.slot_used.cpu()):
+        raise RuntimeError("source host allocator free lists and used slots disagree")
+    if used[limit:].any():
+        raise RuntimeError("target host pool cannot preserve live high host slots")
+    target.free_slots = free[free < target.logical_size].clone()
+    target.release_slots = [
+        v[v < target.logical_size].clone()
+        for v in releases
+        if (v < target.logical_size).any()
+    ]
+    target.num_release_slots = sum(len(v) for v in target.release_slots)
+    if hasattr(target, "slot_used"):
+        target.slot_used.zero_()
+        target.slot_used[:limit].copy_(used[:limit])
+    if hasattr(target, "mem_state") and hasattr(source, "mem_state"):
+        target.mem_state[:limit].copy_(source.mem_state[:limit])
     if target.logical_size > source.logical_size:
         target.free_slots = torch.cat(
             (
@@ -574,13 +572,12 @@ class SchedulerHiCacheTransition:
                 canonical_wire = {"error": f"{type(exc).__name__}: {exc}"}
         for destination in dormant:
             if self.rank == canonical:
-                for work in (
+                ElasticPPLayerTransport.wait(
                     self.group.send_tensor_dict(
                         canonical_wire, dst=destination, async_send=True
                     )
                     or ()
-                ):
-                    work.wait()
+                )
             elif self.rank == destination:
                 wire = self.group.recv_tensor_dict(src=canonical)
                 if "error" in wire:

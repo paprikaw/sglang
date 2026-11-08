@@ -260,6 +260,42 @@ class ElasticPPKVTransport:
             )
         )
 
+    def snapshot_at_fence(self, transition: DynamicPPTransition):
+        """Independent CPU backup of live outgoing KV before target allocation.
+
+        Source tensors are retained too. This backup does not imply physical
+        source-pool release or support for token-capacity resizing.
+        """
+        slots = self.allocator.elastic_pp_live_slots().detach().cpu().clone()
+        layers = {
+            layer
+            for edge in self.outbound_transfers(transition)
+            for layer in self._kv_layer_ids(edge)
+        }
+        backup = {}
+        for layer in sorted(layers):
+            tensors = self.pool.export_elastic_pp_kv_slots(
+                layer_id=layer, slot_ids=slots
+            )
+            backup[layer] = tuple(t.detach().cpu().clone() for t in tensors)
+        self._fence_snapshot = {
+            "generation": transition.target.generation,
+            "slots": slots,
+            "layers": backup,
+        }
+        return sum(
+            t.numel() * t.element_size() for pair in backup.values() for t in pair
+        )
+
+    def release_fence_snapshot(self, transition):
+        snapshot = getattr(self, "_fence_snapshot", None)
+        if (
+            snapshot is not None
+            and snapshot["generation"] != transition.target.generation
+        ):
+            raise RuntimeError("elastic PP KV snapshot generation mismatch")
+        self._fence_snapshot = None
+
     def prepare_transition(self, transition: DynamicPPTransition) -> None:
         """Prepare backing without reading or tracking the serving allocator.
 
@@ -622,6 +658,7 @@ class ElasticPPKVTransport:
         return frozenset(loaded)
 
     def abort_staged(self, transition: DynamicPPTransition) -> None:
+        self.release_fence_snapshot(transition)
         generation = transition.target.generation
         self._staged_chunks = {
             key: value

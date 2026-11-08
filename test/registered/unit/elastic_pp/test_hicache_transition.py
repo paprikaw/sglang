@@ -270,3 +270,43 @@ def test_publish_rebinds_batches_policy_and_sessions():
     assert all(
         holder.tree_cache is new for holder in (scheduler, batch, policy, session)
     )
+
+
+def test_allocator_shrink_clips_only_free_high_capacity():
+    from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
+    from sglang.srt.elastic_pp.hicache_transition import clone_host_allocator
+
+    source = LogicalHostPool(8, 1)
+    source.alloc(2)
+    target = LogicalHostPool(4, 1)
+    clone_host_allocator(source, target)
+    assert target.free_slots.tolist() == [2, 3]
+    source.alloc(4)
+    with pytest.raises(RuntimeError, match="live high host slots"):
+        clone_host_allocator(source, target)
+
+
+def test_native_work_wrapper_is_waited():
+    class Handle:
+        waited = False
+
+        def wait(self):
+            self.waited = True
+
+    handle = Handle()
+
+    class NativeWire(Wire):
+        def send_tensor_dict(self, payload, **kwargs):
+            self.payload = payload
+            return [NS(work=handle, payload=payload)]
+
+    src = HiCacheTransitionAdapter(
+        cache=cache(),
+        pools={0: {3: {"k": torch.ones(5, 4)}}},
+        group=NativeWire(),
+        rank=0,
+    )
+    tx = transition()
+    src.prepare_transition(tx)
+    src.exchange_at_fence(tx)
+    assert handle.waited
