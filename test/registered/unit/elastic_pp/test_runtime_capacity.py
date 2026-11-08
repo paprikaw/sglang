@@ -11,7 +11,7 @@ from sglang.srt.elastic_pp.topology import DynamicPPTransition, PPTopology
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 
-def capacity_report(runner, transition):
+def capacity_report(runner, transition, **kwargs):
     # Load the production method without importing CUDA model backends.
     path = (
         Path(__file__).resolve().parents[4]
@@ -33,7 +33,7 @@ def capacity_report(runner, transition):
         compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
         namespace,
     )
-    return namespace[method.name](runner, transition)
+    return namespace[method.name](runner, transition, **kwargs)
 
 
 def transition():
@@ -95,3 +95,39 @@ def test_native_peak_rejection_occurs_before_allocation(monkeypatch):
     with pytest.raises(RuntimeError, match="peak capacity rejected"):
         capacity_report(runner(pool, device="cuda:0"), transition())
     assert not pool._elastic_pp_pending_kv
+
+
+def test_spilled_admission_counts_retained_target_backing():
+    pool = MHATokenToKVPool(
+        size=8,
+        page_size=1,
+        dtype=torch.float32,
+        head_num=1,
+        head_dim=2,
+        layer_num=4,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+    change = transition()
+    instance = runner(pool)
+    instance.ps.pp_rank = 0
+    overlap = capacity_report(instance, change)
+    spilled = capacity_report(instance, change, source_backing_released=True)
+    assert overlap["kv_bytes"] == 0
+    assert spilled["kv_bytes"] == 2 * 2 * 9 * 2 * 4
+    assert spilled["source_backing_released"]
+    assert not spilled["native_overlap_checked"]
+
+
+def test_spilled_unchanged_gdn_layer_map_still_needs_replacement(hybrid_pool_factory):
+    pool = hybrid_pool_factory(start_layer=0, end_layer=4)
+    topology = PPTopology.from_layer_counts([4, 0], generation=0)
+    change = DynamicPPTransition.build(
+        topology, PPTopology.from_layer_counts([4, 0], generation=1)
+    )
+    instance = runner(pool)
+    instance.ps.pp_rank = 0
+    overlap = capacity_report(instance, change)
+    spilled = capacity_report(instance, change, source_backing_released=True)
+    assert overlap["recurrent_bytes"] == 0
+    assert spilled["recurrent_bytes"] > 0

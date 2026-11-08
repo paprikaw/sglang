@@ -551,6 +551,54 @@ def test_drained_fence_commits_route_replies_and_defers_cleanup():
     assert scheduler._pp_microstep == 4
 
 
+def test_reversible_target_rejection_resumes_source_at_common_ring_boundary():
+    scheduler = _FakeScheduler(rank=0)
+    source = _pp2_topology(generation=0)
+    target = PPTopology.from_layer_counts([2, 2, 0, 4], generation=1)
+    coordinator = _FakeMigrationCoordinator(DynamicPPTransition.build(source, target))
+    scheduler._pp_install_topology(source)
+    scheduler.elastic_pp_migration_coordinator = coordinator
+    scheduler._elastic_pp_draining = True
+    scheduler._elastic_pp_pending_req = None
+    scheduler.mbs = [None, None, None, None]
+    scheduler.last_rank_comm_queue = deque()
+    scheduler.pp_outputs = None
+    scheduler.send_req_work = []
+    scheduler.send_proxy_work = []
+    scheduler.send_output_work = []
+
+    def reject_target(publish):
+        coordinator.phase = ElasticPPMigrationPhase.FAILED
+        raise RuntimeError("target OOM; every source restored")
+
+    coordinator.finalize_at_fence = reject_target
+    assert not scheduler._elastic_pp_finalize_if_drained()
+    assert scheduler._pp_topology() == source
+    assert scheduler._pp_microstep == 4
+    assert not scheduler._elastic_pp_draining
+    assert coordinator.cleanup_event is None
+
+
+def test_async_cleanup_failure_stops_the_next_serving_microstep():
+    scheduler = _FakeScheduler(rank=0)
+    source = _pp2_topology(generation=0)
+    target = PPTopology.from_layer_counts([2, 2, 0, 4], generation=1)
+    coordinator = _FakeMigrationCoordinator(
+        DynamicPPTransition.build(source, target), phase=ElasticPPMigrationPhase.FAILED
+    )
+    original_snapshot = coordinator.snapshot
+    coordinator.snapshot = lambda: SimpleNamespace(
+        **(
+            vars(original_snapshot())
+            | {"source_usable": False, "error": "cleanup failed"}
+        )
+    )
+    scheduler.elastic_pp_migration_coordinator = coordinator
+    scheduler._elastic_pp_pending_req = None
+    with pytest.raises(RuntimeError, match="serving must stop"):
+        scheduler._elastic_pp_drain_due()
+
+
 def test_reconfigure_request_starts_prepare_without_blocking_scheduler_ring():
     scheduler = _FakeScheduler(rank=0)
     source = _pp2_topology(generation=0)

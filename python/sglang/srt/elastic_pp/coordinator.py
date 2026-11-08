@@ -72,6 +72,7 @@ class ElasticPPMigrationCoordinator:
         fence_lead_steps: int = 0,
         strategy: str | None = None,
         cache_transition: Any = None,
+        backing: str | None = None,
     ) -> None:
         # Test doubles without server_args retain the pre-existing allocation-only
         # protocol. Real runners select one of the three explicit policies.
@@ -81,7 +82,16 @@ class ElasticPPMigrationCoordinator:
         )
         if self.strategy not in {"sync", "background", "batched", "legacy"}:
             raise ValueError(f"unknown elastic PP transition strategy: {self.strategy}")
+        self.backing = backing or getattr(
+            args, "elastic_pp_transition_backing", "overlap"
+        )
+        if self.backing not in {"overlap", "cpu_spill"}:
+            raise ValueError(f"unknown elastic PP transition backing: {self.backing}")
+        if self.backing == "cpu_spill" and self.strategy not in {"sync", "batched"}:
+            raise ValueError("CPU-spill backing requires sync or batched transition")
         self.cache_transition = cache_transition
+        self._source_backing_attempted = False
+        self._source_backing_metrics: dict[str, Any] = {}
         self._layers_precopied = False
         self._background_weight_bytes_sent = 0
         self._observed_cuda_allocated_peak = 0
@@ -199,6 +209,8 @@ class ElasticPPMigrationCoordinator:
             self._layers_precopied = False
             self._background_weight_bytes_sent = 0
             self._observed_cuda_allocated_peak = 0
+            self._source_backing_attempted = False
+            self._source_backing_metrics = {}
             self._drain_consensus_tensor = None
             self._drain_consensus_work = None
             self._thread = Thread(
@@ -237,6 +249,10 @@ class ElasticPPMigrationCoordinator:
                 "elastic PP consensus returned the wrong rank count: "
                 f"got={len(reports)}, expected={self.group.world_size}"
             )
+        if any(not isinstance(peer, dict) for peer in reports) or {
+            peer.get("rank") for peer in reports
+        } != set(range(self.group.world_size)):
+            raise RuntimeError("elastic PP consensus requires every resident rank once")
         for peer in reports:
             if not isinstance(peer, dict):
                 raise RuntimeError(f"invalid elastic PP consensus report: {peer!r}")
@@ -379,6 +395,8 @@ class ElasticPPMigrationCoordinator:
             "generation": snapshot.generation,
             "rank": self.rank,
             "strategy": self.strategy,
+            "backing_policy": self.backing,
+            "source_backing": dict(self._source_backing_metrics),
             "phase": snapshot.phase.value,
             "prepare_seconds": snapshot.prepare_seconds,
             "fence_seconds": snapshot.fence_seconds,
@@ -404,7 +422,11 @@ class ElasticPPMigrationCoordinator:
                 self.model_runner, "elastic_pp_transition_capacity_report", None
             )
             if method is not None:
-                details = method(transition)
+                details = (
+                    method(transition, source_backing_released=True)
+                    if self._source_backing_attempted
+                    else method(transition)
+                )
         except BaseException as exc:
             local_error = f"{type(exc).__name__}: {exc}"
         reports = self._consensus(
@@ -417,10 +439,69 @@ class ElasticPPMigrationCoordinator:
 
     def _prepare_backing(self, transition: DynamicPPTransition) -> None:
         """Shared target allocation; sync policies call only after draining."""
-        self.layer_transport.prepare_target(transition)
         self._layer_prepared = True
-        self.kv_transport.prepare_transition(transition)
+        self.layer_transport.prepare_target(transition)
         self._kv_prepared = True
+        self.kv_transport.prepare_transition(transition)
+        if self._source_backing_attempted:
+            self._source_backing_metrics["target_restore"] = (
+                self.kv_transport.restore_target_from_snapshot(transition)
+            )
+        self._observe_memory()
+
+    def _release_source_backing_at_fence(self, transition):
+        if getattr(self.model_runner, "_unified_memory_pool", None) is not None:
+            raise NotImplementedError(
+                "CPU spill requires independently owned KV backing"
+            )
+        for name in (
+            "release_source_backing",
+            "restore_source_backing",
+            "restore_target_from_snapshot",
+            "finalize_source_backing",
+        ):
+            if not callable(getattr(self.kv_transport, name, None)):
+                raise NotImplementedError(f"CPU spill transport is missing {name}")
+        if self.cache_transition is not None:
+            for name in (
+                "release_source_device_aliases",
+                "restore_source_device_aliases",
+                "finalize_source_device_aliases",
+            ):
+                if not callable(getattr(self.cache_transition, name, None)):
+                    raise NotImplementedError(
+                        f"CPU spill host adapter is missing {name}"
+                    )
+        device = torch.device(getattr(self.model_runner, "device", "cpu"))
+
+        def sample():
+            return {
+                "allocated_bytes": torch.cuda.memory_allocated(device),
+                "reserved_bytes": torch.cuda.memory_reserved(device),
+                "free_bytes": torch.cuda.mem_get_info(device)[0],
+            }
+
+        before = sample() if device.type == "cuda" else None
+        # Partial release failures also require source reconstruction.
+        self._source_backing_attempted = True
+        if self.cache_transition is not None:
+            self.cache_transition.release_source_device_aliases(transition)
+        self._source_backing_metrics["release"] = (
+            self.kv_transport.release_source_backing(transition)
+        )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            with torch.cuda.device(device):
+                # Admission uses physical free bytes. Return unused allocator
+                # blocks before that measurement, after tensor owners detach.
+                torch.cuda.empty_cache()
+            after = sample()
+            self._source_backing_metrics["cuda_release"] = {
+                "before": before,
+                "after": after,
+                "allocated_drop_bytes": before["allocated_bytes"]
+                - after["allocated_bytes"],
+            }
         self._observe_memory()
 
     def _precopy_immutable_weights(self, transition: DynamicPPTransition) -> None:
@@ -563,8 +644,7 @@ class ElasticPPMigrationCoordinator:
                 self._phase = ElasticPPMigrationPhase.BULK_READY
                 self._condition.notify_all()
         except BaseException as exc:
-            self._abort_prepared_generation()
-            self._fail(exc, source_usable=True)
+            self._fail_before_publication(exc)
 
     def finalize_at_fence(
         self, commit_topology: Callable[[PPTopology], None]
@@ -611,6 +691,18 @@ class ElasticPPMigrationCoordinator:
                 "fence_snapshot", success=local_error is None, error=local_error
             )
             self._raise_peer_failures("fence snapshot", reports)
+            if self.backing == "cpu_spill":
+                local_error = None
+                try:
+                    self._release_source_backing_at_fence(transition)
+                except BaseException as exc:
+                    local_error = f"{type(exc).__name__}: {exc}"
+                reports = self._consensus(
+                    "source_backing_release",
+                    success=local_error is None,
+                    error=local_error,
+                )
+                self._raise_peer_failures("source backing release", reports)
             if self.strategy in {"sync", "batched"}:
                 self._preflight_capacity(transition)
             local_error = None
@@ -775,8 +867,9 @@ class ElasticPPMigrationCoordinator:
             return transition.target
         except BaseException as exc:
             if not commit_started:
-                self._abort_prepared_generation()
-            self._fail(exc, source_usable=not commit_started)
+                self._fail_before_publication(exc)
+            else:
+                self._fail(exc, source_usable=False)
             raise
 
     def start_cleanup(self, completion_event: Any = None) -> None:
@@ -816,6 +909,12 @@ class ElasticPPMigrationCoordinator:
                 self.model_runner.cleanup_elastic_pp_generation(
                     generation=transition.target.generation
                 )
+                if self._source_backing_attempted:
+                    # Every rank already acknowledged publication. CPU source
+                    # authority can now be retired, never used for rollback.
+                    self.kv_transport.finalize_source_backing(transition)
+                    if self.cache_transition is not None:
+                        self.cache_transition.finalize_source_device_aliases(transition)
                 if self.cache_transition is not None:
                     self.cache_transition.release_retired()
                 release_snapshot = getattr(
@@ -854,27 +953,67 @@ class ElasticPPMigrationCoordinator:
         if transition is None:
             return
         generation = transition.target.generation
+        errors = []
+
+        def attempt(name, action):
+            try:
+                action()
+            except BaseException as exc:
+                errors.append(f"{name}: {type(exc).__name__}: {exc}")
+
         if self.cache_transition is not None:
-            try:
-                self.cache_transition.abort(transition)
-            except BaseException:
-                logger.exception("Elastic PP host cache abort failed")
-        try:
-            self.kv_transport.abort_staged(transition)
-        except BaseException:
-            pass
+            attempt("host abort", lambda: self.cache_transition.abort(transition))
+        attempt("KV staging abort", lambda: self.kv_transport.abort_staged(transition))
         if self._kv_prepared:
-            try:
-                self.model_runner.abort_elastic_pp_kv_layers(generation=generation)
-            except BaseException:
-                pass
+            attempt(
+                "KV backing abort",
+                lambda: self.model_runner.abort_elastic_pp_kv_layers(
+                    generation=generation
+                ),
+            )
             self._kv_prepared = False
         if self._layer_prepared:
-            try:
-                self.model_runner.abort_elastic_pp_layers(generation=generation)
-            except BaseException:
-                pass
+            attempt(
+                "weight backing abort",
+                lambda: self.model_runner.abort_elastic_pp_layers(
+                    generation=generation
+                ),
+            )
             self._layer_prepared = False
+        if self._source_backing_attempted:
+            attempt(
+                "source backing restore",
+                lambda: self.kv_transport.restore_source_backing(transition),
+            )
+            if self.cache_transition is not None:
+                attempt(
+                    "source host device aliases restore",
+                    lambda: self.cache_transition.restore_source_device_aliases(
+                        transition
+                    ),
+                )
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+    def _fail_before_publication(self, exc: BaseException) -> None:
+        """Resume only after every resident rank proves source rollback."""
+        try:
+            local_error = None
+            try:
+                self._abort_prepared_generation()
+            except BaseException as rollback_exc:
+                local_error = f"{type(rollback_exc).__name__}: {rollback_exc}"
+            reports = self._consensus(
+                "abort_restore", success=local_error is None, error=local_error
+            )
+            self._raise_peer_failures("source rollback", reports)
+        except BaseException as rollback_exc:
+            self._fail(
+                RuntimeError(f"{exc}; source rollback unverified: {rollback_exc}"),
+                source_usable=False,
+            )
+        else:
+            self._fail(exc, source_usable=True)
 
     def _fail(self, exc: BaseException, *, source_usable: bool) -> None:
         with self._condition:

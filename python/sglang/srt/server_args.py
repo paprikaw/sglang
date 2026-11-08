@@ -1123,6 +1123,18 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "sync"
+    elastic_pp_transition_backing: A[
+        str,
+        Arg(
+            help=(
+                "Elastic PP backing policy: overlap retains source GPU pools; "
+                "cpu_spill snapshots and releases native KV/GDN backing at the "
+                "drained fence before allocating the target (sync/batched, eager only)."
+            ),
+            choices=["overlap", "cpu_spill"],
+        ),
+        NS("parallel"),
+    ] = "overlap"
     enable_elastic_pp_autoscaling: A[
         bool,
         "Enable the tokenizer-side backlog controller for elastic PP.",
@@ -7959,6 +7971,10 @@ class ServerArgs:
             return
 
         if not self.enable_elastic_pp:
+            if self.elastic_pp_transition_backing != "overlap":
+                raise ValueError(
+                    "--elastic-pp-transition-backing requires --enable-elastic-pp"
+                )
             if self.elastic_pp_kv_backend != "native":
                 raise ValueError("--elastic-pp-kv-backend requires --enable-elastic-pp")
             if self.enable_elastic_pp_autoscaling:
@@ -7971,6 +7987,13 @@ class ServerArgs:
                     "--enable-elastic-pp-autoscaling"
                 )
             return
+        if self.elastic_pp_transition_backing == "cpu_spill":
+            if self.elastic_pp_transition_strategy not in {"sync", "batched"}:
+                raise ValueError("CPU-spill backing requires sync or batched transition")
+            if self.elastic_pp_kv_backend != "native":
+                raise ValueError("CPU-spill backing requires the native KV backend")
+            if not self.disable_cuda_graph:
+                raise ValueError("CPU-spill backing requires --disable-cuda-graph")
         if self.pp_size <= 1:
             raise ValueError("--enable-elastic-pp requires --pp-size greater than 1")
         if self.tp_size != 1:

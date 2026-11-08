@@ -320,7 +320,7 @@ def test_fence_slot_failure_reaches_consensus_before_abort():
     else:
         raise AssertionError("fence slot failure unexpectedly committed")
 
-    assert group.stages[-1] == "fence_slots"
+    assert group.stages[-2:] == ["fence_slots", "abort_restore"]
     assert coordinator.phase == ElasticPPMigrationPhase.FAILED
     assert coordinator.snapshot().source_usable
     assert runner.aborted_layers
@@ -527,3 +527,213 @@ def test_cleanup_failure_never_promises_retired_source_rollback():
     assert not failed.source_usable
     assert coordinator.current_topology == transition.target
     assert runner.committed
+
+
+def _spill_coordinator(*, strategy="sync", fail_stage=None):
+    coordinator, transition, runner, kv = _coordinator(_Group(fail_stage=fail_stage))
+    coordinator.strategy, coordinator.backing = strategy, "cpu_spill"
+    events = []
+
+    class Cache:
+        def prepare_transition(self, transition):
+            events.append("host_snapshot")
+
+        def release_source_device_aliases(self, transition):
+            events.append("release_aliases")
+
+        def restore_source_device_aliases(self, transition):
+            events.append("restore_aliases")
+
+        def finalize_source_device_aliases(self, transition):
+            events.append("finalize_aliases")
+
+        def exchange_at_fence(self, transition):
+            events.append("exchange_host")
+
+        def apply_staged(self, transition):
+            events.append("apply_host")
+
+        def commit(self, transition):
+            events.append("commit_host")
+
+        def abort(self, transition):
+            events.append("abort_host")
+
+        def release_retired(self):
+            events.append("release_retired")
+
+    coordinator.cache_transition = Cache()
+    kv.snapshot_at_fence = lambda transition: events.append("KV_snapshot")
+
+    def release(transition):
+        assert events[-1] == "release_aliases"
+        assert not coordinator.layer_transport.prepared
+        events.append("release_backing")
+        return {"detached_bytes": 1024}
+
+    def capacity(transition, *, source_backing_released=False):
+        assert source_backing_released
+        assert events[-1] == "release_backing"
+        events.append("capacity")
+        return {"source_backing_released": True}
+
+    def restore_target(transition):
+        assert coordinator.layer_transport.prepared
+        events.append("restore_target")
+        return {"restored_bytes": 512}
+
+    kv.release_source_backing = release
+    kv.restore_target_from_snapshot = restore_target
+    kv.restore_source_backing = lambda transition: events.append("restore_source")
+    kv.finalize_source_backing = lambda transition: events.append("finalize_source")
+    runner.elastic_pp_transition_capacity_report = capacity
+    return coordinator, transition, runner, kv, events
+
+
+@pytest.mark.parametrize("strategy", ["sync", "batched"])
+def test_cpu_spill_releases_before_allocation_and_retires_only_after_publish(strategy):
+    coordinator, transition, runner, kv, events = _spill_coordinator(strategy=strategy)
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    assert events == []
+    coordinator.finalize_at_fence(lambda target: events.append("publish"))
+    assert events[:6] == [
+        "host_snapshot",
+        "KV_snapshot",
+        "release_aliases",
+        "release_backing",
+        "capacity",
+        "restore_target",
+    ]
+    assert events[-1] == "publish"
+    assert "finalize_source" not in events
+    assert "restore_source" not in events
+    metrics = coordinator.transition_metrics()
+    assert metrics["backing_policy"] == "cpu_spill"
+    assert metrics["source_backing"]["release"]["detached_bytes"] == 1024
+    coordinator.start_cleanup()
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.DONE, timeout=2)
+    assert events[-3:] == ["finalize_source", "finalize_aliases", "release_retired"]
+
+
+@pytest.mark.parametrize(
+    "stage", ["source_backing_release", "capacity", "fence_prepare", "fence_copy"]
+)
+def test_cpu_spill_peer_failure_restores_every_source_before_retry(stage):
+    coordinator, transition, runner, kv, events = _spill_coordinator(fail_stage=stage)
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    with pytest.raises(RuntimeError, match="injected peer failure"):
+        coordinator.finalize_at_fence(lambda target: events.append("publish"))
+    assert coordinator.snapshot().source_usable
+    assert coordinator.current_topology == transition.source
+    assert events[-2:] == ["restore_source", "restore_aliases"]
+    assert coordinator.group.stages[-1] == "abort_restore"
+    assert not runner.committed and "publish" not in events
+    coordinator.group.fail_stage = None
+    # A fresh transition resets the backing-attempt state before preparing.
+    events.clear()
+    coordinator.layer_transport.prepared = False
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    coordinator.finalize_at_fence(lambda target: None)
+    assert runner.committed
+
+
+@pytest.mark.parametrize("local_failure", [False, True])
+def test_unverified_source_restore_is_failstop(local_failure):
+    coordinator, transition, runner, kv, events = _spill_coordinator(
+        fail_stage="fence_prepare" if local_failure else "abort_restore"
+    )
+    if local_failure:
+
+        def failed_restore(transition):
+            events.append("restore_source")
+            raise RuntimeError("source restore OOM")
+
+        kv.restore_source_backing = failed_restore
+    else:
+
+        def failed_target(transition):
+            raise RuntimeError("target OOM")
+
+        coordinator.layer_transport.prepare_target = failed_target
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    with pytest.raises(RuntimeError):
+        coordinator.finalize_at_fence(lambda target: None)
+    assert not coordinator.snapshot().source_usable
+    assert "source rollback unverified" in coordinator.snapshot().error
+    assert runner.aborted_layers
+    assert events[-1] == "restore_aliases"
+    with pytest.raises(RuntimeError, match="partial commit failure"):
+        coordinator.begin(transition)
+
+
+def test_partial_target_allocation_is_aborted_and_source_restored():
+    coordinator, transition, runner, kv, events = _spill_coordinator()
+
+    def failed_target(transition):
+        coordinator.layer_transport.prepared = True
+        raise RuntimeError("target allocation OOM after partial allocation")
+
+    coordinator.layer_transport.prepare_target = failed_target
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    with pytest.raises(RuntimeError, match="target allocation OOM"):
+        coordinator.finalize_at_fence(lambda target: None)
+    assert runner.aborted_layers and coordinator.snapshot().source_usable
+    assert events[-2:] == ["restore_source", "restore_aliases"]
+
+
+def test_spilled_post_publication_failure_never_restores_source():
+    coordinator, transition, runner, kv, events = _spill_coordinator()
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+
+    def failed_publication(target):
+        raise RuntimeError("route publication failure")
+
+    with pytest.raises(RuntimeError, match="route publication failure"):
+        coordinator.finalize_at_fence(failed_publication)
+    assert runner.committed
+    assert not coordinator.snapshot().source_usable
+    assert "restore_source" not in events and "abort_host" not in events
+
+
+def test_duplicate_resident_rank_cannot_prove_prepare_or_source_rollback():
+    group = _Group()
+    group.all_gather_object = lambda report: [report, dict(report)]
+    coordinator, transition, runner, kv = _coordinator(group)
+    coordinator.begin(transition)
+    snapshot = coordinator.wait_for_phase(ElasticPPMigrationPhase.FAILED, timeout=2)
+    assert "every resident rank once" in snapshot.error
+    assert not snapshot.source_usable
+    assert not runner.committed
+
+
+def test_cpu_spill_refuses_a_shared_unified_owner_before_detach():
+    coordinator, transition, runner, kv, events = _spill_coordinator()
+    runner._unified_memory_pool = object()
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    with pytest.raises(RuntimeError, match="independently owned KV backing"):
+        coordinator.finalize_at_fence(lambda target: None)
+    assert "release_backing" not in events and "release_aliases" not in events
+    assert "restore_source" not in events
+    assert coordinator.snapshot().source_usable
+
+
+def test_background_cpu_spill_is_rejected_before_background_allocation():
+    source, transition = _transition()
+    with pytest.raises(ValueError, match="sync or batched"):
+        ElasticPPMigrationCoordinator(
+            rank=0,
+            current_topology=source,
+            group=_Group(),
+            model_runner=_Runner(),
+            layer_transport=_LayerTransport(),
+            kv_transport=_KVTransport(),
+            strategy="background",
+            backing="cpu_spill",
+        )

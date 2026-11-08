@@ -405,6 +405,11 @@ class SchedulerPPMixin:
             self._elastic_pp_request_ring_fence_seen = False
             self._elastic_pp_request_ring_drained = False
             self._elastic_pp_emit_terminal_response()
+            if not snapshot.source_usable:
+                raise RuntimeError(
+                    "elastic PP source rollback is unavailable; serving must stop: "
+                    f"{snapshot.error}"
+                )
             return False
         if (
             self.ps.pp_rank == 0
@@ -554,11 +559,12 @@ class SchedulerPPMixin:
         self._pp_commit_comm_work(self.send_proxy_work)
         self._pp_commit_comm_work(self.send_output_handoff_work)
         self._pp_commit_comm_work(self.send_output_work)
+        # Failure to agree on a common ring boundary cannot safely resume.
+        resume_microstep = coordinator.aligned_resume_microstep(
+            self._pp_microstep,
+            self.pp_loop_size,
+        )
         try:
-            resume_microstep = coordinator.aligned_resume_microstep(
-                self._pp_microstep,
-                self.pp_loop_size,
-            )
             coordinator.finalize_at_fence(self._pp_install_topology)
         except BaseException:
             snapshot = coordinator.snapshot()
@@ -571,6 +577,9 @@ class SchedulerPPMixin:
                     "elastic PP suffered a partial commit; serving cannot safely resume: "
                     f"{snapshot.error}"
                 )
+            # A rejected allocation still drained ranks at different local
+            # microsteps. Reuse the agreed boundary for the restored source.
+            self._pp_microstep = resume_microstep
             return False
 
         self._elastic_pp_draining = False

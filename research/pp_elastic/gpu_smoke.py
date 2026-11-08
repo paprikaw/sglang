@@ -62,9 +62,9 @@ def prepare(args):
     commit = git('rev-parse', 'HEAD')
     if git('rev-parse', args.tag + '^{commit}') != commit or git('cat-file', '-t', args.tag) != 'tag':
         raise RuntimeError('An annotated tag at current HEAD is required')
-    # Reuse the audited Qwen-capable Guard bundle used by AgentX; the installed
-    # generic entry point still only admits GLM and must not be bypassed by
-    # relabelling a Qwen cache as GLM. This bundle uses the same shared registry.
+    # Freeze the explicitly selected Guard, preserving its actual Qwen profile
+    # and shared registry. The current canonical Guard admits this profile;
+    # historical run configs retain their frozen bundles and are not rewritten.
     guard = Path(args.guard_scripts).resolve()
     explicit_node_spec = getattr(args, 'node_spec', None)
     if explicit_node_spec is not None:

@@ -25,6 +25,76 @@ h = base.h
 sys.path.insert(0, str(ROOT / "runtime_profiles/agentx_a100"))
 
 
+def rank_states(states):
+    ranks = {state["transition_rank"]: state for state in states}
+    if len(states) != 3 or set(ranks) != {0, 1, 2}:
+        raise AssertionError("transition evidence must contain each resident rank once")
+    return ranks
+
+
+def validate_transition_states(states, generation, source_ranks, backing):
+    ranks = rank_states(states)
+    for state in ranks.values():
+        metrics = state.get("transition_metrics", {})
+        if metrics.get("generation") != generation or metrics.get("phase") != "done":
+            raise AssertionError(
+                "transition metrics are stale or cleanup is incomplete"
+            )
+        if metrics.get("backing_policy") != backing:
+            raise AssertionError("transition backing differs from the frozen config")
+    sent = sum(
+        state["transition_metrics"].get("host", {}).get("host_bytes_sent", 0)
+        for state in ranks.values()
+    )
+    if sent <= 0:
+        raise AssertionError("no CPU-only host payload moved during this transition")
+    if backing == "cpu_spill":
+        for rank in source_ranks:
+            source = ranks[rank]["transition_metrics"].get("source_backing", {})
+            if source.get("release", {}).get("detached_bytes", 0) <= 0:
+                raise AssertionError(
+                    "source backing was not detached on an active rank"
+                )
+            if source.get("cuda_release", {}).get("allocated_drop_bytes", 0) <= 0:
+                raise AssertionError("no measured CUDA owner release on an active rank")
+
+
+def validate_fenced_decode(states, generation, source_ranks, output_length):
+    ranks = rank_states(states)
+    for rank in source_ranks:
+        records = [
+            record
+            for record in ranks[rank].get("transition_fence_records", [])
+            if record["generation"] == generation
+        ]
+        if len(records) != 1 or not any(
+            0 < req["output_length"] < output_length for req in records[0]["requests"]
+        ):
+            raise AssertionError(
+                "no active Decode state at the actual generation fence"
+            )
+
+
+def fresh_prefix_restores(states, started_at, active_ranks, prefix_length):
+    ranks = rank_states(states)
+    restores = {
+        rank: [
+            event
+            for event in state.get("agentx_restores", [])
+            if event["time"] >= started_at
+        ]
+        for rank, state in ranks.items()
+    }
+    if not all(
+        any(event.get("loaded_tokens", 0) >= prefix_length for event in restores[rank])
+        for rank in active_ranks
+    ):
+        raise AssertionError(
+            "final prefix lacks fresh CPU loadback on every active stage"
+        )
+    return restores
+
+
 def install_hooks():
     spec = importlib.util.spec_from_file_location(
         "transition_native_adapter", base.NATIVE / "a100_runtime_adapter.py"
@@ -102,6 +172,8 @@ def engine_entry(cfg, row):
                 cfg["initial_partition"],
                 "--elastic-pp-transition-strategy",
                 cfg["strategy"],
+                "--elastic-pp-transition-backing",
+                cfg.get("backing", "overlap"),
                 "--disable-cuda-graph",
                 "--max-total-tokens",
                 "4096",
@@ -147,6 +219,7 @@ def worker(run, cfg):
     started = time.monotonic()
     children, evidence = [], {
         "strategy": cfg["strategy"],
+        "backing": cfg.get("backing", "overlap"),
         "passed": False,
         "resident_ranks": 3,
         "gpu_released": False,
@@ -261,34 +334,19 @@ def worker(run, cfg):
                     for state in states
                 ):
                     evidence["transitions"][-1]["states"] = states
-                    if (
-                        sum(
-                            state.get("transition_metrics", {})
-                            .get("host", {})
-                            .get("host_bytes_sent", 0)
-                            for state in states
-                        )
-                        <= 0
-                    ):
-                        raise AssertionError(
-                            "no CPU-only host payload moved during transition"
-                        )
+                    validate_transition_states(
+                        states,
+                        generation,
+                        (0, 2) if generation == 1 else (0, 1, 2),
+                        cfg.get("backing", "overlap"),
+                    )
                     break
                 if time.monotonic() >= deadline:
                     raise TimeoutError("transition cleanup did not complete")
                 time.sleep(0.05)
         fence_states = http("/get_server_info")["internal_states"]
         for generation, source_ranks in ((1, (0, 2)), (2, (0, 1, 2))):
-            for state in fence_states:
-                if state["transition_rank"] not in source_ranks:
-                    continue
-                record = next(
-                    r
-                    for r in state["transition_fence_records"]
-                    if r["generation"] == generation
-                )
-                if not any(0 < r["output_length"] < 256 for r in record["requests"]):
-                    raise AssertionError("no active Decode state at actual fence")
+            validate_fenced_decode(fence_states, generation, source_ranks, 256)
         evidence["fence_states"] = fence_states
         demote()
         restore_start = time.time()
@@ -296,24 +354,9 @@ def worker(run, cfg):
         if restored["output_ids"] != reference["output_ids"]:
             raise AssertionError("CPU-only prefix continuation changed")
         info = http("/get_server_info")
-        restores = {
-            state["transition_rank"]: [
-                event
-                for event in state.get("agentx_restores", [])
-                if event["time"] >= restore_start
-            ]
-            for state in info["internal_states"]
-        }
-        if not all(
-            any(
-                event.get("loaded_tokens", 0) >= len(prefix)
-                for event in restores.get(rank, [])
-            )
-            for rank in (0, 2)
-        ):
-            raise AssertionError(
-                "final prefix lacks fresh CPU loadback on both active stages"
-            )
+        restores = fresh_prefix_restores(
+            info["internal_states"], restore_start, (0, 2), len(prefix)
+        )
         evidence["final_prefix_restore_events"] = restores
         evidence.update(passed=True, restored=restored, after=info)
     except BaseException as exc:
@@ -359,6 +402,7 @@ def prepare(args):
     cfg.update(
         cases=["transition"],
         strategy=args.strategy,
+        backing=args.backing,
         initial_counts=initial,
         initial_partition=",".join(map(str, initial)),
         grown_counts=grown,
@@ -397,7 +441,10 @@ def main():
         "--python",
         default="/data/gpfs/projects/punim2715/vllm_workbench/sglang_overlap_compare/venv-dd15fb57-cu12/bin/python",
     )
-    parser.add_argument("--guard-scripts", required=False)
+    parser.add_argument(
+        "--guard-scripts",
+        default="/home/bxb1/.codex/skills/llm-experiment-guard/scripts",
+    )
     parser.add_argument("--backfill-state", required=False)
     parser.add_argument(
         "--node-spec",
@@ -409,7 +456,12 @@ def main():
     parser.add_argument(
         "--strategy", choices=["sync", "background", "batched"], default="sync"
     )
+    parser.add_argument(
+        "--backing", choices=["overlap", "cpu_spill"], default="overlap"
+    )
     args = parser.parse_args()
+    if args.backing == "cpu_spill" and args.strategy == "background":
+        parser.error("CPU-spill backing requires sync or batched transition")
     if args.prepare:
         prepare(args)
         return
