@@ -464,6 +464,56 @@ class SchedulerPPMixin:
             return False
         return not any(self._pp_tensor_dict_inbox.values())
 
+    def _elastic_pp_live_requests(self):
+        """All retained request objects, including dormant scheduler ranks."""
+        batches = [getattr(self, name, None) for name in
+                   ("running_batch", "last_batch")]
+        for name in ("running_mbs", "last_mbs", "mbs"):
+            batches.extend(getattr(self, name, ()))
+        requests = [req for batch in batches if batch is not None
+                    for req in getattr(batch, "reqs", ())]
+        requests.extend(getattr(self, "waiting_queue", ()))
+        chunked = getattr(self, "chunked_req", None)
+        if chunked is not None:
+            requests.append(chunked)
+        return {id(req): req for req in requests}.values()
+
+    def _elastic_pp_request_cache_state(self):
+        """Serializable fenced handles for canonical dormant-tree rebuilding.
+
+        Progress and allocator slots are signatures, never overwritten to hide
+        a divergent scheduler. Only cache handles are rebound at publication.
+        """
+        import copy
+
+        fields = ("last_node", "last_host_node", "best_match_node",
+                  "skip_lock_node_ids", "swa_uuid_for_lock",
+                  "swa_prefix_lock_released", "cache_protected_len")
+        records = {}
+        for req in self._elastic_pp_live_requests():
+            rid = str(req.rid)
+            record = {
+                "progress": (getattr(req, "req_pool_idx", None),
+                             tuple(getattr(req, "output_ids", ())),
+                             tuple(getattr(req, "origin_input_ids", ()))),
+                "handles": {name: copy.deepcopy(getattr(req, name, None))
+                            for name in fields},
+            }
+            if rid in records and records[rid] != record:
+                raise RuntimeError(f"elastic PP duplicate divergent request: {rid}")
+            records[rid] = record
+        return records
+
+    def _elastic_pp_rebind_request_cache_state(self, records):
+        local = self._elastic_pp_request_cache_state()
+        if set(local) != set(records) or any(
+            local[rid]["progress"] != records[rid]["progress"] for rid in local
+        ):
+            raise RuntimeError("elastic PP dormant request progress differs from canonical rank")
+        for req in self._elastic_pp_live_requests():
+            for name, value in records[str(req.rid)]["handles"].items():
+                setattr(req, name, value)
+
     def _elastic_pp_finalize_if_drained(self: Scheduler) -> bool:
         coordinator = self.elastic_pp_migration_coordinator
         if coordinator is None or not self._elastic_pp_draining:
@@ -640,6 +690,13 @@ class SchedulerPPMixin:
         transition = DynamicPPTransition.build(current, target)
         self._elastic_pp_pending_req = recv_req
         try:
+            if self.enable_hierarchical_cache and coordinator.cache_transition is None:
+                from sglang.srt.elastic_pp.hicache_transition import SchedulerHiCacheTransition
+
+                coordinator.cache_transition = SchedulerHiCacheTransition(
+                    scheduler=self, model_runner=self.tp_worker.model_runner,
+                    group=coordinator.group, rank=self.ps.pp_rank,
+                )
             coordinator.begin(transition)
         except BaseException as exc:
             self._elastic_pp_pending_req = None

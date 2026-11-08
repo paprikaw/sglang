@@ -1111,6 +1111,16 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "native"
+    elastic_pp_transition_strategy: A[
+        str,
+        Arg(
+            help=("Elastic PP transition policy: sync pauses before target preparation; "
+                  "background preloads immutable weights over CPU transport while serving; "
+                  "batched uses bounded KV chunks at the drained fence."),
+            choices=["sync", "background", "batched"],
+        ),
+        NS("parallel"),
+    ] = "sync"
     enable_elastic_pp_autoscaling: A[
         bool,
         "Enable the tokenizer-side backlog controller for elastic PP.",

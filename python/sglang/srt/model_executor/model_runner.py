@@ -1369,6 +1369,55 @@ class ModelRunner:
         method = self._elastic_pp_model_method("abort_elastic_pp_layers")
         return method(generation=generation)
 
+    def elastic_pp_transition_capacity_report(self, transition):
+        """Conservative admission for native source+target overlap, not pool resizing.
+
+        Includes a whole replacement GDN pool when layer IDs change, even for
+        retained layers. Runtime/allocator workspace has an explicit reserve.
+        Actual allocation can still fail; publication remains transactional.
+        """
+        import math
+
+        pool = self.token_to_kv_pool
+        full = getattr(pool, "full_kv_pool", pool)
+        if getattr(full, "is_kvcached_elastic_pool", False):
+            # VMM physical commitment needs backend accounting, not logical
+            # tensor sizes. Preserve its existing transactional admission.
+            return {"backend": "kvcached", "native_overlap_checked": False}
+        rank = self.ps.pp_rank
+        source = transition.source.layer_range(rank)
+        target = transition.target.layer_range(rank)
+        incoming = set(range(target.start, target.end)) - set(range(source.start, source.end))
+        profile = self.elastic_pp_weight_profile
+        weights = sum(profile.layer_weight_sizes[i] for i in incoming)
+        k_shape, v_shape = full._kv_buffer_shapes()
+        item_bytes = torch.empty(0, dtype=full.store_dtype).element_size()
+        kv_per_layer = (math.prod(k_shape) + math.prod(v_shape)) * item_bytes
+        if hasattr(pool, "recurrent_layer_ids"):
+            attention_ids = set(pool.elastic_pp_kv_layer_ids(target))
+            kv_bytes = len(incoming & attention_ids) * kv_per_layer
+            target_ids = pool.recurrent_layer_ids(target)
+            state = pool.mamba_pool.mamba_cache
+            recurrent_bytes = 0
+            if tuple(pool.req_to_token_pool.mamba_map) != target_ids:
+                per_layer = sum(math.prod(t.shape[1:]) * t.element_size()
+                                for t in (*state.conv, state.temporal))
+                recurrent_bytes = len(target_ids) * per_layer
+        else:
+            kv_bytes = len(incoming) * kv_per_layer
+            recurrent_bytes = 0
+        required = weights + kv_bytes + recurrent_bytes
+        reserve = max(256 * 2**20, math.ceil(required * 0.05))
+        device = torch.device(self.device)
+        free = torch.cuda.mem_get_info(device)[0] if device.type == "cuda" else None
+        report = {"backend": "native", "native_overlap_checked": True,
+                  "weight_bytes": weights, "kv_bytes": kv_bytes,
+                  "recurrent_bytes": recurrent_bytes, "reserve_bytes": reserve,
+                  "required_free_bytes": required + reserve, "free_bytes": free}
+        if free is not None and required + reserve > free:
+            raise RuntimeError(f"elastic PP source+target peak capacity rejected: {report}")
+        return report
+
     def prepare_elastic_pp_kv_layers(
         self, *, target: LayerRange, generation: int
     ) -> frozenset[int]:

@@ -386,3 +386,107 @@ def test_pp2_pp4_pp2_reuses_coordinator_without_slot_tracker_lifecycle():
         coordinator.wait_for_phase(ElasticPPMigrationPhase.DONE, timeout=2)
         assert coordinator.current_topology == transition.target
     assert kv_transport.phases == [("bulk", (1, 3, 5)), ("delta", ())] * 2
+
+@pytest.mark.parametrize("strategy", ["sync", "batched"])
+def test_synchronous_policies_snapshot_before_target_allocation(strategy):
+    coordinator, transition, runner, kv = _coordinator()
+    coordinator.strategy = strategy
+    events = []
+    kv.snapshot_at_fence = lambda transition: events.append("snapshot")
+    old_prepare = coordinator.layer_transport.prepare_target
+    coordinator.layer_transport.prepare_target = lambda transition: (
+        events.append("allocate"), old_prepare(transition)
+    )[-1]
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    assert events == []
+    assert not coordinator.layer_transport.prepared
+    coordinator.finalize_at_fence(lambda target: events.append("publish"))
+    assert events == ["snapshot", "allocate", "publish"]
+    assert runner.committed
+
+
+@pytest.mark.parametrize("failure_stage", ["prepare", "apply", "commit"])
+def test_host_cache_transaction_failure_obeys_publication_boundary(failure_stage):
+    coordinator, transition, runner, kv = _coordinator()
+    events = []
+
+    class Cache:
+        def run(self, stage):
+            events.append(stage)
+            if stage == failure_stage:
+                raise RuntimeError("injected cache failure")
+
+        def prepare_transition(self, transition):
+            self.run("prepare")
+
+        def exchange_at_fence(self, transition):
+            self.run("exchange")
+
+        def apply_staged(self, transition):
+            self.run("apply")
+
+        def commit(self, transition):
+            self.run("commit")
+
+        def abort(self, transition):
+            events.append("abort")
+
+    coordinator.cache_transition = Cache()
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    with pytest.raises(RuntimeError, match="injected cache failure"):
+        coordinator.finalize_at_fence(lambda target: None)
+    assert coordinator.snapshot().source_usable is (failure_stage != "commit")
+    assert ("abort" in events) is (failure_stage != "commit")
+    assert runner.committed is (failure_stage == "commit")
+
+
+def test_background_precopy_uses_cpu_payload_and_leaves_live_model_unpublished():
+    import contextlib
+    import queue
+    from sglang.srt.elastic_pp.layer_transport import ElasticPPLayerTransport
+
+    payloads = queue.Queue()
+    source, transition = _transition()
+    tensors = {"weight": torch.arange(12).reshape(3, 4).float()}
+    imported = {}
+
+    class Group:
+        world_size = 2
+
+        def send_tensor_dict(self, payload, *, dst, async_send):
+            assert dst == 1 and async_send
+            assert all(t.device.type == "cpu" for t in payload.values() if isinstance(t, torch.Tensor))
+            payloads.put(payload)
+            return ()
+
+        def recv_tensor_dict(self, *, src):
+            assert src == 0
+            return payloads.get(timeout=2)
+
+    class Runner(_Runner):
+        def export_elastic_pp_layer_state(self, layer_ids):
+            assert list(layer_ids) == [1]
+            return {1: tensors}
+
+        def import_elastic_pp_layer_state(self, *, generation, layer_states):
+            assert generation == 1
+            imported.update(layer_states)
+
+    class Layers(_LayerTransport):
+        _migration_stream = None
+        _sort_key = staticmethod(ElasticPPLayerTransport._sort_key)
+        _stream_context = staticmethod(contextlib.nullcontext)
+
+    def make(rank):
+        return ElasticPPMigrationCoordinator(rank=rank, current_topology=source,
+            group=Group(), model_runner=Runner(), layer_transport=Layers(),
+            kv_transport=_KVTransport(), strategy="background")
+
+    sender, receiver = make(0), make(1)
+    sender._precopy_immutable_weights(transition)
+    receiver._precopy_immutable_weights(transition)
+    assert torch.equal(imported[1]["weight"], tensors["weight"])
+    assert imported[1]["weight"].data_ptr() != tensors["weight"].data_ptr()
+    assert not sender.model_runner.committed and not receiver.model_runner.committed
