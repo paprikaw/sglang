@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from sglang.srt.elastic_pp.kv_slots import ElasticKVSlotTracker
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -87,3 +88,37 @@ def test_token_allocator_snapshot_after_committed_free_group():
         allocated[1:],
     )
     allocator.finish_elastic_pp_slot_tracking(generation=1)
+
+
+@pytest.mark.parametrize("page_size", [1, 4])
+def test_paged_allocator_snapshot_preserves_cached_pages_and_excludes_releases(page_size):
+    allocator = PagedTokenToKVPoolAllocator(
+        size=page_size * 4,
+        page_size=page_size,
+        dtype=torch.float32,
+        device="cpu",
+        kvcache=object(),
+        need_sort=True,
+    )
+    slots = allocator.alloc(page_size * 3)
+    allocator.free(slots[page_size : page_size * 2])
+    # The first/third pages can belong to active requests or cached prefixes;
+    # the allocator keeps both, independent of scheduler request membership.
+    expected = torch.cat((slots[:page_size], slots[page_size * 2 :]))
+    assert torch.equal(allocator.elastic_pp_live_slots(), expected)
+    allocator.free_group_begin()
+    allocator.free(slots[:page_size])
+    with pytest.raises(RuntimeError, match="closed allocator free group"):
+        allocator.elastic_pp_live_slots()
+    allocator.free_group_end()
+    assert torch.equal(allocator.elastic_pp_live_slots(), slots[page_size * 2 :])
+
+
+def test_paged_allocator_snapshot_rejects_deferred_page_representatives():
+    allocator = PagedTokenToKVPoolAllocator(
+        size=8, page_size=2, dtype=torch.float32, device="cpu",
+        kvcache=object(), need_sort=False,
+    )
+    allocator.free_page_reps_group = [torch.tensor([2])]
+    with pytest.raises(RuntimeError, match="closed allocator free group"):
+        allocator.elastic_pp_live_slots()
