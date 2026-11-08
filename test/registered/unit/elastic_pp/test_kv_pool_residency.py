@@ -161,3 +161,24 @@ def test_hybrid_recurrent_import_rejects_wrong_tensor_layout(hybrid_pool_factory
         )
     assert pool.req_to_token_pool.mamba_map == {}
     assert pool.mamba_pool.mamba_cache.temporal.shape[0] == 0
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+def test_abort_is_repeatable_before_publication_only(hybrid_pool_factory, hybrid):
+    pool = (
+        hybrid_pool_factory(start_layer=0, end_layer=2)
+        if hybrid
+        else _make_pool(start_layer=0, layer_num=2)
+    )
+    assert pool.abort_elastic_pp_kv_layers(generation=1) == ()
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(0, 4), generation=1, total_num_layers=4
+    )
+    assert pool.abort_elastic_pp_kv_layers(generation=1)
+    assert pool.abort_elastic_pp_kv_layers(generation=1) == ()
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(0, 2), generation=1, total_num_layers=4
+    )
+    pool.commit_elastic_pp_kv_layers(generation=1)
+    with pytest.raises(RuntimeError, match="after topology publication"):
+        pool.abort_elastic_pp_kv_layers(generation=1)

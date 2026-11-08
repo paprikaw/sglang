@@ -274,9 +274,7 @@ class ElasticPPKVTransport:
         }
         backup = {}
         for layer in sorted(layers):
-            tensors = self.pool.export_elastic_pp_kv_slots(
-                layer_id=layer, slot_ids=slots
-            )
+            tensors = self._export_source_kv(layer_id=layer, slot_ids=slots)
             backup[layer] = tuple(t.detach().cpu().clone() for t in tensors)
         self._fence_snapshot = {
             "generation": transition.target.generation,
@@ -307,7 +305,7 @@ class ElasticPPKVTransport:
 
         try:
             self.prepare_target(transition)
-        except BaseException:
+        except BaseException as exc:
             # The coordinator cannot set its prepared flag until this
             # method returns. Roll back locally so a failure after backing
             # allocation cannot leak a pending generation.
@@ -317,9 +315,99 @@ class ElasticPPKVTransport:
                 )
             except BaseException:
                 pass
-            raise
+            from sglang.srt.elastic_pp.backing_spill import discard_tensor_tracebacks
+
+            raise discard_tensor_tracebacks(exc)
+
+    def release_source_backing(self, transition):
+        """Opt-in sync-only spill. Caller must fence producers and invalidate graphs.
+
+        Source CPU authority survives failed target allocation. This method never
+        resumes scheduling; abort must restore_source_backing before doing so.
+        """
+        from sglang.srt.elastic_pp.backing_spill import HybridKVSpill, NativeKVSpill
+
+        if getattr(self, "_spill", None) is not None:
+            raise RuntimeError("source backing is already spilled")
+        if hasattr(self.pool, "full_kv_pool"):
+            spill = HybridKVSpill(self.pool)
+        else:
+            spill = NativeKVSpill(
+                self.pool, total_num_layers=transition.source.num_layers
+            )
+        spill.snapshot()
+        self._spill = spill
+        self._spill_generation = transition.target.generation
+        spill.release_source_backing()
+        return self.backing_spill_metrics()
+
+    def restore_source_backing(self, transition):
+        spill = getattr(self, "_spill", None)
+        if spill is not None:
+            if self._spill_generation != transition.target.generation:
+                raise RuntimeError("source spill generation mismatch")
+            spill.restore_source()
+            self._last_spill_metrics = self.backing_spill_metrics()
+            self._spill = None
+        return self.backing_spill_metrics()
+
+    def restore_target_from_snapshot(self, transition):
+        # prepare_target restores retained layers before receiving new owners.
+        spill = getattr(self, "_spill", None)
+        if (
+            spill is None
+            or spill.state != "target_prepared"
+            or spill.generation != transition.target.generation
+        ):
+            raise RuntimeError("no prepared spilled target")
+        return self.backing_spill_metrics()
+
+    def backing_spill_metrics(self):
+        import copy
+
+        spill = getattr(self, "_spill", None)
+        metrics = (
+            spill.metrics
+            if spill is not None
+            else getattr(self, "_last_spill_metrics", {})
+        )
+        result = copy.deepcopy(metrics)
+        if spill is not None:
+            result["state"] = spill.state
+        return result
+
+    def finalize_source_backing(self, transition):
+        """Discard CPU rollback authority only after all-rank publication."""
+        spill = getattr(self, "_spill", None)
+        if spill is not None:
+            spill.finalize(generation=transition.target.generation)
+            self._last_spill_metrics = self.backing_spill_metrics()
+            self._spill = None
+        return self.backing_spill_metrics()
+
+    def _export_source_kv(self, *, layer_id, slot_ids):
+        spill = getattr(self, "_spill", None)
+        if spill is None:
+            return self.pool.export_elastic_pp_kv_slots(
+                layer_id=layer_id, slot_ids=slot_ids
+            )
+        if hasattr(spill, "attention"):
+            pair = spill.attention.backup[self.pool._full_id_to_ordinal[layer_id]]
+        else:
+            pair = spill.backup[layer_id]
+        return tuple(
+            t.index_select(0, slot_ids.cpu()).to(self.pool.device) for t in pair
+        )
 
     def prepare_target(self, transition: DynamicPPTransition) -> frozenset[int]:
+        spill = getattr(self, "_spill", None)
+        if spill is not None:
+            return frozenset(
+                spill.prepare_target(
+                    target=transition.target.layer_range(self.rank),
+                    generation=transition.target.generation,
+                )
+            )
         with self._stream_context(self._receive_stream):
             prepared = self.model_runner.prepare_elastic_pp_kv_layers(
                 target=transition.target.layer_range(self.rank),
@@ -367,7 +455,7 @@ class ElasticPPKVTransport:
                 )
                 for chunk_index, chunk in enumerate(chunks):
                     layer_kv = {
-                        layer_id: self.pool.export_elastic_pp_kv_slots(
+                        layer_id: self._export_source_kv(
                             layer_id=layer_id, slot_ids=chunk
                         )
                         for layer_id in layer_ids
@@ -546,7 +634,7 @@ class ElasticPPKVTransport:
                     )
                     for chunk_index, source_chunk in enumerate(chunks):
                         layer_kv = {
-                            layer_id: self.pool.export_elastic_pp_kv_slots(
+                            layer_id: self._export_source_kv(
                                 layer_id=layer_id, slot_ids=source_chunk
                             )
                             for layer_id in layer_ids

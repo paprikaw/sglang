@@ -91,7 +91,9 @@ def test_token_allocator_snapshot_after_committed_free_group():
 
 
 @pytest.mark.parametrize("page_size", [1, 4])
-def test_paged_allocator_snapshot_preserves_cached_pages_and_excludes_releases(page_size):
+def test_paged_allocator_snapshot_preserves_cached_pages_and_excludes_releases(
+    page_size,
+):
     allocator = PagedTokenToKVPoolAllocator(
         size=page_size * 4,
         page_size=page_size,
@@ -116,8 +118,12 @@ def test_paged_allocator_snapshot_preserves_cached_pages_and_excludes_releases(p
 
 def test_paged_allocator_snapshot_rejects_deferred_page_representatives():
     allocator = PagedTokenToKVPoolAllocator(
-        size=8, page_size=2, dtype=torch.float32, device="cpu",
-        kvcache=object(), need_sort=False,
+        size=8,
+        page_size=2,
+        dtype=torch.float32,
+        device="cpu",
+        kvcache=object(),
+        need_sort=False,
     )
     allocator.free_page_reps_group = [torch.tensor([2])]
     with pytest.raises(RuntimeError, match="closed allocator free group"):
