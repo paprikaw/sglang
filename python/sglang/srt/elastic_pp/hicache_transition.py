@@ -511,7 +511,7 @@ def prepare_target_host_cache(cache, *, device_pool, target, generation):
                     )
     except BaseException:
         if clone.host_pool_group is not cache.host_pool_group:
-            clone.release_host_resources()
+            discard_host_cache(clone)
         raise
     clone._elastic_pp_projected_pool = projected
     return clone
@@ -680,7 +680,7 @@ class SchedulerHiCacheTransition:
         if self.adapter is not None:
             self.adapter.abort(transition)
         if self.target_cache is not None:
-            self.target_cache.release_host_resources()
+            discard_host_cache(self.target_cache)
         self.target_cache = None
         self.adapter = None
 
@@ -693,7 +693,7 @@ class SchedulerHiCacheTransition:
         """Only after topology publication; failures must not suggest rollback."""
         retired, self.retired_caches = self.retired_caches, []
         for cache in retired:
-            cache.release_host_resources()
+            discard_host_cache(cache)
 
 
 def snapshot_tree_metadata(cache):
@@ -891,3 +891,23 @@ def publish_scheduler_cache(scheduler, clone, model_runner):
     canary = getattr(model_runner, "canary_manager", None)
     if canary is not None:
         canary.attach_radix_cache(clone)
+
+
+def discard_host_cache(cache):
+    """Retire host aliases explicitly, including controllers in frozen GC heaps."""
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _COMPONENT_HOST_ATTR,
+    )
+
+    cache.release_host_resources()
+    controller = cache.cache_controller
+    if controller is not None:
+        controller.mem_pool_host = None
+        controller.mem_pool_host_draft = None
+    for ct, (cache_attr, component_attr) in _COMPONENT_HOST_ATTR.items():
+        setattr(cache, cache_attr, None)
+        if ct in cache.components:
+            setattr(cache.components[ct], component_attr, None)
+    cache.token_to_kv_pool_host = None
+    cache.host_pool_group = None
+    cache.cache_controller = None

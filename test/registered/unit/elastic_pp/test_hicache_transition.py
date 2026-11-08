@@ -310,3 +310,92 @@ def test_native_work_wrapper_is_waited():
     src.prepare_transition(tx)
     src.exchange_at_fence(tx)
     assert handle.waited
+
+
+def test_failed_hybrid_host_construction_releases_new_full_pool(monkeypatch):
+    from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as module
+
+    released = []
+    pool = NS(destroy=lambda: released.append(True))
+    monkeypatch.setattr(
+        module,
+        "get_memory",
+        lambda: NS(hicache_size=0, hicache_ratio=2, hicache_mem_layout="page_first"),
+    )
+    monkeypatch.setattr(module, "build_kv_host_pool", lambda **kwargs: pool)
+    monkeypatch.setattr(module, "_get_allocator_type", lambda args: "default")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected target mamba allocation failure")
+
+    monkeypatch.setattr(module, "MambaPoolHost", fail)
+    params = NS(
+        req_to_token_pool=NS(mamba_allocator=NS()),
+        mtp_draft_device_pools=(),
+        page_size=1,
+    )
+    with pytest.raises(RuntimeError, match="target mamba allocation"):
+        module.build_hybrid_mamba_stack(
+            params=params,
+            server_args=None,
+            kv_pool=NS(layer_num=1),
+            mamba_pool=NS(num_mamba_layers=1),
+            full_layer_mapping={0: 0},
+            mamba_layer_mapping={1: 0},
+            load_cache_event=None,
+            storage_backend=None,
+            use_mla=False,
+        )
+    assert released == [True]
+
+
+def test_initial_later_elastic_stage_uses_local_host_layer_ids(
+    monkeypatch, hybrid_pool_factory
+):
+    from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as module
+
+    pool = hybrid_pool_factory(start_layer=2, end_layer=4)
+    captured = {}
+
+    def build(**kwargs):
+        captured.update(kwargs)
+        return NS(get_pool=lambda name: NS()), NS()
+
+    monkeypatch.setattr(module, "build_hybrid_mamba_stack", build)
+    module._MambaStrategy().build(
+        cache=NS(),
+        kvcache=pool,
+        params=NS(req_to_token_pool=pool.req_to_token_pool),
+        server_args=None,
+        load_cache_event=None,
+    )
+    assert pool.full_attention_layer_id_mapping == {3: 1}
+    assert captured["full_layer_mapping"] == {1: 0}
+    assert captured["mamba_layer_mapping"] == {0: 0}
+
+
+def test_discard_drops_frozen_controller_host_aliases():
+    from sglang.srt.elastic_pp.hicache_transition import discard_host_cache
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+    group = object()
+    controller = NS(mem_pool_host=group, mem_pool_host_draft=group)
+    component = NS(_full_kv_pool_host=group)
+    released = []
+    cache = NS(
+        release_host_resources=lambda: released.append(True),
+        cache_controller=controller,
+        host_pool_group=group,
+        full_kv_pool_host=group,
+        token_to_kv_pool_host=group,
+        components={ComponentType.FULL: component},
+    )
+    discard_host_cache(cache)
+    assert released == [True]
+    assert (
+        cache.host_pool_group
+        is cache.cache_controller
+        is cache.full_kv_pool_host
+        is None
+    )
+    assert component._full_kv_pool_host is controller.mem_pool_host is None
