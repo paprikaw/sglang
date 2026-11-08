@@ -33,6 +33,7 @@ def acceptance():
             "install_diagnostic_fanout",
             "demote_cpu_prefixes",
             "correctness_prompts",
+            "reference_qualification",
             "observe_request_launch",
             "validate_uninterrupted_decode",
             "state_evidence",
@@ -45,6 +46,21 @@ def acceptance():
         namespace,
     )
     return namespace
+
+
+@pytest.mark.parametrize("warm", [[1, 9, 3], [1, 2], []])
+def test_cold_warm_reference_qualification_rejects_divergence(acceptance, warm):
+    result = acceptance["reference_qualification"](
+        {"output_ids": [1, 2, 3]}, {"output_ids": warm}
+    )
+    assert not result["qualified"]
+    assert result["first_difference"] is not None
+
+
+def test_cold_warm_reference_qualification_requires_nonempty_exact_ids(acceptance):
+    qualify = acceptance["reference_qualification"]
+    assert qualify({"output_ids": [1, 2]}, {"output_ids": [1, 2]})["qualified"]
+    assert not qualify({}, {})["qualified"]
 
 
 def test_worker_retains_published_control_when_continuation_fails(

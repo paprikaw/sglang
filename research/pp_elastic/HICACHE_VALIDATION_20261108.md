@@ -1,5 +1,21 @@
 # HiCache resident PP transition validation, 2026-11-08
 
+The complete dynamic acceptance remains unqualified. At clean aa93b5188c8a,
+r9 completed generation one and its uninterrupted active request, then stalled
+while preparing generation two's host cache. It failed after 176.100 seconds
+including verified cleanup, and Guard released its lease. The exact resumed
+IDs matched the warmed reference. The same prompt and greedy sampling had
+already produced different cold and warmed gen0 IDs at output index six, so
+that match does not establish generation correctness.
+
+The shrink stall has a CPU/Gloo reproduction: the migration-specific dormant
+host constructor skipped FULL/MAMBA MIN reductions while the physical ranks
+entered them. Cache a99c6cf681e4 reuses the initial logical constructor's sizing
+protocol. In the same real-constructor Gloo script, all three ranks now finish
+FULL MIN, MAMBA MIN and the subsequent all-gather in both expand and shrink.
+The controller is stubbed and no model or CUDA device is used. This is a
+collective-order fix, not a completed GPU shrink.
+
 This is a correctness check for one Qwen3.6-35B-A3B BF16 model with native KV and
 FP32 GDN state. Tensor and expert parallel sizes are both one. Three resident
 A100 workers on booked node spartan-gpgpu168 keep HiCache enabled while the
@@ -150,5 +166,31 @@ injects a post-publication request failure and verifies that publication is
 retained while acceptance still fails and owned cleanup runs. Saved internal
 states use a diagnostic field allowlist rather than full ServerArgs. All 67
 acceptance and scheduler checks pass, with no failures or skips. The cache
-context/session repair needs combined CPU validation, independent review and a
-new immutable source/tag before the next real reference attempt.
+context/session repair was merged and independently reviewed before r9. At clean
+aa93b5188c8a, 232 focused CPU checks passed in 52.73 seconds. A separate
+independent run passed the exact historical 537 CPU node IDs across 52 files in
+34.43 seconds, with zero failures, errors or skips, unchanged clean source and
+zero visible CUDA devices. Their selections and JUnit archives are preserved
+separately; the counts are not additive unique coverage.
+
+r9 recorded generation-one publication on every rank and fresh host traffic:
+rank 0 sent 49,217,536 bytes, rank 2 sent 46,071,808 and rank 1 received
+95,289,344. The resumed request completed all 256 output tokens with the same
+RID, zero retractions, no Prefill after Decode, and actual Decode launches on
+each target-active rank. Generation two entered the fence but did not publish.
+No final prefix-loadback or CPU-spill CUDA-release acceptance follows. Original
+results and cleanup remain under gpu-hicache-r9; the failed run is immutable.
+
+Further policy or spill sweeps are blocked on generation qualification. A
+private, static-gen0 diagnostic retains cold256/warm8 on the original 20/0/20
+layout. It observes the original GDN calls, checkpoint512 at birth and cold
+completion, warm CoW source/destination, and the first eight actual sampler
+logits. It records raw track length 513 and its chunk64 boundary512, exact RIDs,
+argmax and generated prefixes. Analysis compares logits only on common input
+histories and reports bitwise state relations without selecting a tolerance.
+Continuous FP32 state at token512 remains unobserved. The diagnostic performs
+no transition and cannot qualify a 256-token warmed trajectory. The current
+four-file CPU selection passes 98 checks in 5.627 seconds, with zero failures,
+errors or skips and zero visible CUDA devices. The source hashes are unchanged
+across that run. Its first failed run, caused by an
+undefined variable in newly added phase logging, is preserved separately.

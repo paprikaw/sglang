@@ -1,5 +1,15 @@
 # PP + HiCache transition runtime checkpoint
 
+Dynamic acceptance is still blocked. r9 at aa93b5188c8a completed one
+publication and uninterrupted active Decode relative to its warmed reference,
+then stalled during the shrink host-cache preparation. The failed run took
+176.100 seconds with verified cleanup and a released Guard lease. Cold and warm
+gen0 requests with identical input and greedy settings already diverged at
+output index six; warmed-reference agreement alone does not qualify generation.
+The private acceptance now rejects unequal cold/warmed references before any
+transition. A separate static cold256/warm8 observation is the next diagnostic;
+it does not establish a numerical tolerance or a dynamic pass.
+
 The three explicit policies share the model/KV transports and one coordinator.
 `sync` drains before host/active-state snapshots, capacity admission and target
 allocation, then copies KV as one source-sized batch. `batched` uses the same
@@ -20,8 +30,9 @@ The opt-in `cpu_spill` backing contract is wired through the same coordinator
 for `sync` and `batched`: drain host I/O, snapshot mutable state, detach source
 device owners, collectively confirm release, admit against physical free memory,
 allocate target backing, restore retained state and transfer moved layers. It
-includes the cache branch's spill/alias and receive-staging APIs (dependency
-3f41063832). Spill receives are validated and copied to CPU staging before the
+includes the cache branch's spill/alias and receive-staging APIs, publication
+context rebinding (10b46fea07), and dormant host sizing (a99c6cf681). Spill
+receives are validated and copied to CPU staging before the
 wire buffers are released; this adds per-rank host admission and byte accounting,
 not an atomic node-wide RAM reservation or a strict long-window peak proof.
 Overlap mode still accumulates incoming GPU rows until import. Native
@@ -107,6 +118,16 @@ active request before recording control success; committed engine metrics are
 preserved separately. Control success is now saved immediately and continuation
 is verified separately. A real worker-loop failure regression plus the existing
 acceptance/IPC/scheduler checks pass 67 cases. Saved state is limited to the
-diagnostics required for acceptance. The cache context/session fix requires a
-combined checkpoint and a new real attempt; grow/shrink recovery, exact output
+diagnostics required for acceptance. The cache context/session fix was merged
+before r9; 232 focused and a separate exact historical 537 CPU selection passed
+at clean aa93b5188c8a. The first-generation completion fault did not recur in r9.
+
+The shrink dormant constructor formerly skipped the fixed-size FULL/MAMBA MIN
+reductions, advancing to an all-gather while physical ranks waited in MIN.
+a99c6cf681 uses the same logical host-sizing helper as initial construction.
+The same three-process Gloo reproduction now completes two MIN operations and
+the following all-gather on every rank during initial, expand and shrink
+construction. It uses real host constructors with a stubbed I/O controller and
+zero CUDA devices. Separate stage logs distinguish KV/GDN bulk, delta and import
+from host exchange and host preparation/import. GPU shrink, full-cycle request
 equivalence and CPU-spill CUDA owner release remain unqualified.

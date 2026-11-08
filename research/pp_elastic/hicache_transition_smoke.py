@@ -185,6 +185,25 @@ def correctness_prompts():
     return common_prefix + [1160], active_prefix + [2160], len(common_prefix)
 
 
+def reference_qualification(cold, warm):
+    cold_ids, warm_ids = cold.get("output_ids") or [], warm.get("output_ids") or []
+    first_difference = next(
+        (
+            index
+            for index, pair in enumerate(zip(cold_ids, warm_ids))
+            if pair[0] != pair[1]
+        ),
+        min(len(cold_ids), len(warm_ids)) if len(cold_ids) != len(warm_ids) else None,
+    )
+    return {
+        "qualified": bool(cold_ids) and cold_ids == warm_ids,
+        "comparison": "exact token IDs; identical input and greedy sampling",
+        "first_difference": first_difference,
+        "cold_output_tokens": len(cold_ids),
+        "warm_output_tokens": len(warm_ids),
+    }
+
+
 def demote_cpu_prefixes(http):
     deadline = time.monotonic() + 15
     while True:
@@ -267,6 +286,10 @@ def install_hooks():
 
     install_diagnostic_fanout(Scheduler, TokenizerControlMixin)
     install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator)
+    if os.environ.get("PP_HICACHE_BASELINE_PROBE") == "1":
+        import hicache_baseline_probe
+
+        hicache_baseline_probe.install_hooks()
 
 
 def install_diagnostic_fanout(Scheduler, TokenizerControlMixin):
@@ -477,6 +500,11 @@ def launch(run, cfg, row, key):
     def environment(cfg, row, run):
         env = original_environment(cfg, row, run)
         env.update(INTEGRATION_SERVER="0", PP_HICACHE_SMOKE_ENGINE="1")
+        if cfg.get("baseline_probe"):
+            env.update(
+                PP_HICACHE_BASELINE_PROBE="1",
+                PP_HICACHE_PROBE_DIR=str(run / "baseline_probe"),
+            )
         return env
 
     base.environment, base.__file__ = environment, __file__
@@ -487,6 +515,10 @@ def launch(run, cfg, row, key):
 
 
 def worker(run, cfg):
+    if cfg.get("baseline_probe"):
+        from hicache_baseline_probe import worker as baseline_worker
+
+        return baseline_worker(run, cfg)
     import agentx_replay
 
     h.authenticate(run, cfg, os.environ, local=True)
@@ -577,6 +609,16 @@ def worker(run, cfg):
             "cold_active": cold_active,
             "active": active_reference,
         }
+        evidence["reference_qualification"] = {
+            "prefix": reference_qualification(cold_prefix, reference),
+            "active": reference_qualification(cold_active, active_reference),
+        }
+        if not all(
+            item["qualified"] for item in evidence["reference_qualification"].values()
+        ):
+            raise AssertionError(
+                "cold/warm reference output IDs differ before transition"
+            )
 
         checkpoint("initial_cpu_demotion")
         evidence["initial_demotion"] = demote_cpu_prefixes(http)
@@ -717,6 +759,7 @@ def prepare(args):
         initial_partition=",".join(map(str, initial)),
         grown_counts=grown,
         engine_entrypoint=str(Path(__file__).resolve()),
+        baseline_probe=args.baseline_probe,
     )
     cfg["model_cache"]["usage_logs"] = {args.node: [use]}
     h.save(run / "config.json", cfg)
@@ -734,6 +777,10 @@ def prepare(args):
         x for x in spec["frozen_inputs"] if x["path"] != str(run / "config.json")
     ]
     spec["frozen_inputs"] += [base.desc(run / "config.json"), base.desc(__file__)]
+    if args.baseline_probe:
+        spec["title"] = "Qwen HiCache static generation-zero qualification diagnostic"
+        spec["tasks"][0]["label"] = "Static cold256/warm8 state and sampler diagnostic"
+        spec["frozen_inputs"].append(base.desc(ROOT / "hicache_baseline_probe.py"))
     h.save(run / "dashboard_spec.json", spec)
 
 
@@ -744,6 +791,7 @@ def main():
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--engine-entry", action="store_true")
     parser.add_argument("--layout")
+    parser.add_argument("--baseline-probe", action="store_true")
     parser.add_argument("--tag")
     parser.add_argument("--node", default="spartan-gpgpu168")
     parser.add_argument("--job", default="33463293")

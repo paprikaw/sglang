@@ -795,10 +795,20 @@ class ElasticPPMigrationCoordinator:
                 ):
                     self.kv_transport.slot_chunk_size = max(1, int(fence_slots.numel()))
                 try:
+                    logger.info(
+                        "Elastic PP generation=%d rank=%d KV/GDN bulk exchange begin",
+                        transition.target.generation,
+                        self.rank,
+                    )
                     self.kv_transport.exchange_phase(
                         transition,
                         phase="bulk",
                         slot_ids=fence_slots,
+                    )
+                    logger.info(
+                        "Elastic PP generation=%d rank=%d KV/GDN bulk exchange complete",
+                        transition.target.generation,
+                        self.rank,
                     )
                 finally:
                     if previous_chunk_size is not None:
@@ -807,15 +817,45 @@ class ElasticPPMigrationCoordinator:
                 # authoritative snapshot is now taken only once at the fence.
                 # An empty delta still carries one manifest per ownership edge
                 # and proves the receive set is complete before publication.
+                logger.info(
+                    "Elastic PP generation=%d rank=%d KV/GDN delta exchange begin",
+                    transition.target.generation,
+                    self.rank,
+                )
                 self.kv_transport.exchange_phase(
                     transition,
                     phase="delta",
                     slot_ids=fence_slots[:0],
                 )
+                logger.info(
+                    "Elastic PP generation=%d rank=%d KV/GDN delta exchange complete; import begin",
+                    transition.target.generation,
+                    self.rank,
+                )
                 self.kv_transport.apply_staged(transition)
+                logger.info(
+                    "Elastic PP generation=%d rank=%d KV/GDN import complete",
+                    transition.target.generation,
+                    self.rank,
+                )
                 if self.cache_transition is not None:
+                    logger.info(
+                        "Elastic PP generation=%d rank=%d HiCache host exchange begin",
+                        transition.target.generation,
+                        self.rank,
+                    )
                     self.cache_transition.exchange_at_fence(transition)
+                    logger.info(
+                        "Elastic PP generation=%d rank=%d HiCache host exchange complete; host preparation/import begin",
+                        transition.target.generation,
+                        self.rank,
+                    )
                     self.cache_transition.apply_staged(transition)
+                    logger.info(
+                        "Elastic PP generation=%d rank=%d HiCache host preparation/import complete",
+                        transition.target.generation,
+                        self.rank,
+                    )
                 logger.info(
                     "Elastic PP generation=%d rank=%d fenced KV copy complete "
                     "in %.3f s",
