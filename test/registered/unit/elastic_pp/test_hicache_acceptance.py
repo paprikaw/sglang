@@ -3,6 +3,7 @@
 import ast
 import copy
 from pathlib import Path
+from types import SimpleNamespace as NS
 
 import pytest
 
@@ -23,6 +24,7 @@ def acceptance():
             "validate_transition_states",
             "validate_fenced_decode",
             "fresh_prefix_restores",
+            "install_transition_hooks",
         }
     ]
     namespace = {}
@@ -104,3 +106,72 @@ def test_logical_detach_without_measured_owner_release_cannot_pass(acceptance):
         )
     with pytest.raises(AssertionError, match="CUDA owner release"):
         acceptance["validate_transition_states"](evidence, 2, (0, 1, 2), "cpu_spill")
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2])
+def test_installed_state_hook_uses_parallel_state_rank(acceptance, rank):
+    live = NS(rid="active", output_ids=[1] * 16, finished=lambda: False)
+    done = NS(rid="finished", output_ids=[2] * 24, finished=lambda: True)
+    calls = []
+
+    class Scheduler:
+        def __init__(self):
+            # The actual scheduler keeps rank identity in ps, with no pp_rank alias.
+            self.ps = NS(pp_rank=rank)
+
+        def get_internal_state(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return NS(internal_state={"existing": True})
+
+        def _elastic_pp_live_requests(self):
+            return [live, done]
+
+    class Coordinator:
+        def finalize_at_fence(self, publish):
+            publish()
+            return "committed"
+
+        def transition_metrics(self):
+            return {"generation": 1, "phase": "done"}
+
+    acceptance["install_transition_hooks"](Scheduler, Coordinator)
+    scheduler = Scheduler()
+    coordinator = Coordinator()
+    scheduler.elastic_pp_migration_coordinator = coordinator
+    coordinator.cache_transition = NS(scheduler=scheduler)
+    coordinator._transition = NS(target=NS(generation=1))
+    published = []
+    assert coordinator.finalize_at_fence(lambda: published.append(True)) == "committed"
+    result = scheduler.get_internal_state("request", probe=True)
+    assert published == [True]
+    assert calls == [(("request",), {"probe": True})]
+    assert result.internal_state == {
+        "existing": True,
+        "transition_rank": rank,
+        "transition_active_output_lengths": [16],
+        "transition_metrics": {"generation": 1, "phase": "done"},
+        "transition_fence_records": [
+            {"generation": 1, "requests": [{"rid": "active", "output_length": 16}]}
+        ],
+    }
+
+
+def test_failed_finalize_does_not_publish_successful_fence_record(acceptance):
+    class Scheduler:
+        def get_internal_state(self):
+            return NS(internal_state={})
+
+        def _elastic_pp_live_requests(self):
+            return []
+
+    class Coordinator:
+        def finalize_at_fence(self, publish):
+            raise RuntimeError("prepare failed")
+
+    acceptance["install_transition_hooks"](Scheduler, Coordinator)
+    coordinator = Coordinator()
+    coordinator.cache_transition = NS(scheduler=Scheduler())
+    coordinator._transition = NS(target=NS(generation=1))
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        coordinator.finalize_at_fence(lambda: None)
+    assert not getattr(coordinator, "_smoke_fence_records", [])

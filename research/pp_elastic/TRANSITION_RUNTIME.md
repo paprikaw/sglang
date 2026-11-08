@@ -58,7 +58,12 @@ then timed out in HiCache initialization before requests. It completed owned
 cleanup in 166.714 seconds; Guard released its lease. The fixed-size host-pool
 MIN collective was skipped by the zero-layer logical pool. The merged fix makes
 all resident ranks join FULL then MAMBA reductions, using neutral values on
-logical pools; the corrected revision still needs a newly tagged GPU attempt. Native paged
+logical pools. The fifth attempt completed HiCache initialization on all ranks,
+then failed before requests because the internal-state diagnostic hook used the
+obsolete scheduler rank attribute. That hook now uses `scheduler.ps.pp_rank`,
+with 43 installed-hook and scheduler checks passing. r5 completed verified
+cleanup in 112.434 seconds and Guard released its lease. A freshly tagged
+attempt remains necessary. Native paged
 allocator support is now merged, with the owned-layer qualification preserved.
 Existing static PP + HiCache runs do not qualify
 this dynamic path. The short real-model acceptance must include startup, warmup,

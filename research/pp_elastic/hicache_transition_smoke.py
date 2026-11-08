@@ -114,6 +114,10 @@ def install_hooks():
 
     from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
 
+    install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator)
+
+
+def install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator):
     original_finalize = ElasticPPMigrationCoordinator.finalize_at_fence
 
     def finalize(self, publish):
@@ -135,7 +139,7 @@ def install_hooks():
 
     def get_state(self, *args, **kwargs):
         result = previous_get(self, *args, **kwargs)
-        result.internal_state["transition_rank"] = self.pp_rank
+        result.internal_state["transition_rank"] = self.ps.pp_rank
         coordinator = getattr(self, "elastic_pp_migration_coordinator", None)
         if coordinator is not None:
             result.internal_state["transition_fence_records"] = getattr(

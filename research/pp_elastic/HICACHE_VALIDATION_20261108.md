@@ -32,6 +32,17 @@ exercise physical MHA/Mamba host constructors and logical pools, aligned
 capacities, the all-logical fallback and ratio sizing. A fresh tagged GPU run is
 required to validate that correction on the actual startup path.
 
+r5 used source 03317bcccb816dc8dcbff79926f5fa2fed6e6470 with immutable tag
+experiment/sglang/pp-hicache-transition-20261108-r5. All three ranks completed
+HiCache initialization, and HTTP startup completed. The first internal-state
+inspection then failed because the diagnostic hook used the old Scheduler
+pp_rank attribute instead of ps.pp_rank. No correctness request or transition
+completed. The failed run took 112.434 seconds including verified cleanup;
+Guard released its lease. The hook now uses the actual parallel-state API, and
+43 CPU acceptance/scheduler checks pass, including installed wrappers for all
+three resident ranks and failure paths. This correction requires a fresh GPU
+attempt and does not change the failed r5 classification.
+
 The merged checkpoint passed 197 CPU checks in 48.97 seconds across 15 files,
 including multi-generation three-rank KV/GDN backing reconstruction, host
 transactions, allocator live rows, partial OOM ownership and retry, publication
@@ -54,3 +65,7 @@ experiment/sglang/pp-hicache-transition-20261108-r4. The result and cleanup
 visibility receipts were verified before classification. Guard model-cache
 postcheck passed while scientific acceptance failed. Raw attempts are never
 rewritten as success after a source fix.
+
+The grouped [experiment snapshot](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_transition_20261108/manifest.json)
+records exact sources, launch manifests, stable result checksums and cleanup
+proof for r4 and r5. Earlier failed attempts remain at their original paths.
