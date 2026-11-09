@@ -1111,6 +1111,30 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "native"
+    elastic_pp_transition_strategy: A[
+        str,
+        Arg(
+            help=(
+                "Elastic PP transition policy: sync pauses before target preparation; "
+                "background preloads immutable weights over CPU transport while serving; "
+                "batched uses bounded KV chunks at the drained fence."
+            ),
+            choices=["sync", "background", "batched"],
+        ),
+        NS("parallel"),
+    ] = "sync"
+    elastic_pp_transition_backing: A[
+        str,
+        Arg(
+            help=(
+                "Elastic PP backing policy: overlap retains source GPU pools; "
+                "cpu_spill snapshots and releases native KV/GDN backing at the "
+                "drained fence before allocating the target (sync/batched, eager only)."
+            ),
+            choices=["overlap", "cpu_spill"],
+        ),
+        NS("parallel"),
+    ] = "overlap"
     enable_elastic_pp_autoscaling: A[
         bool,
         "Enable the tokenizer-side backlog controller for elastic PP.",
@@ -7947,6 +7971,10 @@ class ServerArgs:
             return
 
         if not self.enable_elastic_pp:
+            if self.elastic_pp_transition_backing != "overlap":
+                raise ValueError(
+                    "--elastic-pp-transition-backing requires --enable-elastic-pp"
+                )
             if self.elastic_pp_kv_backend != "native":
                 raise ValueError("--elastic-pp-kv-backend requires --enable-elastic-pp")
             if self.enable_elastic_pp_autoscaling:
@@ -7959,6 +7987,13 @@ class ServerArgs:
                     "--enable-elastic-pp-autoscaling"
                 )
             return
+        if self.elastic_pp_transition_backing == "cpu_spill":
+            if self.elastic_pp_transition_strategy not in {"sync", "batched"}:
+                raise ValueError("CPU-spill backing requires sync or batched transition")
+            if self.elastic_pp_kv_backend != "native":
+                raise ValueError("CPU-spill backing requires the native KV backend")
+            if not self.disable_cuda_graph:
+                raise ValueError("CPU-spill backing requires --disable-cuda-graph")
         if self.pp_size <= 1:
             raise ValueError("--enable-elastic-pp requires --pp-size greater than 1")
         if self.tp_size != 1:
@@ -10185,24 +10220,25 @@ class ServerArgs:
 
         if self.pp_size > 1:
             if envs.SGLANG_ENABLE_PP_SPEC.get():
-                assert self.disable_overlap_schedule, (
-                    "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"
-                )
-                assert self.speculative_algorithm == "EAGLE" and not self.enable_multi_layer_eagle, (
-                    "SGLANG_ENABLE_PP_SPEC supports single-layer EAGLE/MTP only"
-                )
-                assert self.disaggregation_mode == "null", (
-                    "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
-                )
-                assert not self.speculative_adaptive, (
-                    "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
-                )
-                assert not self.enable_dp_attention, (
-                    "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
-                )
-                assert not self.enable_elastic_pp, (
-                    "SGLANG_ENABLE_PP_SPEC does not support elastic PP reconfiguration"
-                )
+                assert (
+                    self.disable_overlap_schedule
+                ), "SGLANG_ENABLE_PP_SPEC requires --disable-overlap-schedule"
+                assert (
+                    self.speculative_algorithm == "EAGLE"
+                    and not self.enable_multi_layer_eagle
+                ), "SGLANG_ENABLE_PP_SPEC supports single-layer EAGLE/MTP only"
+                assert (
+                    self.disaggregation_mode == "null"
+                ), "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
+                assert (
+                    not self.speculative_adaptive
+                ), "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
+                assert (
+                    not self.enable_dp_attention
+                ), "SGLANG_ENABLE_PP_SPEC is not compatible with --enable-dp-attention"
+                assert (
+                    not self.enable_elastic_pp
+                ), "SGLANG_ENABLE_PP_SPEC does not support elastic PP reconfiguration"
             else:
                 assert (
                     self.disable_overlap_schedule and self.speculative_algorithm is None

@@ -163,6 +163,73 @@ def test_aborted_layer_releases_loader_reference_cycle(model_class):
             gc.enable()
 
 
+@pytest.mark.parametrize("chain", [None, "cause", "context"])
+def test_retained_weight_oom_drops_target_owners_and_allows_source_retry(
+    model_class, chain
+):
+    model = _model([10.0, None, None], LayerRange(0, 1), model_class)
+    allocated = []
+
+    def fail_second_layer(layer_id, start_layer):
+        layer = _Layer(-float(layer_id), start_layer)
+        layer.weight.weight_loader = layer.forward
+        allocated.append(weakref.ref(layer.weight))
+        if layer_id == 2:
+            message = "injected target weight allocation failure"
+            if chain is None:
+                raise torch.OutOfMemoryError(message)
+            try:
+                raise RuntimeError("constructor allocation failed")
+            except RuntimeError as cause:
+                if chain == "cause":
+                    raise torch.OutOfMemoryError(message) from cause
+                raise torch.OutOfMemoryError(message)
+        return layer
+
+    model._elastic_layer_factory = fail_second_layer
+    with pytest.raises(torch.OutOfMemoryError) as caught:
+        model.prepare_elastic_pp_layers(
+            target=LayerRange(0, 3),
+            generation=1,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+    # Keep the exception alive, as the coordinator does during source restore.
+    assert caught.value is not None
+    if chain is not None:
+        assert str(caught.value.__context__) == "constructor allocation failed"
+        assert caught.value.__context__.__traceback__ is None
+    assert len(allocated) == 2
+    assert all(weight() is None for weight in allocated)
+    assert model.abort_elastic_pp_layers(1) == ()
+    assert model.get_elastic_pp_layer_range() == LayerRange(0, 1)
+    assert torch.equal(model.layers[0].weight, torch.full((3,), 10.0))
+
+    model._elastic_layer_factory = lambda layer_id, start_layer: _Layer(
+        -1.0 - layer_id, start_layer
+    )
+    assert model.prepare_elastic_pp_layers(
+        target=LayerRange(0, 3),
+        generation=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    ) == frozenset({1, 2})
+    model.abort_elastic_pp_layers(1)
+
+
+def test_weight_abort_refuses_published_generation(model_class):
+    model = _model([10.0, 20.0], LayerRange(0, 2), model_class)
+    model.prepare_elastic_pp_layers(
+        target=LayerRange(0, 1),
+        generation=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    model.commit_elastic_pp_layers(1)
+    with pytest.raises(RuntimeError, match="published"):
+        model.abort_elastic_pp_layers(1)
+
+
 def test_quantized_layer_is_materialized_in_runtime_layout(model_class):
     quant_name = "compressed_tensors" if model_class is LlamaModel else "moe_wna16"
     source = _model([10.0, 20.0], LayerRange(0, 2), model_class)

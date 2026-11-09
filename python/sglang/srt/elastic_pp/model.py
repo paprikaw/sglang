@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 from collections.abc import Iterable
 
 import torch
@@ -82,6 +83,29 @@ class ElasticPPModelMixin:
     ) -> frozenset[int]:
         """Materialize missing target layers without changing the live range."""
 
+        try:
+            return self._prepare_elastic_pp_layers(
+                target=target, generation=generation, device=device, dtype=dtype
+            )
+        except BaseException as error:
+            from sglang.srt.elastic_pp.backing_spill import discard_tensor_tracebacks
+
+            # A retained OOM exception must not pin a partially constructed
+            # target layer while the coordinator restores source KV backing.
+            # Constructor frames can also contain loader-reference cycles;
+            # collect these new, unfrozen objects after dropping the frames.
+            discard_tensor_tracebacks(error)
+            gc.collect()
+            raise error from None
+
+    def _prepare_elastic_pp_layers(
+        self,
+        *,
+        target: LayerRange,
+        generation: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> frozenset[int]:
         if self._elastic_layer_residency is None:
             raise RuntimeError("elastic PP layer residency is not enabled")
         quant_name = None if self.quant_config is None else self.quant_config.get_name()
@@ -215,6 +239,13 @@ class ElasticPPModelMixin:
         if self._elastic_layer_residency is None:
             raise RuntimeError("elastic PP layer residency is not enabled")
         with self._elastic_layer_lock:
+            if self._elastic_layer_residency.pending is None:
+                if generation <= self._elastic_layer_residency.generation:
+                    raise RuntimeError(
+                        "cannot abort a published elastic layer generation"
+                    )
+                # The allocation helper may already have rolled back an OOM.
+                return ()
             new_layer_ids = self._elastic_layer_residency.abort(generation)
             removed = []
             for layer_id in sorted(new_layer_ids):

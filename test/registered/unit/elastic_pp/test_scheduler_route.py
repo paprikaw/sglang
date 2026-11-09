@@ -517,7 +517,6 @@ def test_common_future_microstep_arms_drain_on_the_exact_boundary():
     assert scheduler._elastic_pp_drain_due()
 
 
-
 def test_drained_fence_commits_route_replies_and_defers_cleanup():
     scheduler = _FakeScheduler(rank=0)
     source = _pp2_topology(generation=0)
@@ -551,6 +550,53 @@ def test_drained_fence_commits_route_replies_and_defers_cleanup():
     assert coordinator.alignment_calls == [(0, 4)]
     assert scheduler._pp_microstep == 4
 
+
+def test_reversible_target_rejection_resumes_source_at_common_ring_boundary():
+    scheduler = _FakeScheduler(rank=0)
+    source = _pp2_topology(generation=0)
+    target = PPTopology.from_layer_counts([2, 2, 0, 4], generation=1)
+    coordinator = _FakeMigrationCoordinator(DynamicPPTransition.build(source, target))
+    scheduler._pp_install_topology(source)
+    scheduler.elastic_pp_migration_coordinator = coordinator
+    scheduler._elastic_pp_draining = True
+    scheduler._elastic_pp_pending_req = None
+    scheduler.mbs = [None, None, None, None]
+    scheduler.last_rank_comm_queue = deque()
+    scheduler.pp_outputs = None
+    scheduler.send_req_work = []
+    scheduler.send_proxy_work = []
+    scheduler.send_output_work = []
+
+    def reject_target(publish):
+        coordinator.phase = ElasticPPMigrationPhase.FAILED
+        raise RuntimeError("target OOM; every source restored")
+
+    coordinator.finalize_at_fence = reject_target
+    assert not scheduler._elastic_pp_finalize_if_drained()
+    assert scheduler._pp_topology() == source
+    assert scheduler._pp_microstep == 4
+    assert not scheduler._elastic_pp_draining
+    assert coordinator.cleanup_event is None
+
+
+def test_async_cleanup_failure_stops_the_next_serving_microstep():
+    scheduler = _FakeScheduler(rank=0)
+    source = _pp2_topology(generation=0)
+    target = PPTopology.from_layer_counts([2, 2, 0, 4], generation=1)
+    coordinator = _FakeMigrationCoordinator(
+        DynamicPPTransition.build(source, target), phase=ElasticPPMigrationPhase.FAILED
+    )
+    original_snapshot = coordinator.snapshot
+    coordinator.snapshot = lambda: SimpleNamespace(
+        **(
+            vars(original_snapshot())
+            | {"source_usable": False, "error": "cleanup failed"}
+        )
+    )
+    scheduler.elastic_pp_migration_coordinator = coordinator
+    scheduler._elastic_pp_pending_req = None
+    with pytest.raises(RuntimeError, match="serving must stop"):
+        scheduler._elastic_pp_drain_due()
 
 
 def test_reconfigure_request_starts_prepare_without_blocking_scheduler_ring():
@@ -652,7 +698,6 @@ def test_elastic_output_ring_stays_on_process_group_nccl():
     assert not sent["use_pynccl"]
 
 
-
 def test_elastic_proxy_route_rejects_missing_pynccl():
     scheduler = _FakeScheduler(rank=0)
     scheduler._pp_install_topology(_pp2_topology())
@@ -662,7 +707,6 @@ def test_elastic_proxy_route_rejects_missing_pynccl():
         scheduler._pp_send_dict_to_next_stage(
             {"hidden_states": "payload"}, msg_type="proxy"
         )
-
 
 
 @pytest.mark.parametrize(
@@ -722,7 +766,6 @@ def test_tensor_dict_receive_selects_transport_from_actual_metadata(
     assert bool(process_group_recvs) is not expect_pynccl
 
 
-
 def test_reconfigure_supports_compact_pp2_to_pp4():
     scheduler = _FakeScheduler(rank=0)
     source = PPTopology.from_layer_counts([4, 4, 0, 0], generation=0)
@@ -744,7 +787,6 @@ def test_reconfigure_supports_compact_pp2_to_pp4():
     assert coordinator.transition.target == target
 
 
-
 def test_downstream_rank_waits_for_in_band_request_ring_fence():
     scheduler = _FakeScheduler(rank=1)
     source = _pp2_topology(generation=0)
@@ -762,7 +804,6 @@ def test_downstream_rank_waits_for_in_band_request_ring_fence():
     assert scheduler._elastic_pp_extract_request_ring_fence([fence]) == fence
 
 
-
 def test_request_ring_fence_rejects_mixed_payload():
     scheduler = _FakeScheduler(rank=1)
     source = _pp2_topology(generation=0)
@@ -774,7 +815,6 @@ def test_request_ring_fence_rejects_mixed_payload():
 
     with pytest.raises(RuntimeError, match="sole downstream payload"):
         scheduler._elastic_pp_extract_request_ring_fence([object(), fence])
-
 
 
 def test_fence_waits_until_every_rank_reports_its_ring_drained():
@@ -797,7 +837,6 @@ def test_fence_waits_until_every_rank_reports_its_ring_drained():
     assert coordinator.phase == ElasticPPMigrationPhase.BULK_READY
     assert scheduler._pp_topology() == source
     assert scheduler._elastic_pp_draining
-
 
 
 def test_fence_waits_for_resident_request_ring_to_drain():
@@ -830,7 +869,6 @@ def test_fence_waits_for_resident_request_ring_to_drain():
     assert scheduler._pp_topology() == source
 
 
-
 def test_fence_drain_consensus_includes_inflight_topology_sends():
     scheduler = _FakeScheduler(rank=0)
     source = _pp2_topology(generation=0)
@@ -852,3 +890,34 @@ def test_fence_drain_consensus_includes_inflight_topology_sends():
     assert coordinator.local_drain_reports == [False]
     assert coordinator.phase == ElasticPPMigrationPhase.BULK_READY
     assert scheduler._pp_topology() == source
+
+
+def test_dormant_cache_handle_rebind_preserves_request_progress():
+    import copy
+
+    req = SimpleNamespace(
+        rid="request",
+        req_pool_idx=2,
+        output_ids=[10, 11],
+        origin_input_ids=[1, 2],
+        last_node=5,
+        last_host_node=6,
+        best_match_node=5,
+        skip_lock_node_ids={1: 5},
+    )
+    scheduler = SimpleNamespace(running_mbs=[SimpleNamespace(reqs=[req])])
+    scheduler._elastic_pp_live_requests = (
+        lambda: SchedulerPPMixin._elastic_pp_live_requests(scheduler)
+    )
+    scheduler._elastic_pp_request_cache_state = (
+        lambda: SchedulerPPMixin._elastic_pp_request_cache_state(scheduler)
+    )
+    records = copy.deepcopy(scheduler._elastic_pp_request_cache_state())
+    records["request"]["handles"]["last_node"] = 99
+    SchedulerPPMixin._elastic_pp_rebind_request_cache_state(scheduler, records)
+    assert req.last_node == 99
+    assert req.output_ids == [10, 11] and req.req_pool_idx == 2
+    records["request"]["progress"] = (2, (10, 12), (1, 2))
+    with pytest.raises(RuntimeError, match="progress differs"):
+        SchedulerPPMixin._elastic_pp_rebind_request_cache_state(scheduler, records)
+    assert req.output_ids == [10, 11]

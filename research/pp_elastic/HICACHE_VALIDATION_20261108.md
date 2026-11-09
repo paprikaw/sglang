@@ -1,0 +1,252 @@
+# HiCache resident PP transition validation, 2026-11-08
+
+Dynamic acceptance and generation qualification remain unqualified. The single
+static-gen0 r10 diagnostic at clean ac0a73525f6a completed cold256/warm8 and
+verified cleanup in 85.345 seconds; Guard released its lease. Its online analyzer
+rejected eight apparent CoW observations because the observer missed the real
+method's Decode early return. The original result remains failed. Separately
+classified offline evidence finds bitwise checkpoint and CoW preservation on all
+30 GDN layers through the actual warm kernel input, while cold/warm output still
+differs. No numerical tolerance or generation pass follows.
+
+At clean aa93b5188c8a, r9 completed generation one and its uninterrupted active
+request, then stalled while preparing generation two's host cache. It failed
+after 176.100 seconds including verified cleanup, and Guard released its lease.
+The exact resumed IDs matched the warmed reference. The same prompt and greedy
+sampling had already produced different cold and warmed gen0 IDs at output
+index six, so that match does not establish generation correctness.
+
+The shrink stall has a CPU/Gloo reproduction: the migration-specific dormant
+host constructor skipped FULL/MAMBA MIN reductions while the physical ranks
+entered them. Cache a99c6cf681e4 reuses the initial logical constructor's sizing
+protocol. In the same real-constructor Gloo script, all three ranks now finish
+FULL MIN, MAMBA MIN and the subsequent all-gather in both expand and shrink.
+The controller is stubbed and no model or CUDA device is used. This is a
+collective-order fix, not a completed GPU shrink.
+
+This is a correctness check for one Qwen3.6-35B-A3B BF16 model with native KV and
+FP32 GDN state. Tensor and expert parallel sizes are both one. Three resident
+A100 workers on booked node spartan-gpgpu168 keep HiCache enabled while the
+planned global-layer partitions change from 20/0/20 to 13/13/14 and back. The
+zero-layer worker remains a resident GPU process. CUDA Graph is explicitly
+disabled. This is neither a GPU-return measurement nor a pause benchmark.
+
+The overlap reference and CPU-spill path share the transports and coordinator.
+Overlap retains both generations and does not establish GPU-capacity relief.
+CPU spill snapshots full KV/GDN backing to CPU, releases device owners, rebuilds
+target backing and restores retained state. It has CPU recovery and staged
+receive tests; physical CUDA release and real request recovery remain unverified.
+Background currently moves immutable weights before the fence; mutable state
+still moves at the fence. No GPU comparison of the three pause policies exists.
+
+The first three attempts failed before requests: integer HiCache-size parsing,
+strict actual-layer weight qualification, then native paged allocator live-slot
+support. Those failures remain preserved. In r4, strict canonical loading passed
+for all three expected ranks and the actual PagedTokenToKVPoolAllocator was
+identified. HiCache initialization then stalled before HTTP readiness or any
+request. The 165-second worker deadline produced a failed result with
+166.714 seconds including owned cleanup. Guard verified cleanup and released its
+normal-priority lease. No transition or output-equivalence claim follows.
+
+The fixed-size HiCache host constructors enter a pipeline-group MIN reduction
+for FULL and MAMBA capacity. The zero-layer logical branches skipped those
+reductions. Cache checkpoint 3f41063832 now makes each resident rank participate
+in the same order, with neutral int64 values for the zero-layer rank. CPU tests
+exercise physical MHA/Mamba host constructors and logical pools, aligned
+capacities, the all-logical fallback and ratio sizing. r5 subsequently validated
+completion of these constructors on all three actual GPU workers.
+
+r5 used source 03317bcccb816dc8dcbff79926f5fa2fed6e6470 with immutable tag
+experiment/sglang/pp-hicache-transition-20261108-r5. All three ranks completed
+HiCache initialization, and HTTP startup completed. The first internal-state
+inspection then failed because the diagnostic hook used the old Scheduler
+pp_rank attribute instead of ps.pp_rank. No correctness request or transition
+completed. The failed run took 112.434 seconds including verified cleanup;
+Guard released its lease. The hook now uses the actual parallel-state API, and
+43 CPU acceptance/scheduler checks pass, including installed wrappers for all
+three resident ranks and failure paths. This correction requires a fresh GPU
+attempt and does not change the failed r5 classification.
+
+The merged checkpoint passed 197 CPU checks in 48.97 seconds across 15 files,
+including multi-generation three-rank KV/GDN backing reconstruction, host
+transactions, allocator live rows, partial OOM ownership and retry, publication
+failstop, bounded CPU-spill wire chunks and adversarial evidence validation.
+The [CPU archive](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/hicache-runtime-combined-20261108-r5)
+contains the exact file list and JUnit. CPU execution does not qualify CUDA
+fences, owner release or GPU OOM retry.
+
+The short real-model acceptance requires actual Decode state at both generation
+fences, positive CPU-only prefix payload bytes in each generation, unchanged
+active output IDs and fresh final CPU prefix loadback on every final active rank.
+For CPU spill it also requires positive detached bytes and a measured CUDA
+allocated-byte decrease on every source-active rank. All loading, warmup,
+requests, transitions and verified cleanup must finish within 300 seconds.
+
+Raw r4 evidence remains at
+[the immutable run directory](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/gpu-hicache-r4).
+Its source is 1c4823bb198d4026bf8aab8734c338fb705304f2 and immutable tag
+experiment/sglang/pp-hicache-transition-20261108-r4. The result and cleanup
+visibility receipts were verified before classification. Guard model-cache
+postcheck passed while scientific acceptance failed. Raw attempts are never
+rewritten as success after a source fix.
+
+The grouped [experiment snapshot](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_transition_20261108/manifest.json)
+records exact sources, launch manifests, stable result checksums and cleanup
+proof for r4 and r5. Earlier failed attempts remain at their original paths.
+
+r6 was prepared and tagged at f6d1fe27a0 but never launched. Cross-review found
+that a not-yet-idle demotion can return no probe or an old probe; demotion now
+retries until the same command has three positive acknowledgements and fresh,
+completed probes. Requests now use 512 common prefix tokens plus one fixed
+continuation token: the real Req API reserves the final input token, so a
+512-token input could not prove a full 512-token loadback. The strict loadback
+threshold remains 512. Both prefix and active references are collected after
+warmup at the same match boundary; original cold outputs are also retained.
+
+The new continuation evidence joins each response meta_info.id to the same
+request at all three resident fences. It requires zero cumulative retractions,
+zero Prefill launches after the first Decode, and an actual post-fence Decode
+launch on each target-active rank. Counts cover active model-launch batches;
+zero-layer passthrough is excluded. Per-request records contain only IDs and
+integers, with no retained request or tensor owners. The repaired harness and
+scheduler boundaries have 57 passing CPU checks, including real cache-probe
+hook retries, the actual Req prefix cutoff, actual ForwardMode values and
+adversarial retraction/re-prefill/request-ID evidence. None of these CPU changes
+is a dynamic pass.
+
+
+r7 used clean 4c331bcfa24940ee751a7958bcd88309b9aaecb8 and immutable tag
+experiment/sglang/pp-hicache-transition-20261108-r7. Four cold/warmed reference
+requests completed. Both warmed requests reused 512 GPU prefix tokens and
+reported zero retractions. The initial CPU demotion then rejected incomplete
+rank evidence: normal internal-state IPC returns one reply per DP replica,
+while the check correctly requires all three resident PP workers. Zero
+transitions occurred. The run failed in 87.423 seconds including verified
+owned-process/GPU cleanup; Guard released its lease. Stable result and cleanup
+visibility receipts were verified. This is a request-stage failure, with no
+dynamic recovery or output-equivalence claim.
+
+The correction is confined to the private single-node PP3/TP1/DP1 acceptance
+hook. Non-first PP workers send only get/set internal-state replies through
+independent diagnostic sockets, and the same two tokenizer communicators wait
+for three replies. Inference and topology-control replies keep their usual DP
+semantics. A handler collective would deadlock because PP forwards the request
+after the local handler returns. The repaired hook has 66 passing acceptance
+and scheduler CPU checks. These execute the real scheduler IPC constructor,
+ZeroMQ/msgpack, tokenizer communicator initialization/dispatcher and graceful
+resource-release method; two replies cannot complete a three-rank request.
+Socket construction/publication failures close the new context even when the
+exception is retained. Independent review found no blocker in this narrow
+scope. Abnormal-process cleanup still requires Guard evidence on each real run.
+
+An independent run recovered the exact historical 537 CPU node IDs across 52
+files and passed every selected case, with zero failures, errors or skips.
+Source remained clean at 4c331bcfa249 before and after, with zero visible CUDA
+devices. The [historical CPU archive](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/hicache-runtime-historical-537-20261108)
+contains raw JUnit, selection, command/environment and source audit. This is a
+separate suite from the 197 focused checks. Initial whole-file collection
+attempts were incomplete and are preserved separately; they are not baseline
+passes.
+
+r8 used clean 36069aeca07c6fc3669dcb57a02d08a7dccc8ede and immutable tag
+experiment/sglang/pp-hicache-transition-20261108-r8. The private diagnostic path
+returned all three ranks, and initial CPU demotion had three fresh positive
+acknowledgements. Generation one actually committed on all three ranks:
+rank 0 sent 49,217,536 host bytes, rank 2 sent 46,071,808 and rank 1 received
+95,289,344. The engine then resumed PP3 Decode for approximately 17 seconds.
+Request completion failed because the batch-result processor retained the old
+tree, whose request-pool reference had been cleared during retired-cache
+cleanup. The subsequent peer-closed errors were secondary. This is a
+post-publication failure, not a first-fence deadlock or a successful acceptance.
+
+The failed r8 result took 160.804 seconds including verified cleanup; Guard
+released its lease. Model-cache postcheck passed, while scientific acceptance
+failed. The original result has no transition records because its harness
+appended only after active request completion. Raw committed metrics and the
+primary traceback remain in
+[the original engine log](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/gpu-hicache-r8/cache/pp2.log).
+The immutable failed results are preserved. No complete grow/shrink cycle,
+exact resumed-output equivalence or CPU-spill CUDA-release result follows.
+
+The harness now records control return before awaiting the active request and
+marks continuation verification separately. A real worker-loop CPU regression
+injects a post-publication request failure and verifies that publication is
+retained while acceptance still fails and owned cleanup runs. Saved internal
+states use a diagnostic field allowlist rather than full ServerArgs. All 67
+acceptance and scheduler checks pass, with no failures or skips. The cache
+context/session repair was merged and independently reviewed before r9. At clean
+aa93b5188c8a, 232 focused CPU checks passed in 52.73 seconds. A separate
+independent run passed the exact historical 537 CPU node IDs across 52 files in
+34.43 seconds, with zero failures, errors or skips, unchanged clean source and
+zero visible CUDA devices. Their selections and JUnit archives are preserved
+separately; the counts are not additive unique coverage.
+
+r9 recorded generation-one publication on every rank and fresh host traffic:
+rank 0 sent 49,217,536 bytes, rank 2 sent 46,071,808 and rank 1 received
+95,289,344. The resumed request completed all 256 output tokens with the same
+RID, zero retractions, no Prefill after Decode, and actual Decode launches on
+each target-active rank. Generation two entered the fence but did not publish.
+No final prefix-loadback or CPU-spill CUDA-release acceptance follows. Original
+results and cleanup remain under gpu-hicache-r9; the failed run is immutable.
+
+Further policy or spill sweeps are blocked on generation qualification. A
+private, static-gen0 diagnostic retains cold256/warm8 on the original 20/0/20
+layout. It observes the original GDN calls, checkpoint512 at birth and cold
+completion, warm CoW source/destination, and the first eight actual sampler
+logits. It records raw track length 513 and its chunk64 boundary512, exact RIDs,
+argmax and generated prefixes. Analysis compares logits only on common input
+histories and reports bitwise state relations without selecting a tolerance.
+Continuous FP32 state at token512 remains unobserved. The diagnostic performs
+no transition and cannot qualify a 256-token warmed trajectory. The current
+four-file CPU selection passes 98 checks in 5.627 seconds, with zero failures,
+errors or skips and zero visible CUDA devices. The source hashes are unchanged
+across that run. Its first failed run, caused by an
+undefined variable in newly added phase logging, is preserved separately.
+
+r10 used the unchanged original GDN kernel and static 20/0/20 layout, with no
+transition. All four reference requests completed; both warmed requests reused
+512 tokens and every response reported zero retractions. Actual k and kernel h
+were BF16, with FP32 pooled temporal state. The first eight cold/warm output IDs
+still diverged at index six. Actual request payloads, output IDs and full logits
+remain in private run artifacts rather than this report.
+
+The raw observer recorded a genuine initial Extend CoW plus seven Decode
+no-ops per active rank because Decode retains old source/destination fields.
+The strict uniqueness check rejected that evidence. Offline classification
+selects only the output-length-zero pair before the first warm GDN Extend;
+it preserves and hashes the original results, events and tensors. The exact
+frozen analyzer then verifies the derived metadata separately. Independent CPU
+review confirms all 30 layers: checkpoint birth equals cold completion, warm
+CoW source and destination, bitwise for conv and SSM; the destination SSM equals
+the actual warm kernel initial state and every physical address agrees. The
+first local layer has identical last-token q/k/v/g/beta, but the original
+cold513 and warm512+1 calls leave different temporal state. At the common-history
+output divergence the captured cold greedy candidates tie, while the warm
+candidates differ. Continuous FP32 state at512 remains unobserved; these facts
+do not uniquely identify the cause or qualify a numerical tolerance.
+
+The future observer now mirrors every real CoW early-return condition and
+observes only the initial warm Extend. Five tests execute the real method with
+stale indices and require exactly one delegation with no observation. The
+four-file CPU selection passes 103 checks in 6.805 seconds, with no failures,
+errors or skips, zero visible CUDA devices and unchanged source hashes. Its
+first run had five fixture-only failures because an intentionally absent event
+file was read; both runs are preserved. No additional GPU run followed r10.
+
+The [r10 evidence directory](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/gpu-hicache-r10)
+keeps raw failed results and cleanup receipts, central lease-release proof,
+separate offline-classification provenance, independent review and CPU records.
+The local immutable r10 tag identifies ac0a73525f6a. Remote synchronization was
+pending at launch: one bounded push timed out during the receive-pack transport,
+before any hook or pack-objects event. Local source eligibility was explicitly
+authorized; no GitHub synchronization or remote tag is claimed. The next explicitly authorized class is cached execution continuity at the same
+512-token warmed boundary. It permanently records
+`cold_vs_warm_generation_qualified=false`, binds the original failed r10 result
+and independent state proof by hash, and keeps every exact-ID, active-fence,
+no-retraction/no-re-prefill, bidirectional host transfer and fresh loadback
+requirement. It does not grant cold/warm generation equality or a tolerance.
+The private gate and unchanged acceptance boundaries pass 125 CPU checks across
+five files in 8.175 seconds, with no failures, errors or skips and unchanged
+source hashes. Actual r10 receipt validation covers all 30 global GDN layers.
+A single sync/overlap grow/shrink is authorized after source and peer freeze;
+CPU-spill CUDA release remains a subsequent independent check.
