@@ -1,5 +1,7 @@
 # HiCache resident PP transition validation, 2026-11-08
 
+2026-11-09 最新范围：同暖512边界的 sync/cpu_spill GPU 往返及本次组合742项CPU检查已通过，具体源码、证据和未完成项见[基线验收摘要](BASELINE_ACCEPTANCE_20261109.md)。下文保留各历史检查点及失败记录；历史“尚未验证”的表述仅适用于对应版本，不代表当前扩大了冷暖生成、其他策略、Graph 或GPU归还的资格。
+
 Dynamic acceptance and generation qualification remain unqualified. The single
 static-gen0 r10 diagnostic at clean ac0a73525f6a completed cold256/warm8 and
 verified cleanup in 85.345 seconds; Guard released its lease. Its online analyzer

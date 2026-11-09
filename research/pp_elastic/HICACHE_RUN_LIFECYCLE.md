@@ -1,5 +1,7 @@
 # Private HiCache run cancellation and time admission
 
+2026-11-09 最新范围：同暖512边界的 sync/cpu_spill GPU 往返及本次组合742项CPU检查已通过，具体源码、证据和未完成项见[基线验收摘要](BASELINE_ACCEPTANCE_20261109.md)。下文保留各历史检查点及失败记录；历史“尚未验证”的表述仅适用于对应版本，不代表当前扩大了冷暖生成、其他策略、Graph 或GPU归还的资格。
+
 `hicache_guard_run.py --run RUN` starts the unchanged canonical `dashboard_guard.py run`. Its budget begins before Guard is spawned. At the work cutoff it writes a run-specific cancellation request; it does not signal Guard. The controller keeps SSH and Guard alive while the worker's independent cleanup thread terminates only the recorded children. Child launch and registration share a lock with cleanup. Cancellation before worker startup prevents a later model launch.
 
 The acknowledgement binds the frozen run nonce, authenticated lease ID, worker PID/start ticks/host/boot identity, cleanup interval and complete owned-child list. All four cleanup checks must come from the fresh cleanup result. SSH termination, a finished request, an old cleanup file and a usable source pool are insufficient. A successful experiment also requires its original exact output/state assertions, complete hashed diagnostic archive and successful canonical Guard release. Experiment failure with verified cleanup can still release the lease normally.

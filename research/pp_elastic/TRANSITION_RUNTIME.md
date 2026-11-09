@@ -1,5 +1,7 @@
 # PP + HiCache transition runtime checkpoint
 
+2026-11-09 最新范围：同暖512边界的 sync/cpu_spill GPU 往返及本次组合742项CPU检查已通过，具体源码、证据和未完成项见[基线验收摘要](BASELINE_ACCEPTANCE_20261109.md)。下文保留各历史检查点及失败记录；历史“尚未验证”的表述仅适用于对应版本，不代表当前扩大了冷暖生成、其他策略、Graph 或GPU归还的资格。
+
 Dynamic acceptance is still blocked. r9 at aa93b5188c8a completed one
 publication and uninterrupted active Decode relative to its warmed reference,
 then stalled during the shrink host-cache preparation. The failed run took

@@ -17,3 +17,7 @@
 **版本与尚未覆盖的范围。** CPU 使用 r8，引擎 `python/` 源码与 r9 完全相同；r9 的变化是测试和可选运行适配。原生 EP2／EP4 使用 r6，后续唯一引擎改动是上述 DeepEP normal 构造兼容修复，它不改变原生 NCCL 路径。各次不可移动的标签、提交及依赖在 manifest 中记录。动态 PP 扩缩、GPU 真正释放、H100、其他模型／量化路径、DeepEP LL／CE，以及 TBO、异构 TP／PP、speculation 等可选组合仍需各自的硬件资格验证；目前不能声称它们全部无 bug。
 
 **原工作保留。** 46 个原有 worktree 的已跟踪状态和未提交源码哈希均与整合前一致。45 个历史分支已通过祖先关系纳入；33 个 DeepEP 分支作为独立依赖锁定并已有远端备份，其余 10 个分支逐项说明重复、被替代或作为参考保留的原因。见[覆盖清单](branch_coverage.json)和[保留检查](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/original_worktree_preservation.json)。
+
+## 2026-11-09：naive PP＋HiCache 组合验收
+
+在冻结候选 `de7808daeae6` 上，历史537节点与新增205节点去重后共742个CPU用例全部通过，零失败、错误或跳过，源码不变且无可见CUDA设备。实际合入项目的引擎、测试和适配tree与候选一致；r14／r15的有限GPU证据按相同引擎与运行适配复用，本轮未重跑GPU。独立审查与范围说明见[基线验收摘要](BASELINE_ACCEPTANCE_20261109.md)。原2026-11-05静态资格和每次失败记录保留，不自动扩大到新动态组合。

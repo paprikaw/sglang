@@ -1,5 +1,7 @@
 # SGLang 研究基线
 
+2026-11-09：naive PP＋HiCache 的实现范围、组合回归及合并依据见[本次基线验收](BASELINE_ACCEPTANCE_20261109.md)。低干扰机制仍是后续工作，完成状态以[TODO](TODO.md)为准。
+
 当前 PP＋HiCache 实现、验收和后续优化统一追踪于[任务清单](TODO.md)。每个 agent 交付时更新对应条目，规则见[协作约定](WORKFLOW.md)。
 
 后续开发统一合入 `codex/pp-elastic-integration`。上游基点沿用已做 AgentX P/D 验证的 R11，新增功能通过合并保留原分支历史。原实验 worktree、冻结标签和尚未提交的工作均保留。
