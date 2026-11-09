@@ -10,6 +10,7 @@ process's model_path record.
 """
 
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 from sglang.srt.layers.moe.utils import (
@@ -165,6 +166,23 @@ class TestFusionDecisionFlag(CustomTestCase):
         with forward_context(ForwardContext(attn_backend=SimpleNamespace())):
             with self.assertRaises(AssertionError):
                 is_shared_experts_fusion_disabled()
+
+    def test_background_build_reads_fusion_decision_while_source_forwards(self):
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        self._seed(disable_shared_experts_fusion=False)
+        _install(_AlwaysDisables)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            with forward_context(ForwardContext(attn_backend=SimpleNamespace())):
+                pending = executor.submit(is_shared_experts_fusion_disabled)
+                self.assertTrue(pending.result(timeout=5))
+                # The same construction-time read is still illegal on the
+                # inference thread; background support does not relax it.
+                with self.assertRaises(AssertionError):
+                    is_shared_experts_fusion_disabled()
 
     def test_the_intent_stays_on_the_bag(self):
         self._seed(disable_shared_experts_fusion=False)

@@ -8,6 +8,12 @@
 
 首个GPU候选 `b9cfdc0180` 在模型加载前被page-size限制拒绝，原启动协议固定64-token页；`live-patch-gpu-r1` 共35.628秒，清理和正常release验证通过。未改为page-size 1；已补齐标准分页 allocator 的整页生命周期、页尾追加与前向前重写保护，保持原缓存协议。随后 `live-patch-cpu-r4/pytest.xml` **483项CPU组合检查全部通过**，160.810秒，零失败／错误／跳过。这是新一次完整组合回归；早先失败保留，不重复累计通过数。新GPU资格另记。
 
+第二个GPU候选 `57742e9842fc` 使用原64-token页，完成加载和512-token预热后，在首个转换的后台新层构建中失败。原因是进程级forward context让构建线程误判自己在推理；转换尚未提交。`live-patch-gpu-r2` 共144.885秒，owned进程清理及正常release验证通过。原始结果稳定可见，SHA256 `d26add2feee8c4897fb9b0e55364aaf7da6047ad5e012b65b0a960590e379961`。
+
+隔离初版通过512项CPU组合检查（`live-patch-cpu-r5/pytest.xml`），但额外Dynamo检查发现ContextVar.get无法被fullgraph追踪，因此改用线程本地属性。保留同线程forward内的构建状态读取拒绝，以及嵌套／异常恢复；新增编译后切换backend的回归，防止绕过检查或冻结错误backend。修复后的检查及新GPU结果另记，不把失败批次算作在线patch验收；这里只验证同步forward作用域，不支持在作用域内await。
+
+最终线程隔离版本的 `live-patch-cpu-r6/pytest.xml` **512项检查全部通过**，140.830秒，零失败／错误／跳过；范围为elastic_pp全目录、配置声明、draft构建隔离和split attention决策，包含fullgraph下切换backend的检查。这次完整组合回归替代前一修复候选的当前资格，不累计为1024项；实际模型CUDA Graph仍未启用。
+
 ## 2026-11-05：静态 EP／PP／P/D 资格
 
 2026-11-05。共同分支为 `codex/pp-elastic-integration`，基点为 R11 `b862312ce3`。运行记录和完整检查清单位于[验证 manifest](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/validation_manifest.json)。这次验证执行正确性和开关实际生效，不据此发布性能提升结论。
