@@ -11,6 +11,8 @@
 - [x] 实现 KVCacheD 按层映射协议、映射账本、部分失败重试及页面 pin；保存可重放依赖补丁、Python／原生版本检查和 stacking 边界检查。27 项依赖 CPU 检查通过；补丁在干净上游索引重放得到完全相同的源码树。见[实现与边界](KV_LAYER_MAPPING.md)及依赖锁。真实 GPU 页面验证不包含在此勾选中。
 - [x] 修复 SGLang import／abort／cleanup 在校验 generation 前触碰物理页面的问题，并在 map 前检查槽位和 payload。旧基线可复现 3 个故障，新代码 769 项引擎 CPU 回归通过；保留层地址／数值仅在 CPU 适配器验证，不能据此推定真实 GPU 验收。
 - [ ] 验证真实 GPU 的按层 map／unmap、保留层地址与数据及失败回退；接通 HiCache、GDN 和 Attention 的布局约束。持续 KV patch、Graph bank 和真正归还 GPU 仍分别验收，现有 hybrid HiCache 的 native-only 保护不撤除。
+- [x] 建立有限 Graph 预捕获库与持续 KV 行追补的实验模块，本轮75项CPU检查通过（25项新模块＋50项生命周期／参考资格回归）。Graph 按完整 tensor 地址／shape／stride 匹配，eager 回退同样保护页面，复制保护槽位复用；尚未接入整模型 scheduler、跨 rank 传输或 GDN 增量同步。见[接口与接入顺序](GRAPH_KV_PATCH.md)。
+- [ ] 在同一有界 A100 租约中先验证 VMM／Graph／增量复制，再独立回归开启 HiCache 的整模型 PP2→PP3→PP2。底层成功与 native HiCache 基线成功分别报告，不据此宣布新 KV 后端已兼容 HiCache。
 
 ## 当前：先把基线做正确
 

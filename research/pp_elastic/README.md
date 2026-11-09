@@ -1,6 +1,6 @@
 # SGLang 研究基线
 
-2026-11-09：naive PP＋HiCache 的实现范围、组合回归及合并依据见[本次基线验收](BASELINE_ACCEPTANCE_20261109.md)。低干扰机制已开始实现[按层 KV 映射依赖](KV_LAYER_MAPPING.md)；真实 GPU、缓存接入和后续机制的完成状态以[TODO](TODO.md)为准。
+2026-11-09：naive PP＋HiCache 的实现范围、组合回归及合并依据见[本次基线验收](BASELINE_ACCEPTANCE_20261109.md)。低干扰机制已开始实现[按层 KV 映射依赖](KV_LAYER_MAPPING.md)及[Graph 预捕获／持续 KV patch](GRAPH_KV_PATCH.md)；真实 GPU、缓存接入和后续机制的完成状态以[TODO](TODO.md)为准。
 
 当前 PP＋HiCache 实现、验收和后续优化统一追踪于[任务清单](TODO.md)。每个 agent 交付时更新对应条目，规则见[协作约定](WORKFLOW.md)。
 

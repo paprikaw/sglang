@@ -16,6 +16,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -580,6 +581,40 @@ def launch(run, cfg, row, key):
         base.environment, base.__file__ = original_environment, original_file
 
 
+def launch_foundation_probe(run, cfg, row, key):
+    """Own the primitive probe under the same exact-node experiment lease."""
+    env = base.environment(cfg, row, run)
+    env.update(
+        CUDA_VISIBLE_DEVICES="3",
+        PYTHONPATH=os.pathsep.join(
+            [str(ENGINE / "python"), cfg["kv_foundation_probe"]["root"]]
+        ),
+        KVCACHED_LAYER_STACKING="true",
+        KVCACHED_PAGE_PREALLOC_ENABLED="false",
+    )
+    proc = subprocess.Popen(
+        [cfg["python"], str(ROOT / "kv_foundation_gpu_probe.py"), "--run", str(run)],
+        env=env,
+        cwd=ENGINE,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    identity = h.process_record(proc.pid)
+    if not identity or identity["pgid"] != proc.pid or identity["session"] != proc.pid:
+        proc.terminate()
+        proc.wait(timeout=5)
+        raise RuntimeError("Could not establish owned primitive-probe process group")
+    thread = threading.Thread(
+        target=h.stream_log,
+        args=(proc.stdout, str(run / "component_gpu.log"), key),
+        daemon=True,
+    )
+    thread.start()
+    return dict(process=proc, identity=identity, log_thread=thread)
+
+
 def worker(run, cfg):
     if cfg.get("baseline_probe"):
         from hicache_baseline_probe import worker as baseline_worker
@@ -736,13 +771,34 @@ def worker(run, cfg):
             )
         elif evidence["acceptance_class"] != "cold_warm_exact_generation":
             raise AssertionError("unknown reference acceptance class")
+        if cfg.get("kv_foundation_probe"):
+            if lifecycle is None:
+                raise RuntimeError("The foundation probe requires supervised cleanup")
+            checkpoint("component_gpu_probe")
+            child = lifecycle.launch(
+                lambda: launch_foundation_probe(run, cfg, row, key)
+            )
+            deadline = time.monotonic() + 45
+            while child["process"].poll() is None:
+                check_cancelled()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Primitive GPU probe exceeded 45 seconds")
+                time.sleep(0.1)
+            child["log_thread"].join(timeout=2)
+            if child["process"].returncode != 0:
+                raise RuntimeError("Primitive GPU probe failed; see component_gpu.log")
+            component = json.loads((run / "component_gpu.json").read_text())
+            if not component.get("passed"):
+                raise AssertionError("Primitive GPU acceptance was not recorded")
+            evidence["component_gpu"] = component
         checkpoint("startup")
         if lifecycle is None:
-            children.append(launch(run, cfg, row, key))
+            engine_child = launch(run, cfg, row, key)
+            children.append(engine_child)
         else:
-            lifecycle.launch(lambda: launch(run, cfg, row, key))
+            engine_child = lifecycle.launch(lambda: launch(run, cfg, row, key))
         while True:
-            if children[0]["process"].poll() is not None:
+            if engine_child["process"].poll() is not None:
                 raise RuntimeError("engine exited during startup")
             try:
                 http("/get_server_info", timeout=2)
@@ -977,6 +1033,8 @@ def worker(run, cfg):
 
 def prepare(args):
     # Freeze audited node cache and Guard sources using the existing helper.
+    if args.kv_foundation_root and not args.supervised_lifecycle:
+        raise ValueError("The foundation probe requires supervised cleanup")
     args.cases = "pp2"
     base.prepare(args)
     run = args.run.resolve()
@@ -1030,12 +1088,36 @@ def prepare(args):
             args.cached_reference_evidence.read_text()
         )
         qualify_cached_reference_evidence(cfg["cached_reference_evidence"], cfg)
+    if args.kv_foundation_root:
+        root = args.kv_foundation_root.resolve()
+        tree = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True
+        ).strip()
+        lock = json.loads((ROOT / "dependencies.lock.json").read_text())["kvcached"]
+        if (
+            tree != lock["patched_tree"]
+            or subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                cwd=root,
+                text=True,
+            ).strip()
+        ):
+            raise RuntimeError(
+                "The primitive probe requires the locked clean dependency"
+            )
+        binaries = list((root / "kvcached").glob("vmm_ops*.so"))
+        if len(binaries) != 1:
+            raise RuntimeError("Expected one pinned KVCacheD native extension")
+        cfg["kv_foundation_probe"] = dict(
+            root=str(root), tree=tree, native=base.desc(binaries[0])
+        )
     cfg["model_cache"]["usage_logs"] = {args.node: [use]}
     h.save(run / "config.json", cfg)
     spec = json.loads((run / "dashboard_spec.json").read_text())
     spec.update(
         title="Qwen HiCache elastic PP: resident PP2 to PP3 to PP2",
         model_cache=cfg["model_cache"],
+        port=args.dashboard_port,
     )
     spec["tasks"][0].update(
         expected=1,
@@ -1050,6 +1132,14 @@ def prepare(args):
         spec["frozen_inputs"] += [
             base.desc(ROOT / name)
             for name in ("hicache_run_lifecycle.py", "hicache_guard_run.py")
+        ]
+    if args.kv_foundation_root:
+        spec["frozen_inputs"] += [
+            base.desc(ROOT / "kv_foundation_gpu_probe.py"),
+            *(
+                base.desc(ENGINE / "python/sglang/srt/elastic_pp" / name)
+                for name in ("graph_bank.py", "kv_patch.py")
+            ),
         ]
     if args.baseline_probe:
         spec["title"] = "Qwen HiCache static generation-zero qualification diagnostic"
@@ -1087,6 +1177,8 @@ def main():
     parser.add_argument("--layout")
     parser.add_argument("--baseline-probe", action="store_true")
     parser.add_argument("--overhead-sample", action="store_true")
+    parser.add_argument("--kv-foundation-root", type=Path)
+    parser.add_argument("--dashboard-port", type=int, default=24760)
     parser.add_argument("--cached-reference-evidence", type=Path)
     parser.add_argument("--supervised-lifecycle", action="store_true")
     parser.add_argument("--work-seconds", type=float, default=250)
