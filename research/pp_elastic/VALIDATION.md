@@ -23,3 +23,15 @@
 在冻结候选 `de7808daeae6` 上，历史537节点与新增205节点去重后共742个CPU用例全部通过，零失败、错误或跳过，源码不变且无可见CUDA设备。实际合入项目的引擎、测试和适配tree与候选一致；r14／r15的有限GPU证据按相同引擎与运行适配复用，本轮未重跑GPU。独立审查与范围说明见[基线验收摘要](BASELINE_ACCEPTANCE_20261109.md)。原2026-11-05静态资格和每次失败记录保留，不自动扩大到新动态组合。
 
 总 PR #1 合入主线后，29项配置／backend／BF16 EP定向CPU检查全部通过（5.422秒），零失败、错误和跳过；源树与742项候选一致。该重复检查不额外计作独立覆盖。冻结标签：`baseline/sglang/pp-hicache-naive-20261109`。
+
+## 按层 KV 映射首个检查点（2026-11-09）
+
+从 `ce563696401c` 在独立任务分支实施，尚未合入项目或共同基线。用户要求本轮不使用子 agent，因此仅由主 agent 实现及自行检查；本轮不声称完成独立审查或 GPU 验收。接口、复现方法和剩余边界见 [KV_LAYER_MAPPING.md](KV_LAYER_MAPPING.md)，状态见 [TODO](TODO.md)。
+
+引擎 CPU 回归为 **769 项通过、0 失败、0 错误、0 跳过**，包括原先742个节点及27个新增节点，逐个去重。使用相同新增测试在旧基线复现 wrong-generation abort、cleanup、import 三处故障，**3 项均按预期失败**。全量回归后的源码审计确认运行逻辑与测试未变，唯一后续修改是缓存池类的说明文字，不重复累计检查数量。
+
+隔离依赖源码上的协议／几何 CPU 检查为 **27 项通过、0 失败、0 错误、0 跳过**。它们使用模拟原生映射，覆盖所有权过滤、重复 map、部分失败和重试、pin／解 pin、不同 group、初始化 fence 和 stacking 范围；不替代真实 CUDA 页测试。首次 CPU 批次误包含需 CUDA 的旧分配用例，其中28项因隐藏设备／缺少原生加载条件失败；原始记录保留，未计入通过，也未修改这些用例来绕过 GPU 资格。
+
+原生扩展在已有预约节点构建成功，随后在 `CUDA_VISIBLE_DEVICES=999` 下实际加载并检查 Python API／native ABI v1，确认可见 CUDA 设备数为0；没有为这一步启动模型或 GPU 分配测试。依赖补丁从固定上游提交重放，生成 tree `14c85a5f0701a5a7789683ee57f9cbf873ea4cc7`，与依赖检查点完全相同。补丁哈希和前置环境见 [dependencies.lock.json](dependencies.lock.json)。
+
+原始产物位于实验归档 `source_integration/sglang-pp-elastic-20261105/kv-live-foundation-20261109/`，包含 `cpu_attempt1/`、`cpu_attempt2/`、`cpu_final/`、`engine_test_source_audit.json`、`dependency_patch_replay.json`、`native_build_final.json` 和 `native_capability_probe_final.json`。首轮登录节点缺少 `libcuda.so.1` 的加载失败也保留；最终加载证据来自预约节点。真实 GPU 地址／数值保留、物理页回收、OOM 回退、packed stride、HiCache 接入及端到端性能仍未验收。原有 hybrid HiCache 的 native-only 保护保持不变。

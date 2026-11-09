@@ -1,6 +1,6 @@
 # SGLang 研究基线
 
-2026-11-09：naive PP＋HiCache 的实现范围、组合回归及合并依据见[本次基线验收](BASELINE_ACCEPTANCE_20261109.md)。低干扰机制仍是后续工作，完成状态以[TODO](TODO.md)为准。
+2026-11-09：naive PP＋HiCache 的实现范围、组合回归及合并依据见[本次基线验收](BASELINE_ACCEPTANCE_20261109.md)。低干扰机制已开始实现[按层 KV 映射依赖](KV_LAYER_MAPPING.md)；真实 GPU、缓存接入和后续机制的完成状态以[TODO](TODO.md)为准。
 
 当前 PP＋HiCache 实现、验收和后续优化统一追踪于[任务清单](TODO.md)。每个 agent 交付时更新对应条目，规则见[协作约定](WORKFLOW.md)。
 
@@ -18,4 +18,4 @@
 
 **开发方式。** 从此分支创建任务分支和独立 worktree；任务完成后带测试合回此分支。实验固定 commit、annotated tag、运行适配及依赖；冻结后不移动实验标签。不删除承载历史实验或未提交工作的旧 worktree。实验结果和密钥保存在 Git 之外。
 
-**GitHub 协作。** PP＋HiCache 当前项目在 `codex/pp-hicache-autoscaling` 上通过 [Draft 总 PR #1](https://github.com/paprikaw/sglang/pull/1) 集成；子任务各用独立分支和 worktree，先合入项目分支，组合验证后再整体合回共同基线。按可检查的小步提交并推送，任务关系和验证状态记录在 PR 中，详见[协作约定](WORKFLOW.md)。
+**GitHub 协作。** naive PP＋HiCache 的[总 PR #1](https://github.com/paprikaw/sglang/pull/1) 已合并。低干扰机制继续以 `codex/pp-hicache-autoscaling` 为项目集成目标；本轮用户要求由主 agent 自己实施，不启动子 agent。任务仍使用独立分支与 worktree，先审查合入项目分支，组合验证后再整体合回共同基线。按可检查的小步提交并推送，任务关系和验证状态记录在 PR 中，详见[协作约定](WORKFLOW.md)。

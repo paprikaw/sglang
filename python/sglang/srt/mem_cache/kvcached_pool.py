@@ -26,6 +26,10 @@ import torch
 from sglang.srt.elastic_pp.kv_slots import ElasticKVSlotTracker
 from sglang.srt.elastic_pp.topology import LayerRange
 from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.kvcached_compat import (
+    probe_layer_mapping_capabilities,
+    validate_layer_stacking_range,
+)
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.srt.runtime_context import get_parallel
 
@@ -69,6 +73,9 @@ def _load_kvcached_interfaces():
             "--elastic-pp-kv-backend=kvcached requires an installed KVCacheD "
             "package with its SGLang integration"
         ) from exc
+    # Fail before any VMM reservation or manager thread is created. An older
+    # wrapper silently mapping every model layer cannot implement PP reclaim.
+    probe_layer_mapping_capabilities().require()
     return interfaces
 
 
@@ -81,11 +88,11 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
     commit atomically rebinds those lists to a different slice of the global
     backing.
 
-    The currently available KVCacheD SGLang allocator maps a token page for all
-    backing layers.  This is correctness-first and makes prepare/import cheap;
-    it does not yet reclaim per-rank physical KV pages when a rank gives away a
-    layer.  ``physical_layer_partitioned`` exposes that fact to profiling and
-    prevents us from reporting virtual-layer rebinding as physical reclamation.
+    The optional dependency must provide ownership-filtered physical layer
+    groups. Real construction rejects incompatible Python/native interfaces
+    before reserving memory. ``physical_layer_partitioned`` distinguishes this
+    from legacy all-layer backing in test adapters; rebinding views alone must
+    never be reported as physical reclamation.
     """
 
     is_kvcached_elastic_pool = True
@@ -144,6 +151,15 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
             from kvcached.integration.vllm import interfaces as vllm_interfaces
 
             self._kvcached_interfaces = vllm_interfaces
+            from kvcached.utils import PAGE_SIZE
+
+            validate_layer_stacking_range(
+                total_layers=self._kvcached_total_num_layers,
+                start=resolved_start,
+                end=resolved_end,
+                page_bytes=int(PAGE_SIZE),
+                physical_block_bytes=int(self._physical_block_size() or PAGE_SIZE),
+            )
         self._kvcached_global_k_buffer: list[torch.Tensor] = []
         self._kvcached_global_v_buffer: list[torch.Tensor] = []
         super().__init__(
@@ -198,20 +214,7 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
 
     @staticmethod
     def _detect_physical_layer_partitioning() -> bool:
-        try:
-            from kvcached import tp_ipc_util
-            from kvcached import utils as kvcached_utils
-
-            return bool(
-                getattr(kvcached_utils, "LAYER_STACKING", False)
-                and not getattr(kvcached_utils, "PAGE_PREALLOC_ENABLED", True)
-                and hasattr(tp_ipc_util, "register_worker_offset_filter")
-                and hasattr(tp_ipc_util, "map_worker_offsets_for_migration")
-                and hasattr(tp_ipc_util, "unmap_worker_offsets_for_layer_groups")
-                and hasattr(tp_ipc_util, "snapshot_worker_mapped_offsets")
-            )
-        except ImportError:
-            return False
+        return probe_layer_mapping_capabilities().supported
 
     def _allocate_kvcached_global_buffers(
         self,
@@ -433,7 +436,13 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
         self._active_layer_groups()
         from kvcached.tp_ipc_util import register_worker_offset_filter
 
-        register_worker_offset_filter(self._filter_worker_offsets)
+        register_worker_offset_filter(
+            self._filter_worker_offsets,
+            group_id=self._group_id,
+            map_size=int(manager.physical_group_page_size),
+            layer_group_span=self._layer_group_total_span(),
+            num_layer_groups=int(manager.num_layer_groups),
+        )
         self._start_local_mapping_listener()
         page_allocator.set_should_use_worker_ipc_callback(lambda: True)
         manager.reserve_null_block = True
@@ -691,40 +700,84 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
     ) -> None:
-        if self.physical_layer_partitioned:
-            granularity = int(self.kvcached_allocator.layer_group_granularity)
-            group_start = int(layer_id) // granularity * granularity
-            self._map_layer_slots(
-                layer_ids=range(group_start, group_start + granularity),
-                slot_ids=slot_ids,
+        with self._elastic_pp_lock:
+            # Validate before mapping: stale generations, invalid slots or
+            # malformed payloads must not allocate pages in a newer layout.
+            self._require_elastic_pp_kv_supported()
+            k_buffer, v_buffer = self.get_elastic_pp_pending_kv_buffer(
+                generation=generation, layer_id=layer_id
             )
-        super().import_elastic_pp_kv_slots(
-            generation=generation,
-            layer_id=layer_id,
-            slot_ids=slot_ids,
-            cache_k=cache_k,
-            cache_v=cache_v,
-        )
+            if slot_ids.dtype != torch.int64 or slot_ids.ndim != 1:
+                raise ValueError("KV slot ids must be an int64 vector")
+            if slot_ids.numel() and (
+                int(slot_ids.min()) < 0
+                or int(slot_ids.max()) >= int(k_buffer.shape[0])
+                or slot_ids.unique().numel() != slot_ids.numel()
+            ):
+                raise ValueError(
+                    "KV slot ids must be unique and within backing capacity"
+                )
+            for name, payload, buffer in (
+                ("K", cache_k, k_buffer),
+                ("V", cache_v, v_buffer),
+            ):
+                if payload.dtype != buffer.dtype or tuple(payload.shape) != (
+                    slot_ids.numel(),
+                    *buffer.shape[1:],
+                ):
+                    raise ValueError(
+                        f"{name} payload shape/dtype does not match pending KV"
+                    )
+            if self.physical_layer_partitioned:
+                granularity = int(self.kvcached_allocator.layer_group_granularity)
+                group_start = int(layer_id) // granularity * granularity
+                self._map_layer_slots(
+                    layer_ids=range(group_start, group_start + granularity),
+                    slot_ids=slot_ids,
+                )
+            super().import_elastic_pp_kv_slots(
+                generation=generation,
+                layer_id=layer_id,
+                slot_ids=slot_ids,
+                cache_k=cache_k,
+                cache_v=cache_v,
+            )
 
     def abort_elastic_pp_kv_layers(
         self, *, generation: int
     ) -> tuple[torch.Tensor, ...]:
-        pending_ids = set(self._elastic_pp_pending_kv)
-        # Keep the base transaction intact until the fallible VMM operation
-        # succeeds. A failed unmap can then be retried without losing the exact
-        # pending layer set.
-        self._unmap_layer_groups(pending_ids)
-        return super().abort_elastic_pp_kv_layers(generation=generation)
+        with self._elastic_pp_lock:
+            residency = self._elastic_pp_residency
+            if residency is not None:
+                if generation <= residency.generation:
+                    raise RuntimeError(
+                        "cannot abort KV backing after topology publication"
+                    )
+                if (
+                    residency.pending is not None
+                    and residency.pending.generation != generation
+                ):
+                    raise ValueError("elastic KV abort generation mismatch")
+            pending_ids = set(self._elastic_pp_pending_kv)
+            # Validate the epoch before touching physical pages. Keep the base
+            # transaction intact until unmapping succeeds, for safe retries.
+            self._unmap_layer_groups(pending_ids)
+            return super().abort_elastic_pp_kv_layers(generation=generation)
 
     def cleanup_elastic_pp_kv_layers(
         self, *, generation: int
     ) -> tuple[torch.Tensor, ...]:
-        retired_ids = set(self._elastic_pp_retired_kv)
-        # Likewise, do not mark residency cleanup complete until physical
-        # reclamation succeeds. The committed target stays usable and cleanup
-        # remains safely retryable after a transient unmap failure.
-        self._unmap_layer_groups(retired_ids)
-        return super().cleanup_elastic_pp_kv_layers(generation=generation)
+        with self._elastic_pp_lock:
+            residency = self._elastic_pp_residency
+            if residency is None:
+                raise RuntimeError("elastic PP KV residency is not initialized")
+            retired_ids = residency.cleanup_candidates(
+                generation, set(self._elastic_pp_retired_kv)
+            )
+            # Wrong-epoch cleanup must never unmap a newer retirement set.
+            # Do not mark cleanup complete until physical reclamation succeeds.
+            self._unmap_layer_groups(retired_ids)
+            return super().cleanup_elastic_pp_kv_layers(generation=generation)
 
     def get_kv_size_bytes(self):
         # Report the configured serving budget, not KVCacheD's much larger
