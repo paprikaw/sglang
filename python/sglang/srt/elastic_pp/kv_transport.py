@@ -408,10 +408,14 @@ class ElasticPPKVTransport:
             return
         try:
             from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+            from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 
-            if type(self.allocator) is not TokenToKVPoolAllocator:
+            if type(self.allocator) not in (
+                TokenToKVPoolAllocator,
+                PagedTokenToKVPoolAllocator,
+            ):
                 raise NotImplementedError(
-                    "online KV patch requires the standard token allocator"
+                    "online KV patch requires a standard native token/page allocator"
                 )
             source = {
                 layer: (
@@ -465,6 +469,11 @@ class ElasticPPKVTransport:
             self._live_patch_error = f"{type(exc).__name__}: {exc}"
             # Drain before another allocator mutation can reuse these rows.
             patch.abort()
+
+    def prepare_live_patch_writes(self, batch):
+        patch = self._live_patch
+        if patch is not None:
+            patch.prepare_writes(batch.out_cache_loc)
 
     def finish_live_patch(self, transition):
         self.check_live_patch()

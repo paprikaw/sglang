@@ -152,7 +152,7 @@ class LiveKVSnapshot:
         )
         self.session = ContinuousKVPatch(
             generation=generation,
-            capacity=allocator.size + 1,
+            capacity=next(iter(source.values()))[0].shape[0],
             copier=self.copier,
             max_rows=max_rows,
         )
@@ -208,6 +208,33 @@ class LiveKVSnapshot:
                 )
                 self.published.add(slot)
 
+    def prepare_writes(self, slots):
+        """Before forward submission, invalidate rewrites of a published row.
+
+        Page-local appends normally touch unpublished rows. Retraction/replay
+        can revisit a published row without freeing its physical page; wait for
+        its old copy before allowing the new write and advance its incarnation.
+        """
+        with self.lock:
+            if not self.active:
+                return
+            try:
+                for slot in slots.detach().cpu().unique().tolist():
+                    if slot in self.published:
+                        epoch = self.epochs[slot]
+                        try:
+                            self.session.free(slot, epoch, generation=self.generation)
+                        except KVPatchBusy:
+                            self.free_waits += 1
+                            self.session.poll(generation=self.generation, wait=True)
+                            self.session.free(slot, epoch, generation=self.generation)
+                        self.epochs[slot] = self.session.allocate(
+                            slot, generation=self.generation
+                        )
+                        self.published.remove(slot)
+            except BaseException as exc:
+                self._fail(exc)
+
     def progress(self, slots, ready):
         with self.lock:
             if not self.active:
@@ -234,7 +261,7 @@ class LiveKVSnapshot:
             self._publish(slots, ready)
             self.session.finish_at_fence(
                 generation=self.generation,
-                max_rounds=math.ceil(self.allocator.size / self.session.max_rows) + 1,
+                max_rounds=math.ceil(self.session.capacity / self.session.max_rows) + 1,
             )
             self.active = False
             self.complete = True

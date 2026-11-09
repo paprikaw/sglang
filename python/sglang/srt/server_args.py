@@ -8008,13 +8008,8 @@ class ServerArgs:
                 raise ValueError(
                     "online KV patch currently requires native KV and --disable-cuda-graph"
                 )
-            if (
-                self.page_size not in (None, 1)
-                or self.speculative_algorithm is not None
-            ):
-                raise ValueError(
-                    "online KV patch requires page-size 1 and no speculative decoding"
-                )
+            if self.speculative_algorithm is not None:
+                raise ValueError("online KV patch requires no speculative decoding")
         if self.elastic_pp_transition_backing == "cpu_spill":
             if self.elastic_pp_transition_strategy not in {"sync", "batched"}:
                 raise ValueError(

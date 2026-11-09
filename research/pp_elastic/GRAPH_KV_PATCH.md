@@ -2,7 +2,7 @@
 
 更新2026-11-10。由主 agent 顺序实现，属于 [TODO](TODO.md) 的低干扰阶段，接在[按层物理映射](KV_LAYER_MAPPING.md)之后。代码在 Draft PR #4；新接入范围与验证状态见下文。
 
-**真实请求接入：先做在线 CPU shadow。** `--enable-elastic-pp-kv-patch` 仅允许 native KV、eager、page-size 1、无 speculative 的 background／overlap 路径。旧布局继续前向时，以该次实际 request→token 映射和完成事件发布已使用的 KV 行，独立 stream 每轮最多256行备份到 CPU。分配器记录新的槽位 epoch；物理 free 前等待正在复制的行，free group 仍按原协议收尾。HiCache 已分配但尚未被前向使用的行不提前发布；最后排空、退休 HiCache I/O 后补齐完整 live set，再通过已有跨 rank 协议交接。GDN 和 CPU 前缀索引也仍在 fence 同步。CPU shadow 额外内存单独准入并记录字节；复制失败先 drain，再拒绝本次转换，旧布局保留。
+**真实请求接入：先做在线 CPU shadow。** `--enable-elastic-pp-kv-patch` 仅允许 native KV、标准 token／paged allocator、eager、无 speculative 的 background／overlap 路径。旧布局继续前向时，以该次实际 request→token 映射和完成事件发布已使用的 KV 行，独立 stream 每轮最多256行备份到 CPU。分配器记录新的槽位 epoch；分页路径追踪完整页的分配／释放，但不把未写的页尾当作已完成的前缀。物理 free 或重写已发布行前等待正在复制的行，free group 仍按原协议收尾。HiCache 已分配但尚未被前向使用的行不提前发布；最后排空、退休 HiCache I/O 后补齐完整 live set，再通过已有跨 rank 协议交接。GDN 和 CPU 前缀索引也仍在 fence 同步。CPU shadow 额外内存单独准入并记录字节；复制失败先 drain，再拒绝本次转换，旧布局保留。
 
 **这一步验证什么。** 它连接了真实前向、allocator、增量复制和最终网络交接，但网络本身尚未提前发送，也没有启用整模型 Graph 或 VMM 后端。计数区分服务期间已完成的行与 fence 内追补的总行；真实 GPU 必须观察非空在线轮次并通过生成连续性，才能勾选该范围。当前不能据此声称缩短了暂停；后续再把在线影子复制改为直接向目标发送，避免最终 H2D 回传。
 

@@ -6,6 +6,8 @@
 
 产物为 `kv-live-foundation-20261109/live-patch-cpu-r2/pytest.xml`、`live-patch-cpu-r3/pytest.xml` 和 `live-patch-cpu-audit.json`；初次112项定向检查保留在 `live-patch-cpu-r1/`。真实请求在线复制、GPU恢复与性能仍需另行检查，本轮没有独立 reviewer。
 
+首个GPU候选 `b9cfdc0180` 在模型加载前被page-size限制拒绝，原启动协议固定64-token页；`live-patch-gpu-r1` 共35.628秒，清理和正常release验证通过。未改为page-size 1；已补齐标准分页 allocator 的整页生命周期、页尾追加与前向前重写保护，保持原缓存协议。随后 `live-patch-cpu-r4/pytest.xml` **483项CPU组合检查全部通过**，160.810秒，零失败／错误／跳过。这是新一次完整组合回归；早先失败保留，不重复累计通过数。新GPU资格另记。
+
 ## 2026-11-05：静态 EP／PP／P/D 资格
 
 2026-11-05。共同分支为 `codex/pp-elastic-integration`，基点为 R11 `b862312ce3`。运行记录和完整检查清单位于[验证 manifest](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/validation_manifest.json)。这次验证执行正确性和开关实际生效，不据此发布性能提升结论。

@@ -34,7 +34,6 @@ def args(**overrides):
         ({"elastic_pp_transition_backing": "cpu_spill"}, "background/overlap"),
         ({"elastic_pp_kv_backend": "kvcached"}, "native KV"),
         ({"disable_cuda_graph": False}, "disable-cuda-graph"),
-        ({"page_size": 16}, "page-size 1"),
         ({"speculative_algorithm": "EAGLE"}, "no speculative"),
     ],
 )
@@ -43,8 +42,9 @@ def test_unqualified_patch_combinations_rejected(overrides, message):
         args(**overrides)._handle_pipeline_parallelism()
 
 
-def test_native_eager_background_patch_and_default_sync_remain_accepted():
-    args()._handle_pipeline_parallelism()
+@pytest.mark.parametrize("page_size", [1, 64])
+def test_native_eager_background_patch_and_default_sync_remain_accepted(page_size):
+    args(page_size=page_size)._handle_pipeline_parallelism()
     args(
         enable_elastic_pp_kv_patch=False, elastic_pp_transition_strategy="sync"
     )._handle_pipeline_parallelism()

@@ -6,7 +6,7 @@
 
 ## 本轮实施：主 agent 顺序完成
 
-- [ ] 接入真实 PP 前向与 token allocator：仅在 native／eager／background＋overlap 下启用在线 KV CPU shadow。按真实前向完成事件复制已使用的不可变 KV 行，保护复制中的槽位复用，最终 fence 补齐余量，再复用跨 rank 传输；GDN／HiCache 仍在 fence 交接。最新定向与组合CPU证据去重478项通过，GPU待验收；不据此宣称网络 overlap、Graph 接入或性能收益。
+- [ ] 接入真实 PP 前向与标准 token／paged allocator：仅在 native／eager／background＋overlap 下启用在线 KV CPU shadow。按真实前向完成事件复制已使用的 KV 行，保护复制中的槽位复用与重写，最终 fence 补齐余量，再复用跨 rank 传输；GDN／HiCache 仍在 fence 交接。分页支持补齐后483项CPU组合检查全部通过；首次GPU在加载前因分页配置被拒，35.628秒正常清理／release，新版本等待GPU验收。不据此宣称网络 overlap、Graph 接入或性能收益。
 
 从冻结基线 `ce563696401c` 建立 `codex/pp-kv-live-foundation-20261109`，本轮不使用子 agent。[Draft PR #4](https://github.com/paprikaw/sglang/pull/4) 已推送，目标为项目分支，尚未合入；本轮 GPU 冻结源码为 `8d7c21241c`。先固定兼容依赖和按层物理映射接口，再接后续 Graph／Patch；旧分工仅表示模块边界，不是正在运行的任务。
 

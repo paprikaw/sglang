@@ -167,6 +167,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             + torch.arange(self.page_size, device=self.device)
         ).reshape(-1)
 
+        if self._elastic_pp_live_patch is not None:
+            self._elastic_pp_live_patch.allocated(out_indices)
+
         return out_indices
 
     def alloc_extend(
@@ -216,6 +219,7 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        self._notify_elastic_pp_new_pages(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -255,8 +259,19 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
 
+        self._notify_elastic_pp_new_pages(self.free_pages[:num_new_pages])
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
+
+    def _elastic_pp_page_rows(self, page_ids):
+        return (
+            page_ids[:, None] * self.page_size
+            + torch.arange(self.page_size, device=self.device)
+        ).reshape(-1)
+
+    def _notify_elastic_pp_new_pages(self, page_ids):
+        if self._elastic_pp_live_patch is not None and page_ids.numel():
+            self._elastic_pp_live_patch.allocated(self._elastic_pp_page_rows(page_ids))
 
     def free(self, free_index: torch.Tensor):
         if free_index.numel() == 0:
@@ -308,6 +323,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert len(torch.unique(pages)) == len(pages)
 
     def _release_page_ids(self, *page_ids: torch.Tensor):
+        if self._elastic_pp_live_patch is not None:
+            self._elastic_pp_live_patch.freeing(
+                self._elastic_pp_page_rows(torch.cat(page_ids))
+            )
         if self.need_sort:
             self.release_pages = torch.cat((*page_ids, self.release_pages))
         else:
@@ -329,6 +348,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self._debug_check_no_duplicate_pages()
 
     def clear(self):
+        if self._elastic_pp_live_patch is not None:
+            raise RuntimeError("cannot clear the KV allocator during online KV patch")
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device

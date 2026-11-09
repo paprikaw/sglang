@@ -237,6 +237,10 @@ class ElasticPPMigrationCoordinator:
         if self.enable_kv_patch:
             self.kv_transport.progress_live_patch(batch, ready_event, req_to_token_pool)
 
+    def prepare_live_patch_writes(self, batch):
+        if self.enable_kv_patch:
+            self.kv_transport.prepare_live_patch_writes(batch)
+
     @staticmethod
     def _slot_signature(slot_ids: torch.Tensor) -> tuple[int, str]:
         cpu_slots = slot_ids.detach().to(device="cpu", dtype=torch.int64).contiguous()
