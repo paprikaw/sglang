@@ -532,6 +532,10 @@ class Scheduler(
             time.sleep(t)
 
         # Init cache and memory pool
+        if get_parallel().enable_elastic_pp and self.enable_hierarchical_cache:
+            logger.info(
+                "Elastic PP HiCache initialization begin rank=%d", self.ps.pp_rank
+            )
         result = kv_cache_builder.build_kv_cache(
             server_args=self.server_args,
             model_config=self.model_config,
@@ -567,6 +571,10 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        if get_parallel().enable_elastic_pp and self.enable_hierarchical_cache:
+            logger.info(
+                "Elastic PP HiCache initialization complete rank=%d", self.ps.pp_rank
+            )
         self.init_elastic_pp_migration_coordinator()
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()

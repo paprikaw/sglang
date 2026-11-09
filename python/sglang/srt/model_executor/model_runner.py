@@ -475,9 +475,9 @@ class ModelRunner:
 
         if self.ps.pp_size > 1:
             if not (envs.SGLANG_ENABLE_PP_SPEC.get() and self.is_draft_worker):
-                assert self.support_pp, (
-                    "Pipeline Parallel is not compatible with this model."
-                )
+                assert (
+                    self.support_pp
+                ), "Pipeline Parallel is not compatible with this model."
 
         # For weight updates
         self.init_weight_updater()
@@ -856,6 +856,14 @@ class ModelRunner:
                 )
 
                 transport_class = ElasticPPHybridKVTransport
+            logger.info(
+                "Elastic PP KV transport=%s allocator=%s.%s pool=%s.%s",
+                transport_class.__name__,
+                type(self.token_to_kv_pool_allocator).__module__,
+                type(self.token_to_kv_pool_allocator).__name__,
+                type(self.token_to_kv_pool).__module__,
+                type(self.token_to_kv_pool).__name__,
+            )
             self.elastic_pp_kv_transport = transport_class(
                 group=self.elastic_pp_migration_group,
                 model_runner=self,
@@ -1369,6 +1377,84 @@ class ModelRunner:
         method = self._elastic_pp_model_method("abort_elastic_pp_layers")
         return method(generation=generation)
 
+    def elastic_pp_transition_capacity_report(
+        self, transition, *, source_backing_released=False
+    ):
+        """Conservative admission against currently available physical capacity.
+
+        Includes a whole replacement GDN pool when layer IDs change, even for
+        retained layers. Runtime/allocator workspace has an explicit reserve.
+        Actual allocation can still fail; publication remains transactional.
+        """
+        import math
+
+        pool = self.token_to_kv_pool
+        full = getattr(pool, "full_kv_pool", pool)
+        if getattr(full, "is_kvcached_elastic_pool", False):
+            if source_backing_released:
+                raise NotImplementedError("CPU-spill backing requires native KV pools")
+            # VMM physical commitment needs backend accounting, not logical
+            # tensor sizes. Preserve its existing transactional admission.
+            return {"backend": "kvcached", "native_overlap_checked": False}
+        rank = self.ps.pp_rank
+        source = transition.source.layer_range(rank)
+        target = transition.target.layer_range(rank)
+        incoming = set(range(target.start, target.end)) - set(
+            range(source.start, source.end)
+        )
+        profile = self.elastic_pp_weight_profile
+        weights = sum(profile.layer_weight_sizes[i] for i in incoming)
+        k_shape, v_shape = full._kv_buffer_shapes()
+        item_bytes = torch.empty(0, dtype=full.store_dtype).element_size()
+        kv_per_layer = (math.prod(k_shape) + math.prod(v_shape)) * item_bytes
+        if hasattr(pool, "recurrent_layer_ids"):
+            attention_ids = set(pool.elastic_pp_kv_layer_ids(target))
+            kv_bytes = (
+                len(
+                    attention_ids
+                    if source_backing_released
+                    else incoming & attention_ids
+                )
+                * kv_per_layer
+            )
+            target_ids = pool.recurrent_layer_ids(target)
+            state = pool.mamba_pool.mamba_cache
+            recurrent_bytes = 0
+            if (
+                source_backing_released
+                or tuple(pool.req_to_token_pool.mamba_map) != target_ids
+            ):
+                per_layer = sum(
+                    math.prod(t.shape[1:]) * t.element_size()
+                    for t in (*state.conv, state.temporal)
+                )
+                recurrent_bytes = len(target_ids) * per_layer
+        else:
+            kv_bytes = (
+                target.size if source_backing_released else len(incoming)
+            ) * kv_per_layer
+            recurrent_bytes = 0
+        required = weights + kv_bytes + recurrent_bytes
+        reserve = max(256 * 2**20, math.ceil(required * 0.05))
+        device = torch.device(self.device)
+        free = torch.cuda.mem_get_info(device)[0] if device.type == "cuda" else None
+        report = {
+            "backend": "native",
+            "native_overlap_checked": not source_backing_released,
+            "source_backing_released": bool(source_backing_released),
+            "weight_bytes": weights,
+            "kv_bytes": kv_bytes,
+            "recurrent_bytes": recurrent_bytes,
+            "reserve_bytes": reserve,
+            "required_free_bytes": required + reserve,
+            "free_bytes": free,
+        }
+        if free is not None and required + reserve > free:
+            raise RuntimeError(
+                f"elastic PP transition peak capacity rejected: {report}"
+            )
+        return report
+
     def prepare_elastic_pp_kv_layers(
         self, *, target: LayerRange, generation: int
     ) -> frozenset[int]:
@@ -1384,8 +1470,44 @@ class ModelRunner:
             total_num_layers=self.model_config.num_hidden_layers,
         )
 
+    def invalidate_elastic_pp_attention_state_views(self):
+        """Drop lazy GDN tracking views at a drained backing change.
+
+        The tracking cache owns full conv/SSM tensors. Keeping its old tuple
+        would pin source storage during CPU spill and track into retired state
+        after an overlap commit. Rebuild it lazily from the current request pool;
+        rollback must not retain an old tuple for restoration.
+        """
+        pending = [
+            getattr(self, "attn_backend", None),
+            getattr(self, "decode_attn_backend", None),
+            *(getattr(self, "decode_attn_backend_group", None) or ()),
+        ]
+        seen = set()
+        while pending:
+            backend = pending.pop()
+            if backend is None or id(backend) in seen:
+                continue
+            seen.add(id(backend))
+            if hasattr(backend, "_track_pools_cache"):
+                del backend._track_pools_cache
+            for name in (
+                "full_attn_backend",
+                "linear_attn_backend",
+                "prefill_backend",
+                "decode_backend",
+                "primary",
+            ):
+                pending.append(getattr(backend, name, None))
+            for name in ("attn_backend_list", "children"):
+                pending.extend(getattr(backend, name, None) or ())
+
     def commit_elastic_pp_kv_layers(self, *, generation: int) -> LayerRange:
-        return self.token_to_kv_pool.commit_elastic_pp_kv_layers(generation=generation)
+        target = self.token_to_kv_pool.commit_elastic_pp_kv_layers(
+            generation=generation
+        )
+        self.invalidate_elastic_pp_attention_state_views()
+        return target
 
     def elastic_pp_kv_ready(self, *, generation: int) -> bool:
         return self.token_to_kv_pool.elastic_pp_kv_ready(generation=generation)

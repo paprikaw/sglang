@@ -345,3 +345,27 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache.load_cpu_copy(
             kv_cache_cpu, indices, mamba_indices=mamba_indices
         )
+
+    def elastic_pp_live_slots(self) -> torch.Tensor:
+        """Return every row in allocated pages at the drained scheduler fence.
+
+        Radix-cache pages remain allocated even without an active request. Copy
+        their complete pages, including unused tail rows, so migration preserves
+        all future page-local appends. The padding page is never a live page.
+        """
+        if (
+            not self.is_not_in_free_group
+            or self.free_group
+            or self.free_page_reps_group
+        ):
+            raise RuntimeError(
+                "elastic PP live-slot snapshots require a closed allocator "
+                "free group"
+            )
+        live = torch.ones(self.num_pages + 1, dtype=torch.bool, device=self.device)
+        live[0] = False
+        live[self.free_pages] = False
+        live[self.release_pages] = False
+        pages = torch.nonzero(live, as_tuple=False).flatten()
+        offsets = torch.arange(self.page_size, dtype=torch.int64, device=self.device)
+        return (pages[:, None] * self.page_size + offsets).flatten()

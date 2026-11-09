@@ -1,5 +1,9 @@
 # SGLang 研究基线
 
+2026-11-09：naive PP＋HiCache 的实现范围、组合回归及合并依据见[本次基线验收](BASELINE_ACCEPTANCE_20261109.md)。低干扰机制仍是后续工作，完成状态以[TODO](TODO.md)为准。
+
+当前 PP＋HiCache 实现、验收和后续优化统一追踪于[任务清单](TODO.md)。每个 agent 交付时更新对应条目，规则见[协作约定](WORKFLOW.md)。
+
 后续开发统一合入 `codex/pp-elastic-integration`。上游基点沿用已做 AgentX P/D 验证的 R11，新增功能通过合并保留原分支历史。原实验 worktree、冻结标签和尚未提交的工作均保留。
 
 **引擎中的优化。** 包含 EP overlap、BF16 Expert runner、AWQ/Humming 专家切分、PP tensor channel 和调度、HiCache/GDN 恢复及 P→D 层映射、CPU canonical/node-local 权重缓存，以及排空与恢复 PP 的控制面。冲突优先保留较新的层映射、逻辑输出回传和 PP loadback 轮询协议，未将旧协议叠加到新协议上。
@@ -13,3 +17,5 @@
 **测试。** `gpu_smoke.py` 在 canonical Experiment Guard 下运行真实 A100 35B 模型，覆盖 EP2、EP4、PP2、EP2 Prefill→PP2 Decode，启用 HiCache，计数实际 Decode Graph 执行，并检查 CPU 恢复后的输出。该脚本是回归检查，不用于发布性能结论。CPU 回归及实际硬件验证结果见项目的 `VALIDATION.md`；未覆盖的模型、通信后端和在线扩缩路径需单独验证。
 
 **开发方式。** 从此分支创建任务分支和独立 worktree；任务完成后带测试合回此分支。实验固定 commit、annotated tag、运行适配及依赖；冻结后不移动实验标签。不删除承载历史实验或未提交工作的旧 worktree。实验结果和密钥保存在 Git 之外。
+
+**GitHub 协作。** PP＋HiCache 当前项目在 `codex/pp-hicache-autoscaling` 上通过 [Draft 总 PR #1](https://github.com/paprikaw/sglang/pull/1) 集成；子任务各用独立分支和 worktree，先合入项目分支，组合验证后再整体合回共同基线。按可检查的小步提交并推送，任务关系和验证状态记录在 PR 中，详见[协作约定](WORKFLOW.md)。

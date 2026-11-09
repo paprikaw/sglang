@@ -171,7 +171,25 @@ def qualify_model(runner, compute, quant_info):
               if hasattr(m, 'w13_weight') and hasattr(m, 'dispatcher')]
     native_allgather = ps.moe_ep_size in (2, 4) and all(
         isinstance(m.dispatcher, StandardDispatcher) for m in layers)
-    expected = 40 // ps.pp_size
+    elastic = getattr(runner.server_args, 'enable_elastic_pp', False)
+    expected_ids = None
+    if elastic:
+        counts = tuple(map(int, runner.server_args.elastic_pp_initial_partition.split(',')))
+        if len(counts) != ps.pp_size or sum(counts) != 40:
+            raise RuntimeError('Elastic initial partition differs from audited full 40-layer model')
+        begin = sum(counts[:ps.pp_rank])
+        expected_ids = list(range(begin, begin + counts[ps.pp_rank]))
+        observed_ids = []
+        for name, module in runner.model.named_modules():
+            if hasattr(module, 'w13_weight') and hasattr(module, 'dispatcher'):
+                parts = name.split('.')
+                index = parts.index('layers')
+                observed_ids.append(int(parts[index + 1]))
+        if sorted(observed_ids) != expected_ids:
+            raise RuntimeError(f'Elastic owned layer IDs differ: {observed_ids} != {expected_ids}')
+        expected = len(expected_ids)
+    else:
+        expected = 40 // ps.pp_size
     if torch.cuda.get_device_capability()[0] != 8 or "A100" not in torch.cuda.get_device_name():
         raise RuntimeError("Expected an A100 GPU")
     for m in layers:
@@ -241,12 +259,12 @@ def qualify_model(runner, compute, quant_info):
             rows.append(dict(tokens_per_source=count, input_delta=delta, route=route,
                              received_rows=layer._bridge_last_received_rows, relative_rms=rel))
     else:
-        if ps.moe_ep_size != 1 or ps.pp_size != 2:
-            raise RuntimeError('Expected full EP2/EP4 or PP2/EP1 model')
-        layer = layers[0]
-        g = geometry(layer)
+        if ps.moe_ep_size != 1 or (ps.pp_size != 2 and not elastic):
+            raise RuntimeError('Expected full EP2/EP4 or audited static/elastic PP EP1 model')
+        layer = layers[0] if layers else None
+        g = geometry(layer) if layer is not None else None
         rows = []
-        for count in (1, 4, 16):
+        for count in ((1, 4, 16) if layers else ()):
             gen = torch.Generator(device='cpu').manual_seed(791 + ps.pp_rank)
             x = (torch.randn(count, g.hidden_size, generator=gen) * .1).to('cuda', torch.bfloat16)
             ids = ((torch.arange(count)[:, None] * 17 + torch.arange(8)[None, :] * 31)
@@ -268,7 +286,9 @@ def qualify_model(runner, compute, quant_info):
     root.mkdir(parents=True, exist_ok=True)
     data = dict(passed=True, tp_rank=ps.tp_rank, pp_rank=ps.pp_rank,
         dp_rank=ps.dp_rank, expert_parallel=ps.moe_ep_size, layers=len(layers),
-        experts_per_layer=layers[0].num_local_experts,
+        experts_per_layer=layers[0].num_local_experts if layers else 0,
+        elastic_owned_layer_ids=expected_ids,
+        zero_layer_rank=not layers,
         dtype='BF16_Triton', device=torch.cuda.get_device_name(), checks=rows,
         geometry=[vars(geometry(m)) for m in layers])
     data['transport'] = ('native_nccl_allgather' if native_allgather else
