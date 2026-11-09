@@ -17,3 +17,5 @@
 **尚未完成什么。** 真实 GPU OOM／迁移失败回退、background／batched 的 GPU 资格、持续 KV patch、在线 KV 池扩缩、候选 CUDA Graph 预捕获、真正归还工作 GPU，以及动态 P/D 接入仍未完成。静态路径保留既有显式优化，不把它们的旧GPU资格扩展为所有动态组合都已通过。
 
 **证据与入口。** 验收产物统一位于 `baseline-acceptance-20261109/`：`metadata.json`、`nodeids.txt`、`junit.xml`、`pytest.log`、`source_equivalence.json`、`project_merge.json` 和 `independent_review.json`。历史GPU依据为 `gpu-hicache-r14/results.json` 及 `peer_review/independent_r14_audit.json`、`gpu-hicache-r15/REPORT.md` 与原始结果。它们归档在现有 source-integration 实验目录，未复制敏感请求或原始日志到仓库。合并完成状态及冻结标签见 [TODO](TODO.md)；总体路径为 Runtime／Cache → 项目分支 → [总 PR #1](https://github.com/paprikaw/sglang/pull/1) → `codex/pp-elastic-integration`。
+
+**合并与冻结。** Runtime PR #2 以 `3a72d5781835` 合入项目，总 PR #1 以 `5542d19d90d8` 合入共同基线。主线工作区随后对受支持配置限制、Runtime backend 视图及 BF16 EP 适配复查29项CPU检查，全部通过、零失败／错误／跳过，pytest用时5.422秒；这是定向重复检查，不与742相加为独立覆盖。冻结标签为 `baseline/sglang/pp-hicache-naive-20261109`，后续任务从该标签建立分支。最终代码等价与远端核对另存 `release_manifest.json`。
