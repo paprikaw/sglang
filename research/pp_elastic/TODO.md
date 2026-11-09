@@ -6,14 +6,14 @@
 
 ## 本轮实施：主 agent 顺序完成
 
-- [ ] 接入真实 PP 前向与标准 token／paged allocator：仅在 native／eager／background＋overlap 下启用在线 KV CPU shadow。按真实前向完成事件复制已使用的 KV 行，保护复制中的槽位复用与重写，最终 fence 补齐余量，再复用跨 rank 传输；GDN／HiCache 仍在 fence 交接。GPU r1在加载前因分页配置被拒，35.628秒正常清理；r2完成预热后，后台新层构建被另一线程的全局 forward context误判，144.885秒正常清理／release。隔离修复采用Dynamo可追踪的线程本地属性，512项CPU组合检查全部通过，等待新GPU验收。不据此宣称网络 overlap、Graph 接入或性能收益。
+- [x] 接入真实 PP 前向与标准 token／paged allocator，保护复制中的槽位复用与重写。仅限 native／eager／background＋overlap 的在线 KV CPU shadow；最终 fence 补齐余量后复用跨 rank 传输，GDN／HiCache仍在fence交接。512项CPU检查全过；冻结 `e7c9cb1264a9` 的A100 64-token页PP2→PP3→PP2通过同暖512边界连续性和CPU前缀loadback。扩容两个源rank各在线完成662行，缩容源rank完成659行；它们是各rank的槽位行计数，不是全局输入token数。整轮含清理171.795秒，正常release。r1／r2失败保留于[验证记录](VALIDATION.md)。不据此宣称网络 overlap、Graph 接入或性能收益。
 
-从冻结基线 `ce563696401c` 建立 `codex/pp-kv-live-foundation-20261109`，本轮不使用子 agent。[Draft PR #4](https://github.com/paprikaw/sglang/pull/4) 已推送，目标为项目分支，尚未合入；本轮 GPU 冻结源码为 `8d7c21241c`。先固定兼容依赖和按层物理映射接口，再接后续 Graph／Patch；旧分工仅表示模块边界，不是正在运行的任务。
+从冻结基线 `ce563696401c` 建立 `codex/pp-kv-live-foundation-20261109`，本轮不使用子 agent。[Draft PR #4](https://github.com/paprikaw/sglang/pull/4) 已推送，目标为项目分支，尚未合入。底层原语GPU冻结源码为 `8d7c21241c`，本轮native在线shadow为 `e7c9cb1264a9`；两条执行路径分开验收。旧分工仅表示模块边界，不是正在运行的任务。
 
 - [x] 实现 KVCacheD 按层映射协议、映射账本、部分失败重试及页面 pin；保存可重放依赖补丁、Python／原生版本检查和 stacking 边界检查。27 项依赖 CPU 检查通过；补丁在干净上游索引重放得到完全相同的源码树。见[实现与边界](KV_LAYER_MAPPING.md)及依赖锁。真实 GPU 页面验证不包含在此勾选中。
 - [x] 修复 SGLang import／abort／cleanup 在校验 generation 前触碰物理页面的问题，并在 map 前检查槽位和 payload。旧基线可复现 3 个故障，新代码 769 项引擎 CPU 回归通过；保留层地址／数值仅在 CPU 适配器验证，不能据此推定真实 GPU 验收。
 - [ ] 接通 HiCache、GDN 和 Attention 的完整布局约束，并验证实际 OOM／迁移失败回退。底层 GPU 的 map／unmap、保留地址和数据及页面 pin 拒绝已通过；这不替代整模型新后端兼容性或归还工作 GPU，现有 hybrid HiCache 的 native-only 保护不撤除。
-- [x] 建立有限 Graph 预捕获库与持续 KV 行追补的实验模块，本轮75项CPU检查通过（25项新模块＋50项生命周期／参考资格回归）。Graph 按完整 tensor 地址／shape／stride 匹配，eager 回退同样保护页面，复制保护槽位复用；尚未接入整模型 scheduler、跨 rank 传输或 GDN 增量同步。见[接口与接入顺序](GRAPH_KV_PATCH.md)。
+- [x] 建立有限 Graph 预捕获库与持续 KV 行追补的实验模块，本轮75项CPU检查通过（25项新模块＋50项生命周期／参考资格回归）。Graph按完整tensor地址／shape／stride匹配，eager回退同样保护页面；整模型Graph尚未接入。Patch的native CPU shadow已在本轮接入scheduler，在线跨rank传输和GDN增量仍待实现。见[接口与接入顺序](GRAPH_KV_PATCH.md)。
 - [x] A100 `gpu-r1` 完成底层 GPU 检查：退役组驱动可见显存增加8 MiB，保留地址和数据；2次 Graph capture／2次 replay、1次地址变化 fallback及1次未映射拒绝；patch为2轮／4行，包含新增行及槽位复用。它是小规模单 GPU 检查，尚未证明完整模型、跨 rank 或在线复制的性能。
 - [x] 同一租约内，开启 HiCache 的 native KV 整模型 PP2→PP3→PP2 往返通过同暖512边界的生成连续性和 CPU 前缀 loadback；整轮含清理186.509秒，Guard postcheck、清理及正常release通过。Graph在整模型中仍关闭，cold/warm等价和转换期间GPU归还未通过资格。见[验证说明](VALIDATION.md)。
 
@@ -44,7 +44,7 @@
 
 ## 下一步一：持续 KV patch，缩短推理中断
 
-- [ ] **C：**将已实现的增量行复制接入旧布局真实推理、跨 rank 传输和最终交接。底层 GPU 检查已产生非空增量，但尚无整模型在线 patch；接近追平后才暂停，完成最后增量和状态交接再恢复。
+- [ ] **C：**把已接入真实推理的native CPU shadow进一步改为在线跨rank发送。当前GPU已观察到服务期间的非空复制，但网络仍在最终fence；需要目标侧版本确认、缓冲生命周期及与正常PP通信的顺序协议，再验证能否缩短中断。
 - [ ] **C，依赖 A 的状态接口：**处理请求新增／结束、KV 槽位复用、迁移版本及 GDN recurrent state 的更新，保证追补不会覆盖新状态；追不平或失败时可退回同步基线。
 - [ ] **B 运行、独立审查：**对照当前同步基线，测暂停、请求延迟、额外传输和后台复制对正常推理的影响。先证明正确，再判断是否值得采用；不预设持续同步一定更快。
 

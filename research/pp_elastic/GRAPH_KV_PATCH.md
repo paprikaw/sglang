@@ -6,6 +6,8 @@
 
 **这一步验证什么。** 它连接了真实前向、allocator、增量复制和最终网络交接，但网络本身尚未提前发送，也没有启用整模型 Graph 或 VMM 后端。计数区分服务期间已完成的行与 fence 内追补的总行；真实 GPU 必须观察非空在线轮次并通过生成连续性，才能勾选该范围。当前不能据此声称缩短了暂停；后续再把在线影子复制改为直接向目标发送，避免最终 H2D 回传。
 
+**2026-11-10接入验收。** `e7c9cb1264a9` 的512项CPU检查全过，包含后台构建线程隔离、真实token／paged allocator生命周期和Dynamo backend切换检查。A100 native／HiCache／64-token页PP2→PP3→PP2通过同暖512边界连续性与CPU前缀loadback；扩容源rank各在线完成662行，缩容源rank完成659行，整轮含清理171.795秒，正常release。仅此CPU shadow路径取得有界整模型资格；它不扩大下面Graph／VMM原语的资格。失败尝试、source tag与结果哈希见[VALIDATION](VALIDATION.md)。
+
 **Graph：先准备少量布局，再选择。** `graph_bank.py` 在启动或明确排空的边界捕获，激活后禁止追加 capture。布局、batch、tensor 地址、shape、stride、dtype 和 device 全部匹配才 replay；其余情况统计 eager fallback。调用方必须登记权重、KV／GDN、输入、输出及 workspace，不能只检查 KV。页面未映射时拒绝执行；replay 和 eager 都把页面 pin 保留到完成事件。捕获失败或执行失败不能直接再跑一次，以免重复写入状态。当前模块没有替换 SGLang 的 `CudaGraphRunner`，真实通信预热、完整 binding 清单和 GDN 稳定地址仍待接入。
 
 **Patch 的底层协议。** `kv_patch.py` 维护迁移 generation 和每个 token 槽位的 incarnation，源写入记录完成事件后发布不可变 KV 行；独立 CUDA stream 等待事件并分批复制。复制期间允许新增其他行，被复制的槽位必须延后释放／复用，VMM copier 的源和目标物理页也保持 pin。复用的槽位形成新 incarnation，必须重新复制；最终 fence 停止源写入并有界追平。失败时先排空已提交复制，再解除保护。初始 Tensor copier 是单 GPU、按 stride 复制的实现；本轮 native CPU shadow 接入见上文，跨 rank 在线复制和 GDN 增量同步仍待实现。

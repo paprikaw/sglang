@@ -1,6 +1,6 @@
 # EP／PP／P/D 集成基线验证
 
-## 2026-11-10：真实前向／allocator 接入的 CPU 检查
+## 2026-11-10：真实前向／allocator与在线CPU shadow
 
 新增 native KV CPU shadow 路径，接口和范围见 [GRAPH_KV_PATCH](GRAPH_KV_PATCH.md)。本轮组合检查最初476项通过、1项失败；失败为原有 PP 分区参数绕过配置声明的问题，旧 HEAD 中也存在同样的两处直接赋值。已改为声明更新，并补测配置投影与 allocator resize 前置拒绝。随后40项相关检查全部通过；按最新结果去重，共478项通过、0失败／错误／跳过。它是组合证据与受影响路径复测，不是修改后重跑全部478项，也不与此前769项相加。
 
@@ -12,7 +12,11 @@
 
 隔离初版通过512项CPU组合检查（`live-patch-cpu-r5/pytest.xml`），但额外Dynamo检查发现ContextVar.get无法被fullgraph追踪，因此改用线程本地属性。保留同线程forward内的构建状态读取拒绝，以及嵌套／异常恢复；新增编译后切换backend的回归，防止绕过检查或冻结错误backend。修复后的检查及新GPU结果另记，不把失败批次算作在线patch验收；这里只验证同步forward作用域，不支持在作用域内await。
 
-最终线程隔离版本的 `live-patch-cpu-r6/pytest.xml` **512项检查全部通过**，140.830秒，零失败／错误／跳过；范围为elastic_pp全目录、配置声明、draft构建隔离和split attention决策，包含fullgraph下切换backend的检查。这次完整组合回归替代前一修复候选的当前资格，不累计为1024项；实际模型CUDA Graph仍未启用。
+最终线程隔离版本的 `live-patch-cpu-r6/pytest.xml` **512项检查全部通过**，约141秒，零失败／错误／跳过；范围为elastic_pp全目录、配置声明、draft构建隔离和split attention决策，包含fullgraph下切换backend的检查。这次完整组合回归替代前一修复候选的当前资格，不累计为1024项；实际模型CUDA Graph仍未启用。
+
+**真实GPU接入通过。** `live-patch-gpu-r3` 固定源码 `e7c9cb1264a9599121f3c8ff114bf19f798307d5` 和annotated tag `experiment/sglang/pp-online-kv-shadow-20261110-r3`。三张resident A100上的35B BF16模型使用native KV、64-token页、background／overlap、HiCache开启、Graph关闭；布局20/0/20→13/13/14→20/0/20。两次转换的在线shadow与活跃Decode连续性检查均通过，同暖512边界输出一致，最终CPU前缀实际loadback。扩容源rank0／2各在线完成662槽位行，缩容源rank1完成659行；全部shadow在fence补齐。行计数包含该rank所有待迁出Attention层，不等于全组独立token数。
+
+整轮含清理171.795秒，Guard返回0，owned进程清理及正常lease release验证通过。结果、cleanup和supervisor均经稳定可见性检查；原始结果SHA256 `afa79db7aa34596563b57d139a9f5881a36345c4ff107944943cccf3543fed01`。精简报告在同归档的 `live-patch-gpu-r3/REPORT.md`，结果快照为 `sglang_pp_online_kv_shadow_20261110`。这是单次有界正确性验收，不证明暂停收益；网络、GDN和HiCache仍在fence，整模型Graph、VMM／HiCache组合、OOM／迁移失败GPU回退、冷暖生成等价及转换期间归还工作GPU均未取得资格。没有独立reviewer。
 
 ## 2026-11-05：静态 EP／PP／P/D 资格
 
