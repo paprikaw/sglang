@@ -1,5 +1,13 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-10：真实前向／allocator 接入的 CPU 检查
+
+新增 native KV CPU shadow 路径，接口和范围见 [GRAPH_KV_PATCH](GRAPH_KV_PATCH.md)。本轮组合检查最初476项通过、1项失败；失败为原有 PP 分区参数绕过配置声明的问题，旧 HEAD 中也存在同样的两处直接赋值。已改为声明更新，并补测配置投影与 allocator resize 前置拒绝。随后40项相关检查全部通过；按最新结果去重，共478项通过、0失败／错误／跳过。它是组合证据与受影响路径复测，不是修改后重跑全部478项，也不与此前769项相加。
+
+产物为 `kv-live-foundation-20261109/live-patch-cpu-r2/pytest.xml`、`live-patch-cpu-r3/pytest.xml` 和 `live-patch-cpu-audit.json`；初次112项定向检查保留在 `live-patch-cpu-r1/`。真实请求在线复制、GPU恢复与性能仍需另行检查，本轮没有独立 reviewer。
+
+## 2026-11-05：静态 EP／PP／P/D 资格
+
 2026-11-05。共同分支为 `codex/pp-elastic-integration`，基点为 R11 `b862312ce3`。运行记录和完整检查清单位于[验证 manifest](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/validation_manifest.json)。这次验证执行正确性和开关实际生效，不据此发布性能提升结论。
 
 **CPU 回归。** 共 537 项通过，零失败、零跳过。覆盖 EP／BF16 接口、量化参数转发、PP 通信与微批、HiCache 共识、GDN 和 P/D 状态交接、CPU 权重缓存，以及 elastic PP 控制与状态迁移。结果见 [JUnit](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/final_cpu_tests.xml)，52 个测试文件列于 [cpu_test_paths.txt](cpu_test_paths.txt)。使用锁定 Python，设置引擎 `python/` 的 `PYTHONPATH`、`/home/bxb1/conda/lib` 的 `LD_LIBRARY_PATH`，关闭 pytest 自动插件加载并显式加载 `pytest_asyncio.plugin`，将清单中的文件传给 pytest 即可复跑。

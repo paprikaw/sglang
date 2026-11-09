@@ -57,6 +57,10 @@ class ElasticPPMigrationCoordinator:
     rows, and publishes the new model/KV/route generation.  Keeping serving
     and migration communicator launches on one host thread avoids undefined
     multi-thread NCCL ordering on the same device.
+
+    The opt-in KV patch integration gathers forward-ready native rows into CPU
+    shadows while serving. All network and recurrent/cache handoff still occurs
+    at the drained fence; no background allocator snapshot is permitted.
     """
 
     def __init__(
@@ -90,6 +94,11 @@ class ElasticPPMigrationCoordinator:
         if self.backing == "cpu_spill" and self.strategy not in {"sync", "batched"}:
             raise ValueError("CPU-spill backing requires sync or batched transition")
         self.cache_transition = cache_transition
+        self.enable_kv_patch = bool(getattr(args, "enable_elastic_pp_kv_patch", False))
+        if self.enable_kv_patch and (
+            self.strategy != "background" or self.backing != "overlap"
+        ):
+            raise ValueError("online KV patch requires background/overlap transition")
         self._source_backing_attempted = False
         self._source_backing_metrics: dict[str, Any] = {}
         self._layers_precopied = False
@@ -213,12 +222,20 @@ class ElasticPPMigrationCoordinator:
             self._source_backing_metrics = {}
             self._drain_consensus_tensor = None
             self._drain_consensus_work = None
+            if self.enable_kv_patch:
+                # This caller is the scheduler; allocator snapshots must never
+                # be taken from the preparation worker.
+                self.kv_transport.begin_live_patch(transition)
             self._thread = Thread(
                 target=self._prepare_worker,
                 name=f"elastic-pp-prepare-g{transition.target.generation}-r{self.rank}",
                 daemon=True,
             )
             self._thread.start()
+
+    def progress_live_patch(self, batch, ready_event, req_to_token_pool):
+        if self.enable_kv_patch:
+            self.kv_transport.progress_live_patch(batch, ready_event, req_to_token_pool)
 
     @staticmethod
     def _slot_signature(slot_ids: torch.Tensor) -> tuple[int, str]:
@@ -572,6 +589,8 @@ class ElasticPPMigrationCoordinator:
             local_error = None
             try:
                 self._set_worker_device()
+                if self.enable_kv_patch:
+                    self.kv_transport.check_live_patch()
                 if self.strategy in {"background", "legacy"}:
                     if self.strategy == "background":
                         self._preflight_capacity(transition)
@@ -685,6 +704,8 @@ class ElasticPPMigrationCoordinator:
                     torch.cuda.synchronize(device)
                 if self.cache_transition is not None:
                     self.cache_transition.prepare_transition(transition)
+                if self.enable_kv_patch:
+                    self.kv_transport.finish_live_patch(transition)
                 if self.strategy in {"sync", "batched"}:
                     snapshot = getattr(self.kv_transport, "snapshot_at_fence", None)
                     if snapshot is not None:
@@ -964,6 +985,8 @@ class ElasticPPMigrationCoordinator:
                     self.kv_transport.finalize_source_backing(transition)
                     if self.cache_transition is not None:
                         self.cache_transition.finalize_source_device_aliases(transition)
+                if self.enable_kv_patch:
+                    self.kv_transport.release_live_patch()
                 if self.cache_transition is not None:
                     self.cache_transition.release_retired()
                 release_snapshot = getattr(

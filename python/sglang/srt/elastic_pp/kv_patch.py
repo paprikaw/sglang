@@ -1,9 +1,10 @@
 """Bounded continuous copies of immutable autoregressive KV rows.
 
-Experimental session/copy primitives. The production scheduler/allocator and
-multi-rank transport are not wired here. GDN and request metadata still require
-the final migration fence. Callers must publish writes after recording their
-GPU completion event, and check free/reuse through this session *before* freeing.
+Experimental session/copy primitives. live_kv_patch.py integrates native CPU
+shadows with scheduler/allocator hooks; online multi-rank transport remains
+separate. GDN and request metadata still require the final migration fence.
+Callers must publish writes after recording their GPU completion event, and
+check free/reuse through this session *before* freeing.
 """
 
 from __future__ import annotations

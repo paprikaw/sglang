@@ -322,6 +322,7 @@ def state_evidence(info):
         "hicache_host_memory_mode",
         "elastic_pp_transition_strategy",
         "elastic_pp_transition_backing",
+        "enable_elastic_pp_kv_patch",
     )
     return {
         "internal_states": [
@@ -532,6 +533,7 @@ def engine_entry(cfg, row):
     def args(argv):
         return prepare(
             argv
+            + (["--enable-elastic-pp-kv-patch"] if cfg.get("live_kv_patch") else [])
             + [
                 "--enable-elastic-pp",
                 "--elastic-pp-initial-partition",
@@ -950,6 +952,27 @@ def worker(run, cfg):
                         (0, 2) if generation == 1 else (0, 1, 2),
                         cfg.get("backing", "overlap"),
                     )
+                    if cfg.get("live_kv_patch"):
+                        patches = [
+                            state["transition_metrics"]
+                            .get("kv", {})
+                            .get("live_kv_patch", {})
+                            for state in rank_states(states).values()
+                        ]
+                        copied = [p for p in patches if p.get("shadow_bytes", 0)]
+                        if not copied or any(
+                            not p.get("complete") or p.get("error") for p in copied
+                        ):
+                            raise AssertionError("online KV snapshot was not completed")
+                        if (
+                            sum(p.get("online_submissions", 0) for p in copied) <= 0
+                            or sum(p.get("online_completed_rows", 0) for p in copied)
+                            <= 0
+                        ):
+                            raise AssertionError(
+                                "no KV rows completed during source inference"
+                            )
+                        record["live_kv_patch_verified"] = True
                     record["continuation"] = validate_uninterrupted_decode(
                         states,
                         generation,
@@ -1056,6 +1079,7 @@ def prepare(args):
         cases=["transition"],
         strategy=args.strategy,
         backing=args.backing,
+        live_kv_patch=getattr(args, "live_kv_patch", False),
         initial_counts=initial,
         initial_partition=",".join(map(str, initial)),
         grown_counts=grown,
@@ -1141,6 +1165,11 @@ def prepare(args):
                 for name in ("graph_bank.py", "kv_patch.py")
             ),
         ]
+    if cfg["live_kv_patch"]:
+        spec["frozen_inputs"] += [
+            base.desc(ENGINE / "python/sglang/srt/elastic_pp" / name)
+            for name in ("kv_patch.py", "live_kv_patch.py")
+        ]
     if args.baseline_probe:
         spec["title"] = "Qwen HiCache static generation-zero qualification diagnostic"
         spec["tasks"][0]["label"] = "Static cold256/warm8 state and sampler diagnostic"
@@ -1206,10 +1235,15 @@ def main():
     parser.add_argument(
         "--strategy", choices=["sync", "background", "batched"], default="sync"
     )
+    parser.add_argument("--live-kv-patch", action="store_true")
     parser.add_argument(
         "--backing", choices=["overlap", "cpu_spill"], default="overlap"
     )
     args = parser.parse_args()
+    if args.live_kv_patch and (
+        args.strategy != "background" or args.backing != "overlap"
+    ):
+        parser.error("live KV patch requires background/overlap")
     if args.overhead_sample and not (
         args.supervised_lifecycle
         and args.cached_reference_evidence

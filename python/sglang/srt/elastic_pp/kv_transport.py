@@ -193,6 +193,9 @@ class ElasticPPKVTransport:
         self.allocator = allocator
         self.rank = int(rank)
         self.slot_chunk_size = int(slot_chunk_size)
+        self._live_patch = None
+        self._live_patch_error = None
+        self._last_live_patch_metrics = {"enabled": False}
         self._runner_device = torch.device(getattr(model_runner, "device", "cpu"))
         self._send_stream = None
         self._receive_stream = None
@@ -379,7 +382,113 @@ class ElasticPPKVTransport:
         return result
 
     def metrics(self):
-        return {"backing_spill": self.backing_spill_metrics()}
+        patch = self._live_patch
+        return {
+            "backing_spill": self.backing_spill_metrics(),
+            "live_kv_patch": (
+                patch.metrics() if patch is not None else self._last_live_patch_metrics
+            ),
+        }
+
+    def begin_live_patch(self, transition):
+        """Called only by the scheduler, before its preparation thread starts."""
+        from sglang.srt.elastic_pp.backing_spill import _require_cpu_space
+        from sglang.srt.elastic_pp.live_kv_patch import LiveKVSnapshot
+
+        self._live_patch_error = None
+        self._last_live_patch_metrics = {"enabled": True, "outgoing_kv_layers": 0}
+        layers = sorted(
+            {
+                layer
+                for edge in self.outbound_transfers(transition)
+                for layer in self._kv_layer_ids(edge)
+            }
+        )
+        if not layers:
+            return
+        try:
+            from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+            if type(self.allocator) is not TokenToKVPoolAllocator:
+                raise NotImplementedError(
+                    "online KV patch requires the standard token allocator"
+                )
+            source = {
+                layer: (
+                    self.pool.get_key_buffer(layer),
+                    self.pool.get_value_buffer(layer),
+                )
+                for layer in layers
+            }
+            self._live_patch = LiveKVSnapshot(
+                generation=transition.target.generation,
+                allocator=self.allocator,
+                source=source,
+                max_rows=min(256, self.slot_chunk_size),
+                admit_host_bytes=_require_cpu_space,
+            )
+        except BaseException as exc:
+            # Every rank must still enter the common prepare consensus.
+            self._live_patch_error = f"{type(exc).__name__}: {exc}"
+
+    def check_live_patch(self):
+        error = self._live_patch_error
+        if self._live_patch is not None:
+            error = error or self._live_patch.error
+        if error is not None:
+            raise RuntimeError("online KV patch failed: " + error)
+
+    def progress_live_patch(self, batch, ready_event, req_to_token_pool):
+        patch = self._live_patch
+        if patch is None or not patch.active:
+            return
+        try:
+            # HiCache can have allocated slots whose async load has not run yet.
+            # Publish only the rows used by this completed local forward.
+            lengths = getattr(batch, "seq_lens_cpu", None)
+            if lengths is None:
+                lengths = batch.seq_lens.detach().cpu()
+            lengths = lengths.tolist()
+            requests = batch.req_pool_indices.detach().cpu().tolist()
+            mapping = req_to_token_pool.req_to_token
+            used = []
+            for request, length in zip(requests, lengths, strict=True):
+                if (
+                    not 0 <= request < mapping.shape[0]
+                    or not 0 <= length <= mapping.shape[1]
+                ):
+                    raise ValueError("invalid forward-time KV request mapping")
+                used.append(mapping[request, :length])
+            if used:
+                patch.progress(torch.unique(torch.cat(used)), ready_event)
+        except BaseException as exc:
+            self._live_patch_error = f"{type(exc).__name__}: {exc}"
+            # Drain before another allocator mutation can reuse these rows.
+            patch.abort()
+
+    def finish_live_patch(self, transition):
+        self.check_live_patch()
+        patch = self._live_patch
+        if patch is not None:
+            if patch.generation != transition.target.generation:
+                raise RuntimeError("online KV patch generation mismatch")
+            ready = self._record_ready_event(
+                torch.cuda.current_stream(self._runner_device)
+                if self._runner_device.type == "cuda"
+                else None
+            )
+            if ready is None:
+                from types import SimpleNamespace
+
+                ready = SimpleNamespace(synchronize=lambda: None)
+            patch.finish_at_fence(self.allocator.elastic_pp_live_slots(), ready)
+
+    def release_live_patch(self):
+        patch = self._live_patch
+        if patch is not None:
+            patch.abort()
+            self._last_live_patch_metrics = patch.metrics()
+            self._live_patch = None
 
     def _preflight_cpu_staging(self, transition):
         spill = getattr(self, "_spill", None)
@@ -457,6 +566,7 @@ class ElasticPPKVTransport:
 
     def finalize_source_backing(self, transition):
         """Discard CPU rollback authority only after all-rank publication."""
+        self.release_live_patch()
         spill = getattr(self, "_spill", None)
         if spill is not None:
             spill.finalize(generation=transition.target.generation)
@@ -465,6 +575,11 @@ class ElasticPPKVTransport:
         return self.backing_spill_metrics()
 
     def _export_source_kv(self, *, layer_id, slot_ids):
+        if self._live_patch is not None and self._live_patch.complete:
+            return tuple(
+                t.to(self.pool.device)
+                for t in self._live_patch.export(layer_id, slot_ids)
+            )
         spill = getattr(self, "_spill", None)
         if spill is None:
             return self.pool.export_elastic_pp_kv_slots(
@@ -846,6 +961,12 @@ class ElasticPPKVTransport:
         return frozenset(loaded)
 
     def abort_staged(self, transition: DynamicPPTransition) -> None:
+        if (
+            self._live_patch is not None
+            and self._live_patch.generation != transition.target.generation
+        ):
+            raise RuntimeError("online KV patch generation mismatch")
+        self.release_live_patch()
         self.release_fence_snapshot(transition)
         generation = transition.target.generation
         spill = getattr(self, "_spill", None)
