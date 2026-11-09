@@ -14,6 +14,6 @@
 
 **验收怎样判断。** CPU 检查覆盖部分失败、重复包、pin、非法布局及过期控制消息，另用旧基线复现回收顺序问题。原生扩展构建、真实加载、GPU 页面数变化和模型端到端连续性是不同检查。新后端的 HiCache、packed stride 与 Attention 路径、GDN 稳定地址、Graph、持续 patch 和物理 GPU 释放仍要分别验收；现有 hybrid HiCache 的 native-only 限制继续保留。最新完成情况只在 [TODO](TODO.md) 勾选，未通过的项保持未完成。
 
-**这轮已完成。** 769 项引擎 CPU 回归及 27 项依赖协议／几何检查通过；3 个新增故障用例在旧基线均失败。依赖补丁重放得到源码树 `14c85a5f0701`，SHA256 为 `dbd6d41eaf8c603bc6a807a05b55482007b212a0a3cdbe53e6c59f2a2e8f2d75`。原生扩展已经构建并在隐藏所有 CUDA 设备的条件下验证 ABI 加载，尚无本轮 GPU 分配或模型运行验收。详细检查口径见 [VALIDATION](VALIDATION.md)。
+**这轮已完成。** 769 项引擎 CPU 回归及 27 项依赖协议／几何检查通过；3 个新增故障用例在旧基线均失败。依赖补丁重放得到源码树 `14c85a5f0701`，SHA256 为 `dbd6d41eaf8c603bc6a807a05b55482007b212a0a3cdbe53e6c59f2a2e8f2d75`。原生扩展完成构建及隐藏设备下的 ABI 加载；随后 A100 `gpu-r1` 实测退役层组释放8 MiB，保留层地址和数据，pin 阻止提前回收，重新映射只清零新页。packed-stride KV 行复制与 Graph 基础检查通过，详见 [Graph／Patch](GRAPH_KV_PATCH.md)和 [VALIDATION](VALIDATION.md)。同轮 native HiCache 整模型往返是另一条执行路径，不能当作新后端 HiCache 已接通。
 
 **下一步先检查什么。** 先以最小原生 GPU 探针核对物理页变化与保留值，再接缓存和 Attention。packed K／V view 的行 stride 与部分旧 pointer table／拷贝路径的紧密排列假设需要逐一核对。当前 worker 映射账本以一个新进程的一次池生命周期为界，不支持在同进程随意替换过滤器或重建原生池。

@@ -6,13 +6,14 @@
 
 ## 本轮实施：主 agent 顺序完成
 
-从冻结基线 `ce563696401c` 建立 `codex/pp-kv-live-foundation-20261109`，本轮不使用子 agent。[Draft PR #4](https://github.com/paprikaw/sglang/pull/4) 已推送，目标为项目分支，尚未合入；实现检查点为 `aa62154ae2db`。先固定兼容依赖和按层物理映射接口，再接后续 Graph／Patch；旧分工仅表示模块边界，不是正在运行的任务。
+从冻结基线 `ce563696401c` 建立 `codex/pp-kv-live-foundation-20261109`，本轮不使用子 agent。[Draft PR #4](https://github.com/paprikaw/sglang/pull/4) 已推送，目标为项目分支，尚未合入；本轮 GPU 冻结源码为 `8d7c21241c`。先固定兼容依赖和按层物理映射接口，再接后续 Graph／Patch；旧分工仅表示模块边界，不是正在运行的任务。
 
 - [x] 实现 KVCacheD 按层映射协议、映射账本、部分失败重试及页面 pin；保存可重放依赖补丁、Python／原生版本检查和 stacking 边界检查。27 项依赖 CPU 检查通过；补丁在干净上游索引重放得到完全相同的源码树。见[实现与边界](KV_LAYER_MAPPING.md)及依赖锁。真实 GPU 页面验证不包含在此勾选中。
 - [x] 修复 SGLang import／abort／cleanup 在校验 generation 前触碰物理页面的问题，并在 map 前检查槽位和 payload。旧基线可复现 3 个故障，新代码 769 项引擎 CPU 回归通过；保留层地址／数值仅在 CPU 适配器验证，不能据此推定真实 GPU 验收。
-- [ ] 验证真实 GPU 的按层 map／unmap、保留层地址与数据及失败回退；接通 HiCache、GDN 和 Attention 的布局约束。持续 KV patch、Graph bank 和真正归还 GPU 仍分别验收，现有 hybrid HiCache 的 native-only 保护不撤除。
+- [ ] 接通 HiCache、GDN 和 Attention 的完整布局约束，并验证实际 OOM／迁移失败回退。底层 GPU 的 map／unmap、保留地址和数据及页面 pin 拒绝已通过；这不替代整模型新后端兼容性或归还工作 GPU，现有 hybrid HiCache 的 native-only 保护不撤除。
 - [x] 建立有限 Graph 预捕获库与持续 KV 行追补的实验模块，本轮75项CPU检查通过（25项新模块＋50项生命周期／参考资格回归）。Graph 按完整 tensor 地址／shape／stride 匹配，eager 回退同样保护页面，复制保护槽位复用；尚未接入整模型 scheduler、跨 rank 传输或 GDN 增量同步。见[接口与接入顺序](GRAPH_KV_PATCH.md)。
-- [ ] 在同一有界 A100 租约中先验证 VMM／Graph／增量复制，再独立回归开启 HiCache 的整模型 PP2→PP3→PP2。底层成功与 native HiCache 基线成功分别报告，不据此宣布新 KV 后端已兼容 HiCache。
+- [x] A100 `gpu-r1` 完成底层 GPU 检查：退役组驱动可见显存增加8 MiB，保留地址和数据；2次 Graph capture／2次 replay、1次地址变化 fallback及1次未映射拒绝；patch为2轮／4行，包含新增行及槽位复用。它是小规模单 GPU 检查，尚未证明完整模型、跨 rank 或在线复制的性能。
+- [x] 同一租约内，开启 HiCache 的 native KV 整模型 PP2→PP3→PP2 往返通过同暖512边界的生成连续性和 CPU 前缀 loadback；整轮含清理186.509秒，Guard postcheck、清理及正常release通过。Graph在整模型中仍关闭，cold/warm等价和转换期间GPU归还未通过资格。见[验证说明](VALIDATION.md)。
 
 ## 当前：先把基线做正确
 
@@ -35,13 +36,13 @@
 
 - [x] 主 agent 核对 workbench vLLM/PipeLive、SGLang runtime `8374b0276d19` 及 KVCacheD 工作区，形成研究库 `LOW_INTERRUPTION_PP_REVIEW_20261109.md` 和问题簿 Q25。建议优先 KVCacheD 稳定虚拟地址，保留旧块指针内核作备选；发现按层物理映射 API 不匹配、GDN backing 重建和 stacking 边界限制。仅完成调研，无新增引擎改动或 GPU 验收。
 - [ ] **A：**固定兼容的 KVCacheD 依赖与能力检查，先验证物理页映射／回收和存活状态；只改 local view 不算释放显存。
-- [ ] **B：**建立少量候选布局的 CUDA Graph 预捕获与选择机制，检查权重、KV、GDN、输入和 workspace 地址；记录实际 replay、失效及 fallback，不在同一进程的正常推理期间无保护 capture。
+- [ ] **B：**将预捕获库接入整模型执行器，补齐权重、KV、GDN、输入和 workspace 的完整 binding 及稳定地址；底层库的实际 replay／fallback 已在 A100 检查，不等于模型 Graph 已可切换。不在正常推理期间无保护 capture。
 - [ ] **B：**预初始化并预热候选布局的真实通信路径，验证路由版本、通信顺序和缓冲生命周期。
 - [ ] **A：**选择固定且满足 attention 池层序号边界的 stacking 粒度。显式 preclaim 须与层所有权一致，并计入物理显存；不默认打开全局自动预分配。
 
 ## 下一步一：持续 KV patch，缩短推理中断
 
-- [ ] **C：**实现旧布局继续推理时的 KV 基础复制与持续增量追补，接近追平后才暂停，完成最后增量和状态交接再恢复。不能把后台预搬权重或空 delta 接口当作已完成。
+- [ ] **C：**将已实现的增量行复制接入旧布局真实推理、跨 rank 传输和最终交接。底层 GPU 检查已产生非空增量，但尚无整模型在线 patch；接近追平后才暂停，完成最后增量和状态交接再恢复。
 - [ ] **C，依赖 A 的状态接口：**处理请求新增／结束、KV 槽位复用、迁移版本及 GDN recurrent state 的更新，保证追补不会覆盖新状态；追不平或失败时可退回同步基线。
 - [ ] **B 运行、独立审查：**对照当前同步基线，测暂停、请求延迟、额外传输和后台复制对正常推理的影响。先证明正确，再判断是否值得采用；不预设持续同步一定更快。
 

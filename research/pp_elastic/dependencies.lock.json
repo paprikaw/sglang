@@ -162,6 +162,6 @@
       "KVCACHED_PAGE_PREALLOC_ENABLED": "false"
     },
     "build": "Apply patch to the pinned clean upstream tree and rebuild the native extension in an isolated checkout; select it explicitly with PYTHONPATH.",
-    "limits": "Protocol/geometry CPU checks and native build/loading are separate from GPU acceptance. Hybrid HiCache retains its native-backend-only guard. Graph reuse, active-state protection, GDN stable addresses and live GPU reclamation are not qualified."
+    "limits": "The bounded A100 gpu-r1 primitive check validates mapping/reclamation, retained addresses/values, packed-row copying and two small Graph replays. Full-model Graph reuse, hybrid HiCache on this backend, GDN stable addresses, online patch transport and returning working GPUs remain unqualified. Hybrid HiCache retains its native-backend-only guard."
   }
 }

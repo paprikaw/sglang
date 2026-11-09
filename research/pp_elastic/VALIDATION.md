@@ -35,3 +35,13 @@
 原生扩展在已有预约节点构建成功，随后在 `CUDA_VISIBLE_DEVICES=999` 下实际加载并检查 Python API／native ABI v1，确认可见 CUDA 设备数为0；没有为这一步启动模型或 GPU 分配测试。依赖补丁从固定上游提交重放，生成 tree `14c85a5f0701a5a7789683ee57f9cbf873ea4cc7`，与依赖检查点完全相同。补丁哈希和前置环境见 [dependencies.lock.json](dependencies.lock.json)。
 
 原始产物位于实验归档 `source_integration/sglang-pp-elastic-20261105/kv-live-foundation-20261109/`，包含 `cpu_attempt1/`、`cpu_attempt2/`、`cpu_final/`、`engine_test_source_audit.json`、`dependency_patch_replay.json`、`native_build_final.json` 和 `native_capability_probe_final.json`。首轮登录节点缺少 `libcuda.so.1` 的加载失败也保留；最终加载证据来自预约节点。真实 GPU 地址／数值保留、物理页回收、OOM 回退、packed stride、HiCache 接入及端到端性能仍未验收。原有 hybrid HiCache 的 native-only 保护保持不变。
+
+## Graph／持续 KV patch 初步 GPU 验证（2026-11-09）
+
+冻结源码 `8d7c21241c`，annotated tag `experiment/sglang/pp-graph-kv-probe-20261109-r1`，依赖 tree／native binary 与前一节构建一致。新模块与运行生命周期／参考资格共75项CPU检查通过（新增模块25项，另50项回归），不与此前769项简单相加。本轮由主 agent 实施及核查，没有独立 reviewer。
+
+**底层真实 GPU。** A100 80GB 上，32 MiB 稳定虚拟地址分成4个层组，起初只映射2组。迁移显式映射目标组；重复 map 保留原值，pin 拒绝提前回收。退役8 MiB层组后，驱动可见空闲显存实际增加8 MiB；保留层地址和数值不变，重映射后仅新页为零。两张小算子的 CUDA Graph 均预捕获并 replay，地址改变触发一次 eager fallback，未映射 backing 阻止一次执行。packed-stride K／V 行复制完成2轮、4行，包含第一轮尚待确认时发布的新增行，以及槽位复用后的新 incarnation；最终 K／V 与源一致。此项是单 GPU 原语检查，不是 Attention 后端性能、实际并行 overlap 或完整模型验证。
+
+**HiCache 整模型回归。** 同一 Guard 租约随后在三张 resident A100 上执行 native KV 后端的35B BF16 PP2→PP3→PP2，两次活跃 Decode 切换后的输出均与同暖512边界参考一致，CPU前缀有实际loadback。Graph仍关闭；cold／warm参考生成等价仍未取得资格，工作GPU也未在转换期间归还。整轮包含清理186.509秒，Guard postcheck通过，owned进程清理和正常lease release均验证。它验证新代码共存时的同步基线，没有执行整模型 Graph bank 或在线 patch。
+
+产物目录为上述归档下的 `gpu-r1/`，包含 `component_gpu.json`、`results.json`、`supervisor_outcome.json`、`cleanup_ack.json`、对应可见性回执及 `post_run_audit.json`；精简报告为 `REPORT.md`。底层原始结果 SHA256 `6991b2fb9ac3e02e8a84645b697fd91fec92dd55500c2908316d80798d21bbea`，整模型结果 `e6eb56810c04f57b0ecc0716a1f6c516faa2f1806a7465e88c8fb228184134b1`。真正的 OOM／迁移失败回退、HiCache／GDN稳定地址、allocator生命周期钩子、跨 rank patch、完整模型Graph及暂停收益仍待验证。
