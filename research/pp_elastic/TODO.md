@@ -6,7 +6,7 @@
 
 ## 本轮实施：主 agent 顺序完成
 
-从冻结基线 `ce563696401c` 建立 `codex/pp-kv-live-foundation-20261109`，本轮不使用子 agent。先固定兼容依赖和按层物理映射接口，再接后续 Graph／Patch；旧分工仅表示模块边界，不是正在运行的任务。
+从冻结基线 `ce563696401c` 建立 `codex/pp-kv-live-foundation-20261109`，本轮不使用子 agent。[Draft PR #4](https://github.com/paprikaw/sglang/pull/4) 已推送，目标为项目分支，尚未合入；实现检查点为 `aa62154ae2db`。先固定兼容依赖和按层物理映射接口，再接后续 Graph／Patch；旧分工仅表示模块边界，不是正在运行的任务。
 
 - [x] 实现 KVCacheD 按层映射协议、映射账本、部分失败重试及页面 pin；保存可重放依赖补丁、Python／原生版本检查和 stacking 边界检查。27 项依赖 CPU 检查通过；补丁在干净上游索引重放得到完全相同的源码树。见[实现与边界](KV_LAYER_MAPPING.md)及依赖锁。真实 GPU 页面验证不包含在此勾选中。
 - [x] 修复 SGLang import／abort／cleanup 在校验 generation 前触碰物理页面的问题，并在 map 前检查槽位和 payload。旧基线可复现 3 个故障，新代码 769 项引擎 CPU 回归通过；保留层地址／数值仅在 CPU 适配器验证，不能据此推定真实 GPU 验收。
