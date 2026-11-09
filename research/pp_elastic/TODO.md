@@ -9,15 +9,15 @@
 - [x] 整理 EP／PP／P/D／HiCache 共同代码基线，完成有限范围的静态 CPU 与 A100 回归。证据见 [VALIDATION.md](VALIDATION.md)；这些结果不替代动态转换验证。
 - [x] 实现 resident PP 层布局往返、活跃 KV／GDN／请求进度及 CPU 前缀的转移。已有 PP2→PP3→PP2 同一暖缓存边界的连续性检查通过（r11，`c0a1a1ecb0de`）。这不证明冷／暖缓存生成等价，也不证明空阶段进程退出、GPU 已归还。
 - [x] 实现三种基础策略：同步暂停、后台预搬不可变权重、暂停期间分块复制。KV／GDN 当前仍在最终 fence 同步；没有持续 KV patch，分块复制也不等于在线增量同步。
-- [x] 实现 CPU spill／目标池重建路径，以及 GDN 引用与清理流程修复；相关 CPU 检查及独立审查已有记录。最新冻结运行版本为 `5fa14eae1df0`，见 [Runtime PR #2](https://github.com/paprikaw/sglang/pull/2)。
+- [x] 实现 CPU spill／目标池重建路径，以及 GDN 引用与清理流程修复；相关 CPU 检查及独立审查已有记录。CPU spill 验收版本为 `5fa14eae1df0`，见 [Runtime PR #2](https://github.com/paprikaw/sglang/pull/2)。
 - [x] 验收同步 CPU spill 在真实 GPU 上的成功往返：r14（`5fa14eae1df0`）观察到源 KV／GDN backing 释放、目标恢复、同暖缓存边界的生成连续性及切换后的 CPU 前缀实际 loadback，清理和租约正常结束；完整监督时长 163.294 秒。独立审计 `independent_r14_audit.json`（SHA `6afd282252d8`）通过；原始结果 SHA `ff753f536a37e`。这不包含冷／暖生成等价、严格峰值比较、性能收益或转换期间归还工作 GPU。
 - [ ] 补齐受影响故障路径的实际 GPU 回退验证；已有 CPU 回退检查不替代真实 OOM／迁移失败场景。background、batched 的 GPU 资格也不能由 sync 的成功推定。
 - [ ] 将通过审查的 Runtime 实现合入项目分支，完成相关组合回归，再合入共同基线。Cache 子任务已合入项目；整个动态功能尚未完成最终验收。见 [协作约定](WORKFLOW.md)。
 
 ## 当前：测清楚转换 overhead
 
-- [ ] 正确性通过后，在相同源／目标布局、请求、缓存及硬件下，测一次扩容与缩容，并提供同工作量不转换的参考。每次短验证包含启动、预热和最终清理，保持不超过五分钟；不立即展开大规模参数扫描。
-- [ ] 分别记录总转换时间、推理暂停／token 间隔、权重准备、KV／GDN 备份与恢复、传输字节、峰值 GPU／CPU 内存及请求 TTFT／TPOT。报告绝对 ms 和可比重复的平均值，保留原始样本；未分离的阶段标明未测，不由总时长倒推出原因。
+- [x] 完成一次最小配对 overhead 观测：r15（`8374b0276d19`）在同暖512边界、输入及硬件下，每方向各1条无转换参考与1次 sync/cpu_spill 转换；完整监督186.775秒，正常清理／release。扩／缩 E2E 差分别 +4570.757／+3215.168 ms，各 rank 平均 fence 3389.554／3356.288 ms（非重复实验平均）。差值含目标拓扑速度及控制影响，TTFT在触发前；不作为孤立切换成本或统计性能结论。报告 `gpu-hicache-r15/REPORT.md`，原始结果 SHA `25dea5a4d093`。
+- [ ] 分别记录总转换时间、推理暂停／token 间隔、权重准备、KV／GDN 备份与恢复、传输字节、峰值 GPU／CPU 内存及请求 TTFT／TPOT。报告绝对 ms 和可比重复的平均值，保留原始样本；未分离的阶段标明未测，不由总时长倒推出原因。 r15已有E2E／TTFT／平均TPOT、各rank coordinator prepare／fence／total及host字节；隔离的权重／传输／恢复耗时、最大token gap、严格峰值和可比重复平均仍未测，因此本条保留未完成。
 - [ ] 在共同正确性条件下比较 sync、background、batched，说明后台准备隐藏了哪些开销。启动／预热和转换期间的开销分开报告，完整运行时长另列；正确性 smoke 的单次耗时不直接当作稳定性能收益。
 
 ## 下一步一：持续 KV patch，缩短推理中断
