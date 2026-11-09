@@ -1,7 +1,7 @@
 """Guard-only <=300s Qwen HiCache PP2 -> PP3 -> PP2 correctness check.
 
 Shares the audited CPU-cache/owned-process launch helpers with gpu_smoke.
-This is not a performance benchmark or a toy-model substitution.
+The optional overhead sample pairs each transition with one unchanged-layout request.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ import argparse
 import concurrent.futures as cf
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -35,6 +36,70 @@ def rank_states(states):
             f"{[state.get('transition_rank') for state in states]}"
         )
     return ranks
+
+
+def paired_overhead(baseline, active, states, generation):
+    """One observation per direction, with the source cache tier held fixed."""
+    expected_tier = (
+        {"device": 0, "host": 512} if generation == 1 else {"device": 512, "host": 0}
+    )
+    if generation not in (1, 2):
+        raise AssertionError("unknown overhead direction")
+    if len(baseline.get("output_ids", ())) != 256 or baseline[
+        "output_ids"
+    ] != active.get("output_ids"):
+        raise AssertionError("paired output IDs differ")
+    measured = {}
+    for label, result in (("baseline", baseline), ("transition", active)):
+        meta = result.get("meta_info", {})
+        if (
+            meta.get("cached_tokens") != 512
+            or meta.get("cached_tokens_details") != expected_tier
+            or meta.get("num_retractions") != 0
+        ):
+            raise AssertionError("paired cache tier or retraction count differs")
+        measured[label] = {}
+        for name in ("e2e_ms", "ttft_ms", "tpot_ms"):
+            value = result.get(name)
+            if (
+                not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value <= 0
+            ):
+                raise AssertionError("paired request timing is missing or invalid")
+            measured[label][name] = value
+    measured["difference_ms"] = {
+        name: measured["transition"][name] - measured["baseline"][name]
+        for name in measured["baseline"]
+    }
+    measured["per_rank_ms"] = {}
+    for rank, state in rank_states(states).items():
+        metrics = state["transition_metrics"]
+        timings = {}
+        for name in ("prepare_seconds", "fence_seconds", "total_seconds"):
+            value = metrics.get(name)
+            if (
+                not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise AssertionError("coordinator timing is missing or invalid")
+            timings[name.replace("_seconds", "_ms")] = value * 1000
+        measured["per_rank_ms"][str(rank)] = timings
+    measured.update(
+        samples_per_direction=1,
+        source_counts=[20, 0, 20] if generation == 1 else [13, 13, 14],
+        target_counts=[13, 13, 14] if generation == 1 else [20, 0, 20],
+        cache_tier=expected_tier,
+        timing_scope="client stream E2E/TTFT/mean TPOT; coordinator prepare/fence/through cleanup",
+        unmeasured=[
+            "token interval pause",
+            "isolated transfer",
+            "isolated restore",
+            "strict peak memory",
+        ],
+    )
+    return measured
 
 
 def validate_transition_states(states, generation, source_ranks, backing):
@@ -533,7 +598,7 @@ def worker(run, cfg):
         "passed": False,
         "resident_ranks": 3,
         "gpu_released": False,
-        "performance_sample": False,
+        "performance_sample": bool(cfg.get("overhead_sample", False)),
         "cuda_graph_enabled": False,
         "diagnostic_reply_scope": "private one-node PP3/TP1/DP1 get/set state replies",
         "acceptance_class": cfg.get("acceptance_class", "cold_warm_exact_generation"),
@@ -693,7 +758,7 @@ def worker(run, cfg):
             "reference_cache_state": "warmed at the same prefix-match boundary",
         }
         if lifecycle is not None:
-            lifecycle.admit("references", 105)
+            lifecycle.admit("references", 150 if cfg.get("overhead_sample") else 105)
         checkpoint("prefix_warmup")
         cold_prefix = request(prefix, 24)
         checkpoint("prefix_reference")
@@ -740,10 +805,29 @@ def worker(run, cfg):
         for generation, counts in enumerate(
             (cfg["grown_counts"], cfg["initial_counts"]), 1
         ):
+            baseline = None
+            if cfg.get("overhead_sample"):
+                checkpoint(f"overhead_reference_{generation}")
+                lifecycle.admit(
+                    f"overhead_reference_{generation}", 105 if generation == 1 else 52
+                )
+                baseline = request(active_prompt, 256)
+                evidence.setdefault("overhead_baselines", []).append(baseline)
+                if baseline["output_ids"] != active_reference["output_ids"]:
+                    raise AssertionError(
+                        "no-transition baseline changed warmed output IDs"
+                    )
+                if generation == 1:
+                    evidence["paired_demotion"] = demote_cpu_prefixes(http)
             checkpoint(f"transition_{generation}")
             if lifecycle is not None:
                 lifecycle.admit(
-                    f"transition_{generation}", 60 if generation == 1 else 32
+                    f"transition_{generation}",
+                    (
+                        (80 if cfg.get("overhead_sample") else 60)
+                        if generation == 1
+                        else 32
+                    ),
                 )
             with cf.ThreadPoolExecutor(max_workers=1) as pool:
                 try:
@@ -818,6 +902,10 @@ def worker(run, cfg):
                         (0, 1, 2) if generation == 1 else (0, 2),
                     )
                     record["continuation_verified"] = True
+                    if baseline is not None:
+                        record["overhead"] = paired_overhead(
+                            baseline, result, states, generation
+                        )
                     break
                 if time.monotonic() >= deadline:
                     raise TimeoutError("transition cleanup did not complete")
@@ -915,6 +1003,7 @@ def prepare(args):
         grown_counts=grown,
         engine_entrypoint=str(Path(__file__).resolve()),
         baseline_probe=args.baseline_probe,
+        overhead_sample=getattr(args, "overhead_sample", False),
         acceptance_class=(
             "cached_execution_continuity"
             if args.cached_reference_evidence
@@ -997,6 +1086,7 @@ def main():
     parser.add_argument("--engine-entry", action="store_true")
     parser.add_argument("--layout")
     parser.add_argument("--baseline-probe", action="store_true")
+    parser.add_argument("--overhead-sample", action="store_true")
     parser.add_argument("--cached-reference-evidence", type=Path)
     parser.add_argument("--supervised-lifecycle", action="store_true")
     parser.add_argument("--work-seconds", type=float, default=250)
@@ -1028,6 +1118,15 @@ def main():
         "--backing", choices=["overlap", "cpu_spill"], default="overlap"
     )
     args = parser.parse_args()
+    if args.overhead_sample and not (
+        args.supervised_lifecycle
+        and args.cached_reference_evidence
+        and args.strategy == "sync"
+        and args.backing == "cpu_spill"
+    ):
+        parser.error(
+            "overhead sample requires supervised sync/cpu_spill and reviewed warm evidence"
+        )
     if args.baseline_probe and args.cached_reference_evidence:
         parser.error(
             "static diagnostic and cached execution continuity are separate classes"

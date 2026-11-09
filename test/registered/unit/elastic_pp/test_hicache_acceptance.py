@@ -5,6 +5,7 @@ import concurrent.futures as cf
 import copy
 import functools
 import json
+import math
 import os
 import sys
 import threading
@@ -40,9 +41,10 @@ def acceptance():
             "validate_uninterrupted_decode",
             "state_evidence",
             "worker",
+            "paired_overhead",
         }
     ]
-    namespace = {"time": time}
+    namespace = {"time": time, "math": math}
     exec(
         compile(ast.Module(body=functions, type_ignores=[]), str(path), "exec"),
         namespace,
@@ -78,6 +80,7 @@ def test_worker_retains_published_control_when_continuation_fails(
     first_cleanup,
     supervised,
     record_property,
+    overhead_sample=False,
 ):
     """Exercise the actual worker's HTTP, future, failure and cleanup sequence."""
     control_seen = threading.Event()
@@ -94,7 +97,7 @@ def test_worker_retains_published_control_when_continuation_fails(
 
     def request_one(endpoint, unused, key, tokens, output, index):
         requests.append((len(tokens), output))
-        if len(requests) == 5:
+        if len(requests) == (6 if overhead_sample else 5):
             active_started.set()
             if failure == "control":
                 if not cleanup_started.wait(1):
@@ -120,7 +123,18 @@ def test_worker_retains_published_control_when_continuation_fails(
                 2 if cached_class and output == 256 and len(requests) >= 4 else 1
             ]
             * output,
-            "meta_info": {"cached_tokens": 512, "num_retractions": 0},
+            "meta_info": {
+                "cached_tokens": 512,
+                "num_retractions": 0,
+                "cached_tokens_details": (
+                    {"device": 0, "host": 512}
+                    if len(requests) <= 6
+                    else {"device": 512, "host": 0}
+                ),
+            },
+            "e2e_ms": 100,
+            "ttft_ms": 10,
+            "tpot_ms": 1,
         }
 
     def http_json(port, path, key, payload, *, timeout):
@@ -141,6 +155,11 @@ def test_worker_retains_published_control_when_continuation_fails(
                     "transition_rank": rank,
                     "transition_active_output_lengths": [4],
                     "elastic_pp_state": {"migration_phase": "done"},
+                    "transition_metrics": {
+                        "prepare_seconds": 0.1,
+                        "fence_seconds": 0.2,
+                        "total_seconds": 0.4,
+                    },
                     "enable_hierarchical_cache": True,
                     "disable_cuda_graph": True,
                     "api_key": "must-not-save-state-key",
@@ -205,6 +224,7 @@ def test_worker_retains_published_control_when_continuation_fails(
         "backing": "overlap",
         "initial_counts": [20, 0, 20],
         "grown_counts": [13, 13, 14],
+        "overhead_sample": overhead_sample,
     }
     if supervised:
         scripts = Path(__file__).resolve().parents[4] / "research/pp_elastic"
@@ -313,7 +333,8 @@ def test_worker_retains_published_control_when_continuation_fails(
         "shared_stage_writes_before_cleanup", len(shared_diagnostics_before_cleanup)
     )
     record_property("shared_contract_writes_before_cleanup", 0 if supervised else 4)
-    assert len(requests) == (7 if failure == "completion" else 5)
+    completed_requests = 9 if overhead_sample else 7
+    assert len(requests) == (completed_requests if failure == "completion" else 5)
     assert not cleanup_was_late.is_set(), "cleanup waited for the in-flight HTTP"
     expected_transitions = (
         [
@@ -343,7 +364,17 @@ def test_worker_retains_published_control_when_continuation_fails(
     assert "must-not-save" not in repr(saved)
     contract = json.loads((tmp_path / "reference_request_contract.json").read_text())
     assert contract["capture"] == "actual pre-serialization stream payload"
-    assert len(contract["requests"]) == (7 if failure == "completion" else 4)
+    assert len(contract["requests"]) == (
+        completed_requests if failure == "completion" else 4
+    )
+    if overhead_sample:
+        assert evidence["performance_sample"] is True
+        assert len(evidence["overhead_baselines"]) == 2
+        assert "paired_demotion" in evidence
+        for record in evidence["transitions"]:
+            assert record["overhead"]["samples_per_direction"] == 1
+        payloads = [row["payload"] for row in contract["requests"]]
+        assert all(payloads[index] == payloads[2] for index in (3, 4, 5, 6, 7))
     assert (
         tmp_path / "reference_request_contract.json"
     ).stat().st_mode & 0o777 == 0o600
@@ -372,6 +403,90 @@ def test_worker_rejects_completion_cancelled_after_assertions(
         supervised=True,
         record_property=record_property,
     )
+
+
+def test_paired_overhead_actual_worker_keeps_requests_and_late_failure_gate(
+    acceptance, monkeypatch, tmp_path, record_property
+):
+    test_worker_retains_published_control_when_continuation_fails(
+        acceptance,
+        monkeypatch,
+        tmp_path,
+        cached_class=True,
+        failure="completion",
+        first_cleanup="verified",
+        supervised=True,
+        record_property=record_property,
+        overhead_sample=True,
+    )
+
+
+@pytest.mark.parametrize("generation", [1, 2])
+def test_paired_overhead_reports_signed_single_sample_ms(acceptance, generation):
+    tier = {"device": 0, "host": 512} if generation == 1 else {"device": 512, "host": 0}
+    baseline = {
+        "output_ids": [1] * 256,
+        "meta_info": {
+            "cached_tokens": 512,
+            "cached_tokens_details": tier,
+            "num_retractions": 0,
+        },
+        "e2e_ms": 100,
+        "ttft_ms": 10,
+        "tpot_ms": 1,
+    }
+    active = copy.deepcopy(baseline)
+    active.update(e2e_ms=120, ttft_ms=9)
+    evidence = states()
+    for state in evidence:
+        state["transition_metrics"].update(
+            prepare_seconds=0.1, fence_seconds=0.2, total_seconds=0.4
+        )
+    result = acceptance["paired_overhead"](baseline, active, evidence, generation)
+    assert result["difference_ms"] == {"e2e_ms": 20, "ttft_ms": -1, "tpot_ms": 0}
+    assert result["samples_per_direction"] == 1
+    assert result["per_rank_ms"]["0"] == {
+        "prepare_ms": 100,
+        "fence_ms": 200,
+        "total_ms": 400,
+    }
+
+
+@pytest.mark.parametrize(
+    "fault", ["tier", "ids", "retraction", "missing", "nan", "coordinator"]
+)
+def test_paired_overhead_rejects_incomparable_or_missing_evidence(acceptance, fault):
+    baseline = {
+        "output_ids": [1] * 256,
+        "meta_info": {
+            "cached_tokens": 512,
+            "cached_tokens_details": {"device": 0, "host": 512},
+            "num_retractions": 0,
+        },
+        "e2e_ms": 100,
+        "ttft_ms": 10,
+        "tpot_ms": 1,
+    }
+    active = copy.deepcopy(baseline)
+    evidence = states()
+    for state in evidence:
+        state["transition_metrics"].update(
+            prepare_seconds=0.1, fence_seconds=0.2, total_seconds=0.4
+        )
+    if fault == "tier":
+        active["meta_info"]["cached_tokens_details"] = {"device": 512, "host": 0}
+    elif fault == "ids":
+        active["output_ids"][0] = 9
+    elif fault == "retraction":
+        active["meta_info"]["num_retractions"] = 1
+    elif fault == "missing":
+        active.pop("ttft_ms")
+    elif fault == "nan":
+        active["tpot_ms"] = float("nan")
+    else:
+        evidence[1]["transition_metrics"]["fence_seconds"] = None
+    with pytest.raises(AssertionError):
+        acceptance["paired_overhead"](baseline, active, evidence, 1)
 
 
 def states():
