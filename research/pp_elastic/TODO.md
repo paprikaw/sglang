@@ -36,6 +36,7 @@
 
 ## 已完成调研：下一阶段的接口与机制选择
 
+- [x] 主agent核对NIXL官方API／UCX、现有SGLang NIXL P/D代码和依赖安装状态，形成[NIXL迁移方案](NIXL_KV_TRANSFER_DESIGN.md)。建议推理保留NCCL，KV迁移使用独立NIXL＋UCX和固定GPU双缓冲；当前验证环境未安装NIXL。本项仅为调研，不含依赖安装、运行代码或GPU资格。
 - [x] 主 agent 核对 workbench vLLM/PipeLive、SGLang runtime `8374b0276d19` 及 KVCacheD 工作区，形成研究库 `LOW_INTERRUPTION_PP_REVIEW_20261109.md` 和问题簿 Q25。建议优先 KVCacheD 稳定虚拟地址，保留旧块指针内核作备选；发现按层物理映射 API 不匹配、GDN backing 重建和 stacking 边界限制。仅完成调研，无新增引擎改动或 GPU 验收。
 - [ ] **A：**固定兼容的 KVCacheD 依赖与能力检查，先验证物理页映射／回收和存活状态；只改 local view 不算释放显存。
 - [ ] **B：**将预捕获库接入整模型执行器，补齐权重、KV、GDN、输入和 workspace 的完整 binding 及稳定地址；底层库的实际 replay／fallback 已在 A100 检查，不等于模型 Graph 已可切换。不在正常推理期间无保护 capture。
@@ -44,7 +45,7 @@
 
 ## 下一步一：持续 KV patch，缩短推理中断
 
-- [ ] **主 agent：**以旧GPU→目标GPU的后台直传作为活跃KV主路线，CPU shadow保留为对照，CPU HiCache保留历史前缀及恢复能力。先准备目标状态空间、预热实际通信边，再实现有界基础复制和持续增量；记录实际P2P／网络后端，跨节点RDMA需运行证据。见[实施路线](GRAPH_KV_PATCH.md)。
+- [ ] **主 agent：**隔离固定NIXL／UCX依赖并验证GPU内存注册与实际链路；推理保留NCCL，迁移使用NIXL＋UCX。先以固定GPU双缓冲实现后台基础复制和持续增量，CPU shadow保留作对照，HiCache保留历史前缀及恢复能力。跨节点RDMA需运行证据。见[NIXL实施方案](NIXL_KV_TRANSFER_DESIGN.md)。
 - [ ] **主 agent：**目标在最终暂停前实际应用非空数据并确认；覆盖请求新增／结束、KV槽位复用和改写、迟到包、取消、缓冲回收及正常PP通信顺序。追不平时限速／推迟；提交前失败保留源，不承诺提交后任意回滚。
 - [ ] **主 agent：**最后只排空在途批次、补齐剩余KV和最新GDN／请求进度，再共同发布布局；HiCache保持开启，CPU-only前缀不全部恢复GPU。把完整模型Graph选择及稳定地址容量机制接入同一交接流程，代码、GPU正确性和性能分别验收。
 - [ ] **主 agent：**用相同输入、缓存、源／目标及资源条件，对照同步基线和CPU shadow，记录逐token间隔、平均TPOT、尾部停顿、整请求耗时、搬运字节及峰值。必须证明准备期间继续生成、切换后连续输出和实际暂停缩短；单次正确性或脚本总时长不作为性能结论。
