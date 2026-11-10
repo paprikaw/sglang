@@ -23,6 +23,16 @@ MAX_HEADER_BYTES = 64 << 10
 _QUARANTINED = []  # Keep registrations alive if native cancellation cannot drain.
 
 
+def _agent_name(value):
+    # Metadata import returns bytes in the native binding, while notification
+    # maps use str. Normalize both representations to the same UTF-8 identity.
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"invalid NIXL agent identity: {value!r}")
+    return value
+
+
 class NixlCompletion:
     def __init__(self, future, timeout):
         self.future, self.timeout = future, timeout
@@ -163,7 +173,7 @@ class NixlMigrationEndpoint:
                 raise ValueError("NIXL candidate buffer geometry mismatch")
             if peer["rank"] == self.rank:
                 continue
-            name = self.agent.add_remote_agent(peer["metadata"])
+            name = _agent_name(self.agent.add_remote_agent(peer["metadata"]))
             self._peers[peer["rank"]] = dict(peer, name=name)
             self._names[name] = peer["rank"]
         self._thread = threading.Thread(
@@ -214,9 +224,15 @@ class NixlMigrationEndpoint:
             for peer in peers:
                 self._notify(peer, dict(op="ready", generation=generation))
         for name, messages in self.agent.get_new_notifs().items():
+            if not messages:
+                continue  # A backend may retain empty notification buckets.
+            name = _agent_name(name)
             peer = self._names.get(name)
             if peer is None:
-                raise ValueError("notification from an unregistered NIXL peer")
+                raise ValueError(
+                    f"notification from unregistered NIXL peer {name!r}; "
+                    f"known peers: {tuple(self._names)!r}"
+                )
             for raw in messages:
                 if len(raw) > MAX_HEADER_BYTES:
                     raise ValueError("oversized NIXL notification")

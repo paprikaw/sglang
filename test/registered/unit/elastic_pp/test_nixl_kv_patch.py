@@ -43,7 +43,7 @@ class Agent:
         return self.name.encode()
 
     def add_remote_agent(self, metadata):
-        return metadata.decode()
+        return metadata  # Matches the native loadRemoteMD -> py::bytes binding.
 
     def remove_remote_agent(self, name):
         pass
@@ -282,6 +282,33 @@ def test_failed_native_cancel_retains_registered_buffers(endpoints):
     with pytest.raises(RuntimeError, match="registration remains live"):
         endpoint.close()
     assert endpoint.agent.deregistered == 0
+
+
+def test_empty_notification_buckets_do_not_create_a_sender(endpoints, monkeypatch):
+    original = Agent.get_new_notifs
+
+    def notifications(agent):
+        result = original(agent)
+        result["empty-backend-bucket"] = []
+        return result
+
+    monkeypatch.setattr(Agent, "get_new_notifs", notifications)
+    endpoints[0].warmup()
+    assert endpoints[0].metrics["warm_channels"] == 2
+
+
+def test_binary_notification_agent_names_match_imported_metadata(
+    endpoints, monkeypatch
+):
+    original = Agent.get_new_notifs
+
+    def notifications(agent):
+        return {name.encode(): messages for name, messages in original(agent).items()}
+
+    monkeypatch.setattr(Agent, "get_new_notifs", notifications)
+    for endpoint in endpoints:
+        endpoint.warmup()
+        assert endpoint.metrics["warm_channels"] == 2
 
 
 def test_abort_requires_a_confirmed_source_stream_drain():

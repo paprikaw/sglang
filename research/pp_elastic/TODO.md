@@ -7,7 +7,7 @@
 ## 本轮实施：主 agent 顺序完成
 
 - [x] 用户确认所有候选GPU启动时建立并预热NIXL agent；已实现固定GPU双缓冲、独立进度与目标应用确认，接入native／HiCache持续KV patch及最终fence。已隔离锁定NIXL 1.5.2；487项elastic_pp CPU回归通过，包含实际allocator及模拟字节传输，覆盖写入确认、复用、改写、多接收端、错误payload和取消失败。首次回归发现异常处理线程退出，修复后全过；原失败保留于归档`nixl-live-20261110/cpu-suite-r1.log`，通过证据为`cpu-suite-r2.xml`。本条只验收代码和CPU协议，GPU资格及性能留在下列未完成项。
-- [ ] 真实A100 native／eager／HiCache PP2→PP3→PP2，要求所有候选NIXL端点已预热、目标在最终暂停前实际应用KV，并通过生成连续性、CPU缓存恢复及清理。端点常驻不算释放GPU；真实链路与暂停收益另验。
+- [ ] 真实A100 native／eager／HiCache PP2→PP3→PP2，要求所有候选NIXL端点已预热、目标在最终暂停前实际应用KV，并通过生成连续性、CPU缓存恢复及清理。端点常驻不算释放GPU；真实链路与暂停收益另验。首轮`nixl-gpu-r1`在启动预热时失败：原生metadata导入返回bytes，通知键为str，身份比较未统一；83.513秒内正常清理／release。已统一身份表示并补协议检查，待下一轮GPU验证。
 
 - [x] 接入真实 PP 前向与标准 token／paged allocator，保护复制中的槽位复用与重写。仅限 native／eager／background＋overlap 的在线 KV CPU shadow；最终 fence 补齐余量后复用跨 rank 传输，GDN／HiCache仍在fence交接。512项CPU检查全过；冻结 `e7c9cb1264a9` 的A100 64-token页PP2→PP3→PP2通过同暖512边界连续性和CPU前缀loadback。扩容两个源rank各在线完成662行，缩容源rank完成659行；它们是各rank的槽位行计数，不是全局输入token数。整轮含清理171.795秒，正常release。r1／r2失败保留于[验证记录](VALIDATION.md)。不据此宣称网络 overlap、Graph 接入或性能收益。
 
