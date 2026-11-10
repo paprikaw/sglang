@@ -6,8 +6,8 @@
 
 ## 本轮实施：主 agent 顺序完成
 
-- [x] 用户确认所有候选GPU启动时建立并预热NIXL agent；已实现固定GPU双缓冲、独立进度与目标应用确认，接入native／HiCache持续KV patch及最终fence。已隔离锁定NIXL 1.5.2；487项elastic_pp CPU回归通过，包含实际allocator及模拟字节传输，覆盖写入确认、复用、改写、多接收端、错误payload和取消失败。首次回归发现异常处理线程退出，修复后全过；原失败保留于归档`nixl-live-20261110/cpu-suite-r1.log`，通过证据为`cpu-suite-r2.xml`。本条只验收代码和CPU协议，GPU资格及性能留在下列未完成项。
-- [ ] 真实A100 native／eager／HiCache PP2→PP3→PP2，要求所有候选NIXL端点已预热、目标在最终暂停前实际应用KV，并通过生成连续性、CPU缓存恢复及清理。端点常驻不算释放GPU；真实链路与暂停收益另验。首轮`nixl-gpu-r1`在启动预热时失败：原生metadata导入返回bytes，通知键为str，身份比较未统一；83.513秒内正常清理／release。已统一身份表示并补协议检查，待下一轮GPU验证。
+- [x] 用户确认所有候选GPU启动时建立并预热NIXL agent；已实现固定GPU双缓冲、独立进度与目标应用确认，接入native／HiCache持续KV patch及最终fence。已隔离锁定NIXL 1.5.2；487项elastic_pp CPU回归通过，包含实际allocator及模拟字节传输，覆盖写入确认、复用、改写、多接收端、错误payload和取消失败。首次回归发现异常处理线程退出，修复后全过；原失败保留于归档`nixl-live-20261110/cpu-suite-r1.log`，通过证据为`cpu-suite-r2.xml`。本条只验收代码和CPU协议，GPU正确性见下一条，性能及组合资格留在未完成项。
+- [x] 真实A100 native／eager／HiCache PP2→PP3→PP2的有限正确性通过，冻结`152de4332f`。三个候选端点各完成两条通道预热，每卡注册64 MiB；扩／缩目标在最终暂停前实际应用1320／1318行KV，行数按来源／接收端累计，不是全局原始token数。两个方向各256-token输出与同暖512缓存边界参考一致，没有retraction或重新Prefill，最终CPU前缀实际loadback。完整监督含清理176.008秒，Guard postcheck及正常release通过；同节点日志选择CUDA IPC。首轮bytes／str端点名不匹配失败及83.513秒内正常清理的证据保留；修正后14项NIXL检查通过，与先前487项不累加。端点常驻不算转换期间归还GPU；Graph／VMM组合、真实GPU故障回退、跨节点RDMA及暂停收益仍未验收。见[本轮报告](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/kv-live-foundation-20261109/nixl-gpu-r2/REPORT.md)。
 
 - [x] 接入真实 PP 前向与标准 token／paged allocator，保护复制中的槽位复用与重写。仅限 native／eager／background＋overlap 的在线 KV CPU shadow；最终 fence 补齐余量后复用跨 rank 传输，GDN／HiCache仍在fence交接。512项CPU检查全过；冻结 `e7c9cb1264a9` 的A100 64-token页PP2→PP3→PP2通过同暖512边界连续性和CPU前缀loadback。扩容两个源rank各在线完成662行，缩容源rank完成659行；它们是各rank的槽位行计数，不是全局输入token数。整轮含清理171.795秒，正常release。r1／r2失败保留于[验证记录](VALIDATION.md)。不据此宣称网络 overlap、Graph 接入或性能收益。
 
@@ -16,7 +16,7 @@
 - [x] 实现 KVCacheD 按层映射协议、映射账本、部分失败重试及页面 pin；保存可重放依赖补丁、Python／原生版本检查和 stacking 边界检查。27 项依赖 CPU 检查通过；补丁在干净上游索引重放得到完全相同的源码树。见[实现与边界](KV_LAYER_MAPPING.md)及依赖锁。真实 GPU 页面验证不包含在此勾选中。
 - [x] 修复 SGLang import／abort／cleanup 在校验 generation 前触碰物理页面的问题，并在 map 前检查槽位和 payload。旧基线可复现 3 个故障，新代码 769 项引擎 CPU 回归通过；保留层地址／数值仅在 CPU 适配器验证，不能据此推定真实 GPU 验收。
 - [ ] 接通 HiCache、GDN 和 Attention 的完整布局约束，并验证实际 OOM／迁移失败回退。底层 GPU 的 map／unmap、保留地址和数据及页面 pin 拒绝已通过；这不替代整模型新后端兼容性或归还工作 GPU，现有 hybrid HiCache 的 native-only 保护不撤除。
-- [x] 建立有限 Graph 预捕获库与持续 KV 行追补的实验模块，本轮75项CPU检查通过（25项新模块＋50项生命周期／参考资格回归）。Graph按完整tensor地址／shape／stride匹配，eager回退同样保护页面；整模型Graph尚未接入。Patch的native CPU shadow已在本轮接入scheduler，在线跨rank传输和GDN增量仍待实现。见[接口与接入顺序](GRAPH_KV_PATCH.md)。
+- [x] 建立有限 Graph 预捕获库与持续 KV 行追补的实验模块，本轮75项CPU检查通过（25项新模块＋50项生命周期／参考资格回归）。Graph按完整tensor地址／shape／stride匹配，eager回退同样保护页面；整模型Graph尚未接入。Patch的native CPU shadow已在本轮接入scheduler，跨rank在线传输已在本轮接入NIXL，GDN增量仍待实现。见[接口与接入顺序](GRAPH_KV_PATCH.md)。
 - [x] A100 `gpu-r1` 完成底层 GPU 检查：退役组驱动可见显存增加8 MiB，保留地址和数据；2次 Graph capture／2次 replay、1次地址变化 fallback及1次未映射拒绝；patch为2轮／4行，包含新增行及槽位复用。它是小规模单 GPU 检查，尚未证明完整模型、跨 rank 或在线复制的性能。
 - [x] 同一租约内，开启 HiCache 的 native KV 整模型 PP2→PP3→PP2 往返通过同暖512边界的生成连续性和 CPU 前缀 loadback；整轮含清理186.509秒，Guard postcheck、清理及正常release通过。Graph在整模型中仍关闭，cold/warm等价和转换期间GPU归还未通过资格。见[验证说明](VALIDATION.md)。
 
@@ -48,8 +48,8 @@
 
 ## 下一步一：持续 KV patch，缩短推理中断
 
-- [ ] **主 agent：**隔离固定NIXL／UCX依赖并验证GPU内存注册与实际链路；推理保留NCCL，迁移使用NIXL＋UCX。先以固定GPU双缓冲实现后台基础复制和持续增量，CPU shadow保留作对照，HiCache保留历史前缀及恢复能力。跨节点RDMA需运行证据。见[NIXL实施方案](NIXL_KV_TRANSFER_DESIGN.md)。
-- [ ] **主 agent：**目标在最终暂停前实际应用非空数据并确认；覆盖请求新增／结束、KV槽位复用和改写、迟到包、取消、缓冲回收及正常PP通信顺序。追不平时限速／推迟；提交前失败保留源，不承诺提交后任意回滚。
+- [x] **主 agent：**固定隔离NIXL 1.5.2／UCX依赖，native／HiCache以固定GPU双缓冲实现基础复制、持续增量及目标应用确认；A100同节点GPU注册、CUDA IPC协议和整模型连续性已有顶部条目证据。推理保留NCCL，CPU shadow保留作对照。跨节点RDMA、完整Graph／VMM组合仍需各自资格，见[NIXL实施方案](NIXL_KV_TRANSFER_DESIGN.md)。
+- [ ] **主 agent：**目标暂停前实际应用已在上述GPU往返观察到；CPU协议已覆盖槽位复用／改写、晚到代、错误payload、取消和不能确认完成时保留内存。继续补真实GPU请求新增／结束、迟到包、取消、缓冲回收及正常PP通信顺序的故障注入；追不平时限速／推迟。提交前失败保留源，不承诺提交后任意回滚。
 - [ ] **主 agent：**最后只排空在途批次、补齐剩余KV和最新GDN／请求进度，再共同发布布局；HiCache保持开启，CPU-only前缀不全部恢复GPU。把完整模型Graph选择及稳定地址容量机制接入同一交接流程，代码、GPU正确性和性能分别验收。
 - [ ] **主 agent：**用相同输入、缓存、源／目标及资源条件，对照同步基线和CPU shadow，记录逐token间隔、平均TPOT、尾部停顿、整请求耗时、搬运字节及峰值。必须证明准备期间继续生成、切换后连续输出和实际暂停缩短；单次正确性或脚本总时长不作为性能结论。
 

@@ -1,6 +1,6 @@
 # 用 NIXL 搬缓存，让 PP 伸缩少打扰推理
 
-2026-11-10。调研基于本任务源码 `0860fb7576`、NIXL 官方文档及上游源码快照 `82b356ce0a29`。用户已确认候选 GPU 启动时预初始化，本轮开始接入；尚未取得 GPU 资格；进度统一写入 [TODO](TODO.md)，对应 [Graph／持续补丁设计](GRAPH_KV_PATCH.md)和论文实验 E3。
+2026-11-10。调研基于本任务源码 `0860fb7576`、NIXL 官方文档及上游源码快照 `82b356ce0a29`。用户已确认候选 GPU 启动时预初始化；本轮已接入并取得native／eager／HiCache的有限A100正确性资格；进度统一写入 [TODO](TODO.md)，对应 [Graph／持续补丁设计](GRAPH_KV_PATCH.md)和论文实验 E3。
 
 **结论：建议推理继续使用 NCCL，缓存迁移改用独立的 NIXL＋UCX 通道。** NIXL 提供内存注册、异步 READ／WRITE、完成状态与通知，UCX 支持 GPU／CPU 内存及 RDMA 网络。因此可把 KV 数据搬运从正常 PP 的 NCCL 调用顺序中分离。这是基于接口和当前代码的机制判断，还不是本项目已验证的并发收益；两条通道仍共享 GPU、内存及链路资源。[NIXL 架构](https://docs.nvidia.com/nixl/getting-started/architecture/)、[UCX 后端](https://docs.nvidia.com/nixl/user-guide/backend-selection/ucx/)
 
@@ -26,4 +26,4 @@
 
 **本轮实现。** 已隔离安装并锁定 NIXL／nixl-cu12 1.5.2、原生绑定和 UCX 插件。`nixl_transport.py` 在所有候选 rank 启动时建立 agent、注册固定缓冲并执行双向写入／应用确认；`nixl_kv_patch.py` 接入真实 allocator、目标待启用层和最终完整性检查。三候选 rank 每卡注册64 MiB，单个数据片最多8 MiB。由 `--enable-elastic-pp-kv-patch --elastic-pp-kv-patch-transport nixl` 显式选择；CPU shadow仍是默认对照，native／eager／background＋overlap限制保留。依赖与完整模型GPU资格分开记录；测试进度见[TODO](TODO.md)。
 
-**尚未证明。** 上游源码快照用于调研，实际运行依赖以锁文件为准。真实 GPU 注册、在线应用及整模型生成连续性需分别验收；尚不能宣布暂停缩短、跨节点RDMA、完整模型Graph／VMM组合或实际GPU归还。
+**尚未证明。** 上游源码快照用于调研，实际运行依赖以锁文件为准。源码`152de4332f`在A100通过注册预热、目标在线应用及PP2→PP3→PP2同暖512缓存边界的生成连续性；扩／缩目标在线行计数为1320／1318，完整监督含清理176.008秒。见[验收报告](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/kv-live-foundation-20261109/nixl-gpu-r2/REPORT.md)。这只覆盖native／eager，暂停缩短、跨节点RDMA、完整模型Graph／VMM组合和转换期间GPU归还仍待验证。

@@ -65,3 +65,17 @@
 **HiCache 整模型回归。** 同一 Guard 租约随后在三张 resident A100 上执行 native KV 后端的35B BF16 PP2→PP3→PP2，两次活跃 Decode 切换后的输出均与同暖512边界参考一致，CPU前缀有实际loadback。Graph仍关闭；cold／warm参考生成等价仍未取得资格，工作GPU也未在转换期间归还。整轮包含清理186.509秒，Guard postcheck通过，owned进程清理和正常lease release均验证。它验证新代码共存时的同步基线，没有执行整模型 Graph bank 或在线 patch。
 
 产物目录为上述归档下的 `gpu-r1/`，包含 `component_gpu.json`、`results.json`、`supervisor_outcome.json`、`cleanup_ack.json`、对应可见性回执及 `post_run_audit.json`；精简报告为 `REPORT.md`。底层原始结果 SHA256 `6991b2fb9ac3e02e8a84645b697fd91fec92dd55500c2908316d80798d21bbea`，整模型结果 `e6eb56810c04f57b0ecc0716a1f6c516faa2f1806a7465e88c8fb228184134b1`。真正的 OOM／迁移失败回退、HiCache／GDN稳定地址、allocator生命周期钩子、跨 rank patch、完整模型Graph及暂停收益仍待验证。
+
+## NIXL 预初始化与在线 KV：有限整模型验收（2026-11-10）
+
+冻结源码`152de4332fba49d3de440a28e33e88aa2e51b09f`，annotated tag `experiment/sglang/pp-nixl-online-20261110-r2`，Draft PR #4；本轮由主agent实施、运行及核查，没有独立reviewer。NIXL／nixl-cu12 1.5.2装在隔离覆盖目录，原生绑定、UCX及插件哈希见依赖锁，未改共享serving环境。
+
+**CPU。** 首次组合回归484通过、2失败，原因是错误返回路径的异常变量未绑定，后台线程退出；修复后elastic_pp 487项全过，零失败／错误／跳过。随后修正原生metadata导入bytes与通知str的身份表示，并保护接收端scatter失败后的stream排空；不能证明完成时保留target backing，要求worker退出。修改后的14项NIXL定向检查再次全过，不与487项累加；仅模拟字节传输和CUDA排空故障，实际GPU故障恢复仍未验收。原始记录在归档`nixl-live-20261110/`，包括失败日志、`cpu-suite-r2.xml`及`cpu-api-r6.xml`。
+
+**真实A100。** 35B BF16、native KV、64-token页、eager、HiCache开启，三个resident候选rank在启动时建立agent，各完成两条通道预热并注册64 MiB固定缓冲。20/0/20→13/13/14→20/0/20的两个方向均通过同暖512-token缓存边界的256-token生成连续性，没有retraction或重新Prefill；CPU前缀在最后实际loadback。扩／缩目标在最终暂停前累计应用1320／1318个槽位行；行数按来源／接收端累计，不是全局原始token数。UCX日志对非零CUDA写入选择`cuda_ipc/cuda` zero-copy协议，仅为同节点路径证据。Attention KV payload分别4,325,376／5,898,240字节，GDN／请求进度／HiCache历史状态仍在fence交接。
+
+**时长与清理。** 完整监督含加载及清理176.008秒，Guard postcheck通过，owned进程清理和正常lease release均验证。各rank记录的扩容fence为852.830／852.818／852.725 ms，缩容594.697／594.689／594.665 ms。这是每rank的coordinator阶段耗时，每方向仅一个样本，不是逐token最大停顿、独立重复平均或暂停收益证据。首轮`nixl-gpu-r1`的启动身份比较失败原样保留，83.513秒内正常清理；修复后本轮通过。
+
+[完整报告](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/kv-live-foundation-20261109/nixl-gpu-r2/REPORT.md)及同目录的`post_run_audit.json`、`supervisor_outcome.json`、`controller_results_visibility.json`保留证据；结果SHA256 `c56f58fd6505c73bf5f5388f5a63a8db8b8ffb6ef26163ae26f5031c4b0d6dfa`。后续文档更新不改变此运行源码。
+
+**边界。** 本轮只验收native／eager／HiCache路径的有界正确性；完整模型Graph、KVCacheD／GDN／HiCache组合、真实GPU故障注入、跨节点RDMA和性能收益仍未验收。常驻空阶段不等于在转换期间归还GPU。CPU shadow保持可选正确性对照，冷暖生成等价资格不扩大。
