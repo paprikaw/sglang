@@ -2,7 +2,7 @@
 
 更新2026-11-10。由主 agent 顺序实现，属于 [TODO](TODO.md) 的低干扰阶段，接在[按层物理映射](KV_LAYER_MAPPING.md)之后。代码在 Draft PR #4；新接入范围与验证状态见下文。
 
-**下一阶段的主路线：活跃缓存从旧 GPU 后台直传目标 GPU，CPU 保留历史缓存与恢复能力。** 用户随后提出把迁移与推理的NCCL分开；本轮调研建议改用独立NIXL＋UCX迁移通道，推理保留NCCL，先通过固定GPU双缓冲传输，详见[NIXL方案](NIXL_KV_TRANSFER_DESIGN.md)。它取代前一建议中“先接NCCL迁移”的实施顺序，尚未接入或取得GPU资格。同节点核实实际P2P链路，跨节点核实GPUDirect RDMA；换库不消除显存／链路争用。当前已通过的CPU shadow保留为正确性对照，不作为活跃KV的必经中转。
+**下一阶段的主路线：活跃缓存从旧 GPU 后台直传目标 GPU，CPU 保留历史缓存与恢复能力。** 用户随后提出把迁移与推理的NCCL分开；本轮调研建议改用独立NIXL＋UCX迁移通道，推理保留NCCL，先通过固定GPU双缓冲传输，详见[NIXL方案](NIXL_KV_TRANSFER_DESIGN.md)。它取代前一建议中“先接NCCL迁移”的实施顺序，本轮已接入可选运行路径，GPU资格仍须单列验收。同节点核实实际P2P链路，跨节点核实GPUDirect RDMA；换库不消除显存／链路争用。当前已通过的CPU shadow保留为正确性对照，不作为活跃KV的必经中转。
 
 **先准备，再边生成边搬。** 服务前预初始化并预热允许切换的通信边和有限缓冲；转换时在后台准备新增层和目标状态空间，保留层尽量不动。空间不足就推迟或有选择地使用CPU，不能靠重建整个源池完成低干扰路径。源端在每次真实写完成后，把需要迁移的已有KV和后续新增／改写的行分块发送；目标写入自己的待启用状态空间后确认。NIXL数据面与正常PP的NCCL独立，但仍使用有界缓冲、发送预算、CUDA完成事件及应用确认，处理进度、版本和内存生命周期。请求结束、槽位复用、旧包及取消均受保护。
 
@@ -18,7 +18,7 @@
 
 **Graph：先准备少量布局，再选择。** `graph_bank.py` 在启动或明确排空的边界捕获，激活后禁止追加 capture。布局、batch、tensor 地址、shape、stride、dtype 和 device 全部匹配才 replay；其余情况统计 eager fallback。调用方必须登记权重、KV／GDN、输入、输出及 workspace，不能只检查 KV。页面未映射时拒绝执行；replay 和 eager 都把页面 pin 保留到完成事件。捕获失败或执行失败不能直接再跑一次，以免重复写入状态。当前模块没有替换 SGLang 的 `CudaGraphRunner`，真实通信预热、完整 binding 清单和 GDN 稳定地址仍待接入。
 
-**Patch 的底层协议。** `kv_patch.py` 维护迁移 generation 和每个 token 槽位的 incarnation，源写入记录完成事件后发布不可变 KV 行；独立 CUDA stream 等待事件并分批复制。复制期间允许新增其他行，被复制的槽位必须延后释放／复用，VMM copier 的源和目标物理页也保持 pin。复用的槽位形成新 incarnation，必须重新复制；最终 fence 停止源写入并有界追平。失败时先排空已提交复制，再解除保护。初始 Tensor copier 是单 GPU、按 stride 复制的实现；本轮 native CPU shadow 接入见上文，跨 rank 在线复制和 GDN 增量同步仍待实现。
+**Patch 的底层协议。** `kv_patch.py` 维护迁移 generation 和每个 token 槽位的 incarnation，源写入记录完成事件后发布不可变 KV 行；独立 CUDA stream 等待事件并分批复制。复制期间允许新增其他行，被复制的槽位必须延后释放／复用，VMM copier 的源和目标物理页也保持 pin。复用的槽位形成新 incarnation，必须重新复制；最终 fence 停止源写入并有界追平。失败时先排空已提交复制，再解除保护。初始 Tensor copier 是单 GPU、按 stride 复制的实现；native CPU shadow 接入见上文；本轮新增NIXL跨rank在线copier，GDN仍在最后边界交接。
 
 **真实 GPU 验证分两部分。** `hicache_transition_smoke.py --kv-foundation-root … --supervised-lifecycle` 在同一受监督 A100 租约内，先用第四张卡运行独立 VMM／Graph／Patch 检查，再用前三张卡运行 HiCache 整模型 PP2→PP3→PP2 基线。前者检查实际显存释放、保留地址／数值、真实 replay、fallback 和非空增量；后者继续使用 native KV 后端。二者成功不等于 KVCacheD 已接通 hybrid HiCache，也不等于整模型持续 patch 已通过。失败和清理记录均保留，整轮包括清理最多五分钟。
 

@@ -1,8 +1,8 @@
 """Opt-in scheduler-owned KV snapshots while the source PP layout serves.
 
-This first integration keeps CPU shadows of outgoing native KV layers. Network,
-recurrent state and HiCache exchange still run at the final drained fence. It
-does not enable the experimental VMM backend or a model CUDA Graph bank.
+The default copier keeps CPU shadows. The optional NIXL copier applies rows to
+unpublished target GPU layers while serving. Recurrent state and HiCache still
+use the drained fence; VMM and the model Graph bank remain separate work.
 """
 
 from __future__ import annotations
@@ -138,7 +138,9 @@ class LiveKVSnapshot:
     an allocator's live set on the preparation thread.
     """
 
-    def __init__(self, *, generation, allocator, source, max_rows, admit_host_bytes):
+    def __init__(
+        self, *, generation, allocator, source, max_rows, admit_host_bytes, copier=None
+    ):
         self.generation = generation
         self.allocator = allocator
         self.lock = threading.RLock()
@@ -147,14 +149,18 @@ class LiveKVSnapshot:
         self.complete = False
         self.online_submissions = self.online_completed_rows = self.free_waits = 0
         self.forward_checkpoints = 0
-        self.copier = HostKVPatchCopier(
-            source, max_rows=max_rows, admit_host_bytes=admit_host_bytes
+        self.copier = (
+            copier
+            if copier is not None
+            else HostKVPatchCopier(
+                source, max_rows=max_rows, admit_host_bytes=admit_host_bytes
+            )
         )
         self.session = ContinuousKVPatch(
             generation=generation,
             capacity=next(iter(source.values()))[0].shape[0],
             copier=self.copier,
-            max_rows=max_rows,
+            max_rows=min(max_rows, getattr(self.copier, "max_rows", max_rows)),
         )
         self.epochs = {}
         self.published = set()
@@ -191,6 +197,8 @@ class LiveKVSnapshot:
                         self.free_waits += 1
                         self.session.poll(generation=self.generation, wait=True)
                         self.session.free(slot, epoch, generation=self.generation)
+                    if hasattr(self.copier, "forget"):
+                        self.copier.forget(slot, epoch)
                     del self.epochs[slot]
                     self.published.discard(slot)
             except BaseException as exc:
@@ -228,6 +236,8 @@ class LiveKVSnapshot:
                             self.free_waits += 1
                             self.session.poll(generation=self.generation, wait=True)
                             self.session.free(slot, epoch, generation=self.generation)
+                        if hasattr(self.copier, "forget"):
+                            self.copier.forget(slot, epoch)
                         self.epochs[slot] = self.session.allocate(
                             slot, generation=self.generation
                         )
@@ -244,7 +254,9 @@ class LiveKVSnapshot:
                 self._publish(slots, ready)
                 if self.session.poll(generation=self.generation):
                     self.online_completed_rows = self.session.rows_copied
-                    if self.session.submit(generation=self.generation):
+                    if getattr(
+                        self.copier, "ready_to_submit", True
+                    ) and self.session.submit(generation=self.generation):
                         self.online_submissions += 1
             except BaseException as exc:
                 self._fail(exc)
@@ -264,8 +276,10 @@ class LiveKVSnapshot:
                 max_rounds=math.ceil(self.session.capacity / self.session.max_rows) + 1,
             )
             self.active = False
-            self.complete = True
             self.allocator.detach_elastic_pp_live_patch(self)
+            if hasattr(self.copier, "finish"):
+                self.copier.finish(self.epochs)
+            self.complete = True
             self.copier.source = {}  # Do not pin retired GPU storage after commit.
 
     def export(self, layer_id, slots):
@@ -289,7 +303,11 @@ class LiveKVSnapshot:
         with self.lock:
             return dict(
                 enabled=True,
-                scope="native KV CPU shadow; network/GDN/HiCache at fence",
+                scope=getattr(
+                    self.copier,
+                    "scope",
+                    "native KV CPU shadow; network/GDN/HiCache at fence",
+                ),
                 generation=self.generation,
                 complete=self.complete,
                 error=self.error,

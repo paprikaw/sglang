@@ -1,7 +1,6 @@
 from types import SimpleNamespace
 
 import pytest
-
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -54,3 +53,27 @@ def test_normalized_partition_reaches_projected_configuration():
     config = args(elastic_pp_initial_partition="20, 0, 20")
     config._handle_pipeline_parallelism()
     assert config._resolved().elastic_pp_initial_partition == "20,0,20"
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (
+            {"enable_elastic_pp_kv_patch": False},
+            "requires --enable-elastic-pp-kv-patch",
+        ),
+        ({"enable_hierarchical_cache": False}, "requires HiCache"),
+        ({"disable_cuda_graph": False}, "disable-cuda-graph"),
+    ],
+)
+def test_nixl_keeps_explicit_correctness_scope(overrides, message):
+    options = dict(elastic_pp_kv_patch_transport="nixl", enable_hierarchical_cache=True)
+    options.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        args(**options)._handle_pipeline_parallelism()
+
+
+def test_nixl_selection_survives_argument_projection():
+    config = args(elastic_pp_kv_patch_transport="nixl", enable_hierarchical_cache=True)
+    config._handle_pipeline_parallelism()
+    assert config.elastic_pp_kv_patch_transport == "nixl"

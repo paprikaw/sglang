@@ -1,12 +1,14 @@
 # 用 NIXL 搬缓存，让 PP 伸缩少打扰推理
 
-2026-11-10。调研基于本任务源码 `0860fb7576`、NIXL 官方文档及上游源码快照 `82b356ce0a29`。这是下一阶段的实施建议，尚未接入或取得 GPU 资格；进度统一写入 [TODO](TODO.md)，对应 [Graph／持续补丁设计](GRAPH_KV_PATCH.md)和论文实验 E3。
+2026-11-10。调研基于本任务源码 `0860fb7576`、NIXL 官方文档及上游源码快照 `82b356ce0a29`。用户已确认候选 GPU 启动时预初始化，本轮开始接入；尚未取得 GPU 资格；进度统一写入 [TODO](TODO.md)，对应 [Graph／持续补丁设计](GRAPH_KV_PATCH.md)和论文实验 E3。
 
 **结论：建议推理继续使用 NCCL，缓存迁移改用独立的 NIXL＋UCX 通道。** NIXL 提供内存注册、异步 READ／WRITE、完成状态与通知，UCX 支持 GPU／CPU 内存及 RDMA 网络。因此可把 KV 数据搬运从正常 PP 的 NCCL 调用顺序中分离。这是基于接口和当前代码的机制判断，还不是本项目已验证的并发收益；两条通道仍共享 GPU、内存及链路资源。[NIXL 架构](https://docs.nvidia.com/nixl/getting-started/architecture/)、[UCX 后端](https://docs.nvidia.com/nixl/user-guide/backend-selection/ucx/)
 
 **第一版只选 NIXL＋UCX。** 同节点核实 CUDA IPC／实际 GPU P2P 路径，跨节点核实 GPUDirect RDMA；UCX 可能使用 host staging 或 TCP，因此“能传”不代表“GPU 直传／RDMA 已通过”。保留现有同步／CPU shadow 对照。Mooncake Transfer Engine 也是候选，现有 SGLang 同时有 Mooncake 与 NIXL 实现；只有 UCX 在目标节点出现具体兼容问题时才评估替换，不同时实现多套。NIXL 也有 Mooncake 和 UCCL-P2P 插件，但并不是第一版的前置依赖。[UCX GPU 与协议核查](https://openucx.readthedocs.io/en/master/faq.html#working-with-gpu)、[SGLang P/D 支持](https://github.com/sgl-project/sglang/blob/main/docs/docs/advanced_features/pd_disaggregation.mdx)、[NIXL Mooncake](https://docs.nvidia.com/nixl/user-guide/backend-selection/mooncake/)
 
-**先复用接口经验，不照搬整个 P/D 管理器。** 本地 [NIXL P/D 实现](../../python/sglang/srt/disaggregation/nixl/conn.py)已有 VRAM／DRAM 注册、严格线程同步、WRITE、完成轮询、通知、PP 层映射、GDN 状态和 GPU staging 的代码。弹性 PP 则是移动一部分层的持续状态，需单独实现 migration transport，复用 [现有 KV 生命周期](../../python/sglang/srt/elastic_pp/live_kv_patch.py)、[增量版本协议](../../python/sglang/srt/elastic_pp/kv_patch.py)和 [coordinator](../../python/sglang/srt/elastic_pp/coordinator.py)；不能把静态 P→D 一次交接直接当作在线 PP 重配置。当前锁定 Python 环境中 `nixl` module 及发行包均未安装；要先隔离固定依赖，不能改动共享 serving 环境后直接试跑。
+**先复用接口经验，不照搬整个 P/D 管理器。** 本地 [NIXL P/D 实现](../../python/sglang/srt/disaggregation/nixl/conn.py)已有 VRAM／DRAM 注册、严格线程同步、WRITE、完成轮询、通知、PP 层映射、GDN 状态和 GPU staging 的代码。弹性 PP 则是移动一部分层的持续状态，需单独实现 migration transport，复用 [现有 KV 生命周期](../../python/sglang/srt/elastic_pp/live_kv_patch.py)、[增量版本协议](../../python/sglang/srt/elastic_pp/kv_patch.py)和 [coordinator](../../python/sglang/srt/elastic_pp/coordinator.py)；不能把静态 P→D 一次交接直接当作在线 PP 重配置。调研时锁定 Python 环境未安装 NIXL；本轮另建依赖覆盖目录，不改共享 serving 环境，实际版本和哈希见依赖锁。
+
+**用户确认的启动范围。** 2026-11-10 确认：首版在所有候选 GPU 的 worker 启动时建立 NIXL agent、注册固定双缓冲、交换元数据并预热可迁移通道；切换时复用。只预留小缓冲，不提前建立每种布局的完整 KV 池。候选 rank 常驻，不能将其算作已经归还 GPU；按需启动／退出端点留到后续实际资源归还阶段。
 
 **首版数据路线：KV 池→固定 GPU 发送缓冲→NIXL／UCX→固定 GPU 接收缓冲→目标 KV 池。** 启动时注册少量有界 GPU 双缓冲、交换端点 metadata 并预热实际通道。CPU 线程处理通知和提交，不把大块活跃 KV 先备份到 CPU 再上传；CPU HiCache 继续保存历史前缀和恢复状态。选择 GPU 缓冲的原因是 KVCacheD 将来会 map／unmap 物理页，稳定虚拟地址不等于网络注册永远有效。先用与 KV 池解耦的稳定缓冲把链路跑通，代价是额外 GPU 内部 gather／scatter 和有限缓冲显存；连续且生命周期稳定的区域后续再尝试直接地址列表传输，并测是否值得。真实 GPU 直传仍以链路资格为前提。[NIXL 注册与异步操作](https://docs.nvidia.com/nixl/getting-started/quick-start/)
 
@@ -22,4 +24,6 @@
 
 **端到端验收。** 同输入、缓存、源／目标布局和资源条件，对照同步版、当前 CPU shadow 版和 NIXL 在线版；加入无转换参考，分别观察后台传输期间与最终交接期间的逐 token 间隔、平均 TPOT、尾部停顿、请求总时长、真实传输字节、额外显存和积压。必须在最后暂停前观察到目标实际应用非空数据，同时源仍在生成；覆盖基础复制后的新写、槽位复用、CPU 前缀恢复与失败清理。若要归因于 NIXL 本身，再固定同一补丁协议做 NCCL 传输对照，不能把协议变化的收益都归于换库。GPU 短检查继续使用 Experiment Guard 和已有预约，每轮含清理不超过五分钟。
 
-**本次边界。** 已核对官方资料、当前引擎调用和安装状态；未安装依赖、未改运行代码、未运行 GPU／模型实验。上游源码快照只用于调研，不是已经选定或验证的部署版本。现有 CPU shadow 验收保持原范围；不能据此宣布 NIXL 性能收益、零停顿或实际 GPU 归还。
+**本轮实现。** 已隔离安装并锁定 NIXL／nixl-cu12 1.5.2、原生绑定和 UCX 插件。`nixl_transport.py` 在所有候选 rank 启动时建立 agent、注册固定缓冲并执行双向写入／应用确认；`nixl_kv_patch.py` 接入真实 allocator、目标待启用层和最终完整性检查。三候选 rank 每卡注册64 MiB，单个数据片最多8 MiB。由 `--enable-elastic-pp-kv-patch --elastic-pp-kv-patch-transport nixl` 显式选择；CPU shadow仍是默认对照，native／eager／background＋overlap限制保留。依赖与完整模型GPU资格分开记录；测试进度见[TODO](TODO.md)。
+
+**尚未证明。** 上游源码快照用于调研，实际运行依赖以锁文件为准。真实 GPU 注册、在线应用及整模型生成连续性需分别验收；尚不能宣布暂停缩短、跨节点RDMA、完整模型Graph／VMM组合或实际GPU归还。

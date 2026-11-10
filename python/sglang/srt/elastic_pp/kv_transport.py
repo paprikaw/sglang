@@ -7,7 +7,6 @@ from contextlib import contextmanager
 from typing import Any, Literal
 
 import torch
-
 from sglang.srt.elastic_pp.layer_transport import ElasticPPLayerTransport
 from sglang.srt.elastic_pp.topology import DynamicPPTransition, LayerTransfer
 
@@ -196,6 +195,8 @@ class ElasticPPKVTransport:
         self._live_patch = None
         self._live_patch_error = None
         self._last_live_patch_metrics = {"enabled": False}
+        self._nixl_endpoint = None
+        self._nixl_receiver = None
         self._runner_device = torch.device(getattr(model_runner, "device", "cpu"))
         self._send_stream = None
         self._receive_stream = None
@@ -207,6 +208,45 @@ class ElasticPPKVTransport:
             with torch.cuda.device(self._runner_device):
                 self._send_stream = torch.cuda.Stream(device=self._runner_device)
                 self._receive_stream = torch.cuda.Stream(device=self._runner_device)
+        args = getattr(model_runner, "server_args", None)
+        if getattr(args, "elastic_pp_kv_patch_transport", "cpu") == "nixl":
+            self._initialize_nixl()
+
+    def _initialize_nixl(self):
+        """Startup-only bootstrap on all candidates, including zero-layer ranks."""
+        from sglang.srt.elastic_pp.nixl_kv_patch import NixlKVReceiver
+        from sglang.srt.elastic_pp.nixl_transport import NixlMigrationEndpoint
+
+        endpoint, metadata, error = None, None, None
+        try:
+            endpoint = NixlMigrationEndpoint(
+                rank=self.rank,
+                world_size=self.group.world_size,
+                device=self._runner_device,
+            )
+            metadata = endpoint.metadata()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        reports = self.group.all_gather_object(
+            dict(
+                rank=self.rank,
+                error=error,
+                endpoint=metadata,
+            )
+        )
+        errors = [r for r in reports if r["error"] is not None]
+        if errors:
+            if endpoint is not None:
+                endpoint.close()
+            raise RuntimeError(f"candidate GPU NIXL initialization failed: {errors}")
+        self._nixl_endpoint = endpoint
+        self._nixl_receiver = NixlKVReceiver(endpoint, self.pool)
+        endpoint.connect([r["endpoint"] for r in reports])
+        endpoint.warmup()
+
+    def mark_nixl_target_ready(self, transition):
+        if self._nixl_receiver is not None:
+            self._nixl_receiver.ready(transition.target.generation)
 
     @contextmanager
     def _stream_context(self, stream):
@@ -310,6 +350,7 @@ class ElasticPPKVTransport:
         try:
             self.prepare_target(transition)
             self._preflight_cpu_staging(transition)
+            self.mark_nixl_target_ready(transition)
         except BaseException as exc:
             # The coordinator cannot set its prepared flag until this
             # method returns. Roll back locally so a failure after backing
@@ -388,6 +429,15 @@ class ElasticPPKVTransport:
             "live_kv_patch": (
                 patch.metrics() if patch is not None else self._last_live_patch_metrics
             ),
+            "nixl": (
+                dict(
+                    enabled=True,
+                    endpoint=dict(self._nixl_endpoint.metrics),
+                    receiver=dict(self._nixl_receiver.stats),
+                )
+                if self._nixl_endpoint is not None
+                else {"enabled": False}
+            ),
         }
 
     def begin_live_patch(self, transition):
@@ -397,18 +447,25 @@ class ElasticPPKVTransport:
 
         self._live_patch_error = None
         self._last_live_patch_metrics = {"enabled": True, "outgoing_kv_layers": 0}
-        layers = sorted(
-            {
-                layer
-                for edge in self.outbound_transfers(transition)
-                for layer in self._kv_layer_ids(edge)
-            }
-        )
-        if not layers:
-            return
         try:
-            from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+            if self._nixl_receiver is not None:
+                expected = {}
+                for edge in self.inbound_transfers(transition):
+                    expected.setdefault(edge.src_rank, set()).update(
+                        self._kv_layer_ids(edge)
+                    )
+                self._nixl_receiver.configure(transition.target.generation, expected)
+            layers = sorted(
+                {
+                    layer
+                    for edge in self.outbound_transfers(transition)
+                    for layer in self._kv_layer_ids(edge)
+                }
+            )
+            if not layers:
+                return
             from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+            from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 
             if type(self.allocator) not in (
                 TokenToKVPoolAllocator,
@@ -424,12 +481,29 @@ class ElasticPPKVTransport:
                 )
                 for layer in layers
             }
+            copier = None
+            if self._nixl_endpoint is not None:
+                from sglang.srt.elastic_pp.nixl_kv_patch import NixlKVPatchCopier
+
+                targets = {}
+                for edge in self.outbound_transfers(transition):
+                    targets.setdefault(edge.dst_rank, set()).update(
+                        self._kv_layer_ids(edge)
+                    )
+                copier = NixlKVPatchCopier(
+                    source,
+                    endpoint=self._nixl_endpoint,
+                    generation=transition.target.generation,
+                    targets=targets,
+                    max_rows=min(256, self.slot_chunk_size),
+                )
             self._live_patch = LiveKVSnapshot(
                 generation=transition.target.generation,
                 allocator=self.allocator,
                 source=source,
                 max_rows=min(256, self.slot_chunk_size),
                 admit_host_bytes=_require_cpu_space,
+                copier=copier,
             )
         except BaseException as exc:
             # Every rank must still enter the common prepare consensus.
@@ -477,6 +551,8 @@ class ElasticPPKVTransport:
 
     def finish_live_patch(self, transition):
         self.check_live_patch()
+        if self._nixl_receiver is not None:
+            self._nixl_receiver.mark_fenced()
         patch = self._live_patch
         if patch is not None:
             if patch.generation != transition.target.generation:
@@ -493,6 +569,8 @@ class ElasticPPKVTransport:
             patch.finish_at_fence(self.allocator.elastic_pp_live_slots(), ready)
 
     def release_live_patch(self):
+        if self._nixl_receiver is not None:
+            self._nixl_receiver.retire()
         patch = self._live_patch
         if patch is not None:
             patch.abort()
@@ -584,7 +662,11 @@ class ElasticPPKVTransport:
         return self.backing_spill_metrics()
 
     def _export_source_kv(self, *, layer_id, slot_ids):
-        if self._live_patch is not None and self._live_patch.complete:
+        if (
+            self._live_patch is not None
+            and self._live_patch.complete
+            and self._nixl_endpoint is None
+        ):
             return tuple(
                 t.to(self.pool.device)
                 for t in self._live_patch.export(layer_id, slot_ids)
@@ -827,6 +909,11 @@ class ElasticPPKVTransport:
         impossible without rebuilding the serving communicator.
         """
 
+        if self._nixl_endpoint is not None:
+            # finish_live_patch already copied and sealed all authoritative live
+            # rows. Do not retransmit them through NCCL at this fence. Hybrid
+            # subclasses still exchange the latest recurrent state here.
+            return frozenset()
         transfers = tuple(sorted(transition.kv_transfers, key=self._sort_key))
         loaded: set[int] = set()
         for transfer in transfers:
@@ -886,6 +973,14 @@ class ElasticPPKVTransport:
         """
 
         generation = transition.target.generation
+        if self._nixl_receiver is not None:
+            loaded = self._nixl_receiver.finish(generation)
+            if loaded:
+                self.pool.mark_elastic_pp_kv_layers_loaded(
+                    generation=generation,
+                    layer_ids=set(loaded),
+                )
+            return loaded
         inbound = self.inbound_transfers(transition)
         staged = [
             (key, value)

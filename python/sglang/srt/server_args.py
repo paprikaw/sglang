@@ -1137,9 +1137,17 @@ class ServerArgs:
     ] = "overlap"
     enable_elastic_pp_kv_patch: A[
         bool,
-        "Experimental forward-ready KV CPU shadows during background PP preparation; network and recurrent state still migrate at the fence.",
+        "Experimental forward-ready KV copies during background PP preparation; recurrent state still migrates at the fence.",
         NS("parallel"),
     ] = False
+    elastic_pp_kv_patch_transport: A[
+        str,
+        Arg(
+            help="Online KV copies: cpu shadows, or preinitialized NIXL GPU staging on every candidate rank.",
+            choices=["cpu", "nixl"],
+        ),
+        NS("parallel"),
+    ] = "cpu"
     enable_elastic_pp_autoscaling: A[
         bool,
         "Enable the tokenizer-side backlog controller for elastic PP.",
@@ -7970,6 +7978,16 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
+
+        if self.elastic_pp_kv_patch_transport == "nixl":
+            if not self.enable_elastic_pp_kv_patch:
+                raise ValueError("NIXL migration requires --enable-elastic-pp-kv-patch")
+            if not self.enable_hierarchical_cache:
+                raise ValueError("NIXL migration currently requires HiCache")
+            if self.pp_stage_tp_sizes is not None:
+                raise ValueError(
+                    "NIXL migration requires homogeneous resident PP ranks"
+                )
 
         if self.pp_stage_tp_sizes is not None:
             self._validate_heterogeneous_pp_topology()

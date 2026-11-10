@@ -6,6 +6,9 @@
 
 ## 本轮实施：主 agent 顺序完成
 
+- [x] 用户确认所有候选GPU启动时建立并预热NIXL agent；已实现固定GPU双缓冲、独立进度与目标应用确认，接入native／HiCache持续KV patch及最终fence。已隔离锁定NIXL 1.5.2；487项elastic_pp CPU回归通过，包含实际allocator及模拟字节传输，覆盖写入确认、复用、改写、多接收端、错误payload和取消失败。首次回归发现异常处理线程退出，修复后全过；原失败保留于归档`nixl-live-20261110/cpu-suite-r1.log`，通过证据为`cpu-suite-r2.xml`。本条只验收代码和CPU协议，GPU资格及性能留在下列未完成项。
+- [ ] 真实A100 native／eager／HiCache PP2→PP3→PP2，要求所有候选NIXL端点已预热、目标在最终暂停前实际应用KV，并通过生成连续性、CPU缓存恢复及清理。端点常驻不算释放GPU；真实链路与暂停收益另验。
+
 - [x] 接入真实 PP 前向与标准 token／paged allocator，保护复制中的槽位复用与重写。仅限 native／eager／background＋overlap 的在线 KV CPU shadow；最终 fence 补齐余量后复用跨 rank 传输，GDN／HiCache仍在fence交接。512项CPU检查全过；冻结 `e7c9cb1264a9` 的A100 64-token页PP2→PP3→PP2通过同暖512边界连续性和CPU前缀loadback。扩容两个源rank各在线完成662行，缩容源rank完成659行；它们是各rank的槽位行计数，不是全局输入token数。整轮含清理171.795秒，正常release。r1／r2失败保留于[验证记录](VALIDATION.md)。不据此宣称网络 overlap、Graph 接入或性能收益。
 
 从冻结基线 `ce563696401c` 建立 `codex/pp-kv-live-foundation-20261109`，本轮不使用子 agent。[Draft PR #4](https://github.com/paprikaw/sglang/pull/4) 已推送，目标为项目分支，尚未合入。底层原语GPU冻结源码为 `8d7c21241c`，本轮native在线shadow为 `e7c9cb1264a9`；两条执行路径分开验收。旧分工仅表示模块边界，不是正在运行的任务。
@@ -36,7 +39,7 @@
 
 ## 已完成调研：下一阶段的接口与机制选择
 
-- [x] 主agent核对NIXL官方API／UCX、现有SGLang NIXL P/D代码和依赖安装状态，形成[NIXL迁移方案](NIXL_KV_TRANSFER_DESIGN.md)。建议推理保留NCCL，KV迁移使用独立NIXL＋UCX和固定GPU双缓冲；当前验证环境未安装NIXL。本项仅为调研，不含依赖安装、运行代码或GPU资格。
+- [x] 主agent核对NIXL官方API／UCX、现有SGLang NIXL P/D代码和依赖安装状态，形成[NIXL迁移方案](NIXL_KV_TRANSFER_DESIGN.md)。建议推理保留NCCL，KV迁移使用独立NIXL＋UCX和固定GPU双缓冲；这是当时的调研证据；本轮已另行隔离安装1.5.2并接入代码，运行资格见顶部当前任务，不能由本条调研推出。
 - [x] 主 agent 核对 workbench vLLM/PipeLive、SGLang runtime `8374b0276d19` 及 KVCacheD 工作区，形成研究库 `LOW_INTERRUPTION_PP_REVIEW_20261109.md` 和问题簿 Q25。建议优先 KVCacheD 稳定虚拟地址，保留旧块指针内核作备选；发现按层物理映射 API 不匹配、GDN backing 重建和 stacking 边界限制。仅完成调研，无新增引擎改动或 GPU 验收。
 - [ ] **A：**固定兼容的 KVCacheD 依赖与能力检查，先验证物理页映射／回收和存活状态；只改 local view 不算释放显存。
 - [ ] **B：**将预捕获库接入整模型执行器，补齐权重、KV、GDN、输入和 workspace 的完整 binding 及稳定地址；底层库的实际 replay／fallback 已在 A100 检查，不等于模型 Graph 已可切换。不在正常推理期间无保护 capture。

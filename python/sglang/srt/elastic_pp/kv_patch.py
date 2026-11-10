@@ -1,8 +1,8 @@
 """Bounded continuous copies of immutable autoregressive KV rows.
 
 Experimental session/copy primitives. live_kv_patch.py integrates native CPU
-shadows with scheduler/allocator hooks; online multi-rank transport remains
-separate. GDN and request metadata still require the final migration fence.
+shadows or the opt-in NIXL copier with scheduler/allocator hooks. GDN and
+request metadata still require the final migration fence.
 Callers must publish writes after recording their GPU completion event, and
 check free/reuse through this session *before* freeing.
 """
@@ -167,7 +167,8 @@ class ContinuousKVPatch:
                 raise RuntimeError("cannot abort after KV patch completion")
             self.copier.synchronize()
             if self._pending is not None:
-                self._pending[1].synchronize()
+                completion = self._pending[1]
+                getattr(completion, "drain", completion.synchronize)()
             self._pending = None
             self._pinned.clear()
             self._phase = "aborted"

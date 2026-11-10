@@ -58,9 +58,11 @@ class ElasticPPMigrationCoordinator:
     and migration communicator launches on one host thread avoids undefined
     multi-thread NCCL ordering on the same device.
 
-    The opt-in KV patch integration gathers forward-ready native rows into CPU
-    shadows while serving. All network and recurrent/cache handoff still occurs
-    at the drained fence; no background allocator snapshot is permitted.
+    The opt-in KV patch integration gathers forward-ready native rows while
+    serving. The default CPU shadow crosses ranks at the drained fence; the
+    NIXL variant applies them online through independent registered buffers.
+    Recurrent/cache handoff and final coverage checks remain at the fence;
+    no background allocator snapshot is permitted.
     """
 
     def __init__(
