@@ -32,6 +32,7 @@ class NixlKVReceiver:
         self.sealed = set()
         self.fenced = False
         self.stats = {}
+        self._unsafe_backing = []
         self.stream = (
             torch.cuda.Stream(device=endpoint.device)
             if endpoint.device.type == "cuda"
@@ -165,28 +166,43 @@ class NixlKVReceiver:
                 if self.stream is not None
                 else nullcontext()
             )
-            with context:
-                selected = torch.tensor(accepted, dtype=torch.int64, device=data.device)
-                slots = torch.tensor(
-                    [rows[i][0] for i in accepted],
-                    dtype=torch.int64,
-                    device=data.device,
-                )
-                for layer in self.expected[peer]:
-                    self.pool.import_elastic_pp_kv_slots(
-                        generation=self.generation,
-                        layer_id=layer,
-                        slot_ids=slots,
-                        cache_k=views[layer, "k"].index_select(0, selected),
-                        cache_v=views[layer, "v"].index_select(0, selected),
+            try:
+                with context:
+                    selected = torch.tensor(
+                        accepted, dtype=torch.int64, device=data.device
                     )
+                    slots = torch.tensor(
+                        [rows[i][0] for i in accepted],
+                        dtype=torch.int64,
+                        device=data.device,
+                    )
+                    for layer in self.expected[peer]:
+                        self.pool.import_elastic_pp_kv_slots(
+                            generation=self.generation,
+                            layer_id=layer,
+                            slot_ids=slots,
+                            cache_k=views[layer, "k"].index_select(0, selected),
+                            cache_v=views[layer, "v"].index_select(0, selected),
+                        )
+                    if self.stream is not None:
+                        applied = torch.cuda.Event()
+                        applied.record(self.stream)
+                # Network completion is insufficient: ACK after target scatter.
                 if self.stream is not None:
-                    applied = torch.cuda.Event()
-                    applied.record(self.stream)
-            # A network DONE/notification is not an application ACK. Submit CUDA
-            # reads after arrival, and ACK only after the target scatter finishes.
-            if self.stream is not None:
-                applied.synchronize()
+                    applied.synchronize()
+            except BaseException:
+                if self.stream is not None:
+                    try:
+                        self.stream.synchronize()
+                    except BaseException as drain_error:
+                        # Abort may drop pending-pool ownership. Keep tensor refs
+                        # until owned worker exit if CUDA cannot prove quiescence.
+                        self._unsafe_backing.extend(targets.values())
+                        self.endpoint._stopping.set()
+                        raise RuntimeError(
+                            "NIXL target stream could not drain; worker shutdown required"
+                        ) from drain_error
+                raise
             for i in accepted:
                 slot, epoch = rows[i]
                 self.versions[peer][slot] = epoch
@@ -225,6 +241,10 @@ class NixlKVReceiver:
 
     def retire(self):
         with self.lock:
+            if self._unsafe_backing:
+                raise RuntimeError(
+                    "NIXL target backing remains live; shutdown required"
+                )
             # Serializes against target CUDA application before backing is freed.
             self.prepared, self.generation = False, None
             self.versions, self.retired = {}, {}

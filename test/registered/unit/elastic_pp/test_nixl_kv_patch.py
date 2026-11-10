@@ -5,6 +5,7 @@ import threading
 import time
 from collections import defaultdict
 from concurrent.futures import Future
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -319,6 +320,39 @@ def test_abort_requires_a_confirmed_source_stream_drain():
         completion.drain()
     future._nixl_source_drained = True
     completion.drain()
+
+
+@pytest.mark.parametrize("drain_fails", [False, True])
+def test_target_copy_failure_drains_before_retirement(
+    endpoints, monkeypatch, drain_fails
+):
+    allocator, source, slots, patch, receivers, pools = setup_patch(endpoints)
+    drained = []
+
+    def drain():
+        drained.append(True)
+        if drain_fails:
+            raise RuntimeError("CUDA stream failure")
+
+    def fail_scatter():
+        raise RuntimeError("scatter failure")
+
+    receiver = receivers[1]
+    receiver.stream = SimpleNamespace(synchronize=drain)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
+    pools[1].before_apply = fail_scatter
+    patch.progress(slots, ready())
+    with pytest.raises(RuntimeError, match="receiver rejected"):
+        patch.session._pending[1].synchronize()
+    assert drained == [True]
+    if drain_fails:
+        assert receiver._unsafe_backing
+        with pytest.raises(RuntimeError, match="backing remains live"):
+            receiver.retire()
+    else:
+        receiver.retire()
+    patch.abort()
+    allocator.free(slots)
 
 
 def test_hybrid_global_layer_mapping_writes_pending_attention_only(
