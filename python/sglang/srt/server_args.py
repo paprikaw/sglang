@@ -1115,11 +1115,11 @@ class ServerArgs:
     elastic_pp_weight_staging: A[
         str,
         Arg(
-            help="Background immutable weights: bounded pinned CPU packets, or legacy pageable per-tensor staging. Neither caches candidate GPU weights.",
-            choices=["pinned", "legacy"],
+            help="Background immutable weights: cpu_cache loads targets directly from the existing canonical RAM bank (native Qwen3.5 TP1/EP1 Triton); pinned/legacy export source GPU weights through CPU/Gloo. No candidate GPU weight cache.",
+            choices=["cpu_cache", "pinned", "legacy"],
         ),
         NS("parallel"),
-    ] = "pinned"
+    ] = "legacy"
     elastic_pp_hicache_allocator: A[
         str,
         Arg(

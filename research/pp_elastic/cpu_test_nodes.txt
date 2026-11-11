@@ -1011,6 +1011,8 @@ test/registered/unit/elastic_pp/test_pinned_host_allocator.py::test_host_warmup_
 
 test/registered/unit/elastic_pp/test_weight_backing.py
 test/registered/unit/elastic_pp/test_weight_staging.py
+test/registered/unit/elastic_pp/test_cpu_weight_reload.py
+test/registered/unit/elastic_pp/test_coordinator.py::test_cpu_cache_startup_sync_reaches_weight_consensus_before_kv_copy
 
 test/registered/unit/elastic_pp/test_prepared_decode_graph.py::test_nonresident_cleanup_and_abort_release_only_incoming_weights
 

@@ -4,6 +4,8 @@
 
 ## 当前：减少迁移、最终暂停及推理干扰
 
+- [ ] **2026-11-11：目标GPU直接从已有CPU权重缓存恢复。** 用户要求跳过源GPU导出和CPU／Gloo中转。增加显式`cpu_cache`路径，复用初次加载的canonical CPU bank，按目标新增层使用原生checkpoint loader写回既有Graph地址；缓存缺失、身份变化、覆盖不全或地址变化均拒绝就绪。先验证native Qwen3.5 TP1／EP1 Triton，保持HiCache／NIXL及候选物理权重页释放。代码与CPU检查进行中，真实A100往返尚未运行，不引用旧legacy耗时作为新结果。见[权重恢复设计](WEIGHT_STAGING.md)。
+
 - [ ] **2026-11-11：加速真实搬权重，保持非驻留要求。** 在 `codex/pp-weight-host-pipeline-20261111` 将逐张量pageable中转改为256 MiB有界pinned分块，经独立CUDA流异步D2H／H2D，CPU／Gloo传输，直接写入目标已准入权重页；不缓存候选GPU权重。冻结 `fcefe8604c65` 的1036项完整CPU回归通过（120.55秒），含12项新协议检查。同版本A100 legacy对照通过：完整扩／缩19.758／20.824秒；缩容源D2H约10.007秒、发送及等待10.235秒，目标H2D各1.026／0.861秒。pinned首个启动被Guard因另一正常实验占两台A100而拒绝，未启动模型；后续候选未运行。保留失败和准备记录，[PR #10](https://github.com/paprikaw/sglang/pull/10)保持Draft；新路径GPU正确性及提速尚未验证。下一次从新ID和源标签继续，不覆盖旧配置。见[设计与结果](WEIGHT_STAGING.md)。
 
 - [x] **2026-11-11 用户新增底线：候选布局权重不能常驻 GPU。** 默认 `offload` 将Graph稳定地址与权重物理页拆开，释放退出层及多余输出权重，接班时真实搬权重。冻结 `26bdee39146f`，35B／A100／B1／HiCache的两次独立PP2→PP3→PP2往返通过；每方向实际搬21.87 GB，完整扩／缩均值19.98／20.65秒，最后暂停239／285 ms，运行时capture=0且实际Graph replay。缩回后中间GPU模型参数及物理权重页均为0，每轮驱动可用显存增加20.37890625 GiB。暖缓存连续性、在线KV及CPU loadback、监督清理／正常release、129个输入核对通过；最终1024项完整CPU回归通过（114.57秒）。当前Gloo权重搬运是主要瓶颈。旧约0.3秒仅为resident诊断；KV／GDN／Graph工作区和worker仍占资源，整个GPU归还未完成。见[设计与结果](NONRESIDENT_GRAPH_WEIGHTS.md)。

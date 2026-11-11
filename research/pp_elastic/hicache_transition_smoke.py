@@ -336,7 +336,19 @@ def state_evidence(info):
 def validate_decode_graph_states(
     states, generation, source_ranks, target_ranks, *, prepared=False
 ):
-    for rank, state in rank_states(states).items():
+    ranked = rank_states(states)
+    cached = [
+        state["transition_metrics"]
+        for state in ranked.values()
+        if state["transition_metrics"].get("weight_staging") == "cpu_cache"
+    ]
+    if cached and (
+        len(cached) != len(ranked)
+        or len({m.get("weight_staging_metrics", {}).get("cache_key") for m in cached})
+        != 1
+    ):
+        raise AssertionError("CPU cache weights came from inconsistent rank banks")
+    for rank, state in ranked.items():
         history = state["transition_metrics"]["decode_graph"]
         entries = {row["generation"]: row for row in history}
         if set(entries) != set(range(generation + 1)):
@@ -382,7 +394,41 @@ def validate_decode_graph_states(
                     )
                 if bank.get("inactive_registered_weight_bytes", -1) != 0:
                     raise AssertionError("inactive worker retains spare model weights")
-                if (
+                if metrics.get("weight_staging") == "cpu_cache":
+                    reload = metrics.get("weight_staging_metrics", {})
+                    if (
+                        reload.get("kind") != "canonical_cpu_cache"
+                        or not reload.get("cache_key")
+                        or metrics.get("background_weight_bytes_sent", -1) != 0
+                        or reload.get("gpu_export_bytes", -1) != 0
+                        or reload.get("gloo_weight_bytes", -1) != 0
+                        or reload.get("fallback_count", -1) != 0
+                    ):
+                        raise AssertionError(
+                            "CPU cache weights used an export or fallback path"
+                        )
+                    incoming = {1} if generation == 1 else {0, 2}
+                    if rank in incoming and (
+                        reload.get("target_weight_bytes", 0) <= 0
+                        or reload.get("checkpoint_bytes", 0) <= 0
+                        or reload.get("checkpoint_tensors", 0) <= 0
+                        or not reload.get("cache_key_matches_initial_load")
+                        or not reload.get("storage_verified")
+                        or not reload.get("layers_loaded")
+                        or reload.get("checkpoint_load_seconds", 0) <= 0
+                    ):
+                        raise AssertionError(
+                            "CPU cache target weights were not fully restored"
+                        )
+                    if rank not in incoming and (
+                        reload.get("target_weight_bytes", -1) != 0
+                        or reload.get("checkpoint_bytes", -1) != 0
+                        or reload.get("layers_loaded") != []
+                    ):
+                        raise AssertionError(
+                            "CPU cache reload touched non-target weights"
+                        )
+                elif (
                     rank in ({0, 2} if generation == 1 else {1})
                     and metrics.get("background_weight_bytes_sent", 0) <= 0
                 ):
@@ -1367,6 +1413,15 @@ def prepare(args):
             base.desc(ENGINE / "python/sglang/srt/elastic_pp" / name)
             for name in ("kv_patch.py", "live_kv_patch.py")
         ]
+    if cfg["weight_staging"] == "cpu_cache":
+        spec["frozen_inputs"] += [
+            base.desc(ENGINE / "python/sglang/srt/weight_cache" / name)
+            for name in (
+                "cpu_canonical.py",
+                "cpu_protocol.py",
+                "cpu_canonical_loader.py",
+            )
+        ]
     if cfg["cuda_graph"]:
         spec["frozen_inputs"] += [
             base.desc(ENGINE / path)
@@ -1382,6 +1437,7 @@ def prepare(args):
                 "python/sglang/srt/elastic_pp/prepared_decode_graph.py",
                 "python/sglang/srt/elastic_pp/weight_backing.py",
                 "python/sglang/srt/elastic_pp/weight_staging.py",
+                "python/sglang/srt/elastic_pp/cpu_weight_reload.py",
                 "python/sglang/srt/cuda_vmm_utils.py",
                 "python/sglang/srt/elastic_pp/model.py",
                 "python/sglang/srt/elastic_pp/model_wrapper.py",
@@ -1489,7 +1545,7 @@ def main():
     )
     parser.add_argument("--migration-profile", action="store_true")
     parser.add_argument(
-        "--weight-staging", choices=["legacy", "pinned"], default="pinned"
+        "--weight-staging", choices=["cpu_cache", "legacy", "pinned"], default="pinned"
     )
     parser.add_argument(
         "--hicache-allocator", choices=["mmap", "pytorch"], default="mmap"

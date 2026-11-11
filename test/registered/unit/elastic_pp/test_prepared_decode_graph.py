@@ -71,13 +71,17 @@ def test_prepared_graph_config_projects_and_rejects_unknown_target():
         bank.check_topology(PPTopology.from_layer_counts((14, 12, 14)))
 
 
-def test_private_startup_coordinator_disables_online_patch_without_changing_args():
+@pytest.mark.parametrize("weight_source", ["legacy", "pinned", "cpu_cache"])
+def test_private_startup_coordinator_disables_online_patch_without_changing_args(
+    weight_source,
+):
     from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
 
     cfg = NS(
         enable_elastic_pp_kv_patch=True,
         elastic_pp_transition_strategy="background",
         elastic_pp_transition_backing="overlap",
+        elastic_pp_weight_staging=weight_source,
     )
     options = dict(
         rank=0,

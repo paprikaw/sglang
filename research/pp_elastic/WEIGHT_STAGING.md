@@ -1,5 +1,11 @@
 # 加速真实权重搬运
 
+**新增：直接使用已有CPU缓存。** 用户要求避免源GPU导出。显式选择`--elastic-pp-weight-staging cpu_cache`后，各目标rank直接打开初次加载使用的canonical CPU bank，只读取自己新接手的层，调用模型原生checkpoint loader将融合／切片后的值写入目标既有参数地址。源rank不发送权重，不经Gloo，也不新增常驻GPU候选副本或从GPU建立新的CPU权重快照。当前资格范围是native Qwen3.5、TP1／EP1、Triton、无量化、overlap；运行时使用background，启动Graph预热的同步转换也使用同一CPU bank。通用默认暂保留legacy，实验显式选择新路径。
+
+**正确性边界。** 核对初次加载的cache key和完整checkpoint元数据，保持daemon pin及mmap至CUDA流结束，确认目标参数全部覆盖、对象／地址／shape／stride不变后才标记就绪。CPU bank缺失或身份变化直接失败，不回退磁盘或源GPU。Graph预热和候选物理权重页释放继续独立生效。计时区分打开缓存、原生加载（含CPU打包及H2D）、prepare、最后暂停和完整切换；原生加载时间不能解释为纯PCIe带宽。
+
+**本次验证。** 新路径CPU检查进行中；A100完整往返待运行。下述legacy测量保留为历史对照，不是直接CPU加载的测量结果。
+
 **问题。** 原先约20秒测的不是纯CPU加载：每次重新从源GPU导出，经普通CPU内存／Gloo，再逐张量装入目标GPU。35B BF16每方向实际搬21.87 GB；这条链路的耗时不能直接当作PCIe的CPU→GPU带宽。
 
 **本轮改动。** 增加 `--elastic-pp-weight-staging pinned`：每进程复用256 MiB页锁定CPU缓冲，打包为有界字节块，在独立迁移流异步拷贝，经过Gloo后直接写入目标参数，保持稠密转置的物理布局。缓冲在网络与CUDA读取结束后才可复用，整层完成后才标记就绪。候选层仍释放GPU物理页；不增加候选GPU权重副本。旧pageable路径用 `legacy` 保留，并补D2H、传输、H2D计时。

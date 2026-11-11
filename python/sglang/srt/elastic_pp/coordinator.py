@@ -115,9 +115,16 @@ class ElasticPPMigrationCoordinator:
         self._layers_precopied = False
         self._background_weight_bytes_sent = 0
         self._weight_stager = None
+        self._cpu_weight_reloader = None
         self.weight_staging = getattr(args, "elastic_pp_weight_staging", "legacy")
-        if self.weight_staging not in {"legacy", "pinned"}:
+        if self.weight_staging not in {"legacy", "pinned", "cpu_cache"}:
             raise ValueError("unknown elastic PP weight staging policy")
+        if self.weight_staging == "cpu_cache" and (
+            self.strategy not in {"background", "sync"} or self.backing != "overlap"
+        ):
+            raise ValueError(
+                "CPU cache reload requires background or sync with overlap backing"
+            )
         self._observed_cuda_allocated_peak = 0
         self.rank = int(rank)
         self.current_topology = current_topology
@@ -248,6 +255,8 @@ class ElasticPPMigrationCoordinator:
             self._kv_prepared = False
             self._layers_precopied = False
             self._background_weight_bytes_sent = 0
+            if self._cpu_weight_reloader is not None:
+                self._cpu_weight_reloader.reset_metrics()
             self._observed_cuda_allocated_peak = 0
             self._source_backing_attempted = False
             self._source_backing_metrics = {}
@@ -461,9 +470,13 @@ class ElasticPPMigrationCoordinator:
             "background_weight_bytes_sent": self._background_weight_bytes_sent,
             "weight_staging": self.weight_staging,
             "weight_staging_metrics": (
-                dict(self._weight_stager.metrics)
-                if self._weight_stager is not None
-                else {}
+                dict(self._cpu_weight_reloader.metrics)
+                if self._cpu_weight_reloader is not None
+                else (
+                    dict(self._weight_stager.metrics)
+                    if self._weight_stager is not None
+                    else {}
+                )
             ),
             "prepared_weight_bytes_reused": self._prepared_weight_bytes_reused,
             "stage_seconds": dict(self._stage_seconds),
@@ -599,12 +612,14 @@ class ElasticPPMigrationCoordinator:
         self._observe_memory()
 
     def _precopy_immutable_weights(self, transition: DynamicPPTransition) -> None:
-        """Stage immutable weights over Gloo while the old pipeline executes.
+        """Restore immutable weights while the old pipeline executes.
 
         CPU payloads deliberately avoid launching NCCL from a second host thread.
         One layer is live in host staging at a time. KV/GDN remain authoritative
         at the final fence, since their rows can change during serving.
         """
+        if self.weight_staging == "cpu_cache":
+            return self._precopy_cpu_cached_weights(transition)
         if self.weight_staging == "pinned":
             return self._precopy_pinned_weights(transition)
         for edge in sorted(transition.kv_transfers, key=self.layer_transport._sort_key):
@@ -677,6 +692,24 @@ class ElasticPPMigrationCoordinator:
                         + time.monotonic()
                         - started
                     )
+
+    def _precopy_cpu_cached_weights(self, transition):
+        from sglang.srt.elastic_pp.cpu_weight_reload import CanonicalCpuWeightReloader
+
+        if self._cpu_weight_reloader is None:
+            self._cpu_weight_reloader = CanonicalCpuWeightReloader(
+                model_runner=self.model_runner,
+                stream=self.layer_transport._migration_stream,
+            )
+        incoming = {
+            layer_id
+            for edge in transition.kv_transfers
+            if edge.dst_rank == self.rank
+            for layer_id in range(edge.layer_range.start, edge.layer_range.end)
+        }
+        self._cpu_weight_reloader.reload(
+            generation=transition.target.generation, layer_ids=incoming
+        )
 
     def _precopy_pinned_weights(self, transition):
         from sglang.srt.elastic_pp.weight_staging import (
@@ -936,6 +969,27 @@ class ElasticPPMigrationCoordinator:
                             "cannot migrate GDN state without request-slot remapping"
                         )
             assert fence_slots is not None
+
+            # Startup's private Graph walk uses synchronous transitions. It
+            # must use the same CPU bank, and reach agreement before any KV
+            # P2P operation if a rank cannot restore its target checkpoint.
+            if self.weight_staging == "cpu_cache" and not self._layers_precopied:
+                local_error = None
+                try:
+                    self._timed(
+                        "fence_cpu_cached_weights",
+                        self._precopy_cpu_cached_weights,
+                        transition,
+                    )
+                except BaseException as exc:
+                    local_error = f"{type(exc).__name__}: {exc}"
+                reports = self._consensus(
+                    "fence_cpu_cached_weights",
+                    success=local_error is None,
+                    error=local_error,
+                )
+                self._raise_peer_failures("fence CPU cached weights", reports)
+                self._layers_precopied = True
 
             local_error = None
             works = ()
