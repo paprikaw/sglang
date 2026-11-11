@@ -1008,3 +1008,9 @@ test/registered/unit/elastic_pp/test_pinned_host_allocator.py::test_pinned_polic
 test/registered/unit/elastic_pp/test_pinned_host_allocator.py::test_pinned_policy_uses_torch_allocator_and_default_stays_mmap
 test/registered/unit/elastic_pp/test_pinned_host_allocator.py::test_host_warmup_cannot_run_during_serving_or_with_storage[False-False]
 test/registered/unit/elastic_pp/test_pinned_host_allocator.py::test_host_warmup_cannot_run_during_serving_or_with_storage[True-True]
+
+test/registered/unit/elastic_pp/test_weight_backing.py
+
+test/registered/unit/elastic_pp/test_prepared_decode_graph.py::test_nonresident_cleanup_and_abort_release_only_incoming_weights
+
+test/registered/unit/elastic_pp/test_runtime_capacity.py::test_prepared_graph_admission_counts_unmapped_weight_pages

@@ -1,8 +1,8 @@
 """Bounded, startup-prepared native Decode runners for resident elastic PP.
 
-This deliberately retains native storage, not VMM pages. Each local layer
-interval owns its attention metadata/backend and Graph pool. Runtime selection
-never captures, and fails closed if any external tensor binding has changed.
+Each local interval owns its attention metadata/backend and Graph pool. In the
+offload policy, decoder weight addresses use evictable VMM backing: cached
+Graphs retain addresses, while inactive layer weights have no physical pages.
 """
 
 from __future__ import annotations
@@ -138,6 +138,13 @@ class PreparedDecodeGraphBank:
         self.runtime_selections = 0
         self.resident_weights = {}
         self.host_allocator_warmups = []
+        self.weight_policy = getattr(
+            getattr(mr, "server_args", None),
+            "elastic_pp_prepared_weight_policy",
+            "reuse",
+        )
+        self.weight_backing = getattr(mr, "_elastic_pp_weight_backing", None)
+        self.model_runner = mr
         self.torch_host_allocator = (
             getattr(
                 getattr(mr, "server_args", None), "elastic_pp_hicache_allocator", "mmap"
@@ -164,6 +171,8 @@ class PreparedDecodeGraphBank:
         """
         if self.building:
             raise RuntimeError("prepared weights cannot be reused before sealing")
+        if self.weight_policy == "offload":
+            raise RuntimeError("nonresident prepared weights require actual transfer")
         self.check_topology(transition.target)
         target = transition.target.layer_range(self.rank)
         states = mr.export_elastic_pp_layer_state(range(target.start, target.end))
@@ -286,7 +295,13 @@ class PreparedDecodeGraphBank:
             runtime_captures=0,
             runtime_selections=self.runtime_selections,
             host_allocator_warmups=self.host_allocator_warmups,
+            weight_policy=self.weight_policy,
         )
+        if self.weight_backing is not None:
+            model = self.model_runner.model
+            result["weight_backing"] = self.weight_backing.metrics(
+                set(range(model.start_layer, model.end_layer))
+            )
         if self.torch_host_allocator:
             stats = torch.cuda.memory.host_memory_stats()
             result["pinned_allocator"] = {
@@ -309,6 +324,10 @@ def init_prepared_graph_bank(mr):
 
     disable_graph_pool_borrow("elastic PP retains independent prepared Graph pools")
     mr._elastic_pp_model_method("retain_elastic_pp_graph_layers")()
+    if getattr(args, "elastic_pp_prepared_weight_policy", "offload") == "offload":
+        mr._elastic_pp_weight_backing = mr._elastic_pp_model_method(
+            "enable_elastic_pp_evictable_weights"
+        )()
     mr.token_to_kv_pool.retain_elastic_pp_graph_buffers()
     mr._elastic_pp_prepared_graphs = PreparedDecodeGraphBank(mr, partitions)
 

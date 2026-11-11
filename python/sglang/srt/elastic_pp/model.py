@@ -50,6 +50,22 @@ class ElasticPPModelMixin:
             i: self.layers[i] for i in self._resident_elastic_layer_ids()
         }
 
+    def enable_elastic_pp_evictable_weights(self):
+        """Move weights to stable VA before the first candidate Graph capture."""
+        from sglang.srt.elastic_pp.weight_backing import EvictableWeightBank
+
+        if self.quant_config is not None:
+            raise ValueError(
+                "nonresident prepared weights currently require unquantized layers"
+            )
+        bank = self._elastic_pp_weight_backing = EvictableWeightBank()
+        for layer_id in sorted(self._resident_elastic_layer_ids()):
+            bank.prepare(layer_id, self.layers[layer_id])
+        # Converted parameters no longer own the loader's caching-allocator
+        # allocations. Return those old free blocks to the CUDA driver too.
+        torch.cuda.empty_cache()
+        return bank
+
     @staticmethod
     def _prepare_elastic_quantized_layer(layer: nn.Module) -> None:
         """Put a new quantized layer in its post-load runtime layout.
@@ -150,6 +166,11 @@ class ElasticPPModelMixin:
                     if cached is None and quant_name is not None:
                         self._prepare_elastic_quantized_layer(layer)
                     created[layer_id] = layer
+                    backing = getattr(self, "_elastic_pp_weight_backing", None)
+                    if backing is not None:
+                        backing.prepare(layer_id, layer)
+            if getattr(self, "_elastic_pp_weight_backing", None) is not None:
+                torch.cuda.empty_cache()
             with self._elastic_layer_lock:
                 for layer_id, layer in created.items():
                     if not isinstance(self.layers[layer_id], PPMissingLayer):
@@ -159,6 +180,9 @@ class ElasticPPModelMixin:
                         )
                     self.layers[layer_id] = layer
         except BaseException:
+            backing = getattr(self, "_elastic_pp_weight_backing", None)
+            if backing is not None:
+                backing.evict(created.keys())
             self._release_elastic_layer_loader_refs(created.values())
             with self._elastic_layer_lock:
                 remove_ids = self._elastic_layer_residency.abort(generation)
@@ -260,6 +284,9 @@ class ElasticPPModelMixin:
                 # The allocation helper may already have rolled back an OOM.
                 return ()
             new_layer_ids = self._elastic_layer_residency.abort(generation)
+            backing = getattr(self, "_elastic_pp_weight_backing", None)
+            if backing is not None:
+                backing.evict(new_layer_ids)
             removed = []
             for layer_id in sorted(new_layer_ids):
                 layer = self.layers[layer_id]
@@ -279,6 +306,9 @@ class ElasticPPModelMixin:
             cleanup_ids = self._elastic_layer_residency.cleanup_candidates(
                 generation, self._resident_elastic_layer_ids()
             )
+            backing = getattr(self, "_elastic_pp_weight_backing", None)
+            if backing is not None:
+                backing.evict(cleanup_ids)
             removed = []
             removed_ids = set()
             for layer_id in sorted(cleanup_ids):

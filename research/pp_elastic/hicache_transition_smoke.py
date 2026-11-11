@@ -366,6 +366,27 @@ def validate_decode_graph_states(
                 raise AssertionError(
                     "prepared Graph bank capture/selection evidence incomplete"
                 )
+            if bank.get("weight_policy") == "offload":
+                backing = bank.get("weight_backing", {})
+                if (
+                    backing.get("kind") != "vmm_nonresident_weights"
+                    or backing.get("inactive_mapped_physical_bytes", -1) != 0
+                ):
+                    raise AssertionError(
+                        "inactive candidate weights still occupy physical GPU pages"
+                    )
+                metrics = state["transition_metrics"]
+                if metrics.get("prepared_weight_bytes_reused", -1) != 0:
+                    raise AssertionError(
+                        "nonresident weights were reported as resident reuse"
+                    )
+                if (
+                    rank in source_ranks
+                    and metrics.get("background_weight_bytes_sent", 0) <= 0
+                ):
+                    raise AssertionError(
+                        "nonresident transition did not actually transfer source weights"
+                    )
 
 
 def install_hooks():
@@ -594,7 +615,7 @@ def engine_entry(cfg, row):
                         for counts in (cfg["initial_counts"], cfg["grown_counts"])
                     ),
                     "--elastic-pp-prepared-weight-policy",
-                    cfg.get("prepared_weight_policy", "reuse"),
+                    cfg.get("prepared_weight_policy", "offload"),
                     "--elastic-pp-hicache-allocator",
                     cfg.get("hicache_allocator", "mmap"),
                 ]
@@ -1237,7 +1258,7 @@ def prepare(args):
         kv_patch_transport=getattr(args, "kv_patch_transport", "cpu"),
         cuda_graph=getattr(args, "cuda_graph", False),
         prepared_graphs=getattr(args, "prepared_graphs", False),
-        prepared_weight_policy=getattr(args, "prepared_weight_policy", "reuse"),
+        prepared_weight_policy=getattr(args, "prepared_weight_policy", "offload"),
         migration_profile=getattr(args, "migration_profile", False),
         hicache_allocator=getattr(args, "hicache_allocator", "mmap"),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
@@ -1354,6 +1375,8 @@ def prepare(args):
                 "python/sglang/srt/model_executor/runner_utils/pool.py",
                 "python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py",
                 "python/sglang/srt/elastic_pp/prepared_decode_graph.py",
+                "python/sglang/srt/elastic_pp/weight_backing.py",
+                "python/sglang/srt/cuda_vmm_utils.py",
                 "python/sglang/srt/elastic_pp/model.py",
                 "python/sglang/srt/elastic_pp/model_wrapper.py",
                 "python/sglang/srt/mem_cache/memory_pool.py",
@@ -1454,7 +1477,9 @@ def main():
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--prepared-graphs", action="store_true")
     parser.add_argument(
-        "--prepared-weight-policy", choices=["reuse", "recopy"], default="reuse"
+        "--prepared-weight-policy",
+        choices=["offload", "reuse", "recopy"],
+        default="offload",
     )
     parser.add_argument("--migration-profile", action="store_true")
     parser.add_argument(

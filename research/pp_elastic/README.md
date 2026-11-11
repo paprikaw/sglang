@@ -1,5 +1,7 @@
 # SGLang 研究基线
 
+2026-11-11范围修正：用户要求候选权重不得常驻GPU。新任务将Graph稳定地址与权重物理页分开，预热后释放退出层，接班前真实搬权重；实现及验收见[非驻留权重](NONRESIDENT_GRAPH_WEIGHTS.md)。历史约0.3秒的数据仅为resident诊断结果，不能证明伸缩节省资源。
+
 2026-11-11追加：启动Graph之外，复用候选权重并预热HiCache页锁定CPU分配。35B／B1／A100两次独立往返的完整迁移扩／缩均值0.293／0.321秒、最终暂停246／271 ms；运行时capture=0，1008项CPU回归通过。候选worker及GPU存储继续常驻，细节与本次任务合入状态见[迁移优化记录](MIGRATION_OPTIMIZATION.md)及[TODO](TODO.md)。
 
 2026-11-11：native／HiCache／NIXL新增[启动预捕获与运行时选择](PREPARED_DECODE_GRAPHS.md)，A100 PP2→PP3→PP2运行时capture=0，完整最终交接0.604／0.688秒，两个方向各2048-token暖缓存连续性及实际Graph replay通过。候选布局的原生存储与Graph工作区常驻，额外allocated合计21.513 GiB，VMM组合未接通，worker继续常驻。旧交接时重建基线保留在[接入说明](DECODE_GRAPH_INTEGRATION.md)。[PR #4](https://github.com/paprikaw/sglang/pull/4)已合入项目，992项组合CPU检查通过；[总PR #5](https://github.com/paprikaw/sglang/pull/5)统一同步到共同基线，GitHub记录实际合入状态。[审查与边界](REVIEW_20261111.md)。

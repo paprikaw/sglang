@@ -1,6 +1,8 @@
 # 启动时准备 Graph，运行时切换
 
-**2026-11-11追加优化。** 候选库完成后，运行时默认复用已经验证的不可变权重，避免再次传输；仅限预捕获库，在线权重更新被拒绝。需要对照时使用 `--elastic-pp-prepared-weight-policy recopy`。L2 HiCache另可显式启用 `--elastic-pp-hicache-allocator pytorch`，在启动时预热候选的CPU页锁定分配。35B／B1／A100两个独立往返的完整迁移扩／缩均值0.293／0.321秒，最终暂停246／271 ms；运行时capture=0，Graph选择约2–3 ms。原始样本、常驻内存与范围见[迁移优化记录](MIGRATION_OPTIMIZATION.md)，不能把选择Graph耗时当作完整切换耗时。下文原结果保留其冻结版本。
+2026-11-11范围修正：用户要求候选权重不得常驻GPU。新任务将Graph稳定地址与权重物理页分开，预热后释放退出层，接班前真实搬权重；实现及验收见[非驻留权重](NONRESIDENT_GRAPH_WEIGHTS.md)。历史约0.3秒的数据仅为resident诊断结果，不能证明伸缩节省资源。
+
+**历史resident策略（冻结版本）。** 当时的候选库完成后，运行时默认复用已经验证的不可变权重，避免再次传输；仅限预捕获库，在线权重更新被拒绝。需要对照时使用 `--elastic-pp-prepared-weight-policy recopy`。L2 HiCache另可显式启用 `--elastic-pp-hicache-allocator pytorch`，在启动时预热候选的CPU页锁定分配。35B／B1／A100两个独立往返的完整迁移扩／缩均值0.293／0.321秒，最终暂停246／271 ms；运行时capture=0，Graph选择约2–3 ms。原始样本、常驻内存与范围见[迁移优化记录](MIGRATION_OPTIMIZATION.md)，不能把选择Graph耗时当作完整切换耗时。下文原结果保留其冻结版本。
 
 **已测结果。** 冻结 `c5aa853480`，A100 native／HiCache／NIXL、实际B1的PP2→PP3→PP2通过同版本暖缓存连续性检查。运行时capture=0、目标确有replay，Graph选择1.733–2.596 ms；完整fence扩／缩0.604／0.688秒，初始Graph后候选准备约3.9秒。额外常驻allocated合计21.513 GiB，其中新增阶段20.816 GiB。完整监督178.903秒内完成并验证清理／正常release，尚无配对性能收益或工作GPU归还结论。[报告与绝对指标](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_prepared_decode_graph_20261111/summary.md)。
 
@@ -12,4 +14,4 @@
 
 **如何验证。** `hicache_transition_smoke.py` 增加 `--prepared-graphs --cuda-graph --same-process-warm-reference`；其余 NIXL／HiCache 和受监督的 300 秒预算保持原协议。两次真实生成分别跨越 PP2→PP3 和 PP3→PP2，完整 token IDs 与同进程、同版本的暖缓存参考比较；要求无 retraction／重新 Prefill、目标确有 replay、最终 CPU 前缀实际 loadback，并要求启动捕获次数固定、运行时 capture=0。该新验收类别只证明暖缓存执行连续性，不复用已变更生产源码的旧独立状态审查，也不授予冷暖生成等价资格。旧的严格参考审查类别不改变。
 
-**代价与边界。** 多布局的权重并集、KV／GDN 和 Graph 工作区持续占用显存，缩容暂不回收这些内存。记录启动准备时间、相对初始 Graph 完成后的额外 `memory_allocated`、每布局捕获时间、运行时选择时间及完整最终交接时间。它不是 VMM，也不证明归还工作 GPU、零暂停或逐 token 最大停顿；后两项需要另外测量。先通过有限整模型检查，再讨论共享工作区或减少常驻内存。
+**历史resident版本的代价与边界。** 多布局的权重并集、KV／GDN 和 Graph 工作区持续占用显存，缩容暂不回收这些内存。记录启动准备时间、相对初始 Graph 完成后的额外 `memory_allocated`、每布局捕获时间、运行时选择时间及完整最终交接时间。它不是 VMM，也不证明归还工作 GPU、零暂停或逐 token 最大停顿；后两项需要另外测量。先通过有限整模型检查，再讨论共享工作区或减少常驻内存。

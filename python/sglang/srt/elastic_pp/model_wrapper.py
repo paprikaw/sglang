@@ -54,6 +54,13 @@ class ElasticPPModelWrapperMixin:
     def retain_elastic_pp_graph_layers(self):
         self.model.retain_elastic_pp_graph_layers()
 
+    def enable_elastic_pp_evictable_weights(self):
+        backing = self.model.enable_elastic_pp_evictable_weights()
+        refresh = getattr(self, "_refresh_elastic_pp_moe_weights", None)
+        if refresh is not None:
+            refresh()
+        return backing
+
     def export_elastic_pp_layer_state(self, layer_ids):
         return self.model.export_elastic_pp_layer_state(layer_ids)
 

@@ -1101,17 +1101,17 @@ class ServerArgs:
     ] = None
     elastic_pp_graph_partitions: A[
         Optional[str],
-        "Finite semicolon-separated PP partitions to capture before serving and select without runtime capture; retains native weights/KV/GDN and Graph workspaces.",
+        "Finite PP partitions to capture before serving; retains KV/GDN and Graph workspaces. Weight residency is selected separately.",
         NS("parallel"),
     ] = None
     elastic_pp_prepared_weight_policy: A[
         str,
         Arg(
-            help="Reuse immutable startup-prepared weights, or recopy for controlled comparison.",
-            choices=["reuse", "recopy"],
+            help="Offload inactive weight backing while retaining Graph addresses; reuse/recopy retain candidate GPU weights for diagnostic controls only.",
+            choices=["offload", "reuse", "recopy"],
         ),
         NS("parallel"),
-    ] = "reuse"
+    ] = "offload"
     elastic_pp_hicache_allocator: A[
         str,
         Arg(

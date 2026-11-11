@@ -4,6 +4,8 @@
 
 ## 当前：减少迁移、最终暂停及推理干扰
 
+- [ ] **2026-11-11 用户新增底线：候选布局权重不能常驻 GPU。** 任务分支 `codex/pp-graph-nonresident-weights-20261111` 将预热 Graph 的稳定地址和权重物理页拆开，默认 `offload`：清理退出层的显存，重新启用时真实搬权重。验收包含物理映射账本、驱动可用显存、非零传输字节、输出与 Graph replay；首轮1012项完整CPU回归通过，容量准入修正后的33项相关检查通过；真实GPU验收仍待节点空闲。实现／CPU／GPU结论分别补录。旧约0.3秒仅为resident诊断结果。KV／GDN／Graph工作区和worker仍须单列，不能据此声称整个GPU归还。见[设计与结果](NONRESIDENT_GRAPH_WEIGHTS.md)。
+
 - [x] **主agent直接实施：**`b59993a97f28`复用启动已常驻的不可变候选权重，保留recopy对照和版本／地址检查，补齐准备与交接分项计时。1000项CPU通过；A100同版本每策略一轮，扩／缩完整迁移20.470／20.955→0.691／0.727秒，权重传输每方向减少21,871,498,496字节。暖缓存连续性、Graph replay、在线KV及最终CPU loadback和正常清理通过；尚无重复均值。见[优化记录](MIGRATION_OPTIMIZATION.md)。
 - [x] **主agent直接实施：**`ed2e82c5eda8`新增opt-in PyTorch pinned HiCache分配与启动候选预热，默认mmap保留。1008项完整CPU通过；同一A100节点两次独立启动均通过PP2↔PP3暖缓存连续性、运行时capture=0／实际replay、在线KV及CPU loadback。完整迁移扩／缩均值0.293／0.321秒，最终暂停均值246／271 ms；3进程采样pinned内存5.781 GiB，非总CPU峰值。两轮清理／正常release、127个输入哈希核对通过；仅35B／B1／native／L2 HiCache范围。见[优化记录](MIGRATION_OPTIMIZATION.md)。
 - [x] **主agent直接运行：**相同请求、缓存、Graph／NIXL及节点，原路径与完整优化各两次独立启动、每次往返，另保留同版本仅复用权重单轮。完整迁移扩／缩均值20.459／20.891→0.293／0.321秒，最终暂停634／655→246／271 ms，平均TPOT14.307／14.905→8.692／8.733 ms；各轮输出间隔、E2E和阶段原值已归档。N=2只作描述性重复，TPOT／E2E含进入目标布局更早的效果，更多负载与严格峰值仍未测。[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_migration_optimization_20261111/summary.md)。
