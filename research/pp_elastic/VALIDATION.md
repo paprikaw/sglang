@@ -1,5 +1,11 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-11：有界pinned权重暂存，CPU通过／新GPU路径待验证
+
+任务分支 `codex/pp-weight-host-pipeline-20261111`，冻结 `fcefe8604c659180075fae0d4939dec49eb603ad`／tag `experiment/sglang/pp-pinned-weight-staging-20261111-r1`。1036项完整CPU检查通过，零失败／错误／跳过，120.55秒；新增12项包含跨块、混合dtype、转置、错误元数据拒绝、目标地址保持、失败排空与完成后标记。首次测试夹具错误保留，修正后完整回归通过。
+
+同一A100节点的legacy对照通过完整暖缓存PP2↔PP3往返，控制面扩／缩19.758／20.824秒；缩容源D2H约10.007秒、CPU发送及等待10.235秒，目标H2D各1.026／0.861秒。监督含清理194.694秒，Guard清理／正常release与130个冻结输入核对通过。pinned尝试在模型启动前被其他正常前台占用阻止，保留未启动记录；没有新路径GPU正确性、带宽或提速结论。[设计与状态](WEIGHT_STAGING.md)。本轮主agent直接实施／审查，无独立reviewer，PR保持Draft。
+
 ## 2026-11-11：Graph预热与权重物理页释放分开验收
 
 冻结 `26bdee39146f103716d23749b5b08f523789a12e`，tag `experiment/sglang/pp-graph-nonresident-weights-20261111-r3`。35B BF16、A100、实际B1、native KV／HiCache／NIXL，默认offload的两次独立PP2→PP3→PP2往返通过。完整扩／缩均值19.98／20.65秒，后台权重传输19.68／20.30秒，最后暂停239／285 ms；每方向实际搬21,871,498,496字节，权重复用字节为0。当前权重为Gloo的GPU→CPU→GPU路径，NIXL用于在线KV。

@@ -7,3 +7,7 @@
 **验收。** 先检查跨块／混合dtype／转置、错误generation与布局拒绝、目标地址保持、失败排空和整层提交；再在同一A100节点按原PP2→PP3→PP2协议对照。比较完整切换、最后暂停、搬运分项及请求TPOT，检查暖缓存完整输出、Graph replay、非活跃权重页为0和实际释放显存。每轮含清理最多300秒；未拿到结果前不宣称提速。
 
 CPU缓存预算另含每worker最多256 MiB暂存；当前三worker最多768 MiB，计入原20 GiB主机池预算。没有实现长期CPU权重快照、本机共享内存绕过Gloo或权重NIXL直传；若Gloo成为瓶颈，再据分项数据选择。当前范围及结果继续更新[TODO](TODO.md)。
+
+**已取得的证据。** 冻结 `fcefe8604c65`，1036项完整CPU检查通过，120.55秒。相同源版本／A100节点的legacy对照通过暖缓存连续性、实际Graph replay、非驻留权重及正常清理；完整扩／缩19.758／20.824秒。缩容源rank1的D2H累计10.007秒，发送及等待10.235秒；两个目标rank0／2的H2D各1.026／0.861秒。前两项说明导出和中转占大头；发送／接收含对端等待，不是独立链路带宽。监督含清理194.694秒，130个冻结输入一致。
+
+**尚未完成。** 新路径首个GPU尝试因两台A100被另一正常前台实验占用，被Guard在模型启动前拒绝；后续候选保持未运行，不打断该实验。原记录保留，不能宣称新路径GPU正确或提速。[PR #10](https://github.com/paprikaw/sglang/pull/10)保持Draft，未合入共同基线。[专题报告与指标](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_pinned_weight_staging_20261111/summary.md)。
