@@ -381,7 +381,7 @@ def validate_decode_graph_states(
                         "nonresident weights were reported as resident reuse"
                     )
                 if (
-                    rank in source_ranks
+                    rank in ({0, 2} if generation == 1 else {1})
                     and metrics.get("background_weight_bytes_sent", 0) <= 0
                 ):
                     raise AssertionError(

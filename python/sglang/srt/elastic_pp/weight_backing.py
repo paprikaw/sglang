@@ -87,17 +87,21 @@ def copy_and_rebind_weight_storages(groups, storage):
     with torch.no_grad():
         for key, group in groups.items():
             device = group["source"].device
+            # Keep each original storage's extent and relative offsets. The
+            # direct transport recognizes dense transposes by full-storage size;
+            # exposing the entire packed layer would break that contract.
+            local_storage = storage[group["offset"] : group["offset"] + key[2]]
             source = torch.empty(0, dtype=torch.uint8, device=device).set_(
                 group["source"].untyped_storage(), 0, (key[2],)
             )
             target = torch.empty(0, dtype=torch.uint8, device=device).set_(
-                storage, group["offset"], source.shape
+                local_storage, 0, source.shape
             )
             target.copy_(source)
             for tensor, old_offset, shape, stride in group["views"]:
                 view = torch.empty(0, dtype=tensor.dtype, device=device).set_(
-                    storage,
-                    group["offset"] // tensor.element_size() + old_offset,
+                    local_storage,
+                    old_offset,
                     shape,
                     stride,
                 )

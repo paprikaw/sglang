@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from sglang.srt import cuda_vmm_utils as vmm
+from sglang.srt.elastic_pp.layer_transport import _transport_tensor_view
 from sglang.srt.elastic_pp.weight_backing import (
     EvictableWeightBank,
     copy_and_rebind_weight_storages,
@@ -48,6 +49,22 @@ def test_packed_weights_rebind_unregistered_strided_views_and_keep_parameters():
     assert layer.aliases["tuple"][0][1, 0].item() == 77
     assert layer.scale.dtype == torch.float64
     assert layer.scale.tolist() == [2, 3]
+
+
+def test_rebound_dense_transpose_remains_a_valid_direct_transport_destination():
+    layer = nn.Module()
+    layer.weight = nn.Parameter(torch.arange(12, dtype=torch.float32).reshape(3, 4).t())
+    layer.bias = nn.Parameter(torch.ones(3))
+    expected = layer.weight.detach().clone()
+    groups, size = weight_storage_plan(layer, device_type="cpu")
+    storage = torch.empty(size, dtype=torch.uint8).untyped_storage()
+    copy_and_rebind_weight_storages(groups, storage)
+    flat, layout = _transport_tensor_view(layer.weight, copy_noncontiguous=False)
+    assert flat.numel() == 12 and layout is not None
+    assert layer.weight.untyped_storage().nbytes() == 48
+    assert layer.bias.untyped_storage().nbytes() == 12
+    assert layout == ((4, 3), (1, 4), 0)
+    torch.testing.assert_close(layer.weight, expected)
 
 
 def test_vmm_eviction_keeps_virtual_address_and_retries_driver_failure(monkeypatch):

@@ -302,6 +302,13 @@ class PreparedDecodeGraphBank:
             result["weight_backing"] = self.weight_backing.metrics(
                 set(range(model.start_layer, model.end_layer))
             )
+            device = self.model_runner.device
+            result["cuda_memory"] = dict(
+                driver_free_bytes=torch.cuda.mem_get_info(device)[0],
+                torch_allocated_bytes=torch.cuda.memory_allocated(device),
+                torch_reserved_bytes=torch.cuda.memory_reserved(device),
+                scope="VMM physical weights are outside the PyTorch allocator counters",
+            )
         if self.torch_host_allocator:
             stats = torch.cuda.memory.host_memory_stats()
             result["pinned_allocator"] = {
