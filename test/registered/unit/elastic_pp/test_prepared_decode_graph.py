@@ -217,6 +217,47 @@ def test_nonresident_cleanup_and_abort_release_only_incoming_weights(monkeypatch
     assert calls == [("evict", {0}), ("map", 0), ("evict", {0})]
 
 
+def test_failed_cached_weight_allocation_keeps_native_loader_for_retry(monkeypatch):
+    model = Model()
+    model.retain_elastic_pp_graph_layers()
+    original = model.layers[0]
+    original.weight.weight_loader = original.forward
+    loader = original.weight.weight_loader
+    model.prepare_elastic_pp_layers(
+        target=LayerRange(1, 2),
+        generation=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    model.commit_elastic_pp_layers(1)
+    model.take_elastic_pp_cleanup_layers(1)
+
+    def fail(*args):
+        raise RuntimeError("injected target mapping failure")
+
+    model._elastic_pp_weight_backing = NS(prepare=fail, evict=lambda ids: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    with pytest.raises(RuntimeError, match="mapping failure"):
+        model.prepare_elastic_pp_layers(
+            target=LayerRange(0, 2),
+            generation=2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+    assert original.weight.weight_loader is loader
+    assert isinstance(model.layers[0], PPMissingLayer)
+    model._elastic_pp_weight_backing.prepare = lambda *args: None
+    model.prepare_elastic_pp_layers(
+        target=LayerRange(0, 2),
+        generation=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert model.layers[0] is original
+    assert model.layers[0].weight.weight_loader is loader
+    model.abort_elastic_pp_layers(2)
+
+
 def test_fixed_output_frontier_drops_spare_heads_without_touching_decoder_weights():
     class Wrapper(ElasticPPModelWrapperMixin, nn.Module):
         def __init__(self):

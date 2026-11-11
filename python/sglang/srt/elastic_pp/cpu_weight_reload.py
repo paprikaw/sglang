@@ -63,6 +63,7 @@ class CanonicalCpuWeightReloader:
             cache_key_matches_initial_load=False,
             checkpoint_bytes=0,
             checkpoint_tensors=0,
+            postprocess_modules=0,
             target_weight_bytes=0,
             layers_loaded=[],
             cache_open_seconds=0.0,
@@ -176,6 +177,24 @@ class CanonicalCpuWeightReloader:
                     try:
                         with torch.no_grad(), context:
                             loaded = self.model.load_weights(weights())
+                            if (
+                                seen != expected.keys()
+                                or not parameters.keys() <= loaded
+                            ):
+                                raise RuntimeError(
+                                    "canonical CPU reload did not cover all target weights"
+                                )
+                            # Match ordinary loading, including optional
+                            # in-place BF16 SwiGLU interleaving. Reprocess only
+                            # incoming layers; active weights must not change.
+                            for name, module in self.model.named_modules():
+                                method = getattr(module, "quant_method", None)
+                                if (
+                                    get_layer_id(name + ".") in layer_ids
+                                    and method is not None
+                                ):
+                                    method.process_weights_after_loading(module)
+                                    self.metrics["postprocess_modules"] += 1
                     finally:
                         # Drain before closing mappings or releasing the bank,
                         # including partial-copy failures. Never mark ready on
@@ -184,10 +203,6 @@ class CanonicalCpuWeightReloader:
                     self.metrics["checkpoint_load_seconds"] += (
                         time.monotonic() - started
                     )
-                    if seen != expected.keys() or not parameters.keys() <= loaded:
-                        raise RuntimeError(
-                            "canonical CPU reload did not cover all target weights"
-                        )
                     current_parameters = {
                         name: param
                         for name, param in self.model.named_parameters(

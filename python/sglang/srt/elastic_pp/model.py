@@ -183,7 +183,13 @@ class ElasticPPModelMixin:
             backing = getattr(self, "_elastic_pp_weight_backing", None)
             if backing is not None:
                 backing.evict(created.keys())
-            self._release_elastic_layer_loader_refs(created.values())
+            # Captured layers intentionally remain alive in the Graph bank.
+            # Keep their checkpoint loaders so a later CPU-cache restore can
+            # retry without replacing addresses after a mapping failure.
+            cache = getattr(self, "_elastic_graph_layers", {})
+            self._release_elastic_layer_loader_refs(
+                layer for layer_id, layer in created.items() if layer_id not in cache
+            )
             with self._elastic_layer_lock:
                 remove_ids = self._elastic_layer_residency.abort(generation)
                 for layer_id in remove_ids:

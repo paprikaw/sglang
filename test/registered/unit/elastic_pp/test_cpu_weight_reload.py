@@ -215,6 +215,44 @@ def test_existing_initial_bank_contract_is_required(bank, monkeypatch):
     assert not bank.events
 
 
+@pytest.mark.parametrize("replace_storage", [False, True])
+def test_only_target_native_postprocessing_runs_before_readiness(bank, replace_storage):
+    calls = []
+
+    def active_postprocess(layer):
+        pytest.fail("must not reprocess active source weights")
+
+    def target_postprocess(layer):
+        calls.append("target")
+        assert not bank.model.marked
+        if replace_storage:
+            layer.weight = nn.Parameter(layer.weight.clone())
+        else:
+            layer.weight.copy_(layer.weight.flip(0))
+
+    bank.model.model.layers[0].quant_method = NS(
+        process_weights_after_loading=active_postprocess
+    )
+    bank.model.model.layers[1].quant_method = NS(
+        process_weights_after_loading=target_postprocess
+    )
+    if replace_storage:
+        with pytest.raises(RuntimeError, match="changed prepared Graph"):
+            bank.reloader.reload(generation=1, layer_ids={1})
+        assert not bank.model.marked
+    else:
+        bank.reloader.reload(generation=1, layer_ids={1})
+        expected = torch.cat(
+            [
+                bank.model.checkpoint["model.layers.1.q_proj.weight"],
+                bank.model.checkpoint["model.layers.1.k_proj.weight"],
+            ]
+        ).flip(0)
+        assert torch.equal(bank.model.model.layers[1].weight, expected)
+        assert bank.reloader.metrics["postprocess_modules"] == 1
+    assert calls == ["target"]
+
+
 def test_cpu_cache_coordinator_only_loads_receiver_and_never_exports_or_sends(bank):
     source = PPTopology.from_layer_counts((2, 0), generation=0)
     target = PPTopology.from_layer_counts((1, 1), generation=1)
