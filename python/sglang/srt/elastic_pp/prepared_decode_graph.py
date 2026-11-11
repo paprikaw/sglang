@@ -30,6 +30,10 @@ _BACKEND_FIELDS = (
 
 def validate_graph_partitions(args, initial):
     partitions = parse_elastic_pp_partitions(args.elastic_pp_graph_partitions)
+    if getattr(args, "elastic_pp_hicache_allocator", "mmap") == "pytorch" and (
+        not args.enable_hierarchical_cache or args.hicache_storage_backend is not None
+    ):
+        raise ValueError("elastic pinned allocator requires L2-only HiCache enabled")
     if len(partitions) > 4:
         raise ValueError("prepared Decode Graph supports at most four partitions")
     if args.disable_cuda_graph:
@@ -120,6 +124,7 @@ class PreparedDecodeRunner:
     bindings: dict
     signature: tuple
     capture_seconds: float
+    weight_bindings: dict
 
 
 class PreparedDecodeGraphBank:
@@ -131,6 +136,58 @@ class PreparedDecodeGraphBank:
         self.startup_seconds = None
         self.startup_allocated_delta_bytes = None
         self.runtime_selections = 0
+        self.resident_weights = {}
+        self.host_allocator_warmups = []
+        self.torch_host_allocator = (
+            getattr(
+                getattr(mr, "server_args", None), "elastic_pp_hicache_allocator", "mmap"
+            )
+            == "pytorch"
+        )
+
+    @staticmethod
+    def _weight_identity(tensor):
+        # Inference tensors have no version counter. Public weight updates are
+        # rejected for this immutable bank; normal tensors additionally detect
+        # accidental in-place writes without reading or hashing GPU contents.
+        try:
+            version = tensor._version
+        except RuntimeError:
+            version = None
+        return binding_signature({"tensor": tensor}), version
+
+    def reuse_weights(self, mr, transition):
+        """Validate resident target weights before declaring new layers loaded.
+
+        Startup must still transfer every layer normally. Runtime never writes
+        cached parameters: a different address or version invalidates the bank.
+        """
+        if self.building:
+            raise RuntimeError("prepared weights cannot be reused before sealing")
+        self.check_topology(transition.target)
+        target = transition.target.layer_range(self.rank)
+        states = mr.export_elastic_pp_layer_state(range(target.start, target.end))
+        for layer_id, values in states.items():
+            expected = self.resident_weights.get(layer_id)
+            if expected is None or set(values) != set(expected):
+                raise RuntimeError("prepared weight state is missing or changed")
+            if any(
+                self._weight_identity(tensor) != expected[name]
+                for name, tensor in values.items()
+            ):
+                raise RuntimeError("prepared weight storage or version changed")
+        source = transition.source.layer_range(self.rank)
+        incoming = set(range(target.start, target.end)) - set(
+            range(source.start, source.end)
+        )
+        mr.mark_elastic_pp_layers_loaded(
+            generation=transition.target.generation, layer_ids=incoming
+        )
+        return sum(
+            t.numel() * t.element_size()
+            for layer_id in incoming
+            for t in states[layer_id].values()
+        )
 
     @staticmethod
     def key(mr):
@@ -162,6 +219,11 @@ class PreparedDecodeGraphBank:
             bindings=bindings,
             signature=binding_signature(bindings),
             capture_seconds=capture_seconds,
+            weight_bindings={
+                name: tensor
+                for name, tensor in mr.model.state_dict().items()
+                if re.search(r"(?:^|\.)layers\.\d+\.", name)
+            },
         )
 
     def suspend(self, mr):
@@ -199,10 +261,20 @@ class PreparedDecodeGraphBank:
         }
         if set(self.entries) != expected:
             raise RuntimeError("startup did not capture every declared local interval")
+        # Snapshot after the complete startup walk: loading the same immutable
+        # layer during that walk can increment its version counter.
+        for bundle in self.entries.values():
+            for name, tensor in bundle.weight_bindings.items():
+                match = re.search(r"(?:^|\.)layers\.(\d+)\.(.*)", name)
+                if match:
+                    layer_id, state_name = int(match[1]), match[2]
+                    self.resident_weights.setdefault(layer_id, {})[state_name] = (
+                        self._weight_identity(tensor)
+                    )
         self.building = False
 
     def metrics(self):
-        return dict(
+        result = dict(
             sealed=not self.building,
             local_intervals=[list(key) for key in self.entries],
             startup_runner_captures=len(self.entries),
@@ -213,7 +285,20 @@ class PreparedDecodeGraphBank:
             startup_allocated_delta_bytes=self.startup_allocated_delta_bytes,
             runtime_captures=0,
             runtime_selections=self.runtime_selections,
+            host_allocator_warmups=self.host_allocator_warmups,
         )
+        if self.torch_host_allocator:
+            stats = torch.cuda.memory.host_memory_stats()
+            result["pinned_allocator"] = {
+                key: stats[key]
+                for key in (
+                    "allocated_bytes.current",
+                    "active_bytes.current",
+                    "num_host_alloc",
+                    "num_host_free",
+                )
+            }
+        return result
 
 
 def init_prepared_graph_bank(mr):
@@ -316,6 +401,15 @@ def prewarm_scheduler_graph_bank(scheduler):
             state = coordinator.wait_for_phase({Phase.DONE, Phase.FAILED}, timeout=120)
             if state.phase == Phase.FAILED:
                 raise RuntimeError(f"startup Graph cleanup failed: {state.error}")
+            if (
+                getattr(mr.server_args, "elastic_pp_hicache_allocator", "mmap")
+                == "pytorch"
+            ):
+                from sglang.srt.elastic_pp.hicache_transition import (
+                    prewarm_host_allocator,
+                )
+
+                bank.host_allocator_warmups.append(prewarm_host_allocator(scheduler))
     _reset_startup_residency(mr)
     # Private preparation generations were never advertised to a client. The
     # normal route installer must retain its monotonic serving-generation gate.

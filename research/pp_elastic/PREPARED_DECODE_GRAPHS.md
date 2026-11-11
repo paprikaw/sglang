@@ -1,5 +1,7 @@
 # 启动时准备 Graph，运行时切换
 
+**2026-11-11追加优化。** 候选库完成后，运行时默认复用已经验证的不可变权重，避免再次传输；仅限预捕获库，在线权重更新被拒绝。需要对照时使用 `--elastic-pp-prepared-weight-policy recopy`。L2 HiCache另可显式启用 `--elastic-pp-hicache-allocator pytorch`，在启动时预热候选的CPU页锁定分配。35B／B1／A100两个独立往返的完整迁移扩／缩均值0.293／0.321秒，最终暂停246／271 ms；运行时capture=0，Graph选择约2–3 ms。原始样本、常驻内存与范围见[迁移优化记录](MIGRATION_OPTIMIZATION.md)，不能把选择Graph耗时当作完整切换耗时。下文原结果保留其冻结版本。
+
 **已测结果。** 冻结 `c5aa853480`，A100 native／HiCache／NIXL、实际B1的PP2→PP3→PP2通过同版本暖缓存连续性检查。运行时capture=0、目标确有replay，Graph选择1.733–2.596 ms；完整fence扩／缩0.604／0.688秒，初始Graph后候选准备约3.9秒。额外常驻allocated合计21.513 GiB，其中新增阶段20.816 GiB。完整监督178.903秒内完成并验证清理／正常release，尚无配对性能收益或工作GPU归还结论。[报告与绝对指标](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_prepared_decode_graph_20261111/summary.md)。
 
 **做什么。** 在接收请求前走一遍声明的 PP 布局，预热并捕获各布局的原生 Decode Graph，再回到初始布局。运行时沿用 NIXL 持续 KV 追补和最终交接，选择已准备的 Graph；不在交接时重新捕获。HiCache 开启，候选 worker 和端点常驻。代码与 GPU 验收分开记录在 [TODO](TODO.md)。

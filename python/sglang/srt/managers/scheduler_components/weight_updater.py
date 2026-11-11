@@ -109,6 +109,15 @@ class SchedulerWeightUpdaterManager:
             assert flush_cache_success, "Cache flush failed after updating weights"
 
     def _cpu_weight_cache_online_update_error(self) -> Optional[str]:
+        if getattr(
+            getattr(self.tp_worker.model_runner, "server_args", None),
+            "elastic_pp_graph_partitions",
+            None,
+        ):
+            return (
+                "Online weight updates are disabled for startup-prepared elastic PP "
+                "Graphs: every resident candidate shares an immutable weight version."
+            )
         model = self.tp_worker.model_runner.model
         if hasattr(model, "_cpu_weight_cache_identity"):
             return (
@@ -275,7 +284,9 @@ class SchedulerWeightUpdaterManager:
             if hasattr(model, "_cpu_weight_cache_identity"):
                 from sglang.srt.weight_cache.cpu_loader import publish_model
 
-                cache = self.scheduler.tree_cache if self.scheduler is not None else None
+                cache = (
+                    self.scheduler.tree_cache if self.scheduler is not None else None
+                )
                 if (
                     cache is not None
                     and getattr(cache, "host_pool_group", None) is not None

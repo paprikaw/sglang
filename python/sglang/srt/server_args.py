@@ -1104,6 +1104,22 @@ class ServerArgs:
         "Finite semicolon-separated PP partitions to capture before serving and select without runtime capture; retains native weights/KV/GDN and Graph workspaces.",
         NS("parallel"),
     ] = None
+    elastic_pp_prepared_weight_policy: A[
+        str,
+        Arg(
+            help="Reuse immutable startup-prepared weights, or recopy for controlled comparison.",
+            choices=["reuse", "recopy"],
+        ),
+        NS("parallel"),
+    ] = "reuse"
+    elastic_pp_hicache_allocator: A[
+        str,
+        Arg(
+            help="L2 HiCache backing: registered mmap, or startup-warmed PyTorch pinned blocks for prepared elastic PP Graphs.",
+            choices=["mmap", "pytorch"],
+        ),
+        NS("parallel"),
+    ] = "mmap"
     elastic_pp_kv_backend: A[
         str,
         Arg(

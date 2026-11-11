@@ -2,6 +2,12 @@
 
 更新：2026-11-11。本页是本项目的统一进度入口；任务完成后更新这里，不另外维护相互冲突的清单。勾选表示该条写明的范围已有证据，并不表示全部功能已验证。
 
+## 当前：减少迁移、最终暂停及推理干扰
+
+- [x] **主agent直接实施：**`b59993a97f28`复用启动已常驻的不可变候选权重，保留recopy对照和版本／地址检查，补齐准备与交接分项计时。1000项CPU通过；A100同版本每策略一轮，扩／缩完整迁移20.470／20.955→0.691／0.727秒，权重传输每方向减少21,871,498,496字节。暖缓存连续性、Graph replay、在线KV及最终CPU loadback和正常清理通过；尚无重复均值。见[优化记录](MIGRATION_OPTIMIZATION.md)。
+- [x] **主agent直接实施：**`ed2e82c5eda8`新增opt-in PyTorch pinned HiCache分配与启动候选预热，默认mmap保留。1008项完整CPU通过；同一A100节点两次独立启动均通过PP2↔PP3暖缓存连续性、运行时capture=0／实际replay、在线KV及CPU loadback。完整迁移扩／缩均值0.293／0.321秒，最终暂停均值246／271 ms；3进程采样pinned内存5.781 GiB，非总CPU峰值。两轮清理／正常release、127个输入哈希核对通过；仅35B／B1／native／L2 HiCache范围。见[优化记录](MIGRATION_OPTIMIZATION.md)。
+- [x] **主agent直接运行：**相同请求、缓存、Graph／NIXL及节点，原路径与完整优化各两次独立启动、每次往返，另保留同版本仅复用权重单轮。完整迁移扩／缩均值20.459／20.891→0.293／0.321秒，最终暂停634／655→246／271 ms，平均TPOT14.307／14.905→8.692／8.733 ms；各轮输出间隔、E2E和阶段原值已归档。N=2只作描述性重复，TPOT／E2E含进入目标布局更早的效果，更多负载与严格峰值仍未测。[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_migration_optimization_20261111/summary.md)。
+
 **当前决定。** 保留已完成有限正确性及单次 overhead 观测的同步基线；下一阶段联合研究稳定地址的 KV 池扩缩、有限 CUDA Graph 预捕获与持续 KV patch，目标是减少推理干扰。2026-11-09 已完成独立调研；用户随后要求本轮由主 agent 自己实施，不启动 sub-agent。实施前先固定共同源码、兼容依赖、层分组和状态地址约束；主协调器维护项目分支与本页。当前实现与本次验收汇总见[基线状态](BASELINE_ACCEPTANCE_20261109.md)。
 
 ## 本轮实施：主 agent 顺序完成

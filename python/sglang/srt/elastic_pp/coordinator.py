@@ -143,6 +143,19 @@ class ElasticPPMigrationCoordinator:
         self._kv_prepared = False
         self._drain_consensus_tensor: torch.Tensor | None = None
         self._drain_consensus_work: Any = None
+        self._stage_seconds: dict[str, float] = {}
+        self._prepared_weight_bytes_reused = 0
+        self._weights_reused = False
+
+    def _timed(self, name, action, *args, **kwargs):
+        started = time.monotonic()
+        try:
+            return action(*args, **kwargs)
+        finally:
+            with self._condition:
+                self._stage_seconds[name] = self._stage_seconds.get(name, 0.0) + (
+                    time.monotonic() - started
+                )
 
     @property
     def phase(self) -> ElasticPPMigrationPhase:
@@ -234,6 +247,9 @@ class ElasticPPMigrationCoordinator:
             self._observed_cuda_allocated_peak = 0
             self._source_backing_attempted = False
             self._source_backing_metrics = {}
+            self._stage_seconds = {}
+            self._prepared_weight_bytes_reused = 0
+            self._weights_reused = False
             self._drain_consensus_tensor = None
             self._drain_consensus_work = None
             if self.enable_kv_patch:
@@ -278,7 +294,9 @@ class ElasticPPMigrationCoordinator:
             "error": error,
             "details": details,
         }
-        reports = self.group.all_gather_object(report)
+        reports = self._timed(
+            f"consensus.{stage}", self.group.all_gather_object, report
+        )
         if len(reports) != self.group.world_size:
             raise RuntimeError(
                 "elastic PP consensus returned the wrong rank count: "
@@ -437,6 +455,9 @@ class ElasticPPMigrationCoordinator:
             "fence_seconds": snapshot.fence_seconds,
             "total_seconds": snapshot.total_seconds,
             "background_weight_bytes_sent": self._background_weight_bytes_sent,
+            "prepared_weight_bytes_reused": self._prepared_weight_bytes_reused,
+            "stage_seconds": dict(self._stage_seconds),
+            "stage_timing_scope": "rank-local wall time; nested stages and parallel ranks must not be summed",
             "observed_cuda_allocated_peak_bytes": self._observed_cuda_allocated_peak,
             "peak_scope": "sampled at prepare/copy/commit; not allocator peak proof",
             "gpu_released": False,
@@ -483,9 +504,24 @@ class ElasticPPMigrationCoordinator:
     def _prepare_backing(self, transition: DynamicPPTransition) -> None:
         """Shared target allocation; sync policies call only after draining."""
         self._layer_prepared = True
-        self.layer_transport.prepare_target(transition)
+        self._timed("prepare_layers", self.layer_transport.prepare_target, transition)
+        bank = getattr(self.model_runner, "_elastic_pp_prepared_graphs", None)
+        policy = getattr(
+            getattr(self.model_runner, "server_args", None),
+            "elastic_pp_prepared_weight_policy",
+            "reuse",
+        )
+        if bank is not None and not bank.building and policy == "reuse":
+            self._prepared_weight_bytes_reused = self._timed(
+                "reuse_prepared_weights",
+                bank.reuse_weights,
+                self.model_runner,
+                transition,
+            )
+            self._weights_reused = True
+            self._layers_precopied = True
         self._kv_prepared = True
-        self.kv_transport.prepare_transition(transition)
+        self._timed("prepare_kv", self.kv_transport.prepare_transition, transition)
         if self._source_backing_attempted:
             self._source_backing_metrics["target_restore"] = (
                 self.kv_transport.restore_target_from_snapshot(transition)
@@ -538,7 +574,7 @@ class ElasticPPMigrationCoordinator:
             self.kv_transport.release_source_backing(transition)
         )
         if device.type == "cuda":
-            torch.cuda.synchronize(device)
+            self._timed("fence_device_drain", torch.cuda.synchronize, device)
             with torch.cuda.device(device):
                 # Admission uses physical free bytes. Return unused allocator
                 # blocks before that measurement, after tensor owners detach.
@@ -619,7 +655,7 @@ class ElasticPPMigrationCoordinator:
                     self.kv_transport.check_live_patch()
                 if self.strategy in {"background", "legacy"}:
                     if self.strategy == "background":
-                        self._preflight_capacity(transition)
+                        self._timed("capacity", self._preflight_capacity, transition)
                     self._prepare_backing(transition)
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
@@ -633,14 +669,25 @@ class ElasticPPMigrationCoordinator:
                 "prepare_allocations",
                 success=local_error is None,
                 error=local_error,
+                details={"reuse_weights": self._weights_reused},
             )
             self._raise_peer_failures("prepare allocations", reports)
+            if any(
+                r.get("details") != {"reuse_weights": self._weights_reused}
+                for r in reports
+            ):
+                raise RuntimeError("prepared weight policy differs across ranks")
             # Never enter P2P pre-copy before all peers have allocated backing:
             # a peer allocation failure must not strand a sender/receiver.
             if self.strategy == "background":
                 local_error = None
                 try:
-                    self._precopy_immutable_weights(transition)
+                    if not self._weights_reused:
+                        self._timed(
+                            "precopy_weights",
+                            self._precopy_immutable_weights,
+                            transition,
+                        )
                     self._layers_precopied = True
                 except BaseException as exc:
                     local_error = f"{type(exc).__name__}: {exc}"
@@ -727,11 +774,19 @@ class ElasticPPMigrationCoordinator:
                 device = torch.device(getattr(self.model_runner, "device", "cpu"))
                 if device.type == "cuda":
                     # Dedicated transfer streams must observe all serving producers.
-                    torch.cuda.synchronize(device)
+                    self._timed("fence_device_drain", torch.cuda.synchronize, device)
                 if self.cache_transition is not None:
-                    self.cache_transition.prepare_transition(transition)
+                    self._timed(
+                        "fence_host_snapshot",
+                        self.cache_transition.prepare_transition,
+                        transition,
+                    )
                 if self.enable_kv_patch:
-                    self.kv_transport.finish_live_patch(transition)
+                    self._timed(
+                        "fence_patch_finish",
+                        self.kv_transport.finish_live_patch,
+                        transition,
+                    )
                 if self.strategy in {"sync", "batched"}:
                     snapshot = getattr(self.kv_transport, "snapshot_at_fence", None)
                     if snapshot is not None:
@@ -852,7 +907,9 @@ class ElasticPPMigrationCoordinator:
                         transition.target.generation,
                         self.rank,
                     )
-                    self.kv_transport.exchange_phase(
+                    self._timed(
+                        "fence_kv_bulk",
+                        self.kv_transport.exchange_phase,
                         transition,
                         phase="bulk",
                         slot_ids=fence_slots,
@@ -874,7 +931,9 @@ class ElasticPPMigrationCoordinator:
                     transition.target.generation,
                     self.rank,
                 )
-                self.kv_transport.exchange_phase(
+                self._timed(
+                    "fence_kv_delta",
+                    self.kv_transport.exchange_phase,
                     transition,
                     phase="delta",
                     slot_ids=fence_slots[:0],
@@ -884,7 +943,9 @@ class ElasticPPMigrationCoordinator:
                     transition.target.generation,
                     self.rank,
                 )
-                self.kv_transport.apply_staged(transition)
+                self._timed(
+                    "fence_kv_apply", self.kv_transport.apply_staged, transition
+                )
                 logger.info(
                     "Elastic PP generation=%d rank=%d KV/GDN import complete",
                     transition.target.generation,
@@ -896,13 +957,21 @@ class ElasticPPMigrationCoordinator:
                         transition.target.generation,
                         self.rank,
                     )
-                    self.cache_transition.exchange_at_fence(transition)
+                    self._timed(
+                        "fence_host_exchange",
+                        self.cache_transition.exchange_at_fence,
+                        transition,
+                    )
                     logger.info(
                         "Elastic PP generation=%d rank=%d HiCache host exchange complete; host preparation/import begin",
                         transition.target.generation,
                         self.rank,
                     )
-                    self.cache_transition.apply_staged(transition)
+                    self._timed(
+                        "fence_host_apply",
+                        self.cache_transition.apply_staged,
+                        transition,
+                    )
                     logger.info(
                         "Elastic PP generation=%d rank=%d HiCache host preparation/import complete",
                         transition.target.generation,
@@ -933,14 +1002,18 @@ class ElasticPPMigrationCoordinator:
             local_error = None
             try:
                 commit_started = True
-                self.model_runner.commit_elastic_pp_generation(
-                    generation=transition.target.generation
+                self._timed(
+                    "fence_model_commit",
+                    self.model_runner.commit_elastic_pp_generation,
+                    generation=transition.target.generation,
                 )
                 if self.cache_transition is not None:
-                    self.cache_transition.commit(transition)
+                    self._timed(
+                        "fence_host_commit", self.cache_transition.commit, transition
+                    )
                 # From this point onward the local source generation cannot be
                 # restored, even if route publication or peer commit fails.
-                commit_topology(transition.target)
+                self._timed("fence_route_publish", commit_topology, transition.target)
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
             reports = self._consensus(
@@ -959,7 +1032,9 @@ class ElasticPPMigrationCoordinator:
                     self.model_runner, "rebuild_elastic_pp_decode_graph", None
                 )
                 if rebuild is not None:
-                    rebuild(
+                    self._timed(
+                        "fence_graph_select",
+                        rebuild,
                         generation=transition.target.generation,
                         active=not transition.target.layer_range(self.rank).empty,
                     )
