@@ -1,5 +1,7 @@
 """Graph generation safety and drained recapture without importing GPU kernels."""
 
+import sys
+from contextlib import contextmanager
 from types import SimpleNamespace as NS
 
 import pytest
@@ -7,6 +9,7 @@ import torch
 from sglang.srt.elastic_pp.decode_graph import (
     ElasticPPDecodeGraphState,
     rebuild_decode_graph,
+    retire_decode_graph,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -101,6 +104,59 @@ def test_same_partition_new_generation_is_recaptured_not_reused():
     assert r.captures == 2
     with pytest.raises(RuntimeError, match="generation must increase"):
         rebuild_decode_graph(r, generation=2, active=True)
+
+
+@pytest.mark.parametrize("has_graph", [True, False])
+def test_retirement_releases_backend_and_forgets_nonowning_pool_ids(
+    monkeypatch, has_graph
+):
+    events = []
+
+    @contextmanager
+    def capture_scope():
+        events.append("drain_borrow_arena")
+        yield
+        events.append("leave_scope")
+
+    def reset_pool(value):
+        assert value is None
+        events.append("reset_pool")
+
+    def reset_allocator(value):
+        assert value is None
+        events.append("reset_allocator")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.model_executor.runner_utils.pool",
+        NS(
+            graph_pool_capture_scope=capture_scope,
+            set_global_graph_memory_pool=reset_pool,
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.distributed.device_communicators.pynccl_allocator",
+        NS(set_graph_pool_id=reset_allocator),
+    )
+    state = ElasticPPDecodeGraphState()
+    state.begin(0).update(status="ready")
+    r = NS(
+        decode_cuda_graph_runner=(
+            NS(backend=NS(cleanup=lambda: events.append("release_graphs")))
+            if has_graph
+            else None
+        ),
+        prefill_cuda_graph_runner=None,
+        _elastic_pp_decode_graph_state=state,
+    )
+    retire_decode_graph(r)
+    assert events == ["drain_borrow_arena"] + (
+        ["release_graphs"] if has_graph else []
+    ) + ["reset_pool", "reset_allocator", "leave_scope"]
+    assert r.decode_cuda_graph_runner is None
+    assert r.prefill_cuda_graph_runner is None
+    assert state.snapshot()[-1]["status"] == "retired"
 
 
 @pytest.mark.parametrize("rank,expected", [(0, True), (1, False), (2, True)])

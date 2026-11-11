@@ -44,6 +44,38 @@ class ElasticPPDecodeGraphState:
         return [dict(entry) for entry in self.history]
 
 
+def retire_decode_graph(model_runner):
+    """Retire all captures at the drained boundary, including their pool ID.
+
+    A process-wide pool handle is not an owning reference in PyTorch. Once
+    the last graph releases a pool, sharing its cached ID can hit the
+    allocator's use_count assertion even if some output tensors remain live.
+    Elastic PP gates prefill/speculative/compile graphs, so no other capture
+    in this process is allowed to keep using the shared pool.
+    """
+    from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+        set_graph_pool_id,
+    )
+    from sglang.srt.model_executor.runner_utils.pool import (
+        graph_pool_capture_scope,
+        set_global_graph_memory_pool,
+    )
+
+    # The scope drains any borrow arena before its backing graph is retired.
+    with graph_pool_capture_scope():
+        for name in ("decode_cuda_graph_runner", "prefill_cuda_graph_runner"):
+            runner = getattr(model_runner, name, None)
+            backend = getattr(runner, "backend", None)
+            if backend is not None:
+                backend.cleanup()
+            setattr(model_runner, name, None)
+        set_global_graph_memory_pool(None)
+        set_graph_pool_id(None)
+    state = getattr(model_runner, "_elastic_pp_decode_graph_state", None)
+    if state is not None:
+        state.invalidate()
+
+
 def rebuild_decode_graph(model_runner, *, generation, active):
     """Called on the scheduler thread, after the global commit consensus.
 

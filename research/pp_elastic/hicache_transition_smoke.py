@@ -1266,6 +1266,8 @@ def prepare(args):
                 "python/sglang/srt/elastic_pp/coordinator.py",
                 "python/sglang/srt/model_executor/model_runner.py",
                 "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py",
+                "python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py",
+                "python/sglang/srt/model_executor/runner_utils/pool.py",
                 "python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py",
             )
         ]

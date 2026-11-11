@@ -1394,11 +1394,9 @@ class ModelRunner:
         # Captured graphs retain both the old layer path and parameter pointers.
         # The coordinator rebuilds Decode Graph only after all target weights,
         # KV/GDN, HiCache and logical routes have committed on every rank.
-        self.decode_cuda_graph_runner = None
-        self.prefill_cuda_graph_runner = None
-        state = getattr(self, "_elastic_pp_decode_graph_state", None)
-        if state is not None:
-            state.invalidate()
+        from sglang.srt.elastic_pp.decode_graph import retire_decode_graph
+
+        retire_decode_graph(self)
         return target
 
     def cleanup_elastic_pp_layers(
