@@ -1,5 +1,7 @@
 # 启动时准备 Graph，运行时切换
 
+**已测结果。** 冻结 `c5aa853480`，A100 native／HiCache／NIXL、实际B1的PP2→PP3→PP2通过同版本暖缓存连续性检查。运行时capture=0、目标确有replay，Graph选择1.733–2.596 ms；完整fence扩／缩0.604／0.688秒，初始Graph后候选准备约3.9秒。额外常驻allocated合计21.513 GiB，其中新增阶段20.816 GiB。完整监督178.903秒内完成并验证清理／正常release，尚无配对性能收益或工作GPU归还结论。[报告与绝对指标](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_prepared_decode_graph_20261111/summary.md)。
+
 **做什么。** 在接收请求前走一遍声明的 PP 布局，预热并捕获各布局的原生 Decode Graph，再回到初始布局。运行时沿用 NIXL 持续 KV 追补和最终交接，选择已准备的 Graph；不在交接时重新捕获。HiCache 开启，候选 worker 和端点常驻。代码与 GPU 验收分开记录在 [TODO](TODO.md)。
 
 **怎样保持有效。** 每个本地层区间保留自己的 attention backend、Graph 和工作区；按全局层号保留权重、KV 和 GDN 的内存。退役只移除当前执行关系，不释放 Graph 仍引用的存储。下一次回来时覆盖迁入的活跃状态、同步保留层的 GDN，不能使用缓存中的旧数值。提交后核对权重、KV／GDN、请求表和 Graph 输入的地址、形状及步幅；不一致就停止切换，不偷偷重新捕获或改用 eager。启动内部转换不发布给请求，完成后公开代数仍从 0 开始。

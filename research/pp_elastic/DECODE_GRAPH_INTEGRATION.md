@@ -1,6 +1,6 @@
 # 持续 KV 迁移中的 Decode CUDA Graph
 
-2026-11-11 更新：已开始实现可选的[启动预捕获与运行时选择](PREPARED_DECODE_GRAPHS.md)，通过声明有限候选布局并保留原生存储来复用 Graph；本页后文保留已验证的交接时重建基线。新路径的实际验收以 TODO／VALIDATION 为准，不能将下面的旧结果当作新路径通过。
+2026-11-11 更新：可选的[启动预捕获与运行时选择](PREPARED_DECODE_GRAPHS.md)已通过A100 native／HiCache／NIXL的B1往返检查：运行时capture=0，Graph选择1.733–2.596 ms，完整最终交接0.604／0.688秒。当前版本暖缓存输出连续性通过，额外常驻allocated内存合计21.513 GiB；见[本轮报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_prepared_decode_graph_20261111/summary.md)。本页后文保留交接时重建的旧基线及当时的建议，不能将旧、新结果混成配对性能实验。
 
 2026-11-11。用户要求先接通 Graph，worker 常驻暂不处理。本轮由主 agent 实施，接在 [NIXL 基线](NIXL_KV_TRANSFER_DESIGN.md) 上，进度统一记录在 [TODO](TODO.md)。
 

@@ -1,5 +1,15 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-11：启动预捕获与运行时选择
+
+冻结 `c5aa853480`（完整提交见[manifest](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_prepared_decode_graph_20261111/manifest.json)），annotated tag `experiment/sglang/pp-prepared-decode-graph-20261111-r2`。35B BF16、三张常驻A100、TP1／EP1、native／HiCache／NIXL background＋overlap，20/0/20→13/13/14→20/0/20。每方向B1、513输入／2048输出、公共暖边界512 token、64-token页，完整输出IDs与当前版本同进程暖缓存参考一致；无retraction／重新Prefill，最终CPU前缀实际loadback。当前类为 `same_process_warm_execution_continuity`，不复用已变更生产源码的旧独立审查，不授予冷暖生成等价；观测到cold／warm输出仍不同。
+
+启动时rank0／1／2分别捕获2／1／2套本地区间，档位1／2／4。服务后capture=0；扩容每阶段实际replay1028次，缩回后两个保留阶段各1090次、空阶段0次，活跃代Decode eager=0。Graph选择1.733–2.596 ms；按每方向最晚rank记录完整fence为0.603709／0.687642秒，各rank并行不可相加，后台prepare仍19.799／20.438秒。它不是逐token最大间隔，也不是与旧3.137／2.261秒基线的配对重复性能实验。
+
+初始Graph完成后，额外候选准备各rank3.872–3.945秒，常驻allocated增量为0.348／20.816／0.348 GiB，合计21.513 GiB。没有额外峰值上限或物理页回收结论。目标在最终fence前应用3064／2940个按来源累计的KV槽位行；同节点UCX日志为CUDA IPC。完整监督178.903秒、worker自身155.998秒，边界不同；Guard postcheck、owned cleanup及正常release通过，127个冻结输入一致，JSON稳定可见性检查通过。结果SHA256 `8baf4c3a827a10ff53e4a701438710472691f6b6104d93b81d0b1bd6ecb7f81c`。
+
+546项完整CPU回归通过；随后启动NIXL隔离修正的81项相关检查通过，数量不累加。首次环境import、fake-args兼容、测试路径及空CUDA变量收集失败保留于归档 `prepared-graph-20261111`。gpu-r1在model启动前因auto资源参数、随后缺外层预算文件而失败，未手动清理其有界quarantine；gpu-r2改回已有受监督入口并正常通过。本轮主agent自行实现／核查，无独立reviewer；仅实际B1、单轮，worker与候选存储常驻，VMM组合、故障恢复、跨节点RDMA、性能优势及转换期间归还GPU均未验收。详见[报告与快照](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_prepared_decode_graph_20261111/summary.md)。
+
 ## 2026-11-11：NIXL 持续迁移接通整模型 Decode Graph
 
 **通过范围。** 冻结 `01bc3770e32254e7088d50769c16b115c89dc9f3`，annotated tag `experiment/sglang/pp-nixl-decode-graph-20261111-r3`。35B BF16、三常驻A100、TP1／EP1、native KV、HiCache、background／overlap、NIXL 1.5.2，20/0/20→13/13/14→20/0/20。两个方向各2048-token输出与同暖512边界参考完全一致，无retraction或切换后重新Prefill，最终活跃阶段实际CPU前缀loadback；不是冷暖生成等价资格。
