@@ -581,7 +581,7 @@ def engine_entry(cfg, row):
                 "--max-mamba-cache-size",
                 "16",
                 "--context-length",
-                "2048",
+                str(cfg.get("context_length", 2048)),
                 "--hicache-size",
                 "1",
                 "--chunked-prefill-size",
@@ -1165,6 +1165,9 @@ def prepare(args):
         kv_patch_transport=getattr(args, "kv_patch_transport", "cpu"),
         cuda_graph=getattr(args, "cuda_graph", False),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
+        context_length=(
+            4096 if getattr(args, "active_output_tokens", 256) > 1024 else 2048
+        ),
         nixl_root=(
             str(args.nixl_root.resolve()) if getattr(args, "nixl_root", None) else None
         ),
@@ -1363,8 +1366,8 @@ def main():
         "--backing", choices=["overlap", "cpu_spill"], default="overlap"
     )
     args = parser.parse_args()
-    if not 256 <= args.active_output_tokens <= 1024:
-        parser.error("active output tokens must be between 256 and 1024")
+    if not 256 <= args.active_output_tokens <= 2048:
+        parser.error("active output tokens must be between 256 and 2048")
     if args.overhead_sample and args.active_output_tokens != 256:
         parser.error("the existing paired overhead protocol requires 256 output tokens")
     if args.cuda_graph and args.backing != "overlap":
