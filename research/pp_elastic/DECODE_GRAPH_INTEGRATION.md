@@ -1,5 +1,7 @@
 # 持续 KV 迁移中的 Decode CUDA Graph
 
+2026-11-11 更新：已开始实现可选的[启动预捕获与运行时选择](PREPARED_DECODE_GRAPHS.md)，通过声明有限候选布局并保留原生存储来复用 Graph；本页后文保留已验证的交接时重建基线。新路径的实际验收以 TODO／VALIDATION 为准，不能将下面的旧结果当作新路径通过。
+
 2026-11-11。用户要求先接通 Graph，worker 常驻暂不处理。本轮由主 agent 实施，接在 [NIXL 基线](NIXL_KV_TRANSFER_DESIGN.md) 上，进度统一记录在 [TODO](TODO.md)。
 
 **先接通正确路径。** 启动时捕获初始非空阶段的 Decode Graph；旧布局继续用 Graph 推理并通过 NIXL 发送 KV。最后排空全部在途请求／通信，提交目标权重、KV／GDN、HiCache 和路由，销毁旧 Graph，使用 SGLang 原生 runner 捕获目标 Graph。所有 rank 确认后才恢复推理。空阶段不捕获；再次回到旧布局也重新捕获，因为 native 池地址已经变化。

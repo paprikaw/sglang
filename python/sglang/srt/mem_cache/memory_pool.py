@@ -1921,6 +1921,14 @@ class MHATokenToKVPool(KVCache):
                 "elastic PP KV migration does not yet support speculative KV-copy tables"
             )
 
+    def retain_elastic_pp_graph_buffers(self) -> None:
+        self._require_elastic_pp_kv_supported()
+        self._elastic_graph_kv = self._current_elastic_pp_kv_map()
+        key = (self.start_layer, self.start_layer + len(self.k_buffer))
+        self._elastic_graph_tables = {
+            key: (self.k_data_ptrs, self.v_data_ptrs, self.data_ptrs, self.data_strides)
+        }
+
     def _current_elastic_pp_kv_map(
         self,
     ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
@@ -1986,8 +1994,11 @@ class MHATokenToKVPool(KVCache):
         allocated: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         try:
             for layer_id in sorted(preparation.new_layer_ids):
-                allocated[layer_id] = self._allocate_elastic_pp_kv_pair(
-                    layer_id=layer_id
+                cached = getattr(self, "_elastic_graph_kv", {}).get(layer_id)
+                allocated[layer_id] = (
+                    cached
+                    if cached is not None
+                    else self._allocate_elastic_pp_kv_pair(layer_id=layer_id)
                 )
             with self._elastic_pp_lock:
                 if self._elastic_pp_residency.pending != preparation:
@@ -2139,7 +2150,14 @@ class MHATokenToKVPool(KVCache):
             new_k = [prepared[layer_id][0] for layer_id in target_ids]
             target_ids = range(pending.target.start, pending.target.end)
             new_v = [prepared[layer_id][1] for layer_id in target_ids]
-            pointer_tables = self._build_elastic_pp_pointer_tables(new_k, new_v)
+            tables = getattr(self, "_elastic_graph_tables", None)
+            key = (pending.target.start, pending.target.end)
+            if tables is not None and key in tables:
+                pointer_tables = tables[key]
+            else:
+                pointer_tables = self._build_elastic_pp_pointer_tables(new_k, new_v)
+                if tables is not None:
+                    tables[key] = pointer_tables
             new_descs = self._build_kv_buffer_descs_for(
                 new_k, new_v, layer_num=len(new_k)
             )
@@ -2184,6 +2202,7 @@ class MHATokenToKVPool(KVCache):
             released = tuple(
                 tensor
                 for layer_id in sorted(new_layer_ids)
+                if layer_id not in getattr(self, "_elastic_graph_kv", {})
                 for tensor in self._elastic_pp_pending_kv[layer_id]
             )
             self._elastic_pp_pending_kv = {}
@@ -2202,11 +2221,15 @@ class MHATokenToKVPool(KVCache):
                 set(self._elastic_pp_retired_kv)
                 | set(getattr(self, "_elastic_pp_detached_layer_ids", ())),
             )
+            cache = getattr(self, "_elastic_graph_kv", None)
+            if cache is not None:
+                cache.update(self._elastic_pp_retired_kv)
             released = tuple(
                 tensor
                 for layer_id in sorted(cleanup_ids)
                 if layer_id in self._elastic_pp_retired_kv
                 for tensor in self._elastic_pp_retired_kv[layer_id]
+                if cache is None
             )
             self._elastic_pp_residency.finish_cleanup(generation, set(cleanup_ids))
             self._elastic_pp_retired_kv = {}

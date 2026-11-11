@@ -53,6 +53,10 @@ def retire_decode_graph(model_runner):
     Elastic PP gates prefill/speculative/compile graphs, so no other capture
     in this process is allowed to keep using the shared pool.
     """
+    bank = getattr(model_runner, "_elastic_pp_prepared_graphs", None)
+    if bank is not None:
+        bank.suspend(model_runner)
+        return
     from sglang.srt.distributed.device_communicators.pynccl_allocator import (
         set_graph_pool_id,
     )
@@ -96,7 +100,29 @@ def rebuild_decode_graph(model_runner, *, generation, active):
         return
 
     started = time.monotonic()
+    capturing = True
     try:
+        bank = getattr(model_runner, "_elastic_pp_prepared_graphs", None)
+        if bank is not None:
+            if bank.key(model_runner) in bank.entries:
+                capturing = False
+                bank.select(model_runner, entry)
+                return
+            if not bank.building:
+                capturing = False
+                raise RuntimeError("target Decode Graph was not prepared at startup")
+            # Metadata buffers are mutated by init_cuda_graph_state. A fresh
+            # attention backend and private Graph pool protect earlier captures.
+            from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+                set_graph_pool_id,
+            )
+            from sglang.srt.model_executor.runner_utils.pool import (
+                set_global_graph_memory_pool,
+            )
+
+            set_global_graph_memory_pool(None)
+            set_graph_pool_id(None)
+            model_runner.init_attention_backends()
         # Index 0 is reserved by ReqToTokenPool. Capture's dummy batch resets
         # req_pool_indices/out_cache_loc to zero (DecodeCudaGraphRunner.capture).
         # Fail closed if an unsupported pool violates that contract.
@@ -111,9 +137,14 @@ def rebuild_decode_graph(model_runner, *, generation, active):
         if model_runner.decode_cuda_graph_runner is None:
             raise RuntimeError("elastic PP Decode Graph capture produced no runner")
         entry["status"] = "ready"
+        if bank is not None:
+            bank.remember(model_runner, time.monotonic() - started)
+            entry["prepared"] = True
     except BaseException:
         entry["status"] = "failed"
         model_runner.decode_cuda_graph_runner = None
         raise
     finally:
-        entry["capture_seconds"] = time.monotonic() - started
+        elapsed = time.monotonic() - started
+        entry["capture_seconds"] = elapsed if capturing else 0.0
+        entry["selection_seconds"] = 0.0 if capturing else elapsed

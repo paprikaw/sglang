@@ -42,6 +42,14 @@ class ElasticPPModelMixin:
             if not isinstance(layer, PPMissingLayer)
         }
 
+    def retain_elastic_pp_graph_layers(self) -> None:
+        """Pin immutable parameter storage for the explicitly prepared Graph set."""
+        if self._elastic_layer_residency is None:
+            raise RuntimeError("Graph residency requires elastic model layers")
+        self._elastic_graph_layers = {
+            i: self.layers[i] for i in self._resident_elastic_layer_ids()
+        }
+
     @staticmethod
     def _prepare_elastic_quantized_layer(layer: nn.Module) -> None:
         """Put a new quantized layer in its post-load runtime layout.
@@ -133,8 +141,13 @@ class ElasticPPModelMixin:
         try:
             with set_default_torch_dtype(dtype), device:
                 for layer_id in create_ids:
-                    layer = self._elastic_layer_factory(layer_id, target.start).eval()
-                    if quant_name is not None:
+                    cached = getattr(self, "_elastic_graph_layers", {}).get(layer_id)
+                    layer = cached
+                    if layer is None:
+                        layer = self._elastic_layer_factory(
+                            layer_id, target.start
+                        ).eval()
+                    if cached is None and quant_name is not None:
                         self._prepare_elastic_quantized_layer(layer)
                     created[layer_id] = layer
             with self._elastic_layer_lock:
@@ -251,7 +264,8 @@ class ElasticPPModelMixin:
             for layer_id in sorted(new_layer_ids):
                 layer = self.layers[layer_id]
                 if not isinstance(layer, PPMissingLayer):
-                    removed.append(layer)
+                    if layer_id not in getattr(self, "_elastic_graph_layers", {}):
+                        removed.append(layer)
                     self.layers[layer_id] = PPMissingLayer()
             self._release_elastic_layer_loader_refs(removed)
             return tuple(removed)
@@ -270,7 +284,13 @@ class ElasticPPModelMixin:
             for layer_id in sorted(cleanup_ids):
                 layer = self.layers[layer_id]
                 if not isinstance(layer, PPMissingLayer):
-                    removed.append(layer)
+                    cache = getattr(self, "_elastic_graph_layers", None)
+                    if cache is None:
+                        removed.append(layer)
+                    else:
+                        # The layer is logically detached, but its captured
+                        # storage must remain alive when that layout returns.
+                        cache[layer_id] = layer
                     removed_ids.add(layer_id)
                     self.layers[layer_id] = PPMissingLayer()
             self._elastic_layer_residency.finish_cleanup(generation, removed_ids)

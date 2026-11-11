@@ -6,6 +6,9 @@
 
 ## 本轮实施：主 agent 顺序完成
 
+- [x] **2026-11-11：启动预捕获与运行时选择的代码与CPU检查。** 声明有限PP布局，保留原生权重／KV／GDN、独立backend和Graph工作区；运行时拒绝未知布局或地址变化，禁止重新捕获。546项CPU回归通过，见归档 `prepared-graph-20261111/cpu-r5.xml`；先前测试路径／空CUDA设备变量导致的收集失败保留原记录。[使用与边界](PREPARED_DECODE_GRAPHS.md)。
+- [ ] **新路径A100 PP2↔PP3验收。** 检查同版本暖缓存输出连续、HiCache实际恢复、源／目标均有Graph replay和运行时capture=0；记录启动内存与交接时间。旧Graph重建结果不代替本项。worker继续常驻，VMM组合与归还GPU暂缓。
+
 - [x] **2026-11-11：整模型 Decode CUDA Graph 接入通过。** 冻结 `01bc3770e3`，A100 native／HiCache／NIXL PP2→PP3→PP2在最终排空时重建目标Graph并经全组确认恢复。两个方向各2048-token输出与同暖512边界参考一致，没有retraction／重新Prefill，最终CPU前缀实际loadback。PP3三个阶段各replay1013次；缩回PP2后两个保留阶段各1095次，退出阶段inactive／0次；活跃代Decode eager为0。完整CPU回归508项通过，协议延长后73项harness复查通过，数量不累加。完整监督含清理177.895秒，Guard／owned cleanup／正常release通过。控制面最终交接3.137／2.261秒，包含重建；未宣称暂停收益、全部布局预捕获或VMM组合资格。worker常驻按用户要求后置。见[验证报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_nixl_decode_graph_20261111/summary.md)及[接入说明](DECODE_GRAPH_INTEGRATION.md)。
 
 保留失败：GPU r1因旧共享Graph池ID退役未清除而触发PyTorch `use_count`断言；显式清理backend并重置两个池ID后修复。r2捕获成功，但1024-token请求在准备期间结束、目标replay=0，严格验收保持失败。r1／r2分别132.268／121.676秒内正常清理并release；r3延长至2048输出、4096 context后通过，未放宽活跃请求、输出或replay检查。

@@ -333,7 +333,9 @@ def state_evidence(info):
     }
 
 
-def validate_decode_graph_states(states, generation, source_ranks, target_ranks):
+def validate_decode_graph_states(
+    states, generation, source_ranks, target_ranks, *, prepared=False
+):
     for rank, state in rank_states(states).items():
         history = state["transition_metrics"]["decode_graph"]
         entries = {row["generation"]: row for row in history}
@@ -347,8 +349,23 @@ def validate_decode_graph_states(states, generation, source_ranks, target_ranks)
                 raise AssertionError("target Decode Graph did not actually replay")
             if target["capture_seconds"] is None:
                 raise AssertionError("missing target Graph capture timing")
+            if prepared and (
+                target["capture_seconds"] != 0.0 or not target.get("prepared")
+            ):
+                raise AssertionError("runtime target Graph was not prepared at startup")
         elif target["status"] != "inactive" or target["replays"]:
             raise AssertionError("inactive rank retained a runnable Decode Graph")
+        if prepared:
+            bank = state["transition_metrics"].get("prepared_decode_graphs") or {}
+            if (
+                not bank.get("sealed")
+                or bank.get("runtime_captures") != 0
+                or bank.get("startup_runner_captures") != (1 if rank == 1 else 2)
+                or bank.get("runtime_selections") != (1 if rank == 1 else generation)
+            ):
+                raise AssertionError(
+                    "prepared Graph bank capture/selection evidence incomplete"
+                )
 
 
 def install_hooks():
@@ -486,6 +503,10 @@ def install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator):
     original_finalize = ElasticPPMigrationCoordinator.finalize_at_fence
 
     def finalize(self, publish):
+        # The startup-only, empty-state Graph preparation walk has no cache
+        # adapter or user requests. Only record public serving transitions.
+        if self.cache_transition is None:
+            return original_finalize(self, publish)
         scheduler = self.cache_transition.scheduler
         record = {
             "generation": self._transition.target.generation,
@@ -565,6 +586,17 @@ def engine_entry(cfg, row):
                 ["--cuda-graph-bs-decode", "1", "2", "4"]
                 if cfg.get("cuda_graph")
                 else ["--disable-cuda-graph"]
+            )
+            + (
+                [
+                    "--elastic-pp-graph-partitions",
+                    ";".join(
+                        ",".join(map(str, counts))
+                        for counts in (cfg["initial_counts"], cfg["grown_counts"])
+                    ),
+                ]
+                if cfg.get("prepared_graphs")
+                else []
             )
             + [
                 "--enable-elastic-pp",
@@ -812,6 +844,15 @@ def worker(run, cfg):
                     "elapsed_s": time.time() - qualification_started,
                 }
             )
+        elif evidence["acceptance_class"] == "same_process_warm_execution_continuity":
+            if not cfg.get("prepared_graphs"):
+                raise AssertionError(
+                    "same-process warm protocol requires prepared Graphs"
+                )
+            evidence["reference_scope"] = (
+                "Fresh same-version warmed reference; exact transition continuity only. "
+                "No prior state-review receipt or cold/warm generation qualification."
+            )
         elif evidence["acceptance_class"] != "cold_warm_exact_generation":
             raise AssertionError("unknown reference acceptance class")
         if cfg.get("kv_foundation_probe"):
@@ -881,7 +922,10 @@ def worker(run, cfg):
             item["qualified"] for item in evidence["reference_qualification"].values()
         )
         evidence["observed_cold_warm_exact_ids_equal"] = cold_warm_equal
-        if evidence["acceptance_class"] == "cached_execution_continuity":
+        if evidence["acceptance_class"] in (
+            "cached_execution_continuity",
+            "same_process_warm_execution_continuity",
+        ):
             for warmed_reference in (reference, active_reference):
                 if (
                     warmed_reference.get("meta_info", {}).get("cached_tokens") != 512
@@ -1000,6 +1044,7 @@ def worker(run, cfg):
                             generation,
                             (0, 2) if generation == 1 else (0, 1, 2),
                             (0, 1, 2) if generation == 1 else (0, 2),
+                            prepared=cfg.get("prepared_graphs", False),
                         )
                         record["decode_graph_verified"] = True
                     if cfg.get("live_kv_patch"):
@@ -1129,6 +1174,10 @@ def worker(run, cfg):
             evidence["passed"]
             and evidence["acceptance_class"] == "cached_execution_continuity"
         )
+        evidence["same_process_warm_continuity_verified"] = (
+            evidence["passed"]
+            and evidence["acceptance_class"] == "same_process_warm_execution_continuity"
+        )
         h.save(run / "results.json", {"transition": evidence})
         h.save(run / "worker_progress.json", {"completed": int(evidence["passed"])})
         if lifecycle is not None:
@@ -1164,6 +1213,7 @@ def prepare(args):
         live_kv_patch=getattr(args, "live_kv_patch", False),
         kv_patch_transport=getattr(args, "kv_patch_transport", "cpu"),
         cuda_graph=getattr(args, "cuda_graph", False),
+        prepared_graphs=getattr(args, "prepared_graphs", False),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
         context_length=(
             4096 if getattr(args, "active_output_tokens", 256) > 1024 else 2048
@@ -1180,7 +1230,11 @@ def prepare(args):
         acceptance_class=(
             "cached_execution_continuity"
             if args.cached_reference_evidence
-            else "cold_warm_exact_generation"
+            else (
+                "same_process_warm_execution_continuity"
+                if args.same_process_warm_reference
+                else "cold_warm_exact_generation"
+            )
         ),
     )
     if getattr(args, "supervised_lifecycle", False):
@@ -1272,6 +1326,13 @@ def prepare(args):
                 "python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py",
                 "python/sglang/srt/model_executor/runner_utils/pool.py",
                 "python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py",
+                "python/sglang/srt/elastic_pp/prepared_decode_graph.py",
+                "python/sglang/srt/elastic_pp/model.py",
+                "python/sglang/srt/elastic_pp/model_wrapper.py",
+                "python/sglang/srt/mem_cache/memory_pool.py",
+                "python/sglang/srt/mem_cache/elastic_hybrid_pool.py",
+                "python/sglang/srt/managers/scheduler.py",
+                "python/sglang/srt/server_args.py",
             )
         ]
     if cfg["kv_patch_transport"] == "nixl":
@@ -1300,9 +1361,9 @@ def prepare(args):
         spec["title"] = (
             "Qwen HiCache PP transitions: exact warmed-cache execution continuity"
         )
-        spec["tasks"][0]["label"] = (
-            "512-token warmed boundary; cold/warm generation unqualified"
-        )
+        spec["tasks"][0][
+            "label"
+        ] = "512-token warmed boundary; cold/warm generation unqualified"
         spec["frozen_inputs"] += [
             base.desc(ROOT / "hicache_reference_qualification.py"),
             base.desc(args.cached_reference_evidence),
@@ -1316,6 +1377,11 @@ def prepare(args):
             ),
             base.desc(Path(cfg["model_path"]) / "config.json"),
         ]
+    if args.same_process_warm_reference:
+        spec["title"] = "Startup-prepared Decode Graphs: same-version warmed continuity"
+        spec["tasks"][0][
+            "label"
+        ] = "PP2↔PP3; startup captures only; no cold/warm generation qualification"
     h.save(run / "dashboard_spec.json", spec)
 
 
@@ -1359,6 +1425,8 @@ def main():
     )
     parser.add_argument("--live-kv-patch", action="store_true")
     parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--prepared-graphs", action="store_true")
+    parser.add_argument("--same-process-warm-reference", action="store_true")
     parser.add_argument("--active-output-tokens", type=int, default=256)
     parser.add_argument("--kv-patch-transport", choices=["cpu", "nixl"], default="cpu")
     parser.add_argument("--nixl-root", type=Path)
@@ -1372,6 +1440,16 @@ def main():
         parser.error("the existing paired overhead protocol requires 256 output tokens")
     if args.cuda_graph and args.backing != "overlap":
         parser.error("Decode Graph requires overlap backing")
+    if args.prepared_graphs and not args.cuda_graph:
+        parser.error("prepared Graphs require --cuda-graph")
+    if args.same_process_warm_reference and (
+        not args.prepared_graphs
+        or args.cached_reference_evidence
+        or args.baseline_probe
+    ):
+        parser.error(
+            "same-process warm reference is a separate prepared-Graph protocol"
+        )
     if args.kv_patch_transport == "nixl" and (
         not args.live_kv_patch or not args.nixl_root
     ):

@@ -79,6 +79,7 @@ class ElasticPPMigrationCoordinator:
         strategy: str | None = None,
         cache_transition: Any = None,
         backing: str | None = None,
+        enable_kv_patch: bool | None = None,
     ) -> None:
         # Test doubles without server_args retain the pre-existing allocation-only
         # protocol. Real runners select one of the three explicit policies.
@@ -96,7 +97,11 @@ class ElasticPPMigrationCoordinator:
         if self.backing == "cpu_spill" and self.strategy not in {"sync", "batched"}:
             raise ValueError("CPU-spill backing requires sync or batched transition")
         self.cache_transition = cache_transition
-        self.enable_kv_patch = bool(getattr(args, "enable_elastic_pp_kv_patch", False))
+        self.enable_kv_patch = (
+            bool(getattr(args, "enable_elastic_pp_kv_patch", False))
+            if enable_kv_patch is None
+            else enable_kv_patch
+        )
         if self.enable_kv_patch and (
             self.strategy != "background" or self.backing != "overlap"
         ):
@@ -178,6 +183,9 @@ class ElasticPPMigrationCoordinator:
             )
 
     def begin(self, transition: DynamicPPTransition) -> None:
+        bank = getattr(self.model_runner, "_elastic_pp_prepared_graphs", None)
+        if bank is not None:
+            bank.check_topology(transition.target)
         with self._condition:
             if self._phase not in {
                 ElasticPPMigrationPhase.IDLE,
@@ -429,9 +437,14 @@ class ElasticPPMigrationCoordinator:
             "peak_scope": "sampled at prepare/copy/commit; not allocator peak proof",
             "gpu_released": False,
         }
-        graph_metrics = getattr(self.model_runner, "elastic_pp_decode_graph_metrics", None)
+        graph_metrics = getattr(
+            self.model_runner, "elastic_pp_decode_graph_metrics", None
+        )
         if graph_metrics is not None:
             metrics["decode_graph"] = graph_metrics()
+        prepared = getattr(self.model_runner, "elastic_pp_prepared_graph_metrics", None)
+        if prepared is not None:
+            metrics["prepared_decode_graphs"] = prepared()
         for name, component in (
             ("kv", self.kv_transport),
             ("host", self.cache_transition),
@@ -934,8 +947,8 @@ class ElasticPPMigrationCoordinator:
             self._raise_peer_failures("commit", reports)
 
             # Every rank has installed its target weights, pool and PP route.
-            # Native pools changed addresses: rebuild on this drained scheduler
-            # thread before resuming any inference or asynchronous cleanup.
+            # Select the startup-prepared runner when enabled; otherwise native
+            # pools changed addresses and require drained recapture.
             local_error = None
             try:
                 rebuild = getattr(

@@ -1099,6 +1099,11 @@ class ServerArgs:
         "Comma-separated initial layer counts for every resident elastic PP rank.",
         NS("parallel"),
     ] = None
+    elastic_pp_graph_partitions: A[
+        Optional[str],
+        "Finite semicolon-separated PP partitions to capture before serving and select without runtime capture; retains native weights/KV/GDN and Graph workspaces.",
+        NS("parallel"),
+    ] = None
     elastic_pp_kv_backend: A[
         str,
         Arg(
@@ -7994,6 +7999,10 @@ class ServerArgs:
             return
 
         if not self.enable_elastic_pp:
+            if self.elastic_pp_graph_partitions is not None:
+                raise ValueError(
+                    "--elastic-pp-graph-partitions requires --enable-elastic-pp"
+                )
             if self.enable_elastic_pp_kv_patch:
                 raise ValueError(
                     "--enable-elastic-pp-kv-patch requires --enable-elastic-pp"
@@ -8101,6 +8110,12 @@ class ServerArgs:
             )
 
         normalized_partition = ",".join(str(count) for count in partition)
+        if self.elastic_pp_graph_partitions is not None:
+            from sglang.srt.elastic_pp.prepared_decode_graph import (
+                validate_graph_partitions,
+            )
+
+            validate_graph_partitions(self, partition)
         self._declare(
             "_handle_pipeline_parallelism",
             elastic_pp_initial_partition=normalized_partition,
