@@ -758,6 +758,7 @@ def test_nonresident_graph_acceptance_requires_real_transfer_and_eviction(
                 "startup_runner_captures": 1 if rank == 1 else 2,
                 "runtime_selections": 1 if rank == 1 else generation,
                 "weight_policy": "offload",
+                "inactive_registered_weight_bytes": 0,
                 "weight_backing": {
                     "kind": "vmm_nonresident_weights",
                     "inactive_mapped_physical_bytes": 0,

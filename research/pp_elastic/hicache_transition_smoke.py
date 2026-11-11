@@ -380,6 +380,8 @@ def validate_decode_graph_states(
                     raise AssertionError(
                         "nonresident weights were reported as resident reuse"
                     )
+                if bank.get("inactive_registered_weight_bytes", -1) != 0:
+                    raise AssertionError("inactive worker retains spare model weights")
                 if (
                     rank in ({0, 2} if generation == 1 else {1})
                     and metrics.get("background_weight_bytes_sent", 0) <= 0

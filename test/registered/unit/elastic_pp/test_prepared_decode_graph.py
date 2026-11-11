@@ -14,6 +14,7 @@ from sglang.srt.elastic_pp.decode_graph import (
 )
 from sglang.srt.elastic_pp.layer_residency import ElasticLayerResidency
 from sglang.srt.elastic_pp.model import ElasticPPModelMixin
+from sglang.srt.elastic_pp.model_wrapper import ElasticPPModelWrapperMixin
 from sglang.srt.elastic_pp.prepared_decode_graph import (
     PreparedDecodeGraphBank,
     external_bindings,
@@ -210,6 +211,23 @@ def test_nonresident_cleanup_and_abort_release_only_incoming_weights(monkeypatch
     assert mapped == {1}
     assert isinstance(model.layers[0], PPMissingLayer)
     assert calls == [("evict", {0}), ("map", 0), ("evict", {0})]
+
+
+def test_fixed_output_frontier_drops_spare_heads_without_touching_decoder_weights():
+    class Wrapper(ElasticPPModelWrapperMixin, nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Model()
+            self.model.norm = nn.LayerNorm(2)
+            self.lm_head = nn.Linear(2, 4, bias=False)
+
+    wrapper = Wrapper()
+    layers = tuple(wrapper.model.layers.parameters())
+    weight_ptrs = [t.data_ptr() for t in layers]
+    assert wrapper.discard_elastic_pp_unused_output_weights() == (8 + 4) * 4
+    assert isinstance(wrapper.lm_head, PPMissingLayer)
+    assert isinstance(wrapper.model.norm, PPMissingLayer)
+    assert [t.data_ptr() for t in wrapper.model.layers.parameters()] == weight_ptrs
 
 
 def test_kv_gdn_addresses_return_but_stale_values_are_overwritten(hybrid_pool_factory):
