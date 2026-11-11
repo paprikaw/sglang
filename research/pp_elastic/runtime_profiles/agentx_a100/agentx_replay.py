@@ -28,7 +28,7 @@ def http(host, port, path, key, payload=None, timeout=300):
     return json.loads(body) if path != '/flush_cache?timeout=60' else body.decode()
 
 
-def stream(endpoint, key, payload, timeout=600):
+def stream(endpoint, key, payload, timeout=600, *, event_sink=None):
     start = time.perf_counter()
     request = urllib.request.Request(f"http://{endpoint['host']}:{endpoint['port']}/generate",
         data=json.dumps(payload).encode(),
@@ -51,6 +51,10 @@ def stream(endpoint, key, payload, timeout=600):
                 if meta.get('completion_tokens', 0):
                     last = time.perf_counter()
                     first = last if first is None else first
+                    if event_sink is not None and (
+                        not event_sink or meta['completion_tokens'] > event_sink[-1][0]
+                    ):
+                        event_sink.append([meta['completion_tokens'], 1000*(last-start)])
                 final = value
     except urllib.error.HTTPError as error:
         raise RuntimeError(f'HTTP {error.code}: {error.read().decode()[:500]}') from None

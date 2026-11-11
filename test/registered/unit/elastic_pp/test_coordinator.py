@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -204,6 +205,44 @@ def _coordinator(group=None, *, fence_step_provider=None, fence_lead_steps=0):
     return coordinator, transition, runner, kv_transport
 
 
+@pytest.mark.parametrize("policy", ["reuse", "recopy"])
+def test_prepared_weight_policy_skips_only_verified_resident_weights(policy):
+    coordinator, transition, runner, _ = _coordinator()
+    coordinator.strategy = "background"
+    calls = []
+    runner.server_args = SimpleNamespace(elastic_pp_prepared_weight_policy=policy)
+    runner._elastic_pp_prepared_graphs = SimpleNamespace(
+        building=False,
+        check_topology=lambda t: None,
+        reuse_weights=lambda mr, t: calls.append("reuse") or 64,
+    )
+    coordinator._precopy_immutable_weights = lambda t: calls.append("recopy")
+    coordinator.begin(transition)
+    state = coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    assert state.phase == ElasticPPMigrationPhase.BULK_READY
+    coordinator.finalize_at_fence(lambda _: None)
+    assert calls == [policy]
+    assert not coordinator.layer_transport.received
+    metrics = coordinator.transition_metrics()
+    assert metrics["prepared_weight_bytes_reused"] == (64 if policy == "reuse" else 0)
+    assert metrics["stage_seconds"]["prepare_layers"] >= 0
+    assert metrics["stage_seconds"]["consensus.prepare_allocations"] >= 0
+    coordinator.start_cleanup()
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.DONE, timeout=2)
+
+
+def test_prepared_weight_policy_skew_aborts_before_point_to_point_copy():
+    group = _Group(mismatch_stage="prepare_allocations")
+    coordinator, transition, runner, _ = _coordinator(group)
+    coordinator.strategy = "background"
+    coordinator._precopy_immutable_weights = lambda _: pytest.fail("unsafe P2P copy")
+    coordinator.begin(transition)
+    state = coordinator.wait_for_phase(ElasticPPMigrationPhase.FAILED, timeout=2)
+    assert state.phase == ElasticPPMigrationPhase.FAILED
+    assert state.source_usable and "policy differs" in state.error
+    assert not runner.committed
+
+
 def test_live_patch_starts_on_scheduler_and_finishes_before_fenced_transfer():
     coordinator, transition, runner, kv = _coordinator()
     coordinator.strategy = "background"
@@ -381,7 +420,7 @@ def test_fence_slot_failure_reaches_consensus_before_abort():
 
 
 def test_rank_skewed_bulk_and_delta_snapshots_are_allowed():
-    group = _Group(mismatch_stage="prepare_allocations")
+    group = _Group()
     coordinator, transition, runner, _ = _coordinator(group)
     coordinator.begin(transition)
     coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)

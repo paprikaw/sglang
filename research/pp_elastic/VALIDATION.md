@@ -1,5 +1,15 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-11：候选权重复用与HiCache分配预热
+
+任务分支 `codex/pp-migration-latency-20261111` 从共同基线 `5f530f6de33d` 派生，由主agent直接实施、测试和审查，没有新增独立reviewer。`b59993a97f28` 增加不可变候选权重复用、recopy对照、统一策略确认、在线权重更新拒绝和分项／输出事件计时；`ed2e82c5eda8` 增加opt-in PyTorch pinned HiCache及启动预热。当前源码的1008项完整CPU检查通过，零失败／错误／跳过，115.40秒；用例来自本目录精确清单，不与历史通过数累加。原字段兼容失败、CPU夹具错误及Guard启动前资源冲突均保留。
+
+硬件／工作负载沿用下面的35B BF16、A100三resident rank、B1、native KV／64-token页、HiCache／NIXL、20/0/20→13/13/14→20/0/20及每方向2048输出。权重同版本对照每策略先各一轮：recopy完整迁移20.470／20.955秒，reuse为0.691／0.727秒；每方向少搬21,871,498,496字节。随后冻结tag `experiment/sglang/pp-pinned-host-warm-20261111-r1`，独立启动两次，reuse＋pinned完整迁移扩／缩均值0.293／0.321秒，最终暂停246／271 ms。后者两轮原值与分项见[优化记录](MIGRATION_OPTIMIZATION.md)，N=2仅为描述性重复，不称稳定尾部或广泛性能结论。
+
+两轮新路径均满足暖缓存完整IDs、在线KV目标应用、最终CPU前缀实际loadback、运行时capture=0、目标Graph replay与活跃Decode eager=0。Graph选择最大rank为2.28–2.56 ms；完整最终暂停明显长于选择Graph。完整监督161.478／153.763秒，Guard postcheck、owned cleanup和正常lease release通过；每轮127个冻结输入结束后哈希一致。结果SHA256分别为 `ddbd62e22188b3be5f89b621071024ab4ff87187982ef6a3543ae60d23b7c3cb`、`3111d737a73c408851675672241cd06626c8571b7e86120d213741c6d749c2ad`。原始证据根目录为 `source_integration/sglang-pp-elastic-20261105/migration-optimization-20261111/`。
+
+3进程pinned allocator保留内存合计5.781 GiB，是当前采样而非总CPU峰值；候选GPU权重、KV和Graph继续常驻。只验收实际B1、L2 HiCache、同节点NIXL／CUDA IPC；冷暖生成等价、更多模型／batch、跨节点RDMA、VMM组合及转换期间归还工作GPU均不由本次取得资格。默认mmap路径保留；pinned需显式开启。
+
 ## 2026-11-11：低干扰实现的集成审查
 
 主 agent 直接审查任务分支 `codex/pp-kv-live-foundation-20261109`，未发现阻止已测native／HiCache／NIXL、PP2↔PP3范围合入的功能性问题；没有新增独立reviewer。当前专项574项通过，随后将历史537项基线与新专项按用例去重，**992项组合CPU检查全部通过，零失败／错误／跳过，113.580秒**，不累加通过数。精确用例见[cpu_test_nodes.txt](cpu_test_nodes.txt)；旧[cpu_test_paths.txt](cpu_test_paths.txt)仅为文件索引，部分文件含GPU测试，整文件调用不是CPU验收命令。

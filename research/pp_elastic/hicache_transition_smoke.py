@@ -593,6 +593,10 @@ def engine_entry(cfg, row):
                         ",".join(map(str, counts))
                         for counts in (cfg["initial_counts"], cfg["grown_counts"])
                     ),
+                    "--elastic-pp-prepared-weight-policy",
+                    cfg.get("prepared_weight_policy", "reuse"),
+                    "--elastic-pp-hicache-allocator",
+                    cfg.get("hicache_allocator", "mmap"),
                 ]
                 if cfg.get("prepared_graphs")
                 else []
@@ -753,6 +757,20 @@ def worker(run, cfg):
             )
         return owned_cleanup
 
+    def measured_stream(endpoint, key, payload, timeout):
+        if cfg.get("migration_profile"):
+            events = []
+            result = original_stream(
+                endpoint, key, payload, min(timeout, 45), event_sink=events
+            )
+            result["completion_events"] = events
+            result["completion_event_scope"] = (
+                "client arrival time in ms since request; cumulative token count; "
+                "multi-token chunks do not expose individual token times"
+            )
+            return result
+        return original_stream(endpoint, key, payload, min(timeout, 45))
+
     def captured_stream(endpoint, key, payload, timeout=600):
         check_cancelled()
         request_contracts.append(
@@ -764,7 +782,7 @@ def worker(run, cfg):
         }
         if diagnostics is not None:
             diagnostics.save("reference_request_contract.json", contract)
-            return original_stream(endpoint, key, payload, min(timeout, 45))
+            return measured_stream(endpoint, key, payload, timeout)
         target = run / "reference_request_contract.json"
         descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w") as stream:
@@ -772,7 +790,7 @@ def worker(run, cfg):
                 contract,
                 stream,
             )
-        return original_stream(endpoint, key, payload, min(timeout, 45))
+        return measured_stream(endpoint, key, payload, timeout)
 
     agentx_replay.stream = captured_stream
 
@@ -992,6 +1010,7 @@ def worker(run, cfg):
                                 "no live Decode progress observed before transition"
                             )
                         time.sleep(0.02)
+                    control_started = time.perf_counter()
                     transition = http(
                         "/reconfigure_elastic_pp",
                         {"layer_counts": counts, "generation": generation},
@@ -1003,6 +1022,11 @@ def worker(run, cfg):
                         "control_returned_at": time.time(),
                         "continuation_verified": False,
                     }
+                    if cfg.get("migration_profile"):
+                        record.update(
+                            control_started_perf_counter=control_started,
+                            control_finished_perf_counter=time.perf_counter(),
+                        )
                     evidence["transitions"].append(record)
                     if not transition.get("success"):
                         raise RuntimeError("topology transition failed")
@@ -1213,6 +1237,9 @@ def prepare(args):
         kv_patch_transport=getattr(args, "kv_patch_transport", "cpu"),
         cuda_graph=getattr(args, "cuda_graph", False),
         prepared_graphs=getattr(args, "prepared_graphs", False),
+        prepared_weight_policy=getattr(args, "prepared_weight_policy", "reuse"),
+        migration_profile=getattr(args, "migration_profile", False),
+        hicache_allocator=getattr(args, "hicache_allocator", "mmap"),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
         context_length=(
             4096 if getattr(args, "active_output_tokens", 256) > 1024 else 2048
@@ -1426,6 +1453,13 @@ def main():
     parser.add_argument("--live-kv-patch", action="store_true")
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--prepared-graphs", action="store_true")
+    parser.add_argument(
+        "--prepared-weight-policy", choices=["reuse", "recopy"], default="reuse"
+    )
+    parser.add_argument("--migration-profile", action="store_true")
+    parser.add_argument(
+        "--hicache-allocator", choices=["mmap", "pytorch"], default="mmap"
+    )
     parser.add_argument("--same-process-warm-reference", action="store_true")
     parser.add_argument("--active-output-tokens", type=int, default=256)
     parser.add_argument("--kv-patch-transport", choices=["cpu", "nixl"], default="cpu")

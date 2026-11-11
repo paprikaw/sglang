@@ -221,6 +221,24 @@ class HostKVCache(abc.ABC):
             return
         self._destroyed = True
         buffers = getattr(self, "kv_buffer", None)
+        if getattr(getattr(self, "allocator", None), "manages_registration", False):
+            # A retired controller may survive in frozen-GC cycles. Drop all
+            # CPU tensor views now, after the caller has drained host I/O, so
+            # PyTorch can reuse the blocks without registering them again.
+            for name, value in list(vars(self).items()):
+                if isinstance(value, torch.Tensor) and value.device.type == "cpu":
+                    setattr(self, name, None)
+                elif (
+                    isinstance(value, (list, tuple))
+                    and value
+                    and all(
+                        isinstance(t, torch.Tensor) and t.device.type == "cpu"
+                        for t in value
+                    )
+                ):
+                    setattr(self, name, [])
+            self.kv_buffer = None
+            return
         if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
             if not isinstance(buffers, (list, tuple)):
                 buffers = [buffers]

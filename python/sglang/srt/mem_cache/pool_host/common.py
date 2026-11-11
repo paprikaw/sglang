@@ -64,7 +64,20 @@ class ShmHostTensorAllocator(HostTensorAllocator):
         self.fds = []
 
 
+class TorchPinnedHostTensorAllocator(HostTensorAllocator):
+    """Let PyTorch own registration and cache reusable pinned CPU blocks."""
+
+    manages_registration = True
+
+    def allocate(self, dims, dtype, device):
+        if device != "cpu":
+            raise ValueError("Torch pinned host allocation requires CPU storage")
+        return torch.empty(dims, dtype=dtype, device=device, pin_memory=True)
+
+
 def get_allocator_from_storage(allocator_type):
+    if allocator_type == "torch_pinned":
+        return TorchPinnedHostTensorAllocator()
     if allocator_type == "mooncake":
         try:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -101,6 +114,14 @@ def get_allocator_from_storage(allocator_type):
 
 def get_allocator_type(server_args) -> str:
     backend = getattr(server_args, "hicache_storage_backend", None)
+    if getattr(server_args, "elastic_pp_hicache_allocator", "mmap") == "pytorch":
+        if backend is not None or not getattr(
+            server_args, "elastic_pp_graph_partitions", None
+        ):
+            raise ValueError(
+                "elastic pinned allocator requires prepared Graphs and L2-only HiCache"
+            )
+        return "torch_pinned"
     if backend == "shm":
         return "shm"
     if backend == "dynamic":
@@ -155,7 +176,7 @@ def alloc_with_host_register(
     CudaHostRegister only applies when pin_memory=True.
     """
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
-    if pin_memory:
+    if pin_memory and not getattr(allocator, "manages_registration", False):
         _cuda_host_register(buffer)
     return buffer
 
