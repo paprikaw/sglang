@@ -18,7 +18,7 @@ from sglang.srt.elastic_pp.prepared_decode_graph import (
     PreparedDecodeGraphBank,
     external_bindings,
 )
-from sglang.srt.elastic_pp.topology import LayerRange, PPTopology
+from sglang.srt.elastic_pp.topology import DynamicPPTransition, LayerRange, PPTopology
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -279,6 +279,48 @@ def test_runtime_selection_reuses_exact_runner_and_never_captures(prepared_runne
     entry = mr._elastic_pp_decode_graph_state.history[-1]
     assert entry["capture_seconds"] == 0 and entry["replays"] == 1
     assert bank.metrics()["runtime_selections"] == 1
+
+
+@pytest.mark.parametrize("fault", [None, "address", "version", "missing_state"])
+def test_resident_weights_validate_before_marking_loaded(prepared_runner, fault):
+    mr, bank, _ = prepared_runner
+    model = mr.model
+    # Construct a return to layers 0/1 after layer 0 was logically retired.
+    source = PPTopology.from_layer_counts([0, 2], generation=1)
+    target = PPTopology.from_layer_counts([2, 0], generation=2)
+    transition = DynamicPPTransition.build(source, target)
+    bank.partitions = ((0, 2), (2, 0))
+    marked = []
+    mr.export_elastic_pp_layer_state = model.export_elastic_pp_layer_state
+    mr.mark_elastic_pp_layers_loaded = lambda **kw: marked.append(kw)
+    if fault == "address":
+        model.layers[0].weight = nn.Parameter(model.layers[0].weight.clone())
+    elif fault == "version":
+        with torch.no_grad():
+            model.layers[1].weight.add_(1)
+    elif fault == "missing_state":
+        model.layers[0].register_parameter("bias", None)
+    if fault:
+        with pytest.raises(RuntimeError, match="prepared weight"):
+            bank.reuse_weights(mr, transition)
+        assert marked == []
+    else:
+        assert bank.reuse_weights(mr, transition) == 48
+        assert marked == [{"generation": 2, "layer_ids": {0, 1}}]
+
+
+def test_prepared_candidates_reject_online_weight_mutation_before_loading():
+    from sglang.srt.managers.scheduler_components.weight_updater import (
+        SchedulerWeightUpdaterManager,
+    )
+
+    manager = NS(
+        tp_worker=NS(
+            model_runner=NS(server_args=NS(elastic_pp_graph_partitions="2,0;1,1"))
+        )
+    )
+    error = SchedulerWeightUpdaterManager._cpu_weight_cache_online_update_error(manager)
+    assert "immutable weight version" in error
 
 
 @pytest.mark.parametrize("fault", ["weight", "kv", "request", "input", "interval"])
