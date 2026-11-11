@@ -52,7 +52,7 @@
 
 2026-11-05。共同分支为 `codex/pp-elastic-integration`，基点为 R11 `b862312ce3`。运行记录和完整检查清单位于[验证 manifest](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/validation_manifest.json)。这次验证执行正确性和开关实际生效，不据此发布性能提升结论。
 
-**CPU 回归。** 共 537 项通过，零失败、零跳过。覆盖 EP／BF16 接口、量化参数转发、PP 通信与微批、HiCache 共识、GDN 和 P/D 状态交接、CPU 权重缓存，以及 elastic PP 控制与状态迁移。结果见 [JUnit](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/final_cpu_tests.xml)，52 个测试文件列于 [cpu_test_paths.txt](cpu_test_paths.txt)。使用锁定 Python，设置引擎 `python/` 的 `PYTHONPATH`、`/home/bxb1/conda/lib` 的 `LD_LIBRARY_PATH`，关闭 pytest 自动插件加载并显式加载 `pytest_asyncio.plugin`，将清单中的文件传给 pytest 即可复跑。
+**CPU 回归。** 共 537 项通过，零失败、零跳过。覆盖 EP／BF16 接口、量化参数转发、PP 通信与微批、HiCache 共识、GDN 和 P/D 状态交接、CPU 权重缓存，以及 elastic PP 控制与状态迁移。结果见 [JUnit](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/final_cpu_tests.xml)，52 个测试文件列于历史文件索引 [cpu_test_paths.txt](cpu_test_paths.txt)。复跑使用锁定 Python、引擎 `python/` 的 `PYTHONPATH` 和 `/home/bxb1/conda/lib` 的 `LD_LIBRARY_PATH`，关闭 pytest 自动插件加载并显式加载 `pytest_asyncio.plugin`。CPU用例应从本页顶部的[cpu_test_nodes.txt](cpu_test_nodes.txt)读取；旧文件索引包含混有GPU测试的文件，不能整文件调用来复现CPU资格。
 
 **真实 A100 检查。** 使用节点 `spartan-gpgpu168` 的四张 A100 80GB，模型为本地 Qwen3.6-35B-A3B，BF16 权重／KV、FP32 GDN，HiCache 开启。EP2 位于 NVLink 对 `[0,1]`，EP4 覆盖整节点；P/D 案例为 `[0,1]` 上 EP2 Prefill，向 `[2,3]` 上 PP2 Decode 交接。每个 rank 检查全部本地层的专家布局；代表 Expert 层通过真实权重与独立路由／计算参考比较，包括全部 token 路由到一个 rank 的情况。随后运行完整模型、8 个并发请求及受控缓存恢复。
 
