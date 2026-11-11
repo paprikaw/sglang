@@ -8,9 +8,9 @@ controller points at the target device pool. L3 and pending I/O fail closed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import json
+from dataclasses import dataclass
 
 import torch
 
@@ -360,6 +360,7 @@ def project_target_device_pool(pool, *, target, generation):
     must never be installed in the model runner or serving token allocator.
     """
     import copy
+
     from sglang.srt.mem_cache.elastic_hybrid_pool import ElasticHybridLinearKVPool
 
     def mha_view(source, interval):
@@ -382,7 +383,7 @@ def project_target_device_pool(pool, *, target, generation):
         )
         view.k_buffer = [p[0] for p in pairs]
         view.v_buffer = [p[1] for p in pairs]
-        (view.k_data_ptrs, view.v_data_ptrs, view.data_ptrs, view.data_strides) = (
+        view.k_data_ptrs, view.v_data_ptrs, view.data_ptrs, view.data_strides = (
             source._build_elastic_pp_pointer_tables(view.k_buffer, view.v_buffer)
         )
         # copy.copy must not retain source-generation descriptors/transactions.
@@ -454,6 +455,7 @@ def clone_cache_runtime_metadata(cache):
     """Give a target generation private collaborators pointing at its cache."""
     import copy
     import types
+
     from sglang.srt.session.streaming_session import StreamingSession
 
     clone = copy.copy(cache)
@@ -482,6 +484,63 @@ def clone_cache_runtime_metadata(cache):
             if isinstance(value, types.MethodType) and value.__self__ is source:
                 setattr(component, name, types.MethodType(value.__func__, component))
     return clone
+
+
+def prewarm_host_allocator(scheduler):
+    """Warm exact candidate L2 allocation shapes before any request can run.
+
+    No cache metadata is migrated or published. All ranks join the normal
+    fixed-size host-capacity collectives, including dormant ranks. Temporary
+    pools are destroyed while PyTorch keeps their registered blocks reusable.
+    """
+    import dataclasses
+    import time
+
+    mr = scheduler.tp_worker.model_runner
+    if not scheduler.is_initializing:
+        raise RuntimeError("host allocator warmup requires startup")
+    if mr.server_args.elastic_pp_hicache_allocator != "pytorch":
+        raise RuntimeError("host allocator warmup requires PyTorch pinned backing")
+    source = scheduler.tree_cache
+    if source.enable_storage:
+        raise ValueError("host allocator warmup supports L2-only HiCache")
+    pool = mr.token_to_kv_pool
+    clone = clone_cache_runtime_metadata(source)
+    clone.sidecar_pool_specs = []
+    clone.req_to_token_pool = mr.req_to_token_pool
+    params = dataclasses.replace(
+        source._hicache_init_params, req_to_token_pool=mr.req_to_token_pool
+    )
+    started = time.monotonic()
+    before = torch.cuda.memory.host_memory_stats()
+    try:
+        if mr.model.start_layer == mr.model.end_layer:
+            build_dormant_host_stack(
+                clone, source=source, projected=pool, params=params
+            )
+        else:
+            clone.init_hicache(source._hicache_init_server_args, params)
+    finally:
+        if clone.host_pool_group is not source.host_pool_group:
+            discard_host_cache(clone)
+        # The temporary assembler registers its own layer-done counter. The
+        # live empty cache keeps its original bindings throughout startup.
+        getattr(pool, "full_kv_pool", pool).register_layer_transfer_counter(
+            source.cache_controller.layer_done_counter
+        )
+        if hasattr(mr.req_to_token_pool, "register_layer_transfer_counter"):
+            mr.req_to_token_pool.register_layer_transfer_counter(
+                source.cache_controller.layer_done_counter
+            )
+    after = torch.cuda.memory.host_memory_stats()
+    return {
+        "interval": [mr.model.start_layer, mr.model.end_layer],
+        "seconds": time.monotonic() - started,
+        "pinned_allocated_bytes": after["allocated_bytes.current"],
+        "pinned_active_bytes": after["active_bytes.current"],
+        "new_host_allocations": after["num_host_alloc"] - before["num_host_alloc"],
+        "host_allocations": after["num_host_alloc"],
+    }
 
 
 def _prepare_target_host_cache(cache, *, device_pool, target, generation):
@@ -865,8 +924,9 @@ def snapshot_tree_metadata(cache):
 
 def restore_tree_metadata(payload, cache):
     import pickle
-    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+
     from sglang.srt.mem_cache.unified_cache.components import tree_component
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
 
     tree = pickle.loads(payload)
     tree.device = cache.tree_core.device
@@ -907,7 +967,8 @@ def build_dormant_host_stack(clone, *, source, projected, params):
     """Keep cache allocator/consensus semantics with no layer payloads."""
     import copy
     import threading
-    from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool, HostPoolGroup
+
+    from sglang.srt.mem_cache.hicache_storage import PoolName
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         HybridCacheController,
     )
@@ -915,7 +976,7 @@ def build_dormant_host_stack(clone, *, source, projected, params):
         _COMPONENT_HOST_ATTR,
         _logical_host_pool_size,
     )
-    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, LogicalHostPool
     from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
     entries = []

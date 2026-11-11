@@ -30,6 +30,10 @@ _BACKEND_FIELDS = (
 
 def validate_graph_partitions(args, initial):
     partitions = parse_elastic_pp_partitions(args.elastic_pp_graph_partitions)
+    if getattr(args, "elastic_pp_hicache_allocator", "mmap") == "pytorch" and (
+        not args.enable_hierarchical_cache or args.hicache_storage_backend is not None
+    ):
+        raise ValueError("elastic pinned allocator requires L2-only HiCache enabled")
     if len(partitions) > 4:
         raise ValueError("prepared Decode Graph supports at most four partitions")
     if args.disable_cuda_graph:
@@ -133,6 +137,13 @@ class PreparedDecodeGraphBank:
         self.startup_allocated_delta_bytes = None
         self.runtime_selections = 0
         self.resident_weights = {}
+        self.host_allocator_warmups = []
+        self.torch_host_allocator = (
+            getattr(
+                getattr(mr, "server_args", None), "elastic_pp_hicache_allocator", "mmap"
+            )
+            == "pytorch"
+        )
 
     @staticmethod
     def _weight_identity(tensor):
@@ -263,7 +274,7 @@ class PreparedDecodeGraphBank:
         self.building = False
 
     def metrics(self):
-        return dict(
+        result = dict(
             sealed=not self.building,
             local_intervals=[list(key) for key in self.entries],
             startup_runner_captures=len(self.entries),
@@ -274,7 +285,20 @@ class PreparedDecodeGraphBank:
             startup_allocated_delta_bytes=self.startup_allocated_delta_bytes,
             runtime_captures=0,
             runtime_selections=self.runtime_selections,
+            host_allocator_warmups=self.host_allocator_warmups,
         )
+        if self.torch_host_allocator:
+            stats = torch.cuda.memory.host_memory_stats()
+            result["pinned_allocator"] = {
+                key: stats[key]
+                for key in (
+                    "allocated_bytes.current",
+                    "active_bytes.current",
+                    "num_host_alloc",
+                    "num_host_free",
+                )
+            }
+        return result
 
 
 def init_prepared_graph_bank(mr):
@@ -377,6 +401,15 @@ def prewarm_scheduler_graph_bank(scheduler):
             state = coordinator.wait_for_phase({Phase.DONE, Phase.FAILED}, timeout=120)
             if state.phase == Phase.FAILED:
                 raise RuntimeError(f"startup Graph cleanup failed: {state.error}")
+            if (
+                getattr(mr.server_args, "elastic_pp_hicache_allocator", "mmap")
+                == "pytorch"
+            ):
+                from sglang.srt.elastic_pp.hicache_transition import (
+                    prewarm_host_allocator,
+                )
+
+                bank.host_allocator_warmups.append(prewarm_host_allocator(scheduler))
     _reset_startup_residency(mr)
     # Private preparation generations were never advertised to a client. The
     # normal route installer must retain its monotonic serving-generation gate.

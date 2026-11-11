@@ -1112,6 +1112,14 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "reuse"
+    elastic_pp_hicache_allocator: A[
+        str,
+        Arg(
+            help="L2 HiCache backing: registered mmap, or startup-warmed PyTorch pinned blocks for prepared elastic PP Graphs.",
+            choices=["mmap", "pytorch"],
+        ),
+        NS("parallel"),
+    ] = "mmap"
     elastic_pp_kv_backend: A[
         str,
         Arg(

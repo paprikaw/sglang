@@ -595,6 +595,8 @@ def engine_entry(cfg, row):
                     ),
                     "--elastic-pp-prepared-weight-policy",
                     cfg.get("prepared_weight_policy", "reuse"),
+                    "--elastic-pp-hicache-allocator",
+                    cfg.get("hicache_allocator", "mmap"),
                 ]
                 if cfg.get("prepared_graphs")
                 else []
@@ -1237,6 +1239,7 @@ def prepare(args):
         prepared_graphs=getattr(args, "prepared_graphs", False),
         prepared_weight_policy=getattr(args, "prepared_weight_policy", "reuse"),
         migration_profile=getattr(args, "migration_profile", False),
+        hicache_allocator=getattr(args, "hicache_allocator", "mmap"),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
         context_length=(
             4096 if getattr(args, "active_output_tokens", 256) > 1024 else 2048
@@ -1454,6 +1457,9 @@ def main():
         "--prepared-weight-policy", choices=["reuse", "recopy"], default="reuse"
     )
     parser.add_argument("--migration-profile", action="store_true")
+    parser.add_argument(
+        "--hicache-allocator", choices=["mmap", "pytorch"], default="mmap"
+    )
     parser.add_argument("--same-process-warm-reference", action="store_true")
     parser.add_argument("--active-output-tokens", type=int, default=256)
     parser.add_argument("--kv-patch-transport", choices=["cpu", "nixl"], default="cpu")
