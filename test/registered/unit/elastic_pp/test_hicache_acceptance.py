@@ -15,6 +15,10 @@ from types import SimpleNamespace as NS
 
 import pytest
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
 
 @pytest.fixture
 def acceptance():
@@ -40,6 +44,7 @@ def acceptance():
             "observe_request_launch",
             "validate_uninterrupted_decode",
             "state_evidence",
+            "validate_decode_graph_states",
             "worker",
             "paired_overhead",
         }
@@ -656,6 +661,77 @@ def test_failed_finalize_does_not_publish_successful_fence_record(acceptance):
     assert not getattr(coordinator, "_smoke_fence_records", [])
 
 
+def test_private_startup_graph_walk_has_no_serving_fence_record(acceptance):
+    class Scheduler:
+        def get_internal_state(self):
+            return NS(internal_state={})
+
+        def _record_batch_launch(self, batch):
+            pass
+
+    class Coordinator:
+        cache_transition = None
+
+        def finalize_at_fence(self, publish):
+            return publish()
+
+    acceptance["install_transition_hooks"](Scheduler, Coordinator)
+    coordinator = Coordinator()
+    assert coordinator.finalize_at_fence(lambda: "startup") == "startup"
+    assert not getattr(coordinator, "_smoke_fence_records", [])
+
+
+@pytest.mark.parametrize(
+    "fault", [None, "runtime_capture", "unsealed", "missing_capture", "no_selection"]
+)
+def test_prepared_graph_acceptance_rejects_recapture_and_incomplete_bank(
+    acceptance, fault
+):
+    states = []
+    for rank in range(3):
+        states.append(
+            {
+                "transition_rank": rank,
+                "transition_metrics": {
+                    "decode_graph": [
+                        {"generation": 0, "replays": int(rank != 1)},
+                        {
+                            "generation": 1,
+                            "status": "ready",
+                            "replays": 3,
+                            "capture_seconds": 0.0,
+                            "prepared": True,
+                        },
+                    ],
+                    "prepared_decode_graphs": {
+                        "sealed": True,
+                        "runtime_captures": 0,
+                        "startup_runner_captures": 1 if rank == 1 else 2,
+                        "runtime_selections": 1,
+                    },
+                },
+            }
+        )
+    metrics = states[2]["transition_metrics"]
+    if fault == "runtime_capture":
+        metrics["decode_graph"][1]["capture_seconds"] = 0.8
+    elif fault == "unsealed":
+        metrics["prepared_decode_graphs"]["sealed"] = False
+    elif fault == "missing_capture":
+        metrics["prepared_decode_graphs"]["startup_runner_captures"] = 1
+    elif fault == "no_selection":
+        metrics["prepared_decode_graphs"]["runtime_selections"] = 0
+    if fault:
+        with pytest.raises(AssertionError, match="prepared|bank"):
+            acceptance["validate_decode_graph_states"](
+                states, 1, (0, 2), (0, 1, 2), prepared=True
+            )
+    else:
+        acceptance["validate_decode_graph_states"](
+            states, 1, (0, 2), (0, 1, 2), prepared=True
+        )
+
+
 @pytest.mark.parametrize(
     "initial_probe",
     [
@@ -800,6 +876,7 @@ def test_launch_observer_counts_real_modes_without_retaining_request(
     acceptance, replay
 ):
     import weakref
+
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
     class Request:

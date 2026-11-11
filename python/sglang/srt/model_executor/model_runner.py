@@ -1036,14 +1036,63 @@ class ModelRunner:
         )
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
+        elastic = self.server_args.enable_elastic_pp
+        if elastic and getattr(self.server_args, "elastic_pp_graph_partitions", None):
+            from sglang.srt.elastic_pp.prepared_decode_graph import (
+                init_prepared_graph_bank,
+            )
+
+            init_prepared_graph_bank(self)
+        active = True
+        if elastic and self.server_args.elastic_pp_initial_partition:
+            active = bool(
+                int(
+                    self.server_args.elastic_pp_initial_partition.split(",")[
+                        self.ps.pp_rank
+                    ]
+                )
+            )
         capture = capture_cuda_graphs(
-            model_runner=self, capture_decode_cuda_graph=capture_decode_cuda_graph
+            model_runner=self,
+            capture_decode_cuda_graph=capture_decode_cuda_graph and active,
         )
         self.eager_runner = capture.eager_runner
         self.prefill_cuda_graph_runner = capture.prefill.runner
         self.decode_cuda_graph_runner = capture.decode.runner
+        if elastic and not active:
+            self.decode_cuda_graph_runner = None
         self.graph_memory_usage = capture.memory_usage
         self.graph_time_usage = capture.time_usage
+        if elastic:
+            from sglang.srt.elastic_pp.decode_graph import ElasticPPDecodeGraphState
+
+            self._elastic_pp_decode_graph_state = ElasticPPDecodeGraphState()
+            entry = self._elastic_pp_decode_graph_state.begin(0)
+            entry.update(
+                status=(
+                    "disabled"
+                    if self.server_args.disable_cuda_graph
+                    else "inactive" if not active else "ready"
+                ),
+                capture_seconds=capture.decode.capture_time,
+            )
+            bank = getattr(self, "_elastic_pp_prepared_graphs", None)
+            if bank is not None and active:
+                bank.remember(self, capture.decode.capture_time)
+                entry["prepared"] = True
+
+    def rebuild_elastic_pp_decode_graph(self, *, generation: int, active: bool):
+        from sglang.srt.elastic_pp.decode_graph import rebuild_decode_graph
+
+        rebuild_decode_graph(self, generation=generation, active=active)
+
+    def elastic_pp_decode_graph_metrics(self):
+        state = getattr(self, "_elastic_pp_decode_graph_state", None)
+        return [] if state is None else state.snapshot()
+
+    def elastic_pp_prepared_graph_metrics(self):
+        bank = getattr(self, "_elastic_pp_prepared_graphs", None)
+        return None if bank is None else bank.metrics()
 
     def init_routed_experts_capturer(self):
         if self.is_draft_worker:
@@ -1359,10 +1408,11 @@ class ModelRunner:
         method = self._elastic_pp_model_method("commit_elastic_pp_layers")
         target = method(generation=generation)
         # Captured graphs retain both the old layer path and parameter pointers.
-        # Dropping them at the scheduler fence keeps the first post-commit batch
-        # correct; a later milestone can recapture the stable target topology.
-        self.decode_cuda_graph_runner = None
-        self.prefill_cuda_graph_runner = None
+        # The coordinator rebuilds Decode Graph only after all target weights,
+        # KV/GDN, HiCache and logical routes have committed on every rank.
+        from sglang.srt.elastic_pp.decode_graph import retire_decode_graph
+
+        retire_decode_graph(self)
         return target
 
     def cleanup_elastic_pp_layers(
@@ -1404,6 +1454,12 @@ class ModelRunner:
         )
         profile = self.elastic_pp_weight_profile
         weights = sum(profile.layer_weight_sizes[i] for i in incoming)
+        bank = getattr(self, "_elastic_pp_prepared_graphs", None)
+        if bank is not None and not bank.building:
+            # Startup already owns every candidate allocation. This is not
+            # reclaimed memory: it is resident and included in actual free.
+            bank.check_topology(transition.target)
+            weights = 0
         k_shape, v_shape = full._kv_buffer_shapes()
         item_bytes = torch.empty(0, dtype=full.store_dtype).element_size()
         kv_per_layer = (math.prod(k_shape) + math.prod(v_shape)) * item_bytes
@@ -1434,6 +1490,8 @@ class ModelRunner:
                 target.size if source_backing_released else len(incoming)
             ) * kv_per_layer
             recurrent_bytes = 0
+        if bank is not None and not bank.building:
+            kv_bytes = recurrent_bytes = 0
         required = weights + kv_bytes + recurrent_bytes
         reserve = max(256 * 2**20, math.ceil(required * 0.05))
         device = torch.device(self.device)
@@ -1698,6 +1756,11 @@ class ModelRunner:
         return DecodeCudaGraphRunner
 
     def init_decode_cuda_graph(self):
+        bank = getattr(self, "_elastic_pp_prepared_graphs", None)
+        if bank is not None and not bank.building:
+            raise RuntimeError(
+                "runtime Decode Graph capture is forbidden for prepared layouts"
+            )
         self.decode_cuda_graph_runner = None
         capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner
@@ -2018,7 +2081,14 @@ class ModelRunner:
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
+                state = getattr(self, "_elastic_pp_decode_graph_state", None)
+                if state is not None and forward_batch.forward_mode.is_decode():
+                    state.observe(True)
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+            state = getattr(self, "_elastic_pp_decode_graph_state", None)
+            if state is not None and forward_batch.forward_mode.is_decode():
+                state.observe(False)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns

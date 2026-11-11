@@ -37,7 +37,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.overlap_utils import RelayPayload, resolve_forward_inputs
 from sglang.srt.managers.pp_slot_affinity import PPSlotAffinityState
-
 from sglang.srt.managers.pp_spec_microbatch import launch_then_exchange, own_payload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -763,13 +762,21 @@ class SchedulerPPMixin:
         last_rank_comm_queue: deque,
     ):
         if self._pp_rank_is_active():
-            return self._pp_launch_batch(
+            coordinator = getattr(self, "elastic_pp_migration_coordinator", None)
+            if coordinator is not None:
+                coordinator.prepare_live_patch_writes(cur_batch)
+            result, ready_event = self._pp_launch_batch(
                 mb_id,
                 cur_batch,
                 pp_proxy_tensors,
                 mb_metadata,
                 last_rank_comm_queue,
             )
+            if coordinator is not None:
+                coordinator.progress_live_patch(
+                    cur_batch, ready_event, self.req_to_token_pool
+                )
+            return result, ready_event
 
         # Inactive ranks retain scheduler/request state but own no model
         # layers.  Mirror run_batch's scheduler bookkeeping so result

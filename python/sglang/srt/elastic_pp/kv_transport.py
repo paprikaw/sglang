@@ -193,6 +193,11 @@ class ElasticPPKVTransport:
         self.allocator = allocator
         self.rank = int(rank)
         self.slot_chunk_size = int(slot_chunk_size)
+        self._live_patch = None
+        self._live_patch_error = None
+        self._last_live_patch_metrics = {"enabled": False}
+        self._nixl_endpoint = None
+        self._nixl_receiver = None
         self._runner_device = torch.device(getattr(model_runner, "device", "cpu"))
         self._send_stream = None
         self._receive_stream = None
@@ -204,6 +209,66 @@ class ElasticPPKVTransport:
             with torch.cuda.device(self._runner_device):
                 self._send_stream = torch.cuda.Stream(device=self._runner_device)
                 self._receive_stream = torch.cuda.Stream(device=self._runner_device)
+        args = getattr(model_runner, "server_args", None)
+        if getattr(args, "elastic_pp_kv_patch_transport", "cpu") == "nixl":
+            self._initialize_nixl()
+
+    def _initialize_nixl(self):
+        """Startup-only bootstrap on all candidates, including zero-layer ranks."""
+        from sglang.srt.elastic_pp.nixl_kv_patch import NixlKVReceiver
+        from sglang.srt.elastic_pp.nixl_transport import NixlMigrationEndpoint
+
+        endpoint, metadata, error = None, None, None
+        try:
+            endpoint = NixlMigrationEndpoint(
+                rank=self.rank,
+                world_size=self.group.world_size,
+                device=self._runner_device,
+            )
+            metadata = endpoint.metadata()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        reports = self.group.all_gather_object(
+            dict(
+                rank=self.rank,
+                error=error,
+                endpoint=metadata,
+            )
+        )
+        errors = [r for r in reports if r["error"] is not None]
+        if errors:
+            if endpoint is not None:
+                endpoint.close()
+            raise RuntimeError(f"candidate GPU NIXL initialization failed: {errors}")
+        self._nixl_endpoint = endpoint
+        self._nixl_receiver = NixlKVReceiver(endpoint, self.pool)
+        endpoint.connect([r["endpoint"] for r in reports])
+        endpoint.warmup()
+
+    def mark_nixl_target_ready(self, transition):
+        if self._nixl_receiver is not None:
+            self._nixl_receiver.ready(transition.target.generation)
+
+    @contextmanager
+    def empty_startup_transport(self):
+        """Use fenced empty-state copies without consuming NIXL generations.
+
+        Only the pre-readiness Graph walk calls this. Agents and their progress
+        threads remain alive; the serving receiver is neither configured nor
+        fed a private startup generation. Never use it with requests in flight.
+        """
+        endpoint, receiver = self._nixl_endpoint, self._nixl_receiver
+        if self._live_patch is not None or (
+            receiver is not None and receiver.generation is not None
+        ):
+            raise RuntimeError(
+                "startup transport cannot suspend a live NIXL generation"
+            )
+        self._nixl_endpoint = self._nixl_receiver = None
+        try:
+            yield
+        finally:
+            self._nixl_endpoint, self._nixl_receiver = endpoint, receiver
 
     @contextmanager
     def _stream_context(self, stream):
@@ -307,6 +372,7 @@ class ElasticPPKVTransport:
         try:
             self.prepare_target(transition)
             self._preflight_cpu_staging(transition)
+            self.mark_nixl_target_ready(transition)
         except BaseException as exc:
             # The coordinator cannot set its prepared flag until this
             # method returns. Roll back locally so a failure after backing
@@ -379,7 +445,159 @@ class ElasticPPKVTransport:
         return result
 
     def metrics(self):
-        return {"backing_spill": self.backing_spill_metrics()}
+        patch = self._live_patch
+        return {
+            "backing_spill": self.backing_spill_metrics(),
+            "live_kv_patch": (
+                patch.metrics() if patch is not None else self._last_live_patch_metrics
+            ),
+            "nixl": (
+                dict(
+                    enabled=True,
+                    endpoint=dict(self._nixl_endpoint.metrics),
+                    receiver=dict(self._nixl_receiver.stats),
+                )
+                if self._nixl_endpoint is not None
+                else {"enabled": False}
+            ),
+        }
+
+    def begin_live_patch(self, transition):
+        """Called only by the scheduler, before its preparation thread starts."""
+        from sglang.srt.elastic_pp.backing_spill import _require_cpu_space
+        from sglang.srt.elastic_pp.live_kv_patch import LiveKVSnapshot
+
+        self._live_patch_error = None
+        self._last_live_patch_metrics = {"enabled": True, "outgoing_kv_layers": 0}
+        try:
+            if self._nixl_receiver is not None:
+                expected = {}
+                for edge in self.inbound_transfers(transition):
+                    expected.setdefault(edge.src_rank, set()).update(
+                        self._kv_layer_ids(edge)
+                    )
+                self._nixl_receiver.configure(transition.target.generation, expected)
+            layers = sorted(
+                {
+                    layer
+                    for edge in self.outbound_transfers(transition)
+                    for layer in self._kv_layer_ids(edge)
+                }
+            )
+            if not layers:
+                return
+            from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+            from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+            if type(self.allocator) not in (
+                TokenToKVPoolAllocator,
+                PagedTokenToKVPoolAllocator,
+            ):
+                raise NotImplementedError(
+                    "online KV patch requires a standard native token/page allocator"
+                )
+            source = {
+                layer: (
+                    self.pool.get_key_buffer(layer),
+                    self.pool.get_value_buffer(layer),
+                )
+                for layer in layers
+            }
+            copier = None
+            if self._nixl_endpoint is not None:
+                from sglang.srt.elastic_pp.nixl_kv_patch import NixlKVPatchCopier
+
+                targets = {}
+                for edge in self.outbound_transfers(transition):
+                    targets.setdefault(edge.dst_rank, set()).update(
+                        self._kv_layer_ids(edge)
+                    )
+                copier = NixlKVPatchCopier(
+                    source,
+                    endpoint=self._nixl_endpoint,
+                    generation=transition.target.generation,
+                    targets=targets,
+                    max_rows=min(256, self.slot_chunk_size),
+                )
+            self._live_patch = LiveKVSnapshot(
+                generation=transition.target.generation,
+                allocator=self.allocator,
+                source=source,
+                max_rows=min(256, self.slot_chunk_size),
+                admit_host_bytes=_require_cpu_space,
+                copier=copier,
+            )
+        except BaseException as exc:
+            # Every rank must still enter the common prepare consensus.
+            self._live_patch_error = f"{type(exc).__name__}: {exc}"
+
+    def check_live_patch(self):
+        error = self._live_patch_error
+        if self._live_patch is not None:
+            error = error or self._live_patch.error
+        if error is not None:
+            raise RuntimeError("online KV patch failed: " + error)
+
+    def progress_live_patch(self, batch, ready_event, req_to_token_pool):
+        patch = self._live_patch
+        if patch is None or not patch.active:
+            return
+        try:
+            # HiCache can have allocated slots whose async load has not run yet.
+            # Publish only the rows used by this completed local forward.
+            lengths = getattr(batch, "seq_lens_cpu", None)
+            if lengths is None:
+                lengths = batch.seq_lens.detach().cpu()
+            lengths = lengths.tolist()
+            requests = batch.req_pool_indices.detach().cpu().tolist()
+            mapping = req_to_token_pool.req_to_token
+            used = []
+            for request, length in zip(requests, lengths, strict=True):
+                if (
+                    not 0 <= request < mapping.shape[0]
+                    or not 0 <= length <= mapping.shape[1]
+                ):
+                    raise ValueError("invalid forward-time KV request mapping")
+                used.append(mapping[request, :length])
+            if used:
+                patch.progress(torch.unique(torch.cat(used)), ready_event)
+        except BaseException as exc:
+            self._live_patch_error = f"{type(exc).__name__}: {exc}"
+            # Drain before another allocator mutation can reuse these rows.
+            patch.abort()
+
+    def prepare_live_patch_writes(self, batch):
+        patch = self._live_patch
+        if patch is not None:
+            patch.prepare_writes(batch.out_cache_loc)
+
+    def finish_live_patch(self, transition):
+        self.check_live_patch()
+        if self._nixl_receiver is not None:
+            self._nixl_receiver.mark_fenced()
+        patch = self._live_patch
+        if patch is not None:
+            if patch.generation != transition.target.generation:
+                raise RuntimeError("online KV patch generation mismatch")
+            ready = self._record_ready_event(
+                torch.cuda.current_stream(self._runner_device)
+                if self._runner_device.type == "cuda"
+                else None
+            )
+            if ready is None:
+                from types import SimpleNamespace
+
+                ready = SimpleNamespace(synchronize=lambda: None)
+            patch.finish_at_fence(self.allocator.elastic_pp_live_slots(), ready)
+
+    def release_live_patch(self):
+        if self._nixl_receiver is not None:
+            self._nixl_receiver.retire()
+        patch = self._live_patch
+        if patch is not None:
+            patch.abort()
+            self._last_live_patch_metrics = patch.metrics()
+            self._live_patch = None
 
     def _preflight_cpu_staging(self, transition):
         spill = getattr(self, "_spill", None)
@@ -457,6 +675,7 @@ class ElasticPPKVTransport:
 
     def finalize_source_backing(self, transition):
         """Discard CPU rollback authority only after all-rank publication."""
+        self.release_live_patch()
         spill = getattr(self, "_spill", None)
         if spill is not None:
             spill.finalize(generation=transition.target.generation)
@@ -465,6 +684,15 @@ class ElasticPPKVTransport:
         return self.backing_spill_metrics()
 
     def _export_source_kv(self, *, layer_id, slot_ids):
+        if (
+            self._live_patch is not None
+            and self._live_patch.complete
+            and self._nixl_endpoint is None
+        ):
+            return tuple(
+                t.to(self.pool.device)
+                for t in self._live_patch.export(layer_id, slot_ids)
+            )
         spill = getattr(self, "_spill", None)
         if spill is None:
             return self.pool.export_elastic_pp_kv_slots(
@@ -703,6 +931,11 @@ class ElasticPPKVTransport:
         impossible without rebuilding the serving communicator.
         """
 
+        if self._nixl_endpoint is not None:
+            # finish_live_patch already copied and sealed all authoritative live
+            # rows. Do not retransmit them through NCCL at this fence. Hybrid
+            # subclasses still exchange the latest recurrent state here.
+            return frozenset()
         transfers = tuple(sorted(transition.kv_transfers, key=self._sort_key))
         loaded: set[int] = set()
         for transfer in transfers:
@@ -762,6 +995,14 @@ class ElasticPPKVTransport:
         """
 
         generation = transition.target.generation
+        if self._nixl_receiver is not None:
+            loaded = self._nixl_receiver.finish(generation)
+            if loaded:
+                self.pool.mark_elastic_pp_kv_layers_loaded(
+                    generation=generation,
+                    layer_ids=set(loaded),
+                )
+            return loaded
         inbound = self.inbound_transfers(transition)
         staged = [
             (key, value)
@@ -846,6 +1087,12 @@ class ElasticPPKVTransport:
         return frozenset(loaded)
 
     def abort_staged(self, transition: DynamicPPTransition) -> None:
+        if (
+            self._live_patch is not None
+            and self._live_patch.generation != transition.target.generation
+        ):
+            raise RuntimeError("online KV patch generation mismatch")
+        self.release_live_patch()
         self.release_fence_snapshot(transition)
         generation = transition.target.generation
         spill = getattr(self, "_spill", None)

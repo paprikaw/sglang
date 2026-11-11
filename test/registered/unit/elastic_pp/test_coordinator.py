@@ -204,6 +204,58 @@ def _coordinator(group=None, *, fence_step_provider=None, fence_lead_steps=0):
     return coordinator, transition, runner, kv_transport
 
 
+def test_live_patch_starts_on_scheduler_and_finishes_before_fenced_transfer():
+    coordinator, transition, runner, kv = _coordinator()
+    coordinator.strategy = "background"
+    coordinator.enable_kv_patch = True
+    calls = []
+    kv.begin_live_patch = lambda t: calls.append(
+        ("begin", threading.current_thread().name)
+    )
+    kv.check_live_patch = lambda: None
+    kv.finish_live_patch = lambda t: calls.append(
+        ("finish", threading.current_thread().name)
+    )
+    kv.release_live_patch = lambda: calls.append(
+        ("release", threading.current_thread().name)
+    )
+    coordinator._precopy_immutable_weights = lambda t: None
+    exchange = kv.exchange_phase
+
+    def checked_exchange(*args, **kwargs):
+        assert any(name == "finish" for name, _ in calls)
+        return exchange(*args, **kwargs)
+
+    kv.exchange_phase = checked_exchange
+    coordinator.begin(transition)
+    assert coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    coordinator.finalize_at_fence(lambda topology: None)
+    coordinator.start_cleanup()
+    assert coordinator.wait_for_phase(ElasticPPMigrationPhase.DONE, timeout=2)
+    assert calls[:2] == [
+        ("begin", threading.current_thread().name),
+        ("finish", threading.current_thread().name),
+    ]
+    assert calls[2][0] == "release"
+
+
+def test_live_patch_prepare_failure_reaches_collective_abort():
+    coordinator, transition, runner, kv = _coordinator()
+    coordinator.strategy = "background"
+    coordinator.enable_kv_patch = True
+    kv.begin_live_patch = lambda t: None
+
+    def fail():
+        raise MemoryError("shadow admission rejected")
+
+    kv.check_live_patch = fail
+    coordinator.begin(transition)
+    snapshot = coordinator.wait_for_phase(ElasticPPMigrationPhase.FAILED, timeout=2)
+    assert snapshot.source_usable and kv.aborted_staged
+    assert "prepare_allocations" in coordinator.group.stages
+    assert not runner.committed
+
+
 @pytest.mark.parametrize(
     "device, expected_gpu", [("cpu", None), ("cuda", 3), ("cuda:2", 2)]
 )
@@ -455,6 +507,7 @@ def test_host_cache_transaction_failure_obeys_publication_boundary(failure_stage
 def test_background_precopy_uses_cpu_payload_and_leaves_live_model_unpublished():
     import contextlib
     import queue
+
     from sglang.srt.elastic_pp.layer_transport import ElasticPPLayerTransport
 
     payloads = queue.Queue()

@@ -14,12 +14,16 @@ from typing import Any
 
 import torch
 
-from sglang.srt.elastic_pp.topology import DynamicPPTransition, PPTopology
 from sglang.srt.elastic_pp.layer_transport import (
     flatten_layer_states,
     unflatten_layer_states,
 )
-from sglang.srt.elastic_pp.topology import LayerRange, LayerTransfer
+from sglang.srt.elastic_pp.topology import (
+    DynamicPPTransition,
+    LayerRange,
+    LayerTransfer,
+    PPTopology,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,12 @@ class ElasticPPMigrationCoordinator:
     rows, and publishes the new model/KV/route generation.  Keeping serving
     and migration communicator launches on one host thread avoids undefined
     multi-thread NCCL ordering on the same device.
+
+    The opt-in KV patch integration gathers forward-ready native rows while
+    serving. The default CPU shadow crosses ranks at the drained fence; the
+    NIXL variant applies them online through independent registered buffers.
+    Recurrent/cache handoff and final coverage checks remain at the fence;
+    no background allocator snapshot is permitted.
     """
 
     def __init__(
@@ -73,6 +83,7 @@ class ElasticPPMigrationCoordinator:
         strategy: str | None = None,
         cache_transition: Any = None,
         backing: str | None = None,
+        enable_kv_patch: bool | None = None,
     ) -> None:
         # Test doubles without server_args retain the pre-existing allocation-only
         # protocol. Real runners select one of the three explicit policies.
@@ -90,6 +101,15 @@ class ElasticPPMigrationCoordinator:
         if self.backing == "cpu_spill" and self.strategy not in {"sync", "batched"}:
             raise ValueError("CPU-spill backing requires sync or batched transition")
         self.cache_transition = cache_transition
+        self.enable_kv_patch = (
+            bool(getattr(args, "enable_elastic_pp_kv_patch", False))
+            if enable_kv_patch is None
+            else enable_kv_patch
+        )
+        if self.enable_kv_patch and (
+            self.strategy != "background" or self.backing != "overlap"
+        ):
+            raise ValueError("online KV patch requires background/overlap transition")
         self._source_backing_attempted = False
         self._source_backing_metrics: dict[str, Any] = {}
         self._layers_precopied = False
@@ -167,6 +187,9 @@ class ElasticPPMigrationCoordinator:
             )
 
     def begin(self, transition: DynamicPPTransition) -> None:
+        bank = getattr(self.model_runner, "_elastic_pp_prepared_graphs", None)
+        if bank is not None:
+            bank.check_topology(transition.target)
         with self._condition:
             if self._phase not in {
                 ElasticPPMigrationPhase.IDLE,
@@ -213,12 +236,24 @@ class ElasticPPMigrationCoordinator:
             self._source_backing_metrics = {}
             self._drain_consensus_tensor = None
             self._drain_consensus_work = None
+            if self.enable_kv_patch:
+                # This caller is the scheduler; allocator snapshots must never
+                # be taken from the preparation worker.
+                self.kv_transport.begin_live_patch(transition)
             self._thread = Thread(
                 target=self._prepare_worker,
                 name=f"elastic-pp-prepare-g{transition.target.generation}-r{self.rank}",
                 daemon=True,
             )
             self._thread.start()
+
+    def progress_live_patch(self, batch, ready_event, req_to_token_pool):
+        if self.enable_kv_patch:
+            self.kv_transport.progress_live_patch(batch, ready_event, req_to_token_pool)
+
+    def prepare_live_patch_writes(self, batch):
+        if self.enable_kv_patch:
+            self.kv_transport.prepare_live_patch_writes(batch)
 
     @staticmethod
     def _slot_signature(slot_ids: torch.Tensor) -> tuple[int, str]:
@@ -406,6 +441,14 @@ class ElasticPPMigrationCoordinator:
             "peak_scope": "sampled at prepare/copy/commit; not allocator peak proof",
             "gpu_released": False,
         }
+        graph_metrics = getattr(
+            self.model_runner, "elastic_pp_decode_graph_metrics", None
+        )
+        if graph_metrics is not None:
+            metrics["decode_graph"] = graph_metrics()
+        prepared = getattr(self.model_runner, "elastic_pp_prepared_graph_metrics", None)
+        if prepared is not None:
+            metrics["prepared_decode_graphs"] = prepared()
         for name, component in (
             ("kv", self.kv_transport),
             ("host", self.cache_transition),
@@ -572,6 +615,8 @@ class ElasticPPMigrationCoordinator:
             local_error = None
             try:
                 self._set_worker_device()
+                if self.enable_kv_patch:
+                    self.kv_transport.check_live_patch()
                 if self.strategy in {"background", "legacy"}:
                     if self.strategy == "background":
                         self._preflight_capacity(transition)
@@ -685,6 +730,8 @@ class ElasticPPMigrationCoordinator:
                     torch.cuda.synchronize(device)
                 if self.cache_transition is not None:
                     self.cache_transition.prepare_transition(transition)
+                if self.enable_kv_patch:
+                    self.kv_transport.finish_live_patch(transition)
                 if self.strategy in {"sync", "batched"}:
                     snapshot = getattr(self.kv_transport, "snapshot_at_fence", None)
                     if snapshot is not None:
@@ -903,6 +950,26 @@ class ElasticPPMigrationCoordinator:
             )
             self._raise_peer_failures("commit", reports)
 
+            # Every rank has installed its target weights, pool and PP route.
+            # Select the startup-prepared runner when enabled; otherwise native
+            # pools changed addresses and require drained recapture.
+            local_error = None
+            try:
+                rebuild = getattr(
+                    self.model_runner, "rebuild_elastic_pp_decode_graph", None
+                )
+                if rebuild is not None:
+                    rebuild(
+                        generation=transition.target.generation,
+                        active=not transition.target.layer_range(self.rank).empty,
+                    )
+            except BaseException as exc:
+                local_error = f"{type(exc).__name__}: {exc}"
+            reports = self._consensus(
+                "decode_graph", success=local_error is None, error=local_error
+            )
+            self._raise_peer_failures("Decode Graph rebuild", reports)
+
             with self._condition:
                 self.current_topology = transition.target
                 self._committed_at = time.monotonic()
@@ -964,6 +1031,8 @@ class ElasticPPMigrationCoordinator:
                     self.kv_transport.finalize_source_backing(transition)
                     if self.cache_transition is not None:
                         self.cache_transition.finalize_source_device_aliases(transition)
+                if self.enable_kv_patch:
+                    self.kv_transport.release_live_patch()
                 if self.cache_transition is not None:
                     self.cache_transition.release_retired()
                 release_snapshot = getattr(

@@ -39,9 +39,12 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     ):
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
         self._elastic_pp_slot_tracker: ElasticKVSlotTracker | None = None
+        self._elastic_pp_live_patch = None
         self.clear()
 
     def clear(self):
+        if getattr(self, "_elastic_pp_live_patch", None) is not None:
+            raise RuntimeError("cannot clear the KV allocator during online KV patch")
         if getattr(self, "_elastic_pp_slot_tracker", None) is not None:
             raise RuntimeError(
                 "cannot clear the KV allocator while an elastic PP snapshot "
@@ -59,6 +62,15 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # To avoid minor "len(free_pages) * 1" overhead
         return len(self.free_pages) + len(self.release_pages)
 
+    def resize(self, config):
+        # Base.resize mutates size before clear; reject before that mutation.
+        if (
+            self._elastic_pp_live_patch is not None
+            or self._elastic_pp_slot_tracker is not None
+        ):
+            raise RuntimeError("cannot resize the KV allocator during elastic tracking")
+        super().resize(config)
+
     def alloc(self, need_size: int):
         if self.need_sort and need_size > len(self.free_pages):
             self.merge_and_sort_free()
@@ -70,6 +82,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_pages = self.free_pages[need_size:]
         if self._elastic_pp_slot_tracker is not None:
             self._elastic_pp_slot_tracker.record_alloc(select_index)
+        patch = self._elastic_pp_live_patch
+        if patch is not None:
+            patch.allocated(select_index)
         return select_index
 
     def free(self, free_index: torch.Tensor):
@@ -77,6 +92,10 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             return
 
         if self.is_not_in_free_group:
+            patch = self._elastic_pp_live_patch
+            if patch is not None:
+                # A grouped free reaches this hook only when physically reusable.
+                patch.freeing(free_index)
             if self.need_sort:
                 self.release_pages = torch.cat((self.release_pages, free_index))
             else:
@@ -86,6 +105,20 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
+
+    def attach_elastic_pp_live_patch(self, patch):
+        if (
+            self._elastic_pp_live_patch is not None
+            or self._elastic_pp_slot_tracker is not None
+        ):
+            raise RuntimeError("another elastic KV tracker is already attached")
+        if not self.is_not_in_free_group or self.free_group:
+            raise RuntimeError("online KV patch requires a closed allocator free group")
+        self._elastic_pp_live_patch = patch
+
+    def detach_elastic_pp_live_patch(self, patch):
+        if self._elastic_pp_live_patch is patch:
+            self._elastic_pp_live_patch = None
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         return self._kvcache.load_cpu_copy(
@@ -109,6 +142,8 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return torch.nonzero(live_mask, as_tuple=False).flatten()
 
     def begin_elastic_pp_slot_tracking(self, *, generation: int) -> torch.Tensor:
+        if self._elastic_pp_live_patch is not None:
+            raise RuntimeError("online KV patch is already attached")
         if self._elastic_pp_slot_tracker is not None:
             if self._elastic_pp_slot_tracker.generation != generation:
                 raise RuntimeError(

@@ -13,6 +13,7 @@ from sglang.srt.elastic_pp.topology import (
     LayerTransfer,
     PPTopology,
 )
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -238,6 +239,67 @@ def test_global_exchange_uses_source_slots_with_rank_skew():
     assert torch.equal(
         target_pool.get_value_buffer(1)[slots], source_pool.v_buffer[1][slots]
     )
+
+
+def test_online_shadow_hands_off_real_native_pool_with_final_new_rows():
+    from types import SimpleNamespace
+
+    transition = DynamicPPTransition.build(
+        PPTopology.from_layer_counts([2, 2], generation=0),
+        PPTopology.from_layer_counts([1, 3], generation=1),
+    )
+    source_pool = _make_pool(start_layer=0, layer_num=2)
+    target_pool = _make_pool(start_layer=2, layer_num=2)
+    allocator = TokenToKVPoolAllocator(8, torch.float32, "cpu", source_pool, False)
+    slots = allocator.alloc(2)
+    for t in (source_pool.k_buffer[1], source_pool.v_buffer[1]):
+        t[slots] = 12
+    mailbox = _Mailbox()
+    source = ElasticPPKVTransport(
+        group=_Group(mailbox, 0),
+        model_runner=_Runner(source_pool),
+        allocator=allocator,
+        rank=0,
+    )
+    target = ElasticPPKVTransport(
+        group=_Group(mailbox, 1),
+        model_runner=_Runner(target_pool),
+        allocator=_Allocator(slots),
+        rank=1,
+    )
+    source.begin_live_patch(transition)
+    source.check_live_patch()
+    source._live_patch.progress(slots, SimpleNamespace(synchronize=lambda: None))
+    source._live_patch.progress(slots, SimpleNamespace(synchronize=lambda: None))
+    new = allocator.alloc(1)
+    for t in (source_pool.k_buffer[1], source_pool.v_buffer[1]):
+        t[new] = 37
+    source.prepare_transition(transition)
+    target.prepare_transition(transition)
+    source.finish_live_patch(transition)
+    live = allocator.elastic_pp_live_slots()
+    for phase in ("bulk", "delta"):
+        source.exchange_phase(
+            transition, phase=phase, slot_ids=live if phase == "bulk" else live[:0]
+        )
+        target.exchange_phase(transition, phase=phase, slot_ids=live)
+    target.apply_staged(transition)
+    target_pool.commit_elastic_pp_kv_layers(generation=1)
+    for actual, expected in zip(
+        (target_pool.get_key_buffer(1), target_pool.get_value_buffer(1)),
+        (source_pool.k_buffer[1], source_pool.v_buffer[1]),
+        strict=True,
+    ):
+        assert torch.equal(actual[live], expected[live])
+    metrics = source.metrics()["live_kv_patch"]
+    assert metrics["complete"] and metrics["online_completed_rows"] == 2
+    wrong = DynamicPPTransition.build(
+        transition.target, PPTopology.from_layer_counts([2, 2], generation=2)
+    )
+    with pytest.raises(RuntimeError, match="generation mismatch"):
+        source.abort_staged(wrong)
+    assert source._live_patch is not None
+    source.release_live_patch()
 
 
 def test_empty_source_snapshot_still_delivers_one_chunk():

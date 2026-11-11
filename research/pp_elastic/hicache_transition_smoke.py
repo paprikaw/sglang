@@ -12,12 +12,13 @@ import importlib.util
 import json
 import math
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
+from pathlib import Path
 
 import gpu_smoke as base
 
@@ -321,6 +322,8 @@ def state_evidence(info):
         "hicache_host_memory_mode",
         "elastic_pp_transition_strategy",
         "elastic_pp_transition_backing",
+        "enable_elastic_pp_kv_patch",
+        "elastic_pp_kv_patch_transport",
     )
     return {
         "internal_states": [
@@ -328,6 +331,41 @@ def state_evidence(info):
             for state in info.get("internal_states", [])
         ]
     }
+
+
+def validate_decode_graph_states(
+    states, generation, source_ranks, target_ranks, *, prepared=False
+):
+    for rank, state in rank_states(states).items():
+        history = state["transition_metrics"]["decode_graph"]
+        entries = {row["generation"]: row for row in history}
+        if set(entries) != set(range(generation + 1)):
+            raise AssertionError("missing elastic Decode Graph generations")
+        if rank in source_ranks and entries[generation - 1]["replays"] <= 0:
+            raise AssertionError("source Decode Graph did not actually replay")
+        target = entries[generation]
+        if rank in target_ranks:
+            if target["status"] != "ready" or target["replays"] <= 0:
+                raise AssertionError("target Decode Graph did not actually replay")
+            if target["capture_seconds"] is None:
+                raise AssertionError("missing target Graph capture timing")
+            if prepared and (
+                target["capture_seconds"] != 0.0 or not target.get("prepared")
+            ):
+                raise AssertionError("runtime target Graph was not prepared at startup")
+        elif target["status"] != "inactive" or target["replays"]:
+            raise AssertionError("inactive rank retained a runnable Decode Graph")
+        if prepared:
+            bank = state["transition_metrics"].get("prepared_decode_graphs") or {}
+            if (
+                not bank.get("sealed")
+                or bank.get("runtime_captures") != 0
+                or bank.get("startup_runner_captures") != (1 if rank == 1 else 2)
+                or bank.get("runtime_selections") != (1 if rank == 1 else generation)
+            ):
+                raise AssertionError(
+                    "prepared Graph bank capture/selection evidence incomplete"
+                )
 
 
 def install_hooks():
@@ -345,9 +383,8 @@ def install_hooks():
     import cache_probe
 
     cache_probe.install()
-    from sglang.srt.managers.scheduler import Scheduler
-
     from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
+    from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 
     install_diagnostic_fanout(Scheduler, TokenizerControlMixin)
@@ -465,6 +502,10 @@ def install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator):
     original_finalize = ElasticPPMigrationCoordinator.finalize_at_fence
 
     def finalize(self, publish):
+        # The startup-only, empty-state Graph preparation walk has no cache
+        # adapter or user requests. Only record public serving transitions.
+        if self.cache_transition is None:
+            return original_finalize(self, publish)
         scheduler = self.cache_transition.scheduler
         record = {
             "generation": self._transition.target.generation,
@@ -531,6 +572,31 @@ def engine_entry(cfg, row):
     def args(argv):
         return prepare(
             argv
+            + (
+                [
+                    "--enable-elastic-pp-kv-patch",
+                    "--elastic-pp-kv-patch-transport",
+                    cfg.get("kv_patch_transport", "cpu"),
+                ]
+                if cfg.get("live_kv_patch")
+                else []
+            )
+            + (
+                ["--cuda-graph-bs-decode", "1", "2", "4"]
+                if cfg.get("cuda_graph")
+                else ["--disable-cuda-graph"]
+            )
+            + (
+                [
+                    "--elastic-pp-graph-partitions",
+                    ";".join(
+                        ",".join(map(str, counts))
+                        for counts in (cfg["initial_counts"], cfg["grown_counts"])
+                    ),
+                ]
+                if cfg.get("prepared_graphs")
+                else []
+            )
             + [
                 "--enable-elastic-pp",
                 "--elastic-pp-initial-partition",
@@ -539,7 +605,6 @@ def engine_entry(cfg, row):
                 cfg["strategy"],
                 "--elastic-pp-transition-backing",
                 cfg.get("backing", "overlap"),
-                "--disable-cuda-graph",
                 "--max-total-tokens",
                 "4096",
                 "--max-running-requests",
@@ -547,7 +612,7 @@ def engine_entry(cfg, row):
                 "--max-mamba-cache-size",
                 "16",
                 "--context-length",
-                "2048",
+                str(cfg.get("context_length", 2048)),
                 "--hicache-size",
                 "1",
                 "--chunked-prefill-size",
@@ -566,6 +631,9 @@ def launch(run, cfg, row, key):
     def environment(cfg, row, run):
         env = original_environment(cfg, row, run)
         env.update(INTEGRATION_SERVER="0", PP_HICACHE_SMOKE_ENGINE="1")
+        if cfg.get("kv_patch_transport") == "nixl":
+            env["PYTHONPATH"] = cfg["nixl_root"] + os.pathsep + env["PYTHONPATH"]
+            env.update(UCX_PROTO_INFO="y", UCX_LOG_LEVEL="info")
         if cfg.get("baseline_probe"):
             env.update(
                 PP_HICACHE_BASELINE_PROBE="1",
@@ -580,6 +648,40 @@ def launch(run, cfg, row, key):
         base.environment, base.__file__ = original_environment, original_file
 
 
+def launch_foundation_probe(run, cfg, row, key):
+    """Own the primitive probe under the same exact-node experiment lease."""
+    env = base.environment(cfg, row, run)
+    env.update(
+        CUDA_VISIBLE_DEVICES="3",
+        PYTHONPATH=os.pathsep.join(
+            [str(ENGINE / "python"), cfg["kv_foundation_probe"]["root"]]
+        ),
+        KVCACHED_LAYER_STACKING="true",
+        KVCACHED_PAGE_PREALLOC_ENABLED="false",
+    )
+    proc = subprocess.Popen(
+        [cfg["python"], str(ROOT / "kv_foundation_gpu_probe.py"), "--run", str(run)],
+        env=env,
+        cwd=ENGINE,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    identity = h.process_record(proc.pid)
+    if not identity or identity["pgid"] != proc.pid or identity["session"] != proc.pid:
+        proc.terminate()
+        proc.wait(timeout=5)
+        raise RuntimeError("Could not establish owned primitive-probe process group")
+    thread = threading.Thread(
+        target=h.stream_log,
+        args=(proc.stdout, str(run / "component_gpu.log"), key),
+        daemon=True,
+    )
+    thread.start()
+    return dict(process=proc, identity=identity, log_thread=thread)
+
+
 def worker(run, cfg):
     if cfg.get("baseline_probe"):
         from hicache_baseline_probe import worker as baseline_worker
@@ -587,25 +689,32 @@ def worker(run, cfg):
         return baseline_worker(run, cfg)
     import agentx_replay
 
+    active_tokens = cfg.get("active_output_tokens", 256)
+
     authentication_started = time.time()
     authentication = h.authenticate(run, cfg, os.environ, local=True)
     key = h.read_key(cfg)
     row = cfg["layouts"][0]
     started = time.monotonic()
-    children, evidence = [], {
-        "strategy": cfg["strategy"],
-        "backing": cfg.get("backing", "overlap"),
-        "passed": False,
-        "resident_ranks": 3,
-        "gpu_released": False,
-        "performance_sample": bool(cfg.get("overhead_sample", False)),
-        "cuda_graph_enabled": False,
-        "diagnostic_reply_scope": "private one-node PP3/TP1/DP1 get/set state replies",
-        "acceptance_class": cfg.get("acceptance_class", "cold_warm_exact_generation"),
-        "cold_vs_warm_generation_qualified": False,
-        "generation_qualified": False,
-        "cached_execution_continuity_qualified": False,
-    }
+    children, evidence = (
+        [],
+        {
+            "strategy": cfg["strategy"],
+            "backing": cfg.get("backing", "overlap"),
+            "passed": False,
+            "resident_ranks": 3,
+            "gpu_released": False,
+            "performance_sample": bool(cfg.get("overhead_sample", False)),
+            "cuda_graph_enabled": bool(cfg.get("cuda_graph", False)),
+            "diagnostic_reply_scope": "private one-node PP3/TP1/DP1 get/set state replies",
+            "acceptance_class": cfg.get(
+                "acceptance_class", "cold_warm_exact_generation"
+            ),
+            "cold_vs_warm_generation_qualified": False,
+            "generation_qualified": False,
+            "cached_execution_continuity_qualified": False,
+        },
+    )
     original_stream = agentx_replay.stream
     request_contracts = []
     owned_cleanup = None
@@ -734,15 +843,45 @@ def worker(run, cfg):
                     "elapsed_s": time.time() - qualification_started,
                 }
             )
+        elif evidence["acceptance_class"] == "same_process_warm_execution_continuity":
+            if not cfg.get("prepared_graphs"):
+                raise AssertionError(
+                    "same-process warm protocol requires prepared Graphs"
+                )
+            evidence["reference_scope"] = (
+                "Fresh same-version warmed reference; exact transition continuity only. "
+                "No prior state-review receipt or cold/warm generation qualification."
+            )
         elif evidence["acceptance_class"] != "cold_warm_exact_generation":
             raise AssertionError("unknown reference acceptance class")
+        if cfg.get("kv_foundation_probe"):
+            if lifecycle is None:
+                raise RuntimeError("The foundation probe requires supervised cleanup")
+            checkpoint("component_gpu_probe")
+            child = lifecycle.launch(
+                lambda: launch_foundation_probe(run, cfg, row, key)
+            )
+            deadline = time.monotonic() + 45
+            while child["process"].poll() is None:
+                check_cancelled()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Primitive GPU probe exceeded 45 seconds")
+                time.sleep(0.1)
+            child["log_thread"].join(timeout=2)
+            if child["process"].returncode != 0:
+                raise RuntimeError("Primitive GPU probe failed; see component_gpu.log")
+            component = json.loads((run / "component_gpu.json").read_text())
+            if not component.get("passed"):
+                raise AssertionError("Primitive GPU acceptance was not recorded")
+            evidence["component_gpu"] = component
         checkpoint("startup")
         if lifecycle is None:
-            children.append(launch(run, cfg, row, key))
+            engine_child = launch(run, cfg, row, key)
+            children.append(engine_child)
         else:
-            lifecycle.launch(lambda: launch(run, cfg, row, key))
+            engine_child = lifecycle.launch(lambda: launch(run, cfg, row, key))
         while True:
-            if children[0]["process"].poll() is not None:
+            if engine_child["process"].poll() is not None:
                 raise RuntimeError("engine exited during startup")
             try:
                 http("/get_server_info", timeout=2)
@@ -755,6 +894,7 @@ def worker(run, cfg):
             "fixed_continuation_tokens": 1,
             "prefix_input_tokens": len(prefix),
             "active_input_tokens": len(active_prompt),
+            "active_output_tokens": active_tokens,
             "reference_cache_state": "warmed at the same prefix-match boundary",
         }
         if lifecycle is not None:
@@ -764,9 +904,9 @@ def worker(run, cfg):
         checkpoint("prefix_reference")
         reference = request(prefix, 24)
         checkpoint("active_warmup")
-        cold_active = request(active_prompt, 256)
+        cold_active = request(active_prompt, active_tokens)
         checkpoint("active_reference")
-        active_reference = request(active_prompt, 256)
+        active_reference = request(active_prompt, active_tokens)
         evidence["references"] = {
             "cold_prefix": cold_prefix,
             "prefix": reference,
@@ -781,7 +921,10 @@ def worker(run, cfg):
             item["qualified"] for item in evidence["reference_qualification"].values()
         )
         evidence["observed_cold_warm_exact_ids_equal"] = cold_warm_equal
-        if evidence["acceptance_class"] == "cached_execution_continuity":
+        if evidence["acceptance_class"] in (
+            "cached_execution_continuity",
+            "same_process_warm_execution_continuity",
+        ):
             for warmed_reference in (reference, active_reference):
                 if (
                     warmed_reference.get("meta_info", {}).get("cached_tokens") != 512
@@ -811,7 +954,7 @@ def worker(run, cfg):
                 lifecycle.admit(
                     f"overhead_reference_{generation}", 105 if generation == 1 else 52
                 )
-                baseline = request(active_prompt, 256)
+                baseline = request(active_prompt, active_tokens)
                 evidence.setdefault("overhead_baselines", []).append(baseline)
                 if baseline["output_ids"] != active_reference["output_ids"]:
                     raise AssertionError(
@@ -831,7 +974,7 @@ def worker(run, cfg):
                 )
             with cf.ThreadPoolExecutor(max_workers=1) as pool:
                 try:
-                    active = pool.submit(request, active_prompt, 256)
+                    active = pool.submit(request, active_prompt, active_tokens)
                     deadline = time.monotonic() + 15
                     while True:
                         active_info = http("/get_server_info", timeout=3)
@@ -894,6 +1037,66 @@ def worker(run, cfg):
                         (0, 2) if generation == 1 else (0, 1, 2),
                         cfg.get("backing", "overlap"),
                     )
+                    if cfg.get("cuda_graph"):
+                        validate_decode_graph_states(
+                            states,
+                            generation,
+                            (0, 2) if generation == 1 else (0, 1, 2),
+                            (0, 1, 2) if generation == 1 else (0, 2),
+                            prepared=cfg.get("prepared_graphs", False),
+                        )
+                        record["decode_graph_verified"] = True
+                    if cfg.get("live_kv_patch"):
+                        patches = [
+                            state["transition_metrics"]
+                            .get("kv", {})
+                            .get("live_kv_patch", {})
+                            for state in rank_states(states).values()
+                        ]
+                        copied = [p for p in patches if p.get("total_rows", 0)]
+                        if not copied or any(
+                            not p.get("complete") or p.get("error") for p in copied
+                        ):
+                            raise AssertionError("online KV snapshot was not completed")
+                        if (
+                            sum(p.get("online_submissions", 0) for p in copied) <= 0
+                            or sum(p.get("online_completed_rows", 0) for p in copied)
+                            <= 0
+                        ):
+                            raise AssertionError(
+                                "no KV rows completed during source inference"
+                            )
+                        record["live_kv_patch_verified"] = True
+                        if cfg.get("kv_patch_transport") == "nixl":
+                            transports = [
+                                s["transition_metrics"]["kv"]["nixl"]
+                                for s in rank_states(states).values()
+                            ]
+                            if any(
+                                not t.get("enabled")
+                                or t["endpoint"].get("warm_channels") != 2
+                                for t in transports
+                            ):
+                                raise AssertionError(
+                                    "candidate NIXL endpoints were not prewarmed"
+                                )
+                            applied = sum(
+                                t["receiver"].get("online_applied_rows", 0)
+                                for t in transports
+                            )
+                            sealed = sum(
+                                t["receiver"].get("sealed_sources", 0)
+                                for t in transports
+                            )
+                            if applied <= 0 or sealed <= 0:
+                                raise AssertionError(
+                                    "no online GPU application or final NIXL seal"
+                                )
+                            record["nixl_verified"] = dict(
+                                online_applied_rows=applied,
+                                sealed_sources=sealed,
+                                actual_rdma_qualified=False,
+                            )
                     record["continuation"] = validate_uninterrupted_decode(
                         states,
                         generation,
@@ -912,7 +1115,9 @@ def worker(run, cfg):
                 time.sleep(0.05)
         fence_states = http("/get_server_info")["internal_states"]
         for generation, source_ranks in ((1, (0, 2)), (2, (0, 1, 2))):
-            validate_fenced_decode(fence_states, generation, source_ranks, 256)
+            validate_fenced_decode(
+                fence_states, generation, source_ranks, active_tokens
+            )
         evidence["fence_states"] = fence_states
         checkpoint("final_cpu_demotion")
         evidence["final_demotion"] = demote_cpu_prefixes(http)
@@ -968,6 +1173,10 @@ def worker(run, cfg):
             evidence["passed"]
             and evidence["acceptance_class"] == "cached_execution_continuity"
         )
+        evidence["same_process_warm_continuity_verified"] = (
+            evidence["passed"]
+            and evidence["acceptance_class"] == "same_process_warm_execution_continuity"
+        )
         h.save(run / "results.json", {"transition": evidence})
         h.save(run / "worker_progress.json", {"completed": int(evidence["passed"])})
         if lifecycle is not None:
@@ -977,6 +1186,8 @@ def worker(run, cfg):
 
 def prepare(args):
     # Freeze audited node cache and Guard sources using the existing helper.
+    if args.kv_foundation_root and not args.supervised_lifecycle:
+        raise ValueError("The foundation probe requires supervised cleanup")
     args.cases = "pp2"
     base.prepare(args)
     run = args.run.resolve()
@@ -998,6 +1209,17 @@ def prepare(args):
         cases=["transition"],
         strategy=args.strategy,
         backing=args.backing,
+        live_kv_patch=getattr(args, "live_kv_patch", False),
+        kv_patch_transport=getattr(args, "kv_patch_transport", "cpu"),
+        cuda_graph=getattr(args, "cuda_graph", False),
+        prepared_graphs=getattr(args, "prepared_graphs", False),
+        active_output_tokens=getattr(args, "active_output_tokens", 256),
+        context_length=(
+            4096 if getattr(args, "active_output_tokens", 256) > 1024 else 2048
+        ),
+        nixl_root=(
+            str(args.nixl_root.resolve()) if getattr(args, "nixl_root", None) else None
+        ),
         initial_counts=initial,
         initial_partition=",".join(map(str, initial)),
         grown_counts=grown,
@@ -1007,7 +1229,11 @@ def prepare(args):
         acceptance_class=(
             "cached_execution_continuity"
             if args.cached_reference_evidence
-            else "cold_warm_exact_generation"
+            else (
+                "same_process_warm_execution_continuity"
+                if args.same_process_warm_reference
+                else "cold_warm_exact_generation"
+            )
         ),
     )
     if getattr(args, "supervised_lifecycle", False):
@@ -1030,12 +1256,36 @@ def prepare(args):
             args.cached_reference_evidence.read_text()
         )
         qualify_cached_reference_evidence(cfg["cached_reference_evidence"], cfg)
+    if args.kv_foundation_root:
+        root = args.kv_foundation_root.resolve()
+        tree = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=root, text=True
+        ).strip()
+        lock = json.loads((ROOT / "dependencies.lock.json").read_text())["kvcached"]
+        if (
+            tree != lock["patched_tree"]
+            or subprocess.check_output(
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                cwd=root,
+                text=True,
+            ).strip()
+        ):
+            raise RuntimeError(
+                "The primitive probe requires the locked clean dependency"
+            )
+        binaries = list((root / "kvcached").glob("vmm_ops*.so"))
+        if len(binaries) != 1:
+            raise RuntimeError("Expected one pinned KVCacheD native extension")
+        cfg["kv_foundation_probe"] = dict(
+            root=str(root), tree=tree, native=base.desc(binaries[0])
+        )
     cfg["model_cache"]["usage_logs"] = {args.node: [use]}
     h.save(run / "config.json", cfg)
     spec = json.loads((run / "dashboard_spec.json").read_text())
     spec.update(
         title="Qwen HiCache elastic PP: resident PP2 to PP3 to PP2",
         model_cache=cfg["model_cache"],
+        port=args.dashboard_port,
     )
     spec["tasks"][0].update(
         expected=1,
@@ -1051,6 +1301,58 @@ def prepare(args):
             base.desc(ROOT / name)
             for name in ("hicache_run_lifecycle.py", "hicache_guard_run.py")
         ]
+    if args.kv_foundation_root:
+        spec["frozen_inputs"] += [
+            base.desc(ROOT / "kv_foundation_gpu_probe.py"),
+            *(
+                base.desc(ENGINE / "python/sglang/srt/elastic_pp" / name)
+                for name in ("graph_bank.py", "kv_patch.py")
+            ),
+        ]
+    if cfg["live_kv_patch"]:
+        spec["frozen_inputs"] += [
+            base.desc(ENGINE / "python/sglang/srt/elastic_pp" / name)
+            for name in ("kv_patch.py", "live_kv_patch.py")
+        ]
+    if cfg["cuda_graph"]:
+        spec["frozen_inputs"] += [
+            base.desc(ENGINE / path)
+            for path in (
+                "python/sglang/srt/elastic_pp/decode_graph.py",
+                "python/sglang/srt/elastic_pp/coordinator.py",
+                "python/sglang/srt/elastic_pp/kv_transport.py",
+                "python/sglang/srt/model_executor/model_runner.py",
+                "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py",
+                "python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py",
+                "python/sglang/srt/model_executor/runner_utils/pool.py",
+                "python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py",
+                "python/sglang/srt/elastic_pp/prepared_decode_graph.py",
+                "python/sglang/srt/elastic_pp/model.py",
+                "python/sglang/srt/elastic_pp/model_wrapper.py",
+                "python/sglang/srt/mem_cache/memory_pool.py",
+                "python/sglang/srt/mem_cache/elastic_hybrid_pool.py",
+                "python/sglang/srt/managers/scheduler.py",
+                "python/sglang/srt/server_args.py",
+            )
+        ]
+    if cfg["kv_patch_transport"] == "nixl":
+        spec["frozen_inputs"] += [
+            base.desc(ENGINE / "python/sglang/srt/elastic_pp" / name)
+            for name in ("nixl_transport.py", "nixl_kv_patch.py")
+        ]
+        root = Path(cfg["nixl_root"])
+        for pattern in (
+            "nixl/_api.py",
+            "nixl/__init__.py",
+            "nixl_cu12/_api.py",
+            "nixl_cu12/_bindings*.so",
+            "nixl_cu12.libs/libucp*.so*",
+            "nixl_cu12.libs/nixl/libplugin_UCX.so",
+        ):
+            matched = list(root.glob(pattern))
+            if not matched:
+                raise ValueError(f"NIXL dependency fingerprint missing {pattern}")
+            spec["frozen_inputs"] += [base.desc(path) for path in matched]
     if args.baseline_probe:
         spec["title"] = "Qwen HiCache static generation-zero qualification diagnostic"
         spec["tasks"][0]["label"] = "Static cold256/warm8 state and sampler diagnostic"
@@ -1075,6 +1377,11 @@ def prepare(args):
             ),
             base.desc(Path(cfg["model_path"]) / "config.json"),
         ]
+    if args.same_process_warm_reference:
+        spec["title"] = "Startup-prepared Decode Graphs: same-version warmed continuity"
+        spec["tasks"][0][
+            "label"
+        ] = "PP2↔PP3; startup captures only; no cold/warm generation qualification"
     h.save(run / "dashboard_spec.json", spec)
 
 
@@ -1087,6 +1394,8 @@ def main():
     parser.add_argument("--layout")
     parser.add_argument("--baseline-probe", action="store_true")
     parser.add_argument("--overhead-sample", action="store_true")
+    parser.add_argument("--kv-foundation-root", type=Path)
+    parser.add_argument("--dashboard-port", type=int, default=24760)
     parser.add_argument("--cached-reference-evidence", type=Path)
     parser.add_argument("--supervised-lifecycle", action="store_true")
     parser.add_argument("--work-seconds", type=float, default=250)
@@ -1114,10 +1423,41 @@ def main():
     parser.add_argument(
         "--strategy", choices=["sync", "background", "batched"], default="sync"
     )
+    parser.add_argument("--live-kv-patch", action="store_true")
+    parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--prepared-graphs", action="store_true")
+    parser.add_argument("--same-process-warm-reference", action="store_true")
+    parser.add_argument("--active-output-tokens", type=int, default=256)
+    parser.add_argument("--kv-patch-transport", choices=["cpu", "nixl"], default="cpu")
+    parser.add_argument("--nixl-root", type=Path)
     parser.add_argument(
         "--backing", choices=["overlap", "cpu_spill"], default="overlap"
     )
     args = parser.parse_args()
+    if not 256 <= args.active_output_tokens <= 2048:
+        parser.error("active output tokens must be between 256 and 2048")
+    if args.overhead_sample and args.active_output_tokens != 256:
+        parser.error("the existing paired overhead protocol requires 256 output tokens")
+    if args.cuda_graph and args.backing != "overlap":
+        parser.error("Decode Graph requires overlap backing")
+    if args.prepared_graphs and not args.cuda_graph:
+        parser.error("prepared Graphs require --cuda-graph")
+    if args.same_process_warm_reference and (
+        not args.prepared_graphs
+        or args.cached_reference_evidence
+        or args.baseline_probe
+    ):
+        parser.error(
+            "same-process warm reference is a separate prepared-Graph protocol"
+        )
+    if args.kv_patch_transport == "nixl" and (
+        not args.live_kv_patch or not args.nixl_root
+    ):
+        parser.error("NIXL requires --live-kv-patch and an isolated --nixl-root")
+    if args.live_kv_patch and (
+        args.strategy != "background" or args.backing != "overlap"
+    ):
+        parser.error("live KV patch requires background/overlap")
     if args.overhead_sample and not (
         args.supervised_lifecycle
         and args.cached_reference_evidence

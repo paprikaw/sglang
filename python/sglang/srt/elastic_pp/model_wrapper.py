@@ -51,6 +51,9 @@ class ElasticPPModelWrapperMixin:
             target=target, generation=generation, device=device, dtype=dtype
         )
 
+    def retain_elastic_pp_graph_layers(self):
+        self.model.retain_elastic_pp_graph_layers()
+
     def export_elastic_pp_layer_state(self, layer_ids):
         return self.model.export_elastic_pp_layer_state(layer_ids)
 

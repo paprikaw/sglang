@@ -46,6 +46,7 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self._elastic_pp_live_patch = None
 
     @property
     def size_full(self):
@@ -109,10 +110,27 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         raise NotImplementedError("alloc_decode is only for paged allocator")
 
     def resize(self, config) -> None:
+        if getattr(self, "_elastic_pp_live_patch", None) is not None:
+            raise RuntimeError("cannot resize the KV allocator during online KV patch")
         self.size = config.max_total_num_tokens
         if self.page_size > 1:
             self.num_pages = config.max_total_num_tokens // self.page_size
         self.clear()
+
+    def attach_elastic_pp_live_patch(self, patch):
+        if self._elastic_pp_live_patch is not None:
+            raise RuntimeError("another elastic KV tracker is already attached")
+        if (
+            not self.is_not_in_free_group
+            or self.free_group
+            or getattr(self, "free_page_reps_group", ())
+        ):
+            raise RuntimeError("online KV patch requires a closed allocator free group")
+        self._elastic_pp_live_patch = patch
+
+    def detach_elastic_pp_live_patch(self, patch):
+        if self._elastic_pp_live_patch is patch:
+            self._elastic_pp_live_patch = None
 
     @abc.abstractmethod
     def clear(self):

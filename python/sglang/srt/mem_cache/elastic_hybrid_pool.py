@@ -120,6 +120,12 @@ class ElasticHybridLinearKVPool(HybridLinearKVPool):
             bisect_left(self._all_full_ids, target.end),
         )
 
+    def retain_elastic_pp_graph_buffers(self):
+        self.full_kv_pool.retain_elastic_pp_graph_buffers()
+        self._elastic_graph_states = {
+            tuple(self.req_to_token_pool.mamba_map): self.mamba_pool.mamba_cache
+        }
+
     def _publish_attention_mapping(self, target: LayerRange):
         self.full_attention_layer_id_mapping = {
             layer_id: ordinal
@@ -195,7 +201,10 @@ class ElasticHybridLinearKVPool(HybridLinearKVPool):
                 )
                 ids = self.recurrent_layer_ids(target)
                 old = self.mamba_pool.mamba_cache
-                if ids == tuple(self.req_to_token_pool.mamba_map) and not getattr(
+                cached = getattr(self, "_elastic_graph_states", {}).get(ids)
+                if cached is not None:
+                    state = cached
+                elif ids == tuple(self.req_to_token_pool.mamba_map) and not getattr(
                     self, "_elastic_pp_cpu_spill", None
                 ):
                     state = old
@@ -218,6 +227,8 @@ class ElasticHybridLinearKVPool(HybridLinearKVPool):
                     )
                 self._pending_state = state
                 self._pending_mamba_ids = ids
+                if hasattr(self, "_elastic_graph_states"):
+                    self._elastic_graph_states[ids] = state
             except BaseException:
                 self.full_kv_pool.abort_elastic_pp_kv_layers(generation=generation)
                 self._residency.abort(generation)
@@ -363,6 +374,7 @@ class ElasticHybridLinearKVPool(HybridLinearKVPool):
             extra = (
                 ()
                 if state is self.mamba_pool.mamba_cache
+                or hasattr(self, "_elastic_graph_states")
                 else self._state_tensors(state)
             )
             return (*released, *extra)
@@ -379,4 +391,9 @@ class ElasticHybridLinearKVPool(HybridLinearKVPool):
             state = self._retired_state
             self._retired_state = None
             self._retired_layer_ids = set()
-            return (*released, *self._state_tensors(state))
+            extra = (
+                ()
+                if hasattr(self, "_elastic_graph_states")
+                else self._state_tensors(state)
+            )
+            return (*released, *extra)
