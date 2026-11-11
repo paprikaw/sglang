@@ -429,6 +429,9 @@ class ElasticPPMigrationCoordinator:
             "peak_scope": "sampled at prepare/copy/commit; not allocator peak proof",
             "gpu_released": False,
         }
+        graph_metrics = getattr(self.model_runner, "elastic_pp_decode_graph_metrics", None)
+        if graph_metrics is not None:
+            metrics["decode_graph"] = graph_metrics()
         for name, component in (
             ("kv", self.kv_transport),
             ("host", self.cache_transition),
@@ -929,6 +932,26 @@ class ElasticPPMigrationCoordinator:
                 error=local_error,
             )
             self._raise_peer_failures("commit", reports)
+
+            # Every rank has installed its target weights, pool and PP route.
+            # Native pools changed addresses: rebuild on this drained scheduler
+            # thread before resuming any inference or asynchronous cleanup.
+            local_error = None
+            try:
+                rebuild = getattr(
+                    self.model_runner, "rebuild_elastic_pp_decode_graph", None
+                )
+                if rebuild is not None:
+                    rebuild(
+                        generation=transition.target.generation,
+                        active=not transition.target.layer_range(self.rank).empty,
+                    )
+            except BaseException as exc:
+                local_error = f"{type(exc).__name__}: {exc}"
+            reports = self._consensus(
+                "decode_graph", success=local_error is None, error=local_error
+            )
+            self._raise_peer_failures("Decode Graph rebuild", reports)
 
             with self._condition:
                 self.current_topology = transition.target

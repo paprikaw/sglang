@@ -8022,12 +8022,24 @@ class ServerArgs:
                 raise ValueError(
                     "online KV patch requires background/overlap transition"
                 )
-            if self.elastic_pp_kv_backend != "native" or not self.disable_cuda_graph:
-                raise ValueError(
-                    "online KV patch currently requires native KV and --disable-cuda-graph"
-                )
+            if self.elastic_pp_kv_backend != "native":
+                raise ValueError("online KV patch currently requires native KV")
             if self.speculative_algorithm is not None:
                 raise ValueError("online KV patch requires no speculative decoding")
+        if not self.disable_cuda_graph:
+            if self.elastic_pp_kv_backend != "native":
+                raise ValueError("elastic PP Decode Graph currently requires native KV")
+            if self.enable_torch_compile or self.speculative_algorithm is not None:
+                raise ValueError(
+                    "elastic PP Decode Graph requires no torch.compile or speculative decoding"
+                )
+            if self.cuda_graph_config is not None and (
+                self.cuda_graph_config.decode.backend != Backend.FULL
+                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
+            ):
+                raise ValueError(
+                    "elastic PP currently requires full Decode Graph and disabled Prefill Graph"
+                )
         if self.elastic_pp_transition_backing == "cpu_spill":
             if self.elastic_pp_transition_strategy not in {"sync", "batched"}:
                 raise ValueError(

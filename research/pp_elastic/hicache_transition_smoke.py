@@ -333,6 +333,24 @@ def state_evidence(info):
     }
 
 
+def validate_decode_graph_states(states, generation, source_ranks, target_ranks):
+    for rank, state in rank_states(states).items():
+        history = state["transition_metrics"]["decode_graph"]
+        entries = {row["generation"]: row for row in history}
+        if set(entries) != set(range(generation + 1)):
+            raise AssertionError("missing elastic Decode Graph generations")
+        if rank in source_ranks and entries[generation - 1]["replays"] <= 0:
+            raise AssertionError("source Decode Graph did not actually replay")
+        target = entries[generation]
+        if rank in target_ranks:
+            if target["status"] != "ready" or target["replays"] <= 0:
+                raise AssertionError("target Decode Graph did not actually replay")
+            if target["capture_seconds"] is None:
+                raise AssertionError("missing target Graph capture timing")
+        elif target["status"] != "inactive" or target["replays"]:
+            raise AssertionError("inactive rank retained a runnable Decode Graph")
+
+
 def install_hooks():
     spec = importlib.util.spec_from_file_location(
         "transition_native_adapter", base.NATIVE / "a100_runtime_adapter.py"
@@ -543,6 +561,11 @@ def engine_entry(cfg, row):
                 if cfg.get("live_kv_patch")
                 else []
             )
+            + (
+                ["--cuda-graph-bs-decode", "1", "2", "4"]
+                if cfg.get("cuda_graph")
+                else ["--disable-cuda-graph"]
+            )
             + [
                 "--enable-elastic-pp",
                 "--elastic-pp-initial-partition",
@@ -551,7 +574,6 @@ def engine_entry(cfg, row):
                 cfg["strategy"],
                 "--elastic-pp-transition-backing",
                 cfg.get("backing", "overlap"),
-                "--disable-cuda-graph",
                 "--max-total-tokens",
                 "4096",
                 "--max-running-requests",
@@ -636,6 +658,8 @@ def worker(run, cfg):
         return baseline_worker(run, cfg)
     import agentx_replay
 
+    active_tokens = cfg.get("active_output_tokens", 256)
+
     authentication_started = time.time()
     authentication = h.authenticate(run, cfg, os.environ, local=True)
     key = h.read_key(cfg)
@@ -650,7 +674,7 @@ def worker(run, cfg):
             "resident_ranks": 3,
             "gpu_released": False,
             "performance_sample": bool(cfg.get("overhead_sample", False)),
-            "cuda_graph_enabled": False,
+            "cuda_graph_enabled": bool(cfg.get("cuda_graph", False)),
             "diagnostic_reply_scope": "private one-node PP3/TP1/DP1 get/set state replies",
             "acceptance_class": cfg.get(
                 "acceptance_class", "cold_warm_exact_generation"
@@ -830,6 +854,7 @@ def worker(run, cfg):
             "fixed_continuation_tokens": 1,
             "prefix_input_tokens": len(prefix),
             "active_input_tokens": len(active_prompt),
+            "active_output_tokens": active_tokens,
             "reference_cache_state": "warmed at the same prefix-match boundary",
         }
         if lifecycle is not None:
@@ -839,9 +864,9 @@ def worker(run, cfg):
         checkpoint("prefix_reference")
         reference = request(prefix, 24)
         checkpoint("active_warmup")
-        cold_active = request(active_prompt, 256)
+        cold_active = request(active_prompt, active_tokens)
         checkpoint("active_reference")
-        active_reference = request(active_prompt, 256)
+        active_reference = request(active_prompt, active_tokens)
         evidence["references"] = {
             "cold_prefix": cold_prefix,
             "prefix": reference,
@@ -886,7 +911,7 @@ def worker(run, cfg):
                 lifecycle.admit(
                     f"overhead_reference_{generation}", 105 if generation == 1 else 52
                 )
-                baseline = request(active_prompt, 256)
+                baseline = request(active_prompt, active_tokens)
                 evidence.setdefault("overhead_baselines", []).append(baseline)
                 if baseline["output_ids"] != active_reference["output_ids"]:
                     raise AssertionError(
@@ -906,7 +931,7 @@ def worker(run, cfg):
                 )
             with cf.ThreadPoolExecutor(max_workers=1) as pool:
                 try:
-                    active = pool.submit(request, active_prompt, 256)
+                    active = pool.submit(request, active_prompt, active_tokens)
                     deadline = time.monotonic() + 15
                     while True:
                         active_info = http("/get_server_info", timeout=3)
@@ -969,6 +994,14 @@ def worker(run, cfg):
                         (0, 2) if generation == 1 else (0, 1, 2),
                         cfg.get("backing", "overlap"),
                     )
+                    if cfg.get("cuda_graph"):
+                        validate_decode_graph_states(
+                            states,
+                            generation,
+                            (0, 2) if generation == 1 else (0, 1, 2),
+                            (0, 1, 2) if generation == 1 else (0, 2),
+                        )
+                        record["decode_graph_verified"] = True
                     if cfg.get("live_kv_patch"):
                         patches = [
                             state["transition_metrics"]
@@ -1038,7 +1071,9 @@ def worker(run, cfg):
                 time.sleep(0.05)
         fence_states = http("/get_server_info")["internal_states"]
         for generation, source_ranks in ((1, (0, 2)), (2, (0, 1, 2))):
-            validate_fenced_decode(fence_states, generation, source_ranks, 256)
+            validate_fenced_decode(
+                fence_states, generation, source_ranks, active_tokens
+            )
         evidence["fence_states"] = fence_states
         checkpoint("final_cpu_demotion")
         evidence["final_demotion"] = demote_cpu_prefixes(http)
@@ -1128,6 +1163,8 @@ def prepare(args):
         backing=args.backing,
         live_kv_patch=getattr(args, "live_kv_patch", False),
         kv_patch_transport=getattr(args, "kv_patch_transport", "cpu"),
+        cuda_graph=getattr(args, "cuda_graph", False),
+        active_output_tokens=getattr(args, "active_output_tokens", 256),
         nixl_root=(
             str(args.nixl_root.resolve()) if getattr(args, "nixl_root", None) else None
         ),
@@ -1221,6 +1258,17 @@ def prepare(args):
             base.desc(ENGINE / "python/sglang/srt/elastic_pp" / name)
             for name in ("kv_patch.py", "live_kv_patch.py")
         ]
+    if cfg["cuda_graph"]:
+        spec["frozen_inputs"] += [
+            base.desc(ENGINE / path)
+            for path in (
+                "python/sglang/srt/elastic_pp/decode_graph.py",
+                "python/sglang/srt/elastic_pp/coordinator.py",
+                "python/sglang/srt/model_executor/model_runner.py",
+                "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py",
+                "python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py",
+            )
+        ]
     if cfg["kv_patch_transport"] == "nixl":
         spec["frozen_inputs"] += [
             base.desc(ENGINE / "python/sglang/srt/elastic_pp" / name)
@@ -1305,12 +1353,20 @@ def main():
         "--strategy", choices=["sync", "background", "batched"], default="sync"
     )
     parser.add_argument("--live-kv-patch", action="store_true")
+    parser.add_argument("--cuda-graph", action="store_true")
+    parser.add_argument("--active-output-tokens", type=int, default=256)
     parser.add_argument("--kv-patch-transport", choices=["cpu", "nixl"], default="cpu")
     parser.add_argument("--nixl-root", type=Path)
     parser.add_argument(
         "--backing", choices=["overlap", "cpu_spill"], default="overlap"
     )
     args = parser.parse_args()
+    if not 256 <= args.active_output_tokens <= 1024:
+        parser.error("active output tokens must be between 256 and 1024")
+    if args.overhead_sample and args.active_output_tokens != 256:
+        parser.error("the existing paired overhead protocol requires 256 output tokens")
+    if args.cuda_graph and args.backing != "overlap":
+        parser.error("Decode Graph requires overlap backing")
     if args.kv_patch_transport == "nixl" and (
         not args.live_kv_patch or not args.nixl_root
     ):

@@ -40,6 +40,7 @@ def acceptance():
             "observe_request_launch",
             "validate_uninterrupted_decode",
             "state_evidence",
+            "validate_decode_graph_states",
             "worker",
             "paired_overhead",
         }

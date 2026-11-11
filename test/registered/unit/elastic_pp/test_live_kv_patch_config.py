@@ -32,7 +32,6 @@ def args(**overrides):
         ({"elastic_pp_transition_strategy": "sync"}, "background/overlap"),
         ({"elastic_pp_transition_backing": "cpu_spill"}, "background/overlap"),
         ({"elastic_pp_kv_backend": "kvcached"}, "native KV"),
-        ({"disable_cuda_graph": False}, "disable-cuda-graph"),
         ({"speculative_algorithm": "EAGLE"}, "no speculative"),
     ],
 )
@@ -63,7 +62,6 @@ def test_normalized_partition_reaches_projected_configuration():
             "requires --enable-elastic-pp-kv-patch",
         ),
         ({"enable_hierarchical_cache": False}, "requires HiCache"),
-        ({"disable_cuda_graph": False}, "disable-cuda-graph"),
     ],
 )
 def test_nixl_keeps_explicit_correctness_scope(overrides, message):
@@ -77,3 +75,19 @@ def test_nixl_selection_survives_argument_projection():
     config = args(elastic_pp_kv_patch_transport="nixl", enable_hierarchical_cache=True)
     config._handle_pipeline_parallelism()
     assert config.elastic_pp_kv_patch_transport == "nixl"
+
+
+@pytest.mark.parametrize("transport", ["cpu", "nixl"])
+def test_native_graph_online_patch_is_accepted(transport):
+    args(
+        disable_cuda_graph=False,
+        enable_hierarchical_cache=True,
+        elastic_pp_kv_patch_transport=transport,
+    )._handle_pipeline_parallelism()
+
+
+def test_elastic_graph_rejects_unqualified_compile():
+    with pytest.raises(ValueError, match="no torch.compile"):
+        args(
+            disable_cuda_graph=False, enable_torch_compile=True
+        )._handle_pipeline_parallelism()
