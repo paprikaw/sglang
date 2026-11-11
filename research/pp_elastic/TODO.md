@@ -46,7 +46,7 @@
 - [x] 主agent核对NIXL官方API／UCX、现有SGLang NIXL P/D代码和依赖安装状态，形成[NIXL迁移方案](NIXL_KV_TRANSFER_DESIGN.md)。建议推理保留NCCL，KV迁移使用独立NIXL＋UCX和固定GPU双缓冲；这是当时的调研证据；本轮已另行隔离安装1.5.2并接入代码，运行资格见顶部当前任务，不能由本条调研推出。
 - [x] 主 agent 核对 workbench vLLM/PipeLive、SGLang runtime `8374b0276d19` 及 KVCacheD 工作区，形成研究库 `LOW_INTERRUPTION_PP_REVIEW_20261109.md` 和问题簿 Q25。建议优先 KVCacheD 稳定虚拟地址，保留旧块指针内核作备选；发现按层物理映射 API 不匹配、GDN backing 重建和 stacking 边界限制。仅完成调研，无新增引擎改动或 GPU 验收。
 - [ ] **A：**固定兼容的 KVCacheD 依赖与能力检查，先验证物理页映射／回收和存活状态；只改 local view 不算释放显存。
-- [ ] **B：**将预捕获库接入整模型执行器，补齐权重、KV、GDN、输入和 workspace 的完整 binding 及稳定地址；底层库的实际 replay／fallback 已在 A100 检查，不等于模型 Graph 已可切换。不在正常推理期间无保护 capture。
+- [ ] **B：**将启动预捕获库接入整模型执行器，先限定 PP2／PP3、batch 1／2／4，补齐权重、KV、GDN、输入输出和 workspace 的稳定地址与生命周期；先隔离布局工作区并核算显存。2026-11-11 已核对方案并记入[接入说明](DECODE_GRAPH_INTEGRATION.md)，尚未实现；当前整模型通过的是最终排空时重新捕获。后续须验证切换无 capture、目标实际 replay、输出／HiCache 连续及逐 token 停顿，不能从独立小算子预捕获推定。不在正常推理期间无保护 capture。
 - [ ] **B：**预初始化并预热候选布局的真实通信路径，验证路由版本、通信顺序和缓冲生命周期。
 - [ ] **A：**选择固定且满足 attention 池层序号边界的 stacking 粒度。显式 preclaim 须与层所有权一致，并计入物理显存；不默认打开全局自动预分配。
 
