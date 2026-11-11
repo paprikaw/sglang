@@ -1,6 +1,6 @@
 # SGLang 研究基线
 
-2026-11-11：native／HiCache／NIXL新增[启动预捕获与运行时选择](PREPARED_DECODE_GRAPHS.md)，A100 PP2→PP3→PP2运行时capture=0，完整最终交接0.604／0.688秒，两个方向各2048-token暖缓存连续性及实际Graph replay通过。候选布局的原生存储与Graph工作区常驻，额外allocated合计21.513 GiB，VMM组合未接通，worker继续常驻。旧交接时重建基线保留在[接入说明](DECODE_GRAPH_INTEGRATION.md)，代码仍在Draft PR #4，未合入共同主线。
+2026-11-11：native／HiCache／NIXL新增[启动预捕获与运行时选择](PREPARED_DECODE_GRAPHS.md)，A100 PP2→PP3→PP2运行时capture=0，完整最终交接0.604／0.688秒，两个方向各2048-token暖缓存连续性及实际Graph replay通过。候选布局的原生存储与Graph工作区常驻，额外allocated合计21.513 GiB，VMM组合未接通，worker继续常驻。旧交接时重建基线保留在[接入说明](DECODE_GRAPH_INTEGRATION.md)。[PR #4](https://github.com/paprikaw/sglang/pull/4)已合入项目，992项组合CPU检查通过；[总PR #5](https://github.com/paprikaw/sglang/pull/5)统一同步到共同基线，GitHub记录实际合入状态。[审查与边界](REVIEW_20261111.md)。
 
 2026-11-09：naive PP＋HiCache 的实现范围、组合回归及合并依据见[本次基线验收](BASELINE_ACCEPTANCE_20261109.md)。低干扰机制已开始实现[按层 KV 映射依赖](KV_LAYER_MAPPING.md)及[Graph 预捕获／持续 KV patch](GRAPH_KV_PATCH.md)；真实 GPU、缓存接入和后续机制的完成状态以[TODO](TODO.md)为准。
 

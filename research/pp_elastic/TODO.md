@@ -7,6 +7,7 @@
 ## 本轮实施：主 agent 顺序完成
 
 - [x] **2026-11-11：集成审查及候选检查完成。** 主 agent 直接审查 Graph 地址与状态生命周期、在线 patch 槽位保护、NIXL 应用确认及提交失败边界，未发现阻止有限研究基线合入的功能性问题。修正本次改动的风格检查与 CPU 用例选择；992项组合回归全部通过、零失败／错误／跳过，113.580秒，本次Python改动的isort／Black／Ruff全部通过。全仓CI仍有原基线欠账，不能称为全绿。通过PR #4先合项目，再经总PR合共同基线；合入状态另行记录，独立审查和未测范围不扩大。见[审查记录](REVIEW_20261111.md)。
+- [x] **项目合入完成。** PR #4已以`69dc304d8072`合入`codex/pp-hicache-autoscaling`；项目合并树与992项检查的候选`4d7638b01ac2`完全一致，没有组合冲突。主协调器通过[总PR #5](https://github.com/paprikaw/sglang/pull/5)合回共同基线；GitHub合并记录及冻结标签记录最终提交，后续优化基于该共同分支。
 
 - [x] **2026-11-11：启动预捕获与运行时选择的代码与CPU检查。** 声明有限PP布局，保留原生权重／KV／GDN、独立backend和Graph工作区；运行时拒绝未知布局或地址变化，禁止重新捕获。546项CPU回归通过，见归档 `prepared-graph-20261111/cpu-r5.xml`；先前测试路径／空CUDA设备变量导致的收集失败保留原记录。[使用与边界](PREPARED_DECODE_GRAPHS.md)。
 - [x] **新路径A100 PP2↔PP3有限验收通过。** 冻结 `c5aa853480`，启动捕获本地runner数量2／1／2，运行时capture=0；扩容各目标阶段replay1028次，缩回两个保留阶段各1090次、空阶段0次，活跃代Decode eager=0。两个方向各2048-token输出与当前版本同进程暖缓存参考一致，无retraction／重新Prefill，最终CPU前缀实际loadback。Graph选择1.733–2.596 ms；完整fence扩／缩0.604／0.688秒，后台prepare仍19.799／20.438秒。初始Graph后额外启动准备约3.9秒，常驻allocated显存合计增加21.513 GiB（新增阶段20.816 GiB）。完整监督178.903秒内正常清理并release，127个冻结输入一致。546项完整CPU回归后，启动NIXL隔离修正的81项相关检查通过，不累加。新验收类别只证明同版本暖缓存执行连续性，旧状态审查与冷暖生成等价未扩大；B1、单轮，无独立reviewer。首轮预算入口错误未启动模型，失败原样保留。见[本轮报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_prepared_decode_graph_20261111/summary.md)。
@@ -21,7 +22,7 @@
 
 - [x] 接入真实 PP 前向与标准 token／paged allocator，保护复制中的槽位复用与重写。仅限 native／eager／background＋overlap 的在线 KV CPU shadow；最终 fence 补齐余量后复用跨 rank 传输，GDN／HiCache仍在fence交接。512项CPU检查全过；冻结 `e7c9cb1264a9` 的A100 64-token页PP2→PP3→PP2通过同暖512边界连续性和CPU前缀loadback。扩容两个源rank各在线完成662行，缩容源rank完成659行；它们是各rank的槽位行计数，不是全局输入token数。整轮含清理171.795秒，正常release。r1／r2失败保留于[验证记录](VALIDATION.md)。不据此宣称网络 overlap、Graph 接入或性能收益。
 
-从冻结基线 `ce563696401c` 建立 `codex/pp-kv-live-foundation-20261109`，本轮不使用子 agent。[Draft PR #4](https://github.com/paprikaw/sglang/pull/4) 已推送，目标为项目分支，尚未合入。底层原语GPU冻结源码为 `8d7c21241c`，本轮native在线shadow为 `e7c9cb1264a9`；两条执行路径分开验收。旧分工仅表示模块边界，不是正在运行的任务。
+从冻结基线 `ce563696401c` 建立 `codex/pp-kv-live-foundation-20261109`，本轮不使用子 agent。[PR #4](https://github.com/paprikaw/sglang/pull/4)已在审查后合入项目，共同基线整合见总PR #5。底层原语GPU冻结源码为 `8d7c21241c`，本轮native在线shadow为 `e7c9cb1264a9`；两条执行路径分开验收。旧分工仅表示模块边界，不是正在运行的任务。
 
 - [x] 实现 KVCacheD 按层映射协议、映射账本、部分失败重试及页面 pin；保存可重放依赖补丁、Python／原生版本检查和 stacking 边界检查。27 项依赖 CPU 检查通过；补丁在干净上游索引重放得到完全相同的源码树。见[实现与边界](KV_LAYER_MAPPING.md)及依赖锁。真实 GPU 页面验证不包含在此勾选中。
 - [x] 修复 SGLang import／abort／cleanup 在校验 generation 前触碰物理页面的问题，并在 map 前检查槽位和 payload。旧基线可复现 3 个故障，新代码 769 项引擎 CPU 回归通过；保留层地址／数值仅在 CPU 适配器验证，不能据此推定真实 GPU 验收。
