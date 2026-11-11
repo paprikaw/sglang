@@ -12,13 +12,13 @@ import importlib.util
 import json
 import math
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from pathlib import Path
 
 import gpu_smoke as base
 
@@ -383,9 +383,8 @@ def install_hooks():
     import cache_probe
 
     cache_probe.install()
-    from sglang.srt.managers.scheduler import Scheduler
-
     from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
+    from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
 
     install_diagnostic_fanout(Scheduler, TokenizerControlMixin)

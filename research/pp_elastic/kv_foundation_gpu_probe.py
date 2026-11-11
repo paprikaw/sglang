@@ -14,8 +14,9 @@ from pathlib import Path
 
 def probe():
     import torch
+    from kvcached import tp_ipc_util as ipc
+    from kvcached import vmm_ops as native
 
-    from kvcached import tp_ipc_util as ipc, vmm_ops as native
     from sglang.srt.elastic_pp.graph_bank import (
         ElasticGraphBank,
         GraphKey,

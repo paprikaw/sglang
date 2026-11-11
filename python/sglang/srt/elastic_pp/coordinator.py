@@ -14,12 +14,16 @@ from typing import Any
 
 import torch
 
-from sglang.srt.elastic_pp.topology import DynamicPPTransition, PPTopology
 from sglang.srt.elastic_pp.layer_transport import (
     flatten_layer_states,
     unflatten_layer_states,
 )
-from sglang.srt.elastic_pp.topology import LayerRange, LayerTransfer
+from sglang.srt.elastic_pp.topology import (
+    DynamicPPTransition,
+    LayerRange,
+    LayerTransfer,
+    PPTopology,
+)
 
 logger = logging.getLogger(__name__)
 

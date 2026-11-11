@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 

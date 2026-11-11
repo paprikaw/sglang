@@ -6,6 +6,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 import torch
+
 from sglang.srt.elastic_pp.decode_graph import (
     ElasticPPDecodeGraphState,
     rebuild_decode_graph,

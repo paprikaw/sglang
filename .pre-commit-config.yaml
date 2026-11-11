@@ -8,6 +8,9 @@ repos:
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: trailing-whitespace
+        # Unified diffs require the leading context marker on blank lines.
+        # Stripping it corrupts the reproducible dependency patch.
+        exclude: ^research/pp_elastic/dependencies/.*\.patch$
       - id: end-of-file-fixer
       - id: check-yaml
         args: [--allow-multiple-documents]

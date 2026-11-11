@@ -6,6 +6,8 @@
 
 ## 本轮实施：主 agent 顺序完成
 
+- [x] **2026-11-11：集成审查及候选检查完成。** 主 agent 直接审查 Graph 地址与状态生命周期、在线 patch 槽位保护、NIXL 应用确认及提交失败边界，未发现阻止有限研究基线合入的功能性问题。修正本次改动的风格检查与 CPU 用例选择；992项组合回归全部通过、零失败／错误／跳过，113.580秒，本次Python改动的isort／Black／Ruff全部通过。全仓CI仍有原基线欠账，不能称为全绿。通过PR #4先合项目，再经总PR合共同基线；合入状态另行记录，独立审查和未测范围不扩大。见[审查记录](REVIEW_20261111.md)。
+
 - [x] **2026-11-11：启动预捕获与运行时选择的代码与CPU检查。** 声明有限PP布局，保留原生权重／KV／GDN、独立backend和Graph工作区；运行时拒绝未知布局或地址变化，禁止重新捕获。546项CPU回归通过，见归档 `prepared-graph-20261111/cpu-r5.xml`；先前测试路径／空CUDA设备变量导致的收集失败保留原记录。[使用与边界](PREPARED_DECODE_GRAPHS.md)。
 - [x] **新路径A100 PP2↔PP3有限验收通过。** 冻结 `c5aa853480`，启动捕获本地runner数量2／1／2，运行时capture=0；扩容各目标阶段replay1028次，缩回两个保留阶段各1090次、空阶段0次，活跃代Decode eager=0。两个方向各2048-token输出与当前版本同进程暖缓存参考一致，无retraction／重新Prefill，最终CPU前缀实际loadback。Graph选择1.733–2.596 ms；完整fence扩／缩0.604／0.688秒，后台prepare仍19.799／20.438秒。初始Graph后额外启动准备约3.9秒，常驻allocated显存合计增加21.513 GiB（新增阶段20.816 GiB）。完整监督178.903秒内正常清理并release，127个冻结输入一致。546项完整CPU回归后，启动NIXL隔离修正的81项相关检查通过，不累加。新验收类别只证明同版本暖缓存执行连续性，旧状态审查与冷暖生成等价未扩大；B1、单轮，无独立reviewer。首轮预算入口错误未启动模型，失败原样保留。见[本轮报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_prepared_decode_graph_20261111/summary.md)。
 - [ ] 后续边界：实际B2／B4、减少常驻内存、额外峰值／逐token间隔的独立测量、严格配对性能比较、VMM／HiCache／GDN组合及GPU故障恢复。缩容后worker与候选存储继续常驻，按用户要求暂缓处理；本次没有归还工作GPU的结论。
@@ -49,8 +51,8 @@
 
 - [x] 主agent核对NIXL官方API／UCX、现有SGLang NIXL P/D代码和依赖安装状态，形成[NIXL迁移方案](NIXL_KV_TRANSFER_DESIGN.md)。建议推理保留NCCL，KV迁移使用独立NIXL＋UCX和固定GPU双缓冲；这是当时的调研证据；本轮已另行隔离安装1.5.2并接入代码，运行资格见顶部当前任务，不能由本条调研推出。
 - [x] 主 agent 核对 workbench vLLM/PipeLive、SGLang runtime `8374b0276d19` 及 KVCacheD 工作区，形成研究库 `LOW_INTERRUPTION_PP_REVIEW_20261109.md` 和问题簿 Q25。建议优先 KVCacheD 稳定虚拟地址，保留旧块指针内核作备选；发现按层物理映射 API 不匹配、GDN backing 重建和 stacking 边界限制。仅完成调研，无新增引擎改动或 GPU 验收。
-- [ ] **A：**固定兼容的 KVCacheD 依赖与能力检查，先验证物理页映射／回收和存活状态；只改 local view 不算释放显存。
-- [ ] **B：**将启动预捕获库接入整模型执行器，先限定 PP2／PP3、batch 1／2／4，补齐权重、KV、GDN、输入输出和 workspace 的稳定地址与生命周期；先隔离布局工作区并核算显存。2026-11-11 已核对方案并记入[接入说明](DECODE_GRAPH_INTEGRATION.md)，尚未实现；当前整模型通过的是最终排空时重新捕获。后续须验证切换无 capture、目标实际 replay、输出／HiCache 连续及逐 token 停顿，不能从独立小算子预捕获推定。不在正常推理期间无保护 capture。
+- [x] **主 agent：**固定兼容的 KVCacheD 依赖、能力检查及 stacking 几何检查，底层A100探针确认物理页映射／回收、保留地址与数值及pin拒绝。范围和证据见上方按层映射条目；完整模型与HiCache／Graph组合仍未接通，不能由本条推定归还工作GPU。
+- [ ] **主 agent：**补充提前准备 Graph 的实际B2／B4请求和逐token停顿测量。启动库已接入整模型，捕获档位1／2／4，实际B1的PP2↔PP3、无运行时capture、目标replay及暖缓存连续性已在上方验收；原生存储与工作区的常驻增量已记录。VMM容量机制、更多batch及性能收益仍未验收，详见[启动预捕获说明](PREPARED_DECODE_GRAPHS.md)。
 - [ ] **B：**预初始化并预热候选布局的真实通信路径，验证路由版本、通信顺序和缓冲生命周期。
 - [ ] **A：**选择固定且满足 attention 池层序号边界的 stacking 粒度。显式 preclaim 须与层所有权一致，并计入物理显存；不默认打开全局自动预分配。
 

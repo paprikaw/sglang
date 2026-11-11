@@ -17,7 +17,6 @@ from sglang.srt.elastic_pp.model import ElasticPPModelMixin
 from sglang.srt.elastic_pp.prepared_decode_graph import (
     PreparedDecodeGraphBank,
     external_bindings,
-    validate_graph_partitions,
 )
 from sglang.srt.elastic_pp.topology import LayerRange, PPTopology
 from sglang.srt.layers.utils import PPMissingLayer
@@ -240,8 +239,8 @@ def test_kv_gdn_addresses_return_but_stale_values_are_overwritten(hybrid_pool_fa
 
 @pytest.fixture
 def prepared_runner(monkeypatch):
-    import sglang.srt.model_executor.runner_utils.pool as pool_module
     import sglang.srt.distributed.device_communicators.pynccl_allocator as nccl
+    import sglang.srt.model_executor.runner_utils.pool as pool_module
 
     monkeypatch.setattr(pool_module, "get_global_graph_memory_pool", lambda: (1, 1))
     monkeypatch.setattr(pool_module, "set_global_graph_memory_pool", lambda _: None)

@@ -507,6 +507,7 @@ def test_host_cache_transaction_failure_obeys_publication_boundary(failure_stage
 def test_background_precopy_uses_cpu_payload_and_leaves_live_model_unpublished():
     import contextlib
     import queue
+
     from sglang.srt.elastic_pp.layer_transport import ElasticPPLayerTransport
 
     payloads = queue.Queue()

@@ -5,8 +5,8 @@ import torch
 
 from sglang.srt.elastic_pp.kv_transport import ElasticPPKVTransport
 from sglang.srt.elastic_pp.live_kv_patch import LiveKVSnapshot
-from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")

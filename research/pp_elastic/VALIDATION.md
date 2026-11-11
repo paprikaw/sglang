@@ -1,5 +1,13 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-11：低干扰实现的集成审查
+
+主 agent 直接审查任务分支 `codex/pp-kv-live-foundation-20261109`，未发现阻止已测native／HiCache／NIXL、PP2↔PP3范围合入的功能性问题；没有新增独立reviewer。当前专项574项通过，随后将历史537项基线与新专项按用例去重，**992项组合CPU检查全部通过，零失败／错误／跳过，113.580秒**，不累加通过数。精确用例见[cpu_test_nodes.txt](cpu_test_nodes.txt)；旧[cpu_test_paths.txt](cpu_test_paths.txt)仅为文件索引，部分文件含GPU测试，整文件调用不是CPU验收命令。
+
+产物在 `source_integration/sglang-pp-elastic-20261105/review-20261111`：`cpu-r3.xml`／JSON／日志、import差异检查、依赖补丁哈希和风格检查。首次误用整个文件清单的广泛调用已中止，输出保留，不计为合格运行；r2为574项专项，r3为992项组合。本轮修正仅含import排版、一个测试的CPU注册、CPU用例清单及保护统一diff补丁的whitespace hook。本次Python改动的isort／Black／Ruff均通过；父分支全仓lint本来存在格式、可执行位及23个测试注册缺项，候选补齐一项后仍有22个，不声称GitHub CI全绿。
+
+没有新增GPU实验。与 `c5aa853480` 的生产／运行适配差异逐项检查，import名称及别名集合相同，去除import后的AST一致；复用下面冻结GPU检查的有界结论，不称为逐字节相同源码或新的硬件验收。GPU故障恢复、VMM组合、实际B2／B4及性能优势仍未取得资格。详见[审查记录](REVIEW_20261111.md)。
+
 ## 2026-11-11：启动预捕获与运行时选择
 
 冻结 `c5aa853480`（完整提交见[manifest](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_prepared_decode_graph_20261111/manifest.json)），annotated tag `experiment/sglang/pp-prepared-decode-graph-20261111-r2`。35B BF16、三张常驻A100、TP1／EP1、native／HiCache／NIXL background＋overlap，20/0/20→13/13/14→20/0/20。每方向B1、513输入／2048输出、公共暖边界512 token、64-token页，完整输出IDs与当前版本同进程暖缓存参考一致；无retraction／重新Prefill，最终CPU前缀实际loadback。当前类为 `same_process_warm_execution_continuity`，不复用已变更生产源码的旧独立审查，不授予冷暖生成等价；观测到cold／warm输出仍不同。

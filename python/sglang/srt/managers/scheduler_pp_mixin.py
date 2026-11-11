@@ -37,7 +37,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.overlap_utils import RelayPayload, resolve_forward_inputs
 from sglang.srt.managers.pp_slot_affinity import PPSlotAffinityState
-
 from sglang.srt.managers.pp_spec_microbatch import launch_then_exchange, own_payload
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.utils import (

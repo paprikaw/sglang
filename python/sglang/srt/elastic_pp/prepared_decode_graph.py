@@ -270,8 +270,8 @@ def prewarm_scheduler_graph_bank(scheduler):
         return
     from sglang.srt.elastic_pp.coordinator import (
         ElasticPPMigrationCoordinator,
-        ElasticPPMigrationPhase as Phase,
     )
+    from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationPhase as Phase
     from sglang.srt.elastic_pp.decode_graph import ElasticPPDecodeGraphState
     from sglang.srt.elastic_pp.topology import DynamicPPTransition
 
