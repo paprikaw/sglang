@@ -298,23 +298,24 @@ def prewarm_scheduler_graph_bank(scheduler):
     # All requests are excluded until initialization returns. NIXL endpoints
     # stay initialized; no live-patch generations should leak from this walk.
     walk = [counts for counts in bank.partitions if counts != initial] + [initial]
-    for counts in walk:
-        target = PPTopology.from_layer_counts(
-            counts, generation=coordinator.current_topology.generation + 1
-        )
-        coordinator.begin(
-            DynamicPPTransition.build(coordinator.current_topology, target)
-        )
-        state = coordinator.wait_for_phase(
-            {Phase.BULK_READY, Phase.FAILED}, timeout=120
-        )
-        if state.phase == Phase.FAILED:
-            raise RuntimeError(f"startup Graph preparation failed: {state.error}")
-        coordinator.finalize_at_fence(scheduler._pp_install_topology)
-        coordinator.start_cleanup()
-        state = coordinator.wait_for_phase({Phase.DONE, Phase.FAILED}, timeout=120)
-        if state.phase == Phase.FAILED:
-            raise RuntimeError(f"startup Graph cleanup failed: {state.error}")
+    with mr.elastic_pp_kv_transport.empty_startup_transport():
+        for counts in walk:
+            target = PPTopology.from_layer_counts(
+                counts, generation=coordinator.current_topology.generation + 1
+            )
+            coordinator.begin(
+                DynamicPPTransition.build(coordinator.current_topology, target)
+            )
+            state = coordinator.wait_for_phase(
+                {Phase.BULK_READY, Phase.FAILED}, timeout=120
+            )
+            if state.phase == Phase.FAILED:
+                raise RuntimeError(f"startup Graph preparation failed: {state.error}")
+            coordinator.finalize_at_fence(scheduler._pp_install_topology)
+            coordinator.start_cleanup()
+            state = coordinator.wait_for_phase({Phase.DONE, Phase.FAILED}, timeout=120)
+            if state.phase == Phase.FAILED:
+                raise RuntimeError(f"startup Graph cleanup failed: {state.error}")
     _reset_startup_residency(mr)
     # Private preparation generations were never advertised to a client. The
     # normal route installer must retain its monotonic serving-generation gate.

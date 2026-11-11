@@ -249,6 +249,27 @@ class ElasticPPKVTransport:
             self._nixl_receiver.ready(transition.target.generation)
 
     @contextmanager
+    def empty_startup_transport(self):
+        """Use fenced empty-state copies without consuming NIXL generations.
+
+        Only the pre-readiness Graph walk calls this. Agents and their progress
+        threads remain alive; the serving receiver is neither configured nor
+        fed a private startup generation. Never use it with requests in flight.
+        """
+        endpoint, receiver = self._nixl_endpoint, self._nixl_receiver
+        if self._live_patch is not None or (
+            receiver is not None and receiver.generation is not None
+        ):
+            raise RuntimeError(
+                "startup transport cannot suspend a live NIXL generation"
+            )
+        self._nixl_endpoint = self._nixl_receiver = None
+        try:
+            yield
+        finally:
+            self._nixl_endpoint, self._nixl_receiver = endpoint, receiver
+
+    @contextmanager
     def _stream_context(self, stream):
         if stream is None:
             yield

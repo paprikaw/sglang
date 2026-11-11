@@ -95,6 +95,39 @@ def test_private_startup_coordinator_disables_online_patch_without_changing_args
     assert serving.enable_kv_patch and cfg.enable_elastic_pp_kv_patch
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_empty_startup_keeps_endpoints_alive_and_restores_on_error(fail):
+    from sglang.srt.elastic_pp.kv_transport import ElasticPPKVTransport
+
+    transport = object.__new__(ElasticPPKVTransport)
+    endpoint, receiver = object(), NS(generation=None)
+    transport._nixl_endpoint, transport._nixl_receiver = endpoint, receiver
+    transport._live_patch = None
+    try:
+        with transport.empty_startup_transport():
+            assert transport._nixl_endpoint is transport._nixl_receiver is None
+            if fail:
+                raise ValueError("startup capture failed")
+    except ValueError:
+        assert fail
+    assert transport._nixl_endpoint is endpoint
+    assert transport._nixl_receiver is receiver
+    assert receiver.generation is None
+
+
+def test_startup_cannot_suspend_a_serving_nixl_generation():
+    from sglang.srt.elastic_pp.kv_transport import ElasticPPKVTransport
+
+    transport = object.__new__(ElasticPPKVTransport)
+    transport._nixl_endpoint = object()
+    transport._nixl_receiver = NS(generation=1)
+    transport._live_patch = None
+    with pytest.raises(RuntimeError, match="live NIXL"):
+        with transport.empty_startup_transport():
+            pytest.fail("serving generation suspended")
+    assert transport._nixl_receiver.generation == 1
+
+
 class Model(ElasticPPModelMixin, nn.Module):
     def __init__(self):
         super().__init__()

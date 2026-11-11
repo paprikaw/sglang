@@ -1321,6 +1321,7 @@ def prepare(args):
             for path in (
                 "python/sglang/srt/elastic_pp/decode_graph.py",
                 "python/sglang/srt/elastic_pp/coordinator.py",
+                "python/sglang/srt/elastic_pp/kv_transport.py",
                 "python/sglang/srt/model_executor/model_runner.py",
                 "python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py",
                 "python/sglang/srt/model_executor/runner_backend/full_cuda_graph_backend.py",
