@@ -1456,10 +1456,19 @@ class ModelRunner:
         weights = sum(profile.layer_weight_sizes[i] for i in incoming)
         bank = getattr(self, "_elastic_pp_prepared_graphs", None)
         if bank is not None and not bank.building:
-            # Startup already owns every candidate allocation. This is not
-            # reclaimed memory: it is resident and included in actual free.
             bank.check_topology(transition.target)
-            weights = 0
+            backing = getattr(bank, "weight_backing", None)
+            if backing is not None:
+                # A prepared Graph owns addresses, not necessarily physical
+                # weight pages. Include granularity-rounded restoration cost.
+                weights = sum(
+                    backing.layers[i].size
+                    for i in incoming
+                    if not backing.layers[i].mapped
+                )
+            else:
+                # Resident diagnostic policies already own target weights.
+                weights = 0
         k_shape, v_shape = full._kv_buffer_shapes()
         item_bytes = torch.empty(0, dtype=full.store_dtype).element_size()
         kv_per_layer = (math.prod(k_shape) + math.prod(v_shape)) * item_bytes
