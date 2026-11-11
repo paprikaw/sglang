@@ -677,6 +677,13 @@ class Scheduler(
 
         self.init_rank_consensus_checker()
 
+        if get_parallel().elastic_pp_graph_partitions is not None:
+            from sglang.srt.elastic_pp.prepared_decode_graph import (
+                prewarm_scheduler_graph_bank,
+            )
+
+            prewarm_scheduler_graph_bank(self)
+
         self.is_initializing = False
         self.init_startup_timing_summary()
 
@@ -1445,7 +1452,10 @@ class Scheduler(
             else None
         )
 
-        if self.spec_algorithm.carries_draft_hidden_states() and self.draft_worker is not None:
+        if (
+            self.spec_algorithm.carries_draft_hidden_states()
+            and self.draft_worker is not None
+        ):
             # `draft_runner` aliases `draft_runner_list[0]` in the multi-layer
             # worker, so a single accessor covers both shapes.
             draft_runner = self.draft_worker.draft_worker.draft_runner

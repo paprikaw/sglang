@@ -1,0 +1,2 @@
+# Unified diff context intentionally includes lines containing a single space.
+kvcached-layer-mapping-v1.patch -whitespace

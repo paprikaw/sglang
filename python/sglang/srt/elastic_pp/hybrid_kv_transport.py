@@ -104,6 +104,7 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
         try:
             self.prepare_target(transition)
             self._preflight_cpu_staging(transition)
+            self.mark_nixl_target_ready(transition)
         except BaseException as exc:
             try:
                 self.model_runner.abort_elastic_pp_kv_layers(

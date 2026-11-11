@@ -1,34 +1,41 @@
 # PP 原地伸缩＋HiCache：实现与实验清单
 
-更新：2026-11-09。本页是本项目的统一进度入口；任务完成后更新这里，不另外维护相互冲突的清单。勾选表示该条写明的范围已有证据，并不表示全部功能已验证。
+更新：2026-11-11。本页是本项目的统一进度入口；任务完成后更新这里，不另外维护相互冲突的清单。勾选表示该条写明的范围已有证据，并不表示全部功能已验证。
 
-**当前决定。** 保留已完成有限正确性及单次 overhead 观测的同步基线；下一阶段联合研究稳定地址的 KV 池扩缩、有限 CUDA Graph 预捕获与持续 KV patch，目标是减少推理干扰。2026-11-09 已完成主 agent 独立调研，现已规划下面的 sub-agent 分工，但尚未派发或启动新 GPU 实验。实施前先固定共同源码、兼容依赖、层分组和状态地址约束；主协调器维护项目分支与本页。当前实现与本次验收汇总见[基线状态](BASELINE_ACCEPTANCE_20261109.md)。
+**当前决定。** 保留已完成有限正确性及单次 overhead 观测的同步基线；下一阶段联合研究稳定地址的 KV 池扩缩、有限 CUDA Graph 预捕获与持续 KV patch，目标是减少推理干扰。2026-11-09 已完成独立调研；用户随后要求本轮由主 agent 自己实施，不启动 sub-agent。实施前先固定共同源码、兼容依赖、层分组和状态地址约束；主协调器维护项目分支与本页。当前实现与本次验收汇总见[基线状态](BASELINE_ACCEPTANCE_20261109.md)。
 
-## 下一阶段怎样分工（计划，尚未派发）
+## 本轮实施：主 agent 顺序完成
 
-**共同起点已冻结，接口在派发时确定。** 下一阶段从 `baseline/sglang/pp-hicache-naive-20261109` 建立任务分支，保留本次未验证路径的限制。主 agent 与实现者先约定层／池映射、存储版本、页面固定与回收、KV 写完成事件、patch 应用确认和 prepare／commit／abort 的接口。B、C 可以先做骨架和状态机检查；涉及地址和页面生命周期的联调等 A 的接口确定后进行，不各自假设一套。
+- [x] **2026-11-11：集成审查及候选检查完成。** 主 agent 直接审查 Graph 地址与状态生命周期、在线 patch 槽位保护、NIXL 应用确认及提交失败边界，未发现阻止有限研究基线合入的功能性问题。修正本次改动的风格检查与 CPU 用例选择；992项组合回归全部通过、零失败／错误／跳过，113.580秒，本次Python改动的isort／Black／Ruff全部通过。全仓CI仍有原基线欠账，不能称为全绿。通过PR #4先合项目，再经总PR合共同基线；合入状态另行记录，独立审查和未测范围不扩大。见[审查记录](REVIEW_20261111.md)。
+- [x] **项目合入完成。** PR #4已以`69dc304d8072`合入`codex/pp-hicache-autoscaling`；项目合并树与992项检查的候选`4d7638b01ac2`完全一致，没有组合冲突。主协调器通过[总PR #5](https://github.com/paprikaw/sglang/pull/5)合回共同基线；GitHub合并记录及冻结标签记录最终提交，后续优化基于该共同分支。
 
-**A：Memory，负责 KV 池扩缩与 layer stacking。** 对应下面“固定兼容的 KVCacheD 依赖”及“下一步二”的实现项。负责 KVCacheD 依赖与按层物理映射、受控 preclaim／回收、合法 stacking、GDN 稳定存储和 HiCache 页面生命周期；主要修改 `mem_cache/kvcached_pool.py`、`elastic_hybrid_pool.py`、`kv_cache_configurator.py` 及相关分配器。KVCacheD 外部仓库另用独立 worktree／PR，不混入现有脏修改。交付固定依赖、接口和有界检查；验收要看到存活数据正确、地址约束满足、物理页真实增减，不能只看逻辑容量。
+- [x] **2026-11-11：启动预捕获与运行时选择的代码与CPU检查。** 声明有限PP布局，保留原生权重／KV／GDN、独立backend和Graph工作区；运行时拒绝未知布局或地址变化，禁止重新捕获。546项CPU回归通过，见归档 `prepared-graph-20261111/cpu-r5.xml`；先前测试路径／空CUDA设备变量导致的收集失败保留原记录。[使用与边界](PREPARED_DECODE_GRAPHS.md)。
+- [x] **新路径A100 PP2↔PP3有限验收通过。** 冻结 `c5aa853480`，启动捕获本地runner数量2／1／2，运行时capture=0；扩容各目标阶段replay1028次，缩回两个保留阶段各1090次、空阶段0次，活跃代Decode eager=0。两个方向各2048-token输出与当前版本同进程暖缓存参考一致，无retraction／重新Prefill，最终CPU前缀实际loadback。Graph选择1.733–2.596 ms；完整fence扩／缩0.604／0.688秒，后台prepare仍19.799／20.438秒。初始Graph后额外启动准备约3.9秒，常驻allocated显存合计增加21.513 GiB（新增阶段20.816 GiB）。完整监督178.903秒内正常清理并release，127个冻结输入一致。546项完整CPU回归后，启动NIXL隔离修正的81项相关检查通过，不累加。新验收类别只证明同版本暖缓存执行连续性，旧状态审查与冷暖生成等价未扩大；B1、单轮，无独立reviewer。首轮预算入口错误未启动模型，失败原样保留。见[本轮报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_prepared_decode_graph_20261111/summary.md)。
+- [ ] 后续边界：实际B2／B4、减少常驻内存、额外峰值／逐token间隔的独立测量、严格配对性能比较、VMM／HiCache／GDN组合及GPU故障恢复。缩容后worker与候选存储继续常驻，按用户要求暂缓处理；本次没有归还工作GPU的结论。
 
-**B：Graph／Runtime，负责执行准备和唯一 GPU 运行入口。** 对应 Graph、通信预热和全部 GPU 测量项。负责候选图预捕获／选择／失效处理、权重与 workspace 地址约束、通信路径预热、运行观测和回退接入。独占 `model_executor/` 相关 Graph 路径、`distributed/parallel_state.py`、`managers/scheduler_pp_mixin.py`、`server_args.py` 及权重迁移的 `elastic_pp/layer_transport.py`；A、C 需要这些共享文件的 hook 时交给 B 顺序落地。交付实际 replay／失效记录、地址与内存开销检查。后续所有 GPU 检查统一由 B 经 Guard 启动、监控、清理和归档，其他人提供检查要求，不重复轮询或另起 run。
+- [x] **2026-11-11：整模型 Decode CUDA Graph 接入通过。** 冻结 `01bc3770e3`，A100 native／HiCache／NIXL PP2→PP3→PP2在最终排空时重建目标Graph并经全组确认恢复。两个方向各2048-token输出与同暖512边界参考一致，没有retraction／重新Prefill，最终CPU前缀实际loadback。PP3三个阶段各replay1013次；缩回PP2后两个保留阶段各1095次，退出阶段inactive／0次；活跃代Decode eager为0。完整CPU回归508项通过，协议延长后73项harness复查通过，数量不累加。完整监督含清理177.895秒，Guard／owned cleanup／正常release通过。控制面最终交接3.137／2.261秒，包含重建；未宣称暂停收益、全部布局预捕获或VMM组合资格。worker常驻按用户要求后置。见[验证报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_nixl_decode_graph_20261111/summary.md)及[接入说明](DECODE_GRAPH_INTEGRATION.md)。
 
-**C：Patch，负责推理期间的增量状态迁移。** 对应“下一步一”的前两项。负责 `elastic_pp/coordinator.py`、`kv_slots.py`、`kv_transport.py`、`hybrid_kv_transport.py`，实现基础复制、逐步写完成后的 patch、目标应用 ACK、最终 frontier 和有界回退。A 提供稳定池、页面固定和 GDN 快照能力，B 提供执行完成 hook；C 负责迁移期间的版本与一致性协议。交付含请求加入／结束、槽位复用、延迟包、取消和追不平场景的检查；验收必须证明切换前已有真实增量传输，不能用空 delta 或仅预搬权重替代。
+保留失败：GPU r1因旧共享Graph池ID退役未清除而触发PyTorch `use_count`断言；显式清理backend并重置两个池ID后修复。r2捕获成功，但1024-token请求在准备期间结束、目标replay=0，严格验收保持失败。r1／r2分别132.268／121.676秒内正常清理并release；r3延长至2048输出、4096 context后通过，未放宽活跃请求、输出或replay检查。
 
-**独立审查使用空出的槽位，主 agent 负责集成。** 当前最多是主 agent 加三个子 agent；A／B／C 的有界交付结束后返回，再用空出的槽位启动不同于实现者的审查者。审查冻结 commit、接口和原始证据，不同时修改实现文件、不接管 GPU。主 agent 处理跨模块取舍、顺序合并和最终勾选；必要修改回到原负责人，不让三个 agent 各自建立集成分支。
+- [x] 用户确认所有候选GPU启动时建立并预热NIXL agent；已实现固定GPU双缓冲、独立进度与目标应用确认，接入native／HiCache持续KV patch及最终fence。已隔离锁定NIXL 1.5.2；487项elastic_pp CPU回归通过，包含实际allocator及模拟字节传输，覆盖写入确认、复用、改写、多接收端、错误payload和取消失败。首次回归发现异常处理线程退出，修复后全过；原失败保留于归档`nixl-live-20261110/cpu-suite-r1.log`，通过证据为`cpu-suite-r2.xml`。本条只验收代码和CPU协议，GPU正确性见下一条，性能及组合资格留在未完成项。
+- [x] 真实A100 native／eager／HiCache PP2→PP3→PP2的有限正确性通过，冻结`152de4332f`。三个候选端点各完成两条通道预热，每卡注册64 MiB；扩／缩目标在最终暂停前实际应用1320／1318行KV，行数按来源／接收端累计，不是全局原始token数。两个方向各256-token输出与同暖512缓存边界参考一致，没有retraction或重新Prefill，最终CPU前缀实际loadback。完整监督含清理176.008秒，Guard postcheck及正常release通过；同节点日志选择CUDA IPC。首轮bytes／str端点名不匹配失败及83.513秒内正常清理的证据保留；修正后14项NIXL检查通过，与先前487项不累加。端点常驻不算转换期间归还GPU；Graph／VMM组合、真实GPU故障回退、跨节点RDMA及暂停收益仍未验收。见[本轮报告](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/kv-live-foundation-20261109/nixl-gpu-r2/REPORT.md)。
 
-**按依赖推进，不等全部完成才验收。** 先验 A 的最小物理映射／回收；然后验证 B 在合法布局下的图与地址；C 的协议检查可并行，实际在线迁移接入等待这些接口稳定。先保存一个能正确切换的组合检查点，再测减少中断的效果。第一轮 GPU 验收仍采用 HiCache 开启的单实例短路径，每次总时长不超过五分钟并包含清理；初期不扩展到 P/D、多模型、多 stacking 或全部三种旧策略的 sweep。
+- [x] 接入真实 PP 前向与标准 token／paged allocator，保护复制中的槽位复用与重写。仅限 native／eager／background＋overlap 的在线 KV CPU shadow；最终 fence 补齐余量后复用跨 rank 传输，GDN／HiCache仍在fence交接。512项CPU检查全过；冻结 `e7c9cb1264a9` 的A100 64-token页PP2→PP3→PP2通过同暖512边界连续性和CPU前缀loadback。扩容两个源rank各在线完成662行，缩容源rank完成659行；它们是各rank的槽位行计数，不是全局输入token数。整轮含清理171.795秒，正常release。r1／r2失败保留于[验证记录](VALIDATION.md)。不据此宣称网络 overlap、Graph 接入或性能收益。
 
-**最后怎样判断有收益。** B 补齐暂停／逐 token 间隔、迁移字节、平均及尾部 TPOT、迁移期间吞吐与峰值内存，审查者核对正确性和对照。先在相同 Graph 条件下比较同步与在线迁移，再固定在线路径观察预捕获的收益；r15 的 Graph-off 单样本只作历史参考，不能直接与 Graph-on 新方案作因果比较。优先检查一个有效路径，失败时冻结证据、定位原因后再决定复测，不自动循环试跑。
+从冻结基线 `ce563696401c` 建立 `codex/pp-kv-live-foundation-20261109`，本轮不使用子 agent。[PR #4](https://github.com/paprikaw/sglang/pull/4)已在审查后合入项目，共同基线整合见总PR #5。底层原语GPU冻结源码为 `8d7c21241c`，本轮native在线shadow为 `e7c9cb1264a9`；两条执行路径分开验收。旧分工仅表示模块边界，不是正在运行的任务。
 
-**模型、分支与反馈。** 复杂实现和重要审查均计划用 `gpt-6.1-sol`、`max`，因为涉及并发状态、地址和跨模块正确性；实际派发时显式设置。新 agent 用 `fork_turns=none` 和精简任务单，只带相关提交、文件、接口与验收要求，不复制整段长对话。每个任务一个 `codex/` 分支、独立 worktree、指向项目分支的 Draft PR；一期总 PR #1 已合并，下一阶段有首个交付后另建总 PR 记录依赖，最终仍合到 `codex/pp-elastic-integration`。交付时提交本页对应条目的状态补丁，由主 agent 顺序合入，禁止并发写主工作区。仅完成、失败、阻塞或接口变更时报告；没有新工作就返回。沿用 Astra 每小时15万非缓存输入＋输出的限制，Sol 不套此硬限额；接近限额时减少主动协调并等待事件，不停止安全监控。本计划未核算当前实际用量。
-
-- [ ] **主 agent＋A／B／C：**共同源码已冻结；正式派发时再确定上述接口、实际任务分支、负责人和依赖后开始联调。三个实现 agent 尚未启动。
+- [x] 实现 KVCacheD 按层映射协议、映射账本、部分失败重试及页面 pin；保存可重放依赖补丁、Python／原生版本检查和 stacking 边界检查。27 项依赖 CPU 检查通过；补丁在干净上游索引重放得到完全相同的源码树。见[实现与边界](KV_LAYER_MAPPING.md)及依赖锁。真实 GPU 页面验证不包含在此勾选中。
+- [x] 修复 SGLang import／abort／cleanup 在校验 generation 前触碰物理页面的问题，并在 map 前检查槽位和 payload。旧基线可复现 3 个故障，新代码 769 项引擎 CPU 回归通过；保留层地址／数值仅在 CPU 适配器验证，不能据此推定真实 GPU 验收。
+- [ ] 接通 HiCache、GDN 和 Attention 的完整布局约束，并验证实际 OOM／迁移失败回退。底层 GPU 的 map／unmap、保留地址和数据及页面 pin 拒绝已通过；这不替代整模型新后端兼容性或归还工作 GPU，现有 hybrid HiCache 的 native-only 保护不撤除。
+- [x] 建立有限 Graph 预捕获库与持续 KV 行追补的实验模块，本轮75项CPU检查通过（25项新模块＋50项生命周期／参考资格回归）。Graph按完整tensor地址／shape／stride匹配，eager回退同样保护页面；整模型Graph尚未接入。Patch的native CPU shadow已在本轮接入scheduler，跨rank在线传输已在本轮接入NIXL，GDN增量仍待实现。见[接口与接入顺序](GRAPH_KV_PATCH.md)。
+- [x] A100 `gpu-r1` 完成底层 GPU 检查：退役组驱动可见显存增加8 MiB，保留地址和数据；2次 Graph capture／2次 replay、1次地址变化 fallback及1次未映射拒绝；patch为2轮／4行，包含新增行及槽位复用。它是小规模单 GPU 检查，尚未证明完整模型、跨 rank 或在线复制的性能。
+- [x] 同一租约内，开启 HiCache 的 native KV 整模型 PP2→PP3→PP2 往返通过同暖512边界的生成连续性和 CPU 前缀 loadback；整轮含清理186.509秒，Guard postcheck、清理及正常release通过。Graph在整模型中仍关闭，cold/warm等价和转换期间GPU归还未通过资格。见[验证说明](VALIDATION.md)。
 
 ## 当前：先把基线做正确
 
 - [x] 整理 EP／PP／P/D／HiCache 共同代码基线，完成有限范围的静态 CPU 与 A100 回归。证据见 [VALIDATION.md](VALIDATION.md)；这些结果不替代动态转换验证。
 - [x] 实现 resident PP 层布局往返、活跃 KV／GDN／请求进度及 CPU 前缀的转移。已有 PP2→PP3→PP2 同一暖缓存边界的连续性检查通过（r11，`c0a1a1ecb0de`）。这不证明冷／暖缓存生成等价，也不证明空阶段进程退出、GPU 已归还。
-- [x] 实现三种基础策略：同步暂停、后台预搬不可变权重、暂停期间分块复制。KV／GDN 当前仍在最终 fence 同步；没有持续 KV patch，分块复制也不等于在线增量同步。
+- [x] 实现三种基础策略：同步暂停、后台预搬不可变权重、暂停期间分块复制。默认基线的KV／GDN仍在最终 fence 同步；新opt-in CPU shadow的接入与验收单列在本轮条目，分块复制本身不等于在线增量同步。
 - [x] 实现 CPU spill／目标池重建路径，以及 GDN 引用与清理流程修复；相关 CPU 检查及独立审查已有记录。CPU spill 验收版本为 `5fa14eae1df0`，见 [Runtime PR #2](https://github.com/paprikaw/sglang/pull/2)。
 - [x] 验收同步 CPU spill 在真实 GPU 上的成功往返：r14（`5fa14eae1df0`）观察到源 KV／GDN backing 释放、目标恢复、同暖缓存边界的生成连续性及切换后的 CPU 前缀实际 loadback，清理和租约正常结束；完整监督时长 163.294 秒。独立审计 `independent_r14_audit.json`（SHA `6afd282252d8`）通过；原始结果 SHA `ff753f536a37e`。这不包含冷／暖生成等价、严格峰值比较、性能收益或转换期间归还工作 GPU。
 - [ ] **B 运行、独立审查：**补齐受影响故障路径的实际 GPU 回退验证；已有 CPU 回退检查不替代真实 OOM／迁移失败场景。background、batched 的 GPU 资格也不能由 sync 的成功推定。
@@ -43,17 +50,19 @@
 
 ## 已完成调研：下一阶段的接口与机制选择
 
+- [x] 主agent核对NIXL官方API／UCX、现有SGLang NIXL P/D代码和依赖安装状态，形成[NIXL迁移方案](NIXL_KV_TRANSFER_DESIGN.md)。建议推理保留NCCL，KV迁移使用独立NIXL＋UCX和固定GPU双缓冲；这是当时的调研证据；本轮已另行隔离安装1.5.2并接入代码，运行资格见顶部当前任务，不能由本条调研推出。
 - [x] 主 agent 核对 workbench vLLM/PipeLive、SGLang runtime `8374b0276d19` 及 KVCacheD 工作区，形成研究库 `LOW_INTERRUPTION_PP_REVIEW_20261109.md` 和问题簿 Q25。建议优先 KVCacheD 稳定虚拟地址，保留旧块指针内核作备选；发现按层物理映射 API 不匹配、GDN backing 重建和 stacking 边界限制。仅完成调研，无新增引擎改动或 GPU 验收。
-- [ ] **A：**固定兼容的 KVCacheD 依赖与能力检查，先验证物理页映射／回收和存活状态；只改 local view 不算释放显存。
-- [ ] **B：**建立少量候选布局的 CUDA Graph 预捕获与选择机制，检查权重、KV、GDN、输入和 workspace 地址；记录实际 replay、失效及 fallback，不在同一进程的正常推理期间无保护 capture。
+- [x] **主 agent：**固定兼容的 KVCacheD 依赖、能力检查及 stacking 几何检查，底层A100探针确认物理页映射／回收、保留地址与数值及pin拒绝。范围和证据见上方按层映射条目；完整模型与HiCache／Graph组合仍未接通，不能由本条推定归还工作GPU。
+- [ ] **主 agent：**补充提前准备 Graph 的实际B2／B4请求和逐token停顿测量。启动库已接入整模型，捕获档位1／2／4，实际B1的PP2↔PP3、无运行时capture、目标replay及暖缓存连续性已在上方验收；原生存储与工作区的常驻增量已记录。VMM容量机制、更多batch及性能收益仍未验收，详见[启动预捕获说明](PREPARED_DECODE_GRAPHS.md)。
 - [ ] **B：**预初始化并预热候选布局的真实通信路径，验证路由版本、通信顺序和缓冲生命周期。
 - [ ] **A：**选择固定且满足 attention 池层序号边界的 stacking 粒度。显式 preclaim 须与层所有权一致，并计入物理显存；不默认打开全局自动预分配。
 
 ## 下一步一：持续 KV patch，缩短推理中断
 
-- [ ] **C：**实现旧布局继续推理时的 KV 基础复制与持续增量追补，接近追平后才暂停，完成最后增量和状态交接再恢复。不能把后台预搬权重或空 delta 接口当作已完成。
-- [ ] **C，依赖 A 的状态接口：**处理请求新增／结束、KV 槽位复用、迁移版本及 GDN recurrent state 的更新，保证追补不会覆盖新状态；追不平或失败时可退回同步基线。
-- [ ] **B 运行、独立审查：**对照当前同步基线，测暂停、请求延迟、额外传输和后台复制对正常推理的影响。先证明正确，再判断是否值得采用；不预设持续同步一定更快。
+- [x] **主 agent：**固定隔离NIXL 1.5.2／UCX依赖，native／HiCache以固定GPU双缓冲实现基础复制、持续增量及目标应用确认；A100同节点GPU注册、CUDA IPC协议和整模型连续性已有顶部条目证据。推理保留NCCL，CPU shadow保留作对照。跨节点RDMA、完整Graph／VMM组合仍需各自资格，见[NIXL实施方案](NIXL_KV_TRANSFER_DESIGN.md)。
+- [ ] **主 agent：**目标暂停前实际应用已在上述GPU往返观察到；CPU协议已覆盖槽位复用／改写、晚到代、错误payload、取消和不能确认完成时保留内存。继续补真实GPU请求新增／结束、迟到包、取消、缓冲回收及正常PP通信顺序的故障注入；追不平时限速／推迟。提交前失败保留源，不承诺提交后任意回滚。
+- [ ] **主 agent：**最后只排空在途批次、补齐剩余KV和最新GDN／请求进度，再共同发布布局；HiCache保持开启，CPU-only前缀不全部恢复GPU。把完整模型Graph选择及稳定地址容量机制接入同一交接流程，代码、GPU正确性和性能分别验收。
+- [ ] **主 agent：**用相同输入、缓存、源／目标及资源条件，对照同步基线和CPU shadow，记录逐token间隔、平均TPOT、尾部停顿、整请求耗时、搬运字节及峰值。必须证明准备期间继续生成、切换后连续输出和实际暂停缩短；单次正确性或脚本总时长不作为性能结论。
 
 ## 下一步二：GPU KV 池扩缩，降低转换显存需求
 

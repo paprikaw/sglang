@@ -1099,6 +1099,11 @@ class ServerArgs:
         "Comma-separated initial layer counts for every resident elastic PP rank.",
         NS("parallel"),
     ] = None
+    elastic_pp_graph_partitions: A[
+        Optional[str],
+        "Finite semicolon-separated PP partitions to capture before serving and select without runtime capture; retains native weights/KV/GDN and Graph workspaces.",
+        NS("parallel"),
+    ] = None
     elastic_pp_kv_backend: A[
         str,
         Arg(
@@ -1135,6 +1140,19 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "overlap"
+    enable_elastic_pp_kv_patch: A[
+        bool,
+        "Experimental forward-ready KV copies during background PP preparation; recurrent state still migrates at the fence.",
+        NS("parallel"),
+    ] = False
+    elastic_pp_kv_patch_transport: A[
+        str,
+        Arg(
+            help="Online KV copies: cpu shadows, or preinitialized NIXL GPU staging on every candidate rank.",
+            choices=["cpu", "nixl"],
+        ),
+        NS("parallel"),
+    ] = "cpu"
     enable_elastic_pp_autoscaling: A[
         bool,
         "Enable the tokenizer-side backlog controller for elastic PP.",
@@ -7966,11 +7984,29 @@ class ServerArgs:
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
 
+        if self.elastic_pp_kv_patch_transport == "nixl":
+            if not self.enable_elastic_pp_kv_patch:
+                raise ValueError("NIXL migration requires --enable-elastic-pp-kv-patch")
+            if not self.enable_hierarchical_cache:
+                raise ValueError("NIXL migration currently requires HiCache")
+            if self.pp_stage_tp_sizes is not None:
+                raise ValueError(
+                    "NIXL migration requires homogeneous resident PP ranks"
+                )
+
         if self.pp_stage_tp_sizes is not None:
             self._validate_heterogeneous_pp_topology()
             return
 
         if not self.enable_elastic_pp:
+            if self.elastic_pp_graph_partitions is not None:
+                raise ValueError(
+                    "--elastic-pp-graph-partitions requires --enable-elastic-pp"
+                )
+            if self.enable_elastic_pp_kv_patch:
+                raise ValueError(
+                    "--enable-elastic-pp-kv-patch requires --enable-elastic-pp"
+                )
             if self.elastic_pp_transition_backing != "overlap":
                 raise ValueError(
                     "--elastic-pp-transition-backing requires --enable-elastic-pp"
@@ -7987,9 +8023,37 @@ class ServerArgs:
                     "--enable-elastic-pp-autoscaling"
                 )
             return
+        if self.enable_elastic_pp_kv_patch:
+            if (
+                self.elastic_pp_transition_strategy != "background"
+                or self.elastic_pp_transition_backing != "overlap"
+            ):
+                raise ValueError(
+                    "online KV patch requires background/overlap transition"
+                )
+            if self.elastic_pp_kv_backend != "native":
+                raise ValueError("online KV patch currently requires native KV")
+            if self.speculative_algorithm is not None:
+                raise ValueError("online KV patch requires no speculative decoding")
+        if not self.disable_cuda_graph:
+            if self.elastic_pp_kv_backend != "native":
+                raise ValueError("elastic PP Decode Graph currently requires native KV")
+            if self.enable_torch_compile or self.speculative_algorithm is not None:
+                raise ValueError(
+                    "elastic PP Decode Graph requires no torch.compile or speculative decoding"
+                )
+            if self.cuda_graph_config is not None and (
+                self.cuda_graph_config.decode.backend != Backend.FULL
+                or self.cuda_graph_config.prefill.backend != Backend.DISABLED
+            ):
+                raise ValueError(
+                    "elastic PP currently requires full Decode Graph and disabled Prefill Graph"
+                )
         if self.elastic_pp_transition_backing == "cpu_spill":
             if self.elastic_pp_transition_strategy not in {"sync", "batched"}:
-                raise ValueError("CPU-spill backing requires sync or batched transition")
+                raise ValueError(
+                    "CPU-spill backing requires sync or batched transition"
+                )
             if self.elastic_pp_kv_backend != "native":
                 raise ValueError("CPU-spill backing requires the native KV backend")
             if not self.disable_cuda_graph:
@@ -8046,7 +8110,16 @@ class ServerArgs:
             )
 
         normalized_partition = ",".join(str(count) for count in partition)
-        self.elastic_pp_initial_partition = normalized_partition
+        if self.elastic_pp_graph_partitions is not None:
+            from sglang.srt.elastic_pp.prepared_decode_graph import (
+                validate_graph_partitions,
+            )
+
+            validate_graph_partitions(self, partition)
+        self._declare(
+            "_handle_pipeline_parallelism",
+            elastic_pp_initial_partition=normalized_partition,
+        )
         os.environ["SGLANG_PP_LAYER_PARTITION"] = normalized_partition
 
         from sglang.srt.elastic_pp.hybrid_config import (
@@ -8126,8 +8199,9 @@ class ServerArgs:
             raise ValueError(
                 "elastic PP autoscale max operations must be positive or None"
             )
-        self.elastic_pp_autoscale_partitions = serialize_elastic_pp_partitions(
-            partitions
+        self._declare(
+            "_handle_pipeline_parallelism",
+            elastic_pp_autoscale_partitions=serialize_elastic_pp_partitions(partitions),
         )
 
     def _validate_prefill_only_disable_kv_cache_args(self):

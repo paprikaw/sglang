@@ -457,6 +457,105 @@ def test_physical_cleanup_keeps_retired_mapping_retryable():
     assert pool.unmapped[-1] == frozenset({0, 1})
 
 
+def test_wrong_epoch_abort_does_not_unmap_pending_pages():
+    pool, _ = _prepare_physical_move()
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(2, 4), generation=1, total_num_layers=4
+    )
+    with pytest.raises(ValueError, match="generation mismatch"):
+        pool.abort_elastic_pp_kv_layers(generation=2)
+    assert pool.unmapped == []
+    assert pool._elastic_pp_residency.pending.generation == 1
+
+
+def test_wrong_epoch_cleanup_does_not_unmap_retired_pages():
+    pool, _ = _prepare_physical_move()
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(2, 4), generation=1, total_num_layers=4
+    )
+    pool.mark_elastic_pp_kv_layers_loaded(generation=1, layer_ids={2, 3})
+    pool.commit_elastic_pp_kv_layers(generation=1)
+    with pytest.raises(ValueError, match="generation mismatch"):
+        pool.cleanup_elastic_pp_kv_layers(generation=2)
+    assert pool.unmapped == []
+    assert set(pool._elastic_pp_retired_kv) == {0, 1}
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "epoch",
+        "layer",
+        "slot_dtype",
+        "slot_rank",
+        "negative",
+        "outside",
+        "duplicate",
+        "shape",
+        "dtype",
+    ],
+)
+def test_invalid_import_has_no_physical_mapping_side_effects(invalid):
+    pool, _ = _prepare_physical_move()
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(2, 4), generation=1, total_num_layers=4
+    )
+    args = dict(
+        generation=1,
+        layer_id=2,
+        slot_ids=torch.tensor([1, 2]),
+        cache_k=torch.zeros(2, 1, 2),
+        cache_v=torch.zeros(2, 1, 2),
+    )
+    if invalid == "epoch":
+        args["generation"] = 2
+    elif invalid == "layer":
+        args["layer_id"] = 0
+    elif invalid == "slot_dtype":
+        args["slot_ids"] = torch.tensor([1.0, 2.0])
+    elif invalid == "slot_rank":
+        args["slot_ids"] = torch.tensor([[1, 2]])
+    elif invalid == "negative":
+        args["slot_ids"] = torch.tensor([-1, 2])
+    elif invalid == "outside":
+        args["slot_ids"] = torch.tensor([1, 99])
+    elif invalid == "duplicate":
+        args["slot_ids"] = torch.tensor([1, 1])
+    elif invalid == "shape":
+        args["cache_v"] = torch.zeros(2, 1, 3)
+    else:
+        args["cache_k"] = args["cache_k"].to(torch.bfloat16)
+    with pytest.raises((ValueError, RuntimeError)):
+        pool.import_elastic_pp_kv_slots(**args)
+    assert pool.mapped == []
+
+
+def test_single_attention_layer_group_preserves_retained_values_and_addresses():
+    pool, _ = _prepare_physical_move()
+    pool.kvcached_allocator.layer_group_granularity = 1
+    retained_k, retained_v = pool.k_buffer[1], pool.v_buffer[1]
+    retained_k[1:3].fill_(31)
+    retained_v[1:3].fill_(37)
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(1, 3), generation=1, total_num_layers=4
+    )
+    pool.import_elastic_pp_kv_slots(
+        generation=1,
+        layer_id=2,
+        slot_ids=torch.tensor([1, 2]),
+        cache_k=torch.full((2, 1, 2), 41.0),
+        cache_v=torch.full((2, 1, 2), 43.0),
+    )
+    pool.mark_elastic_pp_kv_layers_loaded(generation=1, layer_ids={2})
+    pool.commit_elastic_pp_kv_layers(generation=1)
+    pool.cleanup_elastic_pp_kv_layers(generation=1)
+    assert pool.k_buffer[0].data_ptr() == retained_k.data_ptr()
+    assert pool.v_buffer[0].data_ptr() == retained_v.data_ptr()
+    assert torch.all(pool.k_buffer[0][1:3] == 31)
+    assert torch.all(pool.v_buffer[0][1:3] == 37)
+    assert pool.unmapped == [frozenset({0})]
+
+
 def _make_snapshot_coordinator(*, rank=0, failure=None):
     """Use real coordinator/transport/allocator logic with CPU-only backing."""
     source = PPTopology.from_layer_counts([2, 2, 0, 0], generation=0)

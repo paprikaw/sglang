@@ -148,5 +148,38 @@
   "mooncake": {
     "python_path": "/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_feasibility_20261030/deps/mooncake_only",
     "source": "PD tests must record actual loaded extension path and hash."
+  },
+  "kvcached": {
+    "upstream_url": "https://github.com/ovg-project/kvcached.git",
+    "upstream_commit": "3cc92bec02fc77b72b86ed6f8d91dc454bbca154",
+    "patch": "dependencies/kvcached-layer-mapping-v1.patch",
+    "patch_sha256": "dbd6d41eaf8c603bc6a807a05b55482007b212a0a3cdbe53e6c59f2a2e8f2d75",
+    "patched_tree": "14c85a5f0701a5a7789683ee57f9cbf873ea4cc7",
+    "python_layer_mapping_api": 1,
+    "native_layer_mapping_abi": 1,
+    "required_environment": {
+      "KVCACHED_LAYER_STACKING": "true",
+      "KVCACHED_PAGE_PREALLOC_ENABLED": "false"
+    },
+    "build": "Apply patch to the pinned clean upstream tree and rebuild the native extension in an isolated checkout; select it explicitly with PYTHONPATH.",
+    "limits": "The bounded A100 gpu-r1 primitive check validates mapping/reclamation, retained addresses/values, packed-row copying and two small Graph replays. Full-model Graph reuse, hybrid HiCache on this backend, GDN stable addresses, online patch transport and returning working GPUs remain unqualified. Hybrid HiCache retains its native-backend-only guard."
+  },
+  "nixl": {
+    "packages": {
+      "nixl": "1.5.2",
+      "nixl-cu12": "1.5.2"
+    },
+    "python_path": "/data/gpfs/projects/punim2715/vllm_workbench/.dependency-runtimes/sglang-nixl-cu12-1.5.2",
+    "installation": "Isolated uv pip --target overlay, --no-deps; use with the locked CUDA12 Python environment without modifying it.",
+    "backend": "UCX",
+    "fingerprints": {
+      "nixl/__init__.py": "c2b51145baaea1f57f6f627926a360c54b376ac7c8e5404ab84227dfc7562970",
+      "nixl/_api.py": "a8706a2df0423981d88dd523804e47e2d94065a571ffaf87f8620568ca84b44d",
+      "nixl_cu12/_api.py": "79ac70eed826672f09a21df7e71c8646654e761961c9783ecd8e145c0a7149a7",
+      "nixl_cu12/_bindings.cpython-312-x86_64-linux-gnu.so": "7f21e2520e7120afbb3cf591349c94bf464737d0328207892d06df7f93ff2e23",
+      "nixl_cu12.libs/libucp-b39b3ed9.so.0.0.0": "b9d0055bc937ae8bd2e5b77b39b8768016e7f42403ae516f8a7283f30b1762b6",
+      "nixl_cu12.libs/nixl/libplugin_UCX.so": "6c8bebd4bbd0e89f291eb0d4ac55f14441febd88ce0f3611e3ea8f2fcdd3bed6"
+    },
+    "limits": "Candidate agents and fixed GPU buffers preinitialize at startup. Native/eager/HiCache only; GPU correctness, actual transport path and performance need a separately frozen Guard run."
   }
 }
