@@ -4,7 +4,9 @@
 
 ## 当前：减少迁移、最终暂停及推理干扰
 
-- [ ] **2026-11-11 用户新增底线：候选布局权重不能常驻 GPU。** 任务分支 `codex/pp-graph-nonresident-weights-20261111` 将预热 Graph 的稳定地址和权重物理页拆开，默认 `offload`：清理退出层的显存，重新启用时真实搬权重。验收包含物理映射账本、驱动可用显存、非零传输字节、输出与 Graph replay；1023项完整CPU回归通过（108.57秒），随后删除非输出rank备用LM head／norm，119项相关检查通过；真实GPU验收仍待节点空闲。实现／CPU／GPU结论分别补录。旧约0.3秒仅为resident诊断结果。KV／GDN／Graph工作区和worker仍须单列，不能据此声称整个GPU归还。见[设计与结果](NONRESIDENT_GRAPH_WEIGHTS.md)。
+- [x] **2026-11-11 用户新增底线：候选布局权重不能常驻 GPU。** 默认 `offload` 将Graph稳定地址与权重物理页拆开，释放退出层及多余输出权重，接班时真实搬权重。冻结 `26bdee39146f`，35B／A100／B1／HiCache的两次独立PP2→PP3→PP2往返通过；每方向实际搬21.87 GB，完整扩／缩均值19.98／20.65秒，最后暂停239／285 ms，运行时capture=0且实际Graph replay。缩回后中间GPU模型参数及物理权重页均为0，每轮驱动可用显存增加20.37890625 GiB。暖缓存连续性、在线KV及CPU loadback、监督清理／正常release、129个输入核对通过；最终1024项完整CPU回归通过（114.57秒）。当前Gloo权重搬运是主要瓶颈。旧约0.3秒仅为resident诊断；KV／GDN／Graph工作区和worker仍占资源，整个GPU归还未完成。见[设计与结果](NONRESIDENT_GRAPH_WEIGHTS.md)。
+
+下面三项保留历史resident实验记录，不代表满足当前权重释放底线。
 
 - [x] **主agent直接实施：**`b59993a97f28`复用启动已常驻的不可变候选权重，保留recopy对照和版本／地址检查，补齐准备与交接分项计时。1000项CPU通过；A100同版本每策略一轮，扩／缩完整迁移20.470／20.955→0.691／0.727秒，权重传输每方向减少21,871,498,496字节。暖缓存连续性、Graph replay、在线KV及最终CPU loadback和正常清理通过；尚无重复均值。见[优化记录](MIGRATION_OPTIMIZATION.md)。
 - [x] **主agent直接实施：**`ed2e82c5eda8`新增opt-in PyTorch pinned HiCache分配与启动候选预热，默认mmap保留。1008项完整CPU通过；同一A100节点两次独立启动均通过PP2↔PP3暖缓存连续性、运行时capture=0／实际replay、在线KV及CPU loadback。完整迁移扩／缩均值0.293／0.321秒，最终暂停均值246／271 ms；3进程采样pinned内存5.781 GiB，非总CPU峰值。两轮清理／正常release、127个输入哈希核对通过；仅35B／B1／native／L2 HiCache范围。见[优化记录](MIGRATION_OPTIMIZATION.md)。
@@ -19,7 +21,7 @@
 
 - [x] **2026-11-11：启动预捕获与运行时选择的代码与CPU检查。** 声明有限PP布局，保留原生权重／KV／GDN、独立backend和Graph工作区；运行时拒绝未知布局或地址变化，禁止重新捕获。546项CPU回归通过，见归档 `prepared-graph-20261111/cpu-r5.xml`；先前测试路径／空CUDA设备变量导致的收集失败保留原记录。[使用与边界](PREPARED_DECODE_GRAPHS.md)。
 - [x] **新路径A100 PP2↔PP3有限验收通过。** 冻结 `c5aa853480`，启动捕获本地runner数量2／1／2，运行时capture=0；扩容各目标阶段replay1028次，缩回两个保留阶段各1090次、空阶段0次，活跃代Decode eager=0。两个方向各2048-token输出与当前版本同进程暖缓存参考一致，无retraction／重新Prefill，最终CPU前缀实际loadback。Graph选择1.733–2.596 ms；完整fence扩／缩0.604／0.688秒，后台prepare仍19.799／20.438秒。初始Graph后额外启动准备约3.9秒，常驻allocated显存合计增加21.513 GiB（新增阶段20.816 GiB）。完整监督178.903秒内正常清理并release，127个冻结输入一致。546项完整CPU回归后，启动NIXL隔离修正的81项相关检查通过，不累加。新验收类别只证明同版本暖缓存执行连续性，旧状态审查与冷暖生成等价未扩大；B1、单轮，无独立reviewer。首轮预算入口错误未启动模型，失败原样保留。见[本轮报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_prepared_decode_graph_20261111/summary.md)。
-- [ ] 后续边界：实际B2／B4、减少常驻内存、额外峰值／逐token间隔的独立测量、严格配对性能比较、VMM／HiCache／GDN组合及GPU故障恢复。缩容后worker与候选存储继续常驻，按用户要求暂缓处理；本次没有归还工作GPU的结论。
+- [ ] 后续边界：实际B2／B4、减少KV／GDN及工作区常驻内存、额外峰值／逐token间隔的独立测量、严格配对性能比较、KV VMM／HiCache／GDN组合及GPU故障恢复。权重物理页释放已由本页首项验收；worker退出仍按用户要求暂缓处理，没有归还工作GPU的结论。
 
 - [x] **2026-11-11：整模型 Decode CUDA Graph 接入通过。** 冻结 `01bc3770e3`，A100 native／HiCache／NIXL PP2→PP3→PP2在最终排空时重建目标Graph并经全组确认恢复。两个方向各2048-token输出与同暖512边界参考一致，没有retraction／重新Prefill，最终CPU前缀实际loadback。PP3三个阶段各replay1013次；缩回PP2后两个保留阶段各1095次，退出阶段inactive／0次；活跃代Decode eager为0。完整CPU回归508项通过，协议延长后73项harness复查通过，数量不累加。完整监督含清理177.895秒，Guard／owned cleanup／正常release通过。控制面最终交接3.137／2.261秒，包含重建；未宣称暂停收益、全部布局预捕获或VMM组合资格。worker常驻按用户要求后置。见[验证报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_nixl_decode_graph_20261111/summary.md)及[接入说明](DECODE_GRAPH_INTEGRATION.md)。
 

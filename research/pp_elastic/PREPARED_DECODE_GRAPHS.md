@@ -1,6 +1,6 @@
 # 启动时准备 Graph，运行时切换
 
-2026-11-11范围修正：用户要求候选权重不得常驻GPU。新任务将Graph稳定地址与权重物理页分开，预热后释放退出层，接班前真实搬权重；实现及验收见[非驻留权重](NONRESIDENT_GRAPH_WEIGHTS.md)。历史约0.3秒的数据仅为resident诊断结果，不能证明伸缩节省资源。
+2026-11-11范围修正：用户要求候选权重不得常驻GPU。默认offload保留Graph虚拟地址，释放退出层物理权重页，接班前真实搬权重。A100两次独立往返完整扩／缩均值19.98／20.65秒，最后暂停239／285 ms；运行时capture=0，缩回后中间GPU权重为0、释放20.37890625 GiB。实现及边界见[非驻留权重](NONRESIDENT_GRAPH_WEIGHTS.md)。历史约0.3秒仅为resident诊断，不能证明伸缩节省资源；整个GPU归还仍未完成。
 
 **历史resident策略（冻结版本）。** 当时的候选库完成后，运行时默认复用已经验证的不可变权重，避免再次传输；仅限预捕获库，在线权重更新被拒绝。需要对照时使用 `--elastic-pp-prepared-weight-policy recopy`。L2 HiCache另可显式启用 `--elastic-pp-hicache-allocator pytorch`，在启动时预热候选的CPU页锁定分配。35B／B1／A100两个独立往返的完整迁移扩／缩均值0.293／0.321秒，最终暂停246／271 ms；运行时capture=0，Graph选择约2–3 ms。原始样本、常驻内存与范围见[迁移优化记录](MIGRATION_OPTIMIZATION.md)，不能把选择Graph耗时当作完整切换耗时。下文原结果保留其冻结版本。
 
@@ -8,7 +8,7 @@
 
 **做什么。** 在接收请求前走一遍声明的 PP 布局，预热并捕获各布局的原生 Decode Graph，再回到初始布局。运行时沿用 NIXL 持续 KV 追补和最终交接，选择已准备的 Graph；不在交接时重新捕获。HiCache 开启，候选 worker 和端点常驻。代码与 GPU 验收分开记录在 [TODO](TODO.md)。
 
-**怎样保持有效。** 每个本地层区间保留自己的 attention backend、Graph 和工作区；按全局层号保留权重、KV 和 GDN 的内存。退役只移除当前执行关系，不释放 Graph 仍引用的存储。下一次回来时覆盖迁入的活跃状态、同步保留层的 GDN，不能使用缓存中的旧数值。提交后核对权重、KV／GDN、请求表和 Graph 输入的地址、形状及步幅；不一致就停止切换，不偷偷重新捕获或改用 eager。启动内部转换不发布给请求，完成后公开代数仍从 0 开始。
+**怎样保持有效。** 每个本地层区间保留自己的attention backend、Graph和工作区。权重保留虚拟地址及Tensor记录，退出层释放物理页，再次启用时重新映射并由正常传输填入权重；KV和GDN目前仍保留原生存储。下一次回来时覆盖迁入的活跃状态、同步保留层的GDN，不能使用旧数值。提交后核对权重、KV／GDN、请求表和Graph输入的地址、形状及步幅；不一致就停止切换，不偷偷重新捕获或改用eager。启动内部转换不发布给请求，完成后公开代数仍从0开始。
 
 **怎样开启。** 在现有 native／overlap 弹性 PP 启动参数上增加 `--elastic-pp-graph-partitions '20,0,20;13,13,14'`，初始布局使用 `--elastic-pp-initial-partition '20,0,20'`。这是三张常驻卡上的逻辑 PP2／PP3，首尾物理 rank 固定活跃。最多声明四个布局；自动伸缩的候选必须都在此集合内。batch 捕获档位沿用 `--cuda-graph-bs-decode 1 2 4`。只支持既有 TP1／EP1、full Decode、native KV 路径，Prefill 仍 eager；不接 LoRA、TBO、PDMux、compile、speculative 或 CPU-spill Graph。
 

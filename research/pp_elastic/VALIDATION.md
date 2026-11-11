@@ -1,5 +1,13 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-11：Graph预热与权重物理页释放分开验收
+
+冻结 `26bdee39146f103716d23749b5b08f523789a12e`，tag `experiment/sglang/pp-graph-nonresident-weights-20261111-r3`。35B BF16、A100、实际B1、native KV／HiCache／NIXL，默认offload的两次独立PP2→PP3→PP2往返通过。完整扩／缩均值19.98／20.65秒，后台权重传输19.68／20.30秒，最后暂停239／285 ms；每方向实际搬21,871,498,496字节，权重复用字节为0。当前权重为Gloo的GPU→CPU→GPU路径，NIXL用于在线KV。
+
+中间GPU缩回后的decoder物理权重页及注册模型参数均为0；每轮释放21,881,683,968字节（20.37890625 GiB），驱动可用显存同步增加相同字节数。所有rank的非活跃层物理权重页均为0。两方向2048-token完整输出与同版本同进程暖缓存参考一致，目标实际Graph replay、活跃Decode eager=0、运行时capture=0、在线KV应用及最终CPU前缀loadback通过。各轮129个冻结输入哈希一致；监督含清理177.091／178.488秒，Guard postcheck、owned cleanup与正常lease release通过。最终1024项完整CPU回归通过，零失败／错误／跳过，114.57秒；此前通过数不累加。代码由主agent自行实施与审查，没有新增独立reviewer。
+
+这是权重显存释放资格，KV／GDN、Graph工作区和worker上下文仍保留，`gpu_released=false`。冷暖生成等价、更多模型／batch／量化、KV VMM组合、跨节点RDMA及GPU故障恢复未验证；当前只检查了35B初始化峰值。两轮仅作描述性重复。历史resident版本约0.3秒不能支撑资源节省主张。[完整报告及绝对指标](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_nonresident_graph_weights_20261111/summary.md)。
+
 ## 2026-11-11：候选权重复用与HiCache分配预热
 
 任务分支 `codex/pp-migration-latency-20261111` 从共同基线 `5f530f6de33d` 派生，由主agent直接实施、测试和审查，没有新增独立reviewer。`b59993a97f28` 增加不可变候选权重复用、recopy对照、统一策略确认、在线权重更新拒绝和分项／输出事件计时；`ed2e82c5eda8` 增加opt-in PyTorch pinned HiCache及启动预热。当前源码的1008项完整CPU检查通过，零失败／错误／跳过，115.40秒；用例来自本目录精确清单，不与历史通过数累加。原字段兼容失败、CPU夹具错误及Guard启动前资源冲突均保留。

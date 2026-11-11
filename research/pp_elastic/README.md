@@ -1,6 +1,6 @@
 # SGLang 研究基线
 
-2026-11-11范围修正：用户要求候选权重不得常驻GPU。新任务将Graph稳定地址与权重物理页分开，预热后释放退出层，接班前真实搬权重；实现及验收见[非驻留权重](NONRESIDENT_GRAPH_WEIGHTS.md)。历史约0.3秒的数据仅为resident诊断结果，不能证明伸缩节省资源。
+2026-11-11范围修正与验收：用户要求候选权重不得常驻GPU。默认offload将Graph稳定地址与权重物理页分开；35B／A100两次独立往返通过，真实搬权重后的完整扩／缩均值19.98／20.65秒，最后暂停239／285 ms，运行时capture=0。缩回后中间GPU权重为0、释放20.37890625 GiB；1024项完整CPU回归通过。KV／GDN、工作区和worker仍占资源，没有归还整个GPU。见[非驻留权重](NONRESIDENT_GRAPH_WEIGHTS.md)。历史约0.3秒仅为resident诊断结果。
 
 2026-11-11追加：启动Graph之外，复用候选权重并预热HiCache页锁定CPU分配。35B／B1／A100两次独立往返的完整迁移扩／缩均值0.293／0.321秒、最终暂停246／271 ms；运行时capture=0，1008项CPU回归通过。候选worker及GPU存储继续常驻，细节与本次任务合入状态见[迁移优化记录](MIGRATION_OPTIMIZATION.md)及[TODO](TODO.md)。
 
