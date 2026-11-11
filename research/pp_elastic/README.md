@@ -1,5 +1,7 @@
 # SGLang 研究基线
 
+2026-11-11：native／HiCache／NIXL持续迁移已接通完整Decode CUDA Graph，A100 PP2→PP3→PP2有实际replay及2048-token连续性证据。当前在最终排空时重新捕获，启动预捕获库／VMM组合未接通，worker继续常驻，见[接入说明](DECODE_GRAPH_INTEGRATION.md)。代码仍在Draft PR #4，未合入共同主线。
+
 2026-11-09：naive PP＋HiCache 的实现范围、组合回归及合并依据见[本次基线验收](BASELINE_ACCEPTANCE_20261109.md)。低干扰机制已开始实现[按层 KV 映射依赖](KV_LAYER_MAPPING.md)及[Graph 预捕获／持续 KV patch](GRAPH_KV_PATCH.md)；真实 GPU、缓存接入和后续机制的完成状态以[TODO](TODO.md)为准。
 
 当前 PP＋HiCache 实现、验收和后续优化统一追踪于[任务清单](TODO.md)。每个 agent 交付时更新对应条目，规则见[协作约定](WORKFLOW.md)。

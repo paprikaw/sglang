@@ -1,6 +1,6 @@
 # Graph 预捕获与持续 KV patch
 
-**2026-11-11 当前接入。** 用户要求先解决整模型 Graph，worker 常驻后置。native 池会改变地址，本轮先在排空交接处重建目标 Decode Graph，再确认恢复，详见[实现范围与验收](DECODE_GRAPH_INTEGRATION.md)。下面的启动预捕获库保留为后续优化与历史原语证据；不把它等同于本轮重建路径。
+**2026-11-11 当前接入通过。** 用户要求先解决整模型 Graph，worker 常驻后置。native 池会改变地址，本轮在排空交接处退役旧Graph及池ID、重建目标Decode Graph，再确认恢复；A100 native／HiCache／NIXL PP2→PP3→PP2已通过实际replay与2048-token连续性检查，详见[实现范围与验收](DECODE_GRAPH_INTEGRATION.md)。下面的启动预捕获库保留为后续优化与历史原语证据；不把它等同于本轮重建路径，VMM组合也未取得资格。
 
 更新2026-11-10。由主 agent 顺序实现，属于 [TODO](TODO.md) 的低干扰阶段，接在[按层物理映射](KV_LAYER_MAPPING.md)之后。代码在 Draft PR #4；新接入范围与验证状态见下文。
 

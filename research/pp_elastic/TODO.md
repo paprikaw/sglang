@@ -6,9 +6,9 @@
 
 ## 本轮实施：主 agent 顺序完成
 
-- [ ] **2026-11-11：整模型 Decode CUDA Graph 接入。** 用户确认本轮只解决 Graph，worker 常驻暂不处理。沿用 native／HiCache／NIXL 持续迁移，在排空边界提交目标权重、KV／GDN、缓存与路由后，重建目标 Decode Graph，再经全组确认恢复；记录各代实际 replay、eager fallback 和 capture 秒数。CPU 首轮503项通过。真实 GPU `graph-integration-20261111/gpu-r1` 已证实初始 PP2 replay，但目标 PP3 捕获在旧共享池的 PyTorch `use_count` 断言失败，132.268秒内清理并正常release；保留失败，已补显式 backend 清理和进程池ID重置，另用新标签复验。不会将底层 Graph 原语资格作为整模型通过。
+- [x] **2026-11-11：整模型 Decode CUDA Graph 接入通过。** 冻结 `01bc3770e3`，A100 native／HiCache／NIXL PP2→PP3→PP2在最终排空时重建目标Graph并经全组确认恢复。两个方向各2048-token输出与同暖512边界参考一致，没有retraction／重新Prefill，最终CPU前缀实际loadback。PP3三个阶段各replay1013次；缩回PP2后两个保留阶段各1095次，退出阶段inactive／0次；活跃代Decode eager为0。完整CPU回归508项通过，协议延长后73项harness复查通过，数量不累加。完整监督含清理177.895秒，Guard／owned cleanup／正常release通过。控制面最终交接3.137／2.261秒，包含重建；未宣称暂停收益、全部布局预捕获或VMM组合资格。worker常驻按用户要求后置。见[验证报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_nixl_decode_graph_20261111/summary.md)及[接入说明](DECODE_GRAPH_INTEGRATION.md)。
 
-Graph 修正后完整 CPU 回归508项通过。GPU r2 的 PP3 三阶段捕获均成功，但1024-token请求在准备期间已经结束，目标 replay=0，严格验收保持失败；121.676秒内清理并正常release。继续用2048-token请求与4096 context复验，不把捕获成功写成接入验收通过。
+保留失败：GPU r1因旧共享Graph池ID退役未清除而触发PyTorch `use_count`断言；显式清理backend并重置两个池ID后修复。r2捕获成功，但1024-token请求在准备期间结束、目标replay=0，严格验收保持失败。r1／r2分别132.268／121.676秒内正常清理并release；r3延长至2048输出、4096 context后通过，未放宽活跃请求、输出或replay检查。
 
 - [x] 用户确认所有候选GPU启动时建立并预热NIXL agent；已实现固定GPU双缓冲、独立进度与目标应用确认，接入native／HiCache持续KV patch及最终fence。已隔离锁定NIXL 1.5.2；487项elastic_pp CPU回归通过，包含实际allocator及模拟字节传输，覆盖写入确认、复用、改写、多接收端、错误payload和取消失败。首次回归发现异常处理线程退出，修复后全过；原失败保留于归档`nixl-live-20261110/cpu-suite-r1.log`，通过证据为`cpu-suite-r2.xml`。本条只验收代码和CPU协议，GPU正确性见下一条，性能及组合资格留在未完成项。
 - [x] 真实A100 native／eager／HiCache PP2→PP3→PP2的有限正确性通过，冻结`152de4332f`。三个候选端点各完成两条通道预热，每卡注册64 MiB；扩／缩目标在最终暂停前实际应用1320／1318行KV，行数按来源／接收端累计，不是全局原始token数。两个方向各256-token输出与同暖512缓存边界参考一致，没有retraction或重新Prefill，最终CPU前缀实际loadback。完整监督含清理176.008秒，Guard postcheck及正常release通过；同节点日志选择CUDA IPC。首轮bytes／str端点名不匹配失败及83.513秒内正常清理的证据保留；修正后14项NIXL检查通过，与先前487项不累加。端点常驻不算转换期间归还GPU；Graph／VMM组合、真实GPU故障回退、跨节点RDMA及暂停收益仍未验收。见[本轮报告](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/kv-live-foundation-20261109/nixl-gpu-r2/REPORT.md)。

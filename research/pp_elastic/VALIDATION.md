@@ -1,5 +1,17 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-11：NIXL 持续迁移接通整模型 Decode Graph
+
+**通过范围。** 冻结 `01bc3770e32254e7088d50769c16b115c89dc9f3`，annotated tag `experiment/sglang/pp-nixl-decode-graph-20261111-r3`。35B BF16、三常驻A100、TP1／EP1、native KV、HiCache、background／overlap、NIXL 1.5.2，20/0/20→13/13/14→20/0/20。两个方向各2048-token输出与同暖512边界参考完全一致，无retraction或切换后重新Prefill，最终活跃阶段实际CPU前缀loadback；不是冷暖生成等价资格。
+
+**Graph。** 启动及最终排空时使用原生full Decode runner，Prefill仍eager。旧backend和进程共享池ID显式退役，不复用已失效池；提交目标后捕获新Graph，全组确认才恢复。扩容目标三阶段各replay1013次；缩容后rank0／2各1095次，rank1 inactive／0次，活跃代Decode eager=0。捕获档位1／2／4，实际请求只验证B1。原语预捕获库和稳定地址VMM组合不在本轮资格中。
+
+**时间与协议。** 控制面扩／缩准备19.866／20.348秒、fence 3.137／2.261秒；各rank捕获分别1059.347／2262.343／809.463 ms，以及1156.896／0／960.974 ms。它们并行执行，不能累加；fence包含KV／GDN／HiCache和Graph，不是逐token最大间隔。暂停前目标实际应用3094／2930个按来源累计的槽位行。UCX的CUDA→CUDA非零写入日志选择CUDA IPC zero-copy，只验证同节点。没有重复实验或性能改善结论。
+
+**检查与清理。** 完整CPU回归508项通过；延长smoke协议后73项harness复查通过，不累加。完整监督含加载及清理177.895秒，Guard postcheck、owned进程清理、正常lease release通过；135个冻结输入哈希一致，远端JSON均通过稳定可见性检查。结果SHA256 `ca56488c5b25fe141dbcbf19b8a9a96fa2fdcf2aafa0878a7a2db20a2ad798ea`。归档为 `graph-integration-20261111/gpu-r3`；[精简报告及快照](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_nixl_decode_graph_20261111/summary.md)含原始结果、CSV、审计及回执，大日志留原处。
+
+**失败保留与边界。** r1旧共享池已无Graph引用，复用池ID触发PyTorch use_count断言；修正显式backend清理和池ID重置后，r2捕获成功，但1024-token请求在准备期间结束、目标replay=0，严格验收仍失败。r3以2048输出／4096 context保持请求跨越切换，未放宽检查。r1／r2分别132.268／121.676秒内正常清理并release。worker常驻按用户要求暂缓处理；启动布局Graph bank、VMM／GDN／HiCache组合、Prefill Graph、GPU故障恢复、跨节点RDMA、性能收益及转换期间归还工作GPU未验收。本轮没有独立reviewer，尚未合入共同主线。
+
 ## 2026-11-10：真实前向／allocator与在线CPU shadow
 
 新增 native KV CPU shadow 路径，接口和范围见 [GRAPH_KV_PATCH](GRAPH_KV_PATCH.md)。本轮组合检查最初476项通过、1项失败；失败为原有 PP 分区参数绕过配置声明的问题，旧 HEAD 中也存在同样的两处直接赋值。已改为声明更新，并补测配置投影与 allocator resize 前置拒绝。随后40项相关检查全部通过；按最新结果去重，共478项通过、0失败／错误／跳过。它是组合证据与受影响路径复测，不是修改后重跑全部478项，也不与此前769项相加。
