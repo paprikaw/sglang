@@ -14,6 +14,7 @@ from sglang.srt.elastic_pp.decode_graph import (
 )
 from sglang.srt.elastic_pp.layer_residency import ElasticLayerResidency
 from sglang.srt.elastic_pp.model import ElasticPPModelMixin
+from sglang.srt.elastic_pp.model_wrapper import ElasticPPModelWrapperMixin
 from sglang.srt.elastic_pp.prepared_decode_graph import (
     PreparedDecodeGraphBank,
     external_bindings,
@@ -172,6 +173,61 @@ def test_parameter_storage_survives_retirement_abort_and_return():
             model.commit_elastic_pp_layers(generation)
             model.take_elastic_pp_cleanup_layers(generation)
     assert hasattr(model.layers[0].weight, "weight_loader")
+
+
+def test_nonresident_cleanup_and_abort_release_only_incoming_weights(monkeypatch):
+    model = Model()
+    model.retain_elastic_pp_graph_layers()
+    mapped = {0, 1}
+    calls = []
+
+    def evict(ids):
+        calls.append(("evict", set(ids)))
+        mapped.difference_update(ids)
+
+    def prepare(layer_id, layer):
+        calls.append(("map", layer_id))
+        mapped.add(layer_id)
+
+    model._elastic_pp_weight_backing = NS(prepare=prepare, evict=evict)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    model.prepare_elastic_pp_layers(
+        target=LayerRange(1, 2),
+        generation=1,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    model.commit_elastic_pp_layers(1)
+    model.take_elastic_pp_cleanup_layers(1)
+    assert mapped == {1}
+    model.prepare_elastic_pp_layers(
+        target=LayerRange(0, 2),
+        generation=2,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert mapped == {0, 1}
+    model.abort_elastic_pp_layers(2)
+    assert mapped == {1}
+    assert isinstance(model.layers[0], PPMissingLayer)
+    assert calls == [("evict", {0}), ("map", 0), ("evict", {0})]
+
+
+def test_fixed_output_frontier_drops_spare_heads_without_touching_decoder_weights():
+    class Wrapper(ElasticPPModelWrapperMixin, nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = Model()
+            self.model.norm = nn.LayerNorm(2)
+            self.lm_head = nn.Linear(2, 4, bias=False)
+
+    wrapper = Wrapper()
+    layers = tuple(wrapper.model.layers.parameters())
+    weight_ptrs = [t.data_ptr() for t in layers]
+    assert wrapper.discard_elastic_pp_unused_output_weights() == (8 + 4) * 4
+    assert isinstance(wrapper.lm_head, PPMissingLayer)
+    assert isinstance(wrapper.model.norm, PPMissingLayer)
+    assert [t.data_ptr() for t in wrapper.model.layers.parameters()] == weight_ptrs
 
 
 def test_kv_gdn_addresses_return_but_stale_values_are_overwritten(hybrid_pool_factory):

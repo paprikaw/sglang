@@ -205,7 +205,7 @@ def _coordinator(group=None, *, fence_step_provider=None, fence_lead_steps=0):
     return coordinator, transition, runner, kv_transport
 
 
-@pytest.mark.parametrize("policy", ["reuse", "recopy"])
+@pytest.mark.parametrize("policy", ["reuse", "recopy", "offload"])
 def test_prepared_weight_policy_skips_only_verified_resident_weights(policy):
     coordinator, transition, runner, _ = _coordinator()
     coordinator.strategy = "background"
@@ -221,7 +221,7 @@ def test_prepared_weight_policy_skips_only_verified_resident_weights(policy):
     state = coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
     assert state.phase == ElasticPPMigrationPhase.BULK_READY
     coordinator.finalize_at_fence(lambda _: None)
-    assert calls == [policy]
+    assert calls == ["reuse" if policy == "reuse" else "recopy"]
     assert not coordinator.layer_transport.received
     metrics = coordinator.transition_metrics()
     assert metrics["prepared_weight_bytes_reused"] == (64 if policy == "reuse" else 0)

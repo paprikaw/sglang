@@ -732,6 +732,80 @@ def test_prepared_graph_acceptance_rejects_recapture_and_incomplete_bank(
         )
 
 
+@pytest.mark.parametrize("generation", [1, 2])
+@pytest.mark.parametrize("fault", [None, "resident", "reuse", "no_transfer"])
+def test_nonresident_graph_acceptance_requires_real_transfer_and_eviction(
+    acceptance, generation, fault
+):
+    senders = {0, 2} if generation == 1 else {1}
+    targets = (0, 1, 2) if generation == 1 else (0, 2)
+    states = []
+    for rank in range(3):
+        metrics = {
+            "decode_graph": [
+                {"generation": 0, "replays": int(rank != 1)},
+                {
+                    "generation": 1,
+                    "status": "ready",
+                    "replays": 3,
+                    "capture_seconds": 0.0,
+                    "prepared": True,
+                },
+            ],
+            "prepared_decode_graphs": {
+                "sealed": True,
+                "runtime_captures": 0,
+                "startup_runner_captures": 1 if rank == 1 else 2,
+                "runtime_selections": 1 if rank == 1 else generation,
+                "weight_policy": "offload",
+                "inactive_registered_weight_bytes": 0,
+                "weight_backing": {
+                    "kind": "vmm_nonresident_weights",
+                    "inactive_mapped_physical_bytes": 0,
+                },
+            },
+            "prepared_weight_bytes_reused": 0,
+            "background_weight_bytes_sent": 4096 if rank in senders else 0,
+        }
+        if generation == 2:
+            metrics["decode_graph"].append(
+                {
+                    "generation": 2,
+                    "status": "ready" if rank in targets else "inactive",
+                    "replays": 3 if rank in targets else 0,
+                    "capture_seconds": 0.0,
+                    "prepared": True,
+                }
+            )
+        states.append({"transition_rank": rank, "transition_metrics": metrics})
+    metrics = states[next(iter(senders))]["transition_metrics"]
+    if fault == "resident":
+        metrics["prepared_decode_graphs"]["weight_backing"][
+            "inactive_mapped_physical_bytes"
+        ] = 1
+    elif fault == "reuse":
+        metrics["prepared_weight_bytes_reused"] = 4096
+    elif fault == "no_transfer":
+        metrics["background_weight_bytes_sent"] = 0
+    if fault:
+        with pytest.raises(AssertionError, match="weights|transfer"):
+            acceptance["validate_decode_graph_states"](
+                states,
+                generation,
+                (0, 2) if generation == 1 else (0, 1, 2),
+                targets,
+                prepared=True,
+            )
+    else:
+        acceptance["validate_decode_graph_states"](
+            states,
+            generation,
+            (0, 2) if generation == 1 else (0, 1, 2),
+            targets,
+            prepared=True,
+        )
+
+
 @pytest.mark.parametrize(
     "initial_probe",
     [

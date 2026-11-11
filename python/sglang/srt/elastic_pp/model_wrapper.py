@@ -54,6 +54,33 @@ class ElasticPPModelWrapperMixin:
     def retain_elastic_pp_graph_layers(self):
         self.model.retain_elastic_pp_graph_layers()
 
+    def discard_elastic_pp_unused_output_weights(self):
+        """Fixed-output Graph frontiers never need spare LM heads or final norms.
+
+        Only called on non-output ranks after finite-frontier validation and
+        loading, before capture. General movable-output elastic PP is unchanged.
+        """
+        from sglang.srt.elastic_pp.model import ElasticPPModelMixin
+        from sglang.srt.layers.utils import PPMissingLayer
+
+        removed_bytes = 0
+        for owner, name in ((self, "lm_head"), (self.model, "norm")):
+            module = getattr(owner, name, None)
+            if module is not None and not isinstance(module, PPMissingLayer):
+                removed_bytes += sum(
+                    p.numel() * p.element_size() for p in module.parameters()
+                )
+                ElasticPPModelMixin._release_elastic_layer_loader_refs([module])
+                setattr(owner, name, PPMissingLayer())
+        return removed_bytes
+
+    def enable_elastic_pp_evictable_weights(self):
+        backing = self.model.enable_elastic_pp_evictable_weights()
+        refresh = getattr(self, "_refresh_elastic_pp_moe_weights", None)
+        if refresh is not None:
+            refresh()
+        return backing
+
     def export_elastic_pp_layer_state(self, layer_ids):
         return self.model.export_elastic_pp_layer_state(layer_ids)
 

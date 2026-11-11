@@ -69,6 +69,34 @@ def test_native_admission_counts_full_new_backing_and_reserve():
     assert result["required_free_bytes"] == 70 + result["kv_bytes"] + 256 * 2**20
 
 
+def test_prepared_graph_admission_counts_unmapped_weight_pages():
+    pool = MHATokenToKVPool(
+        size=8,
+        page_size=1,
+        dtype=torch.float32,
+        head_num=1,
+        head_dim=2,
+        layer_num=0,
+        device="cpu",
+        enable_memory_saver=False,
+    )
+    instance = runner(pool)
+    instance._elastic_pp_prepared_graphs = SimpleNamespace(
+        building=False,
+        check_topology=lambda target: None,
+        weight_backing=SimpleNamespace(
+            layers={
+                2: SimpleNamespace(size=4096, mapped=False),
+                3: SimpleNamespace(size=8192, mapped=True),
+            }
+        ),
+    )
+    report = capacity_report(instance, transition())
+    assert report["weight_bytes"] == 4096
+    assert report["kv_bytes"] == report["recurrent_bytes"] == 0
+    assert report["required_free_bytes"] == 4096 + 256 * 2**20
+
+
 def test_dormant_hybrid_counts_complete_replacement_gdn(hybrid_pool_factory):
     pool = hybrid_pool_factory(start_layer=4, end_layer=4)
     result = capacity_report(runner(pool), transition())

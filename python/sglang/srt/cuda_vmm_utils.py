@@ -590,6 +590,29 @@ class VmmReservation:
         self._mappings.append((address, size, handle))
         return handle
 
+    def unmap(self, offset: int, size: int) -> None:
+        """Release one complete unretained mapping, preserving its VA reservation.
+
+        The caller must drain all readers first. Retained/exported handles need
+        their owner's lifetime protocol and cannot use this local eviction path.
+        A failed driver unmap leaves the mapping recorded for cleanup or retry.
+        """
+        if self._closed:
+            raise RuntimeError("VmmReservation.unmap after close")
+        mapping = next(
+            (m for m in self._mappings if m[:2] == (self.base + offset, size)),
+            None,
+        )
+        if mapping is None:
+            raise ValueError("unmap requires one complete existing mapping")
+        if mapping[2] is not None:
+            raise ValueError("unmap cannot evict a retained handle")
+        check_drv(
+            _get_cuda_driver().cuMemUnmap(mapping[0], mapping[1]),
+            "cuMemUnmap(evict)",
+        )
+        self._mappings.remove(mapping)
+
     def map_existing(self, offset: int, size: int, handle) -> None:
         """Map a caller-owned physical allocation into this reservation."""
         if self._closed:
