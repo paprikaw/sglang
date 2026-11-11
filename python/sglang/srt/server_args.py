@@ -1112,6 +1112,14 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "offload"
+    elastic_pp_weight_staging: A[
+        str,
+        Arg(
+            help="Background immutable weights: bounded pinned CPU packets, or legacy pageable per-tensor staging. Neither caches candidate GPU weights.",
+            choices=["pinned", "legacy"],
+        ),
+        NS("parallel"),
+    ] = "pinned"
     elastic_pp_hicache_allocator: A[
         str,
         Arg(

@@ -630,6 +630,8 @@ def engine_entry(cfg, row):
                 cfg["initial_partition"],
                 "--elastic-pp-transition-strategy",
                 cfg["strategy"],
+                "--elastic-pp-weight-staging",
+                cfg.get("weight_staging", "legacy"),
                 "--elastic-pp-transition-backing",
                 cfg.get("backing", "overlap"),
                 "--max-total-tokens",
@@ -1261,6 +1263,7 @@ def prepare(args):
         cuda_graph=getattr(args, "cuda_graph", False),
         prepared_graphs=getattr(args, "prepared_graphs", False),
         prepared_weight_policy=getattr(args, "prepared_weight_policy", "offload"),
+        weight_staging=getattr(args, "weight_staging", "legacy"),
         migration_profile=getattr(args, "migration_profile", False),
         hicache_allocator=getattr(args, "hicache_allocator", "mmap"),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
@@ -1378,6 +1381,7 @@ def prepare(args):
                 "python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py",
                 "python/sglang/srt/elastic_pp/prepared_decode_graph.py",
                 "python/sglang/srt/elastic_pp/weight_backing.py",
+                "python/sglang/srt/elastic_pp/weight_staging.py",
                 "python/sglang/srt/cuda_vmm_utils.py",
                 "python/sglang/srt/elastic_pp/model.py",
                 "python/sglang/srt/elastic_pp/model_wrapper.py",
@@ -1484,6 +1488,9 @@ def main():
         default="offload",
     )
     parser.add_argument("--migration-profile", action="store_true")
+    parser.add_argument(
+        "--weight-staging", choices=["legacy", "pinned"], default="pinned"
+    )
     parser.add_argument(
         "--hicache-allocator", choices=["mmap", "pytorch"], default="mmap"
     )

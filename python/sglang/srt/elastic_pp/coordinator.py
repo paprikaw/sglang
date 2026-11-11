@@ -114,6 +114,10 @@ class ElasticPPMigrationCoordinator:
         self._source_backing_metrics: dict[str, Any] = {}
         self._layers_precopied = False
         self._background_weight_bytes_sent = 0
+        self._weight_stager = None
+        self.weight_staging = getattr(args, "elastic_pp_weight_staging", "legacy")
+        if self.weight_staging not in {"legacy", "pinned"}:
+            raise ValueError("unknown elastic PP weight staging policy")
         self._observed_cuda_allocated_peak = 0
         self.rank = int(rank)
         self.current_topology = current_topology
@@ -455,6 +459,12 @@ class ElasticPPMigrationCoordinator:
             "fence_seconds": snapshot.fence_seconds,
             "total_seconds": snapshot.total_seconds,
             "background_weight_bytes_sent": self._background_weight_bytes_sent,
+            "weight_staging": self.weight_staging,
+            "weight_staging_metrics": (
+                dict(self._weight_stager.metrics)
+                if self._weight_stager is not None
+                else {}
+            ),
             "prepared_weight_bytes_reused": self._prepared_weight_bytes_reused,
             "stage_seconds": dict(self._stage_seconds),
             "stage_timing_scope": "rank-local wall time; nested stages and parallel ranks must not be summed",
@@ -595,6 +605,8 @@ class ElasticPPMigrationCoordinator:
         One layer is live in host staging at a time. KV/GDN remain authoritative
         at the final fence, since their rows can change during serving.
         """
+        if self.weight_staging == "pinned":
+            return self._precopy_pinned_weights(transition)
         for edge in sorted(transition.kv_transfers, key=self.layer_transport._sort_key):
             for layer_id in range(edge.layer_range.start, edge.layer_range.end):
                 transfer = LayerTransfer(
@@ -602,12 +614,18 @@ class ElasticPPMigrationCoordinator:
                 )
                 if self.rank == edge.src_rank:
                     state = self.model_runner.export_elastic_pp_layer_state([layer_id])
+                    started = time.monotonic()
                     cpu_state = {
                         layer_id: {
                             name: tensor.detach().to("cpu", copy=True)
                             for name, tensor in state[layer_id].items()
                         }
                     }
+                    self._stage_seconds["weight_legacy_d2h"] = (
+                        self._stage_seconds.get("weight_legacy_d2h", 0.0)
+                        + time.monotonic()
+                        - started
+                    )
                     payload = flatten_layer_states(
                         generation=transition.target.generation,
                         transfer=transfer,
@@ -618,12 +636,22 @@ class ElasticPPMigrationCoordinator:
                         for values in cpu_state.values()
                         for t in values.values()
                     )
+                    started = time.monotonic()
                     works = self.group.send_tensor_dict(
                         payload, dst=edge.dst_rank, async_send=True
                     )
                     self.layer_transport.wait(works or ())
+                    self._stage_seconds["weight_legacy_send"] = (
+                        self._stage_seconds.get("weight_legacy_send", 0.0)
+                        + time.monotonic()
+                        - started
+                    )
                 elif self.rank == edge.dst_rank:
-                    payload = self.group.recv_tensor_dict(src=edge.src_rank)
+                    payload = self._timed(
+                        "weight_legacy_recv",
+                        self.group.recv_tensor_dict,
+                        src=edge.src_rank,
+                    )
                     state = unflatten_layer_states(
                         payload,
                         generation=transition.target.generation,
@@ -637,12 +665,60 @@ class ElasticPPMigrationCoordinator:
                         raise RuntimeError(
                             "background weight transport requires CPU payloads"
                         )
+                    started = time.monotonic()
                     with self.layer_transport._stream_context():
                         self.model_runner.import_elastic_pp_layer_state(
                             generation=transition.target.generation, layer_states=state
                         )
                         if self.layer_transport._migration_stream is not None:
                             self.layer_transport._migration_stream.synchronize()
+                    self._stage_seconds["weight_legacy_h2d"] = (
+                        self._stage_seconds.get("weight_legacy_h2d", 0.0)
+                        + time.monotonic()
+                        - started
+                    )
+
+    def _precopy_pinned_weights(self, transition):
+        from sglang.srt.elastic_pp.weight_staging import (
+            PinnedWeightStager,
+            WeightPacketPlan,
+        )
+
+        if self._weight_stager is None:
+            self._weight_stager = PinnedWeightStager(
+                device=self.model_runner.device,
+                stream=self.layer_transport._migration_stream,
+            )
+        self._weight_stager.reset_metrics()
+        for edge in sorted(transition.kv_transfers, key=self.layer_transport._sort_key):
+            if self.rank not in {edge.src_rank, edge.dst_rank}:
+                continue
+            for layer_id in range(edge.layer_range.start, edge.layer_range.end):
+                transfer = LayerTransfer(
+                    edge.src_rank, edge.dst_rank, LayerRange(layer_id, layer_id + 1)
+                )
+                plan = WeightPacketPlan(
+                    generation=transition.target.generation,
+                    transfer=transfer,
+                    layer_states=self.model_runner.export_elastic_pp_layer_state(
+                        [layer_id]
+                    ),
+                )
+                if self.rank == edge.src_rank:
+                    self._weight_stager.send(
+                        plan=plan,
+                        group=self.group,
+                        destination=edge.dst_rank,
+                        wait=self.layer_transport.wait,
+                    )
+                    self._background_weight_bytes_sent += plan.total_bytes
+                else:
+                    self._weight_stager.receive(
+                        plan=plan, group=self.group, source=edge.src_rank
+                    )
+                    self.model_runner.mark_elastic_pp_layers_loaded(
+                        generation=transition.target.generation, layer_ids={layer_id}
+                    )
 
     def _prepare_worker(self) -> None:
         transition = self._require_transition()
