@@ -1,8 +1,14 @@
 # EP／PP／P/D 集成基线验证
 
-## 2026-11-12：CPU提前打包候选，CPU检查
+## 2026-11-12：CPU提前打包，有限GPU对照通过
 
-新增`cpu_prepacked`：启动期独立CPU参数承接原生融合／Expert切片，pinned CPU缓存有明确上限；运行时仅允许缓存命中，再H2D到Graph稳定地址并执行目标后处理。新增CPU检查覆盖活跃模型不被替换、参数别名、内存上限先行、原生覆盖／布局错误拒绝、CPU操作限定及启动准备后复用；扩展同步启动共识和非驻留验收检查。230项专项通过；完整CPU清单1112项通过，零失败／错误／跳过，整体135.032秒。只检查了代码及CPU协议，真实GPU切换和加速尚待本轮对照；不据此取得GPU资格。Ruff专项通过，server_args的既有F722/F841未作为本次修复范围。证据位于`weight-cpu-prepacked-20261112/cpu-full-r1.*`。
+冻结`20d7e1970e980fb2812c8c5e395e4a7c6c911be4`／tag `experiment/sglang/pp-cpu-prepacked-20261112-r3`。完整CPU清单1117项通过，零失败／错误／跳过，pytest118.44秒，含监督139.327秒，源码未变化；覆盖独立CPU参数／Gemma派生buffer、原生覆盖、只在CPU操作、预算先行、warm hit、Graph地址与同步启动共识。证据为`weight-cpu-prepacked-20261112/cpu-full-r3.*`，此前1112／1113项通过不累加。专项Ruff通过，server_args的既有F722/F841未作为本次修复范围。
+
+同一A100节点、35B BF16／B1／TP1／EP1／Triton／HiCache／native KV／持续NIXL patch／启动Graph／offload，`cpu_cache`与`cpu_prepacked`各一次PP2→PP3→PP2通过，两侧正式测量都关闭逐调用诊断。13层单GPU装载4.584→0.896秒，完整扩／缩5.139196／3.025319→1.221063／0.833178秒；最后fence241.415／273.741→264.222／263.587 ms，客户端跨fence间隔265.995／288.075→289.187／319.701 ms。该间隔含正常Decode及SSE，不代表纯新增暂停。准备更早使接班位置改变，混合源／目标布局的请求TPOT不用于隔离干扰结论。
+
+优化后218次H2D、壁钟0.894秒，运行时CPU pack为0；启动接收worker分配6.026秒＋pack5.843秒，总准备11.869秒。三worker额外CPU张量40.739 GiB，每worker上限24 GiB，联合Guard预留92 GiB；canonical bank和引擎HiCache容量不变。两策略每方向2048输出token逐一一致、暖参考连续性、实际Graph replay、runtime capture=0、在线KV及最终CPU前缀loadback通过。没有GPU权重导出／Gloo权重传输／候选权重复用；缩回中间GPU注册模型参数和物理权重为0，驱动可用显存增加20.37890625 GiB。两边135项冻结输入各自一致；优化／对照监督176.887／162.372秒内正常清理并release。
+
+初次CPU预打包GPU在启动期被CPU-only检查拒绝：GemmaRMSNorm的绑定loader还写GPU派生buffer，78.894秒内清理并release，135项输入一致。修正为独立CPU owner和buffer并计入预算，不放宽CPU-only检查；原失败及两份not_run配置保留。单独诊断的10,223次拷贝／3.882秒调用内壁钟／1.840秒剩余host路径含pageable整理、等待及诊断成本，不作正式对照。更多模型／batch／量化、冷暖生成等价、跨节点RDMA、KV VMM组合与整卡归还未扩展；无独立reviewer，PR保持Draft。[专题报告、CPU及GPU来源](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_cpu_prepacked_weights_20261112/summary.md)。
 
 ## 2026-11-12：CPU缓存直接恢复，GDN参数别名修正
 
