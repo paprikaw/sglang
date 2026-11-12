@@ -1115,11 +1115,18 @@ class ServerArgs:
     elastic_pp_weight_staging: A[
         str,
         Arg(
-            help="Background immutable weights: cpu_cache loads targets directly from the existing canonical RAM bank (native Qwen3.5 TP1/EP1 Triton); pinned/legacy export source GPU weights through CPU/Gloo. No candidate GPU weight cache.",
-            choices=["cpu_cache", "pinned", "legacy"],
+            help="Background immutable weights: cpu_cache uses the canonical RAM checkpoint; cpu_prepacked prepares native load-layout weights in bounded pinned CPU RAM during Graph startup (native Qwen3.5 TP1/EP1 Triton). pinned/legacy export through CPU/Gloo. No candidate GPU weight cache.",
+            choices=["cpu_cache", "cpu_prepacked", "pinned", "legacy"],
         ),
         NS("parallel"),
     ] = "legacy"
+    elastic_pp_cpu_weight_cache_gib: A[
+        int,
+        Arg(
+            help="Per-worker CPU prepared-weight cap in GiB; reserve the sum in the experiment host-memory budget."
+        ),
+        NS("parallel"),
+    ] = 24
     elastic_pp_hicache_allocator: A[
         str,
         Arg(

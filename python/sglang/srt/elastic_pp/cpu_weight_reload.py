@@ -16,6 +16,10 @@ from pathlib import Path
 import torch
 
 from sglang.srt.elastic_pp.graph_bank import binding_signature
+from sglang.srt.elastic_pp.prepared_cpu_weights import (
+    NativeCopyAccounting,
+    PreparedCpuWeights,
+)
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.weight_cache.cpu_canonical import model_view
 
@@ -54,11 +58,24 @@ class CanonicalCpuWeightReloader:
             raise ValueError(
                 "CPU cache reload requires an independent migration stream"
             )
+        self.prepacked = (
+            getattr(args, "elastic_pp_weight_staging", None) == "cpu_prepacked"
+        )
+        self.prepared = (
+            PreparedCpuWeights(
+                cache_key=self.key,
+                max_bytes=int(getattr(args, "elastic_pp_cpu_weight_cache_gib", 24))
+                * 1024**3,
+                pinned=self.device.type == "cuda",
+            )
+            if self.prepacked
+            else None
+        )
         self.reset_metrics()
 
     def reset_metrics(self):
         self.metrics = dict(
-            kind="canonical_cpu_cache",
+            kind="prepared_cpu_cache" if self.prepacked else "canonical_cpu_cache",
             cache_key=self.key,
             cache_key_matches_initial_load=False,
             checkpoint_bytes=0,
@@ -68,16 +85,38 @@ class CanonicalCpuWeightReloader:
             layers_loaded=[],
             cache_open_seconds=0.0,
             checkpoint_load_seconds=0.0,
+            cpu_prepare_seconds=0.0,
+            prepared_cpu_cache_hit=False,
+            canonical_checkpoint_read_bytes=0,
+            native_load_host_seconds=0.0,
+            native_h2d_call_wall_seconds=0.0,
+            native_h2d_copy_calls=0,
+            native_h2d_bytes=0,
+            native_noncopy_host_seconds=0.0,
+            postprocess_seconds=0.0,
             gpu_export_bytes=0,
             gloo_weight_bytes=0,
             fallback_count=0,
             storage_verified=False,
-            scope="rank-local native checkpoint loading and CUDA completion; includes CPU packing, not isolated DMA bandwidth",
+            scope="rank-local; native copy-call wall includes pageable staging/waits, noncopy host time includes Python/packing/instrumentation; prepared H2D stream span includes enqueue gaps/contention, not isolated DMA bandwidth",
         )
 
     def _drain(self):
         if self.stream is not None:
             self.stream.synchronize()
+
+    def metrics_snapshot(self):
+        result = dict(self.metrics)
+        if self.prepared is not None:
+            result.update(
+                prepared_cpu_cache_bytes=self.prepared.nbytes,
+                prepared_cpu_cache_cap_bytes=self.prepared.max_bytes,
+                prepared_cpu_cache_entries=len(self.prepared.entries),
+                startup_cpu_prepare_seconds=self.prepared.prepare_seconds,
+                startup_cpu_allocation_seconds=self.prepared.allocation_seconds,
+                startup_cpu_pack_seconds=self.prepared.pack_seconds,
+            )
+        return result
 
     def reload(self, *, generation, layer_ids):
         """Publish readiness only after full checkpoint coverage and stream drain."""
@@ -166,6 +205,7 @@ class CanonicalCpuWeightReloader:
                         seen.add(name)
                         self.metrics["checkpoint_bytes"] += item.nbytes
                         self.metrics["checkpoint_tensors"] += 1
+                        self.metrics["canonical_checkpoint_read_bytes"] += item.nbytes
 
                 context = (
                     nullcontext()
@@ -173,10 +213,67 @@ class CanonicalCpuWeightReloader:
                     else torch.cuda.stream(self.stream)
                 )
                 started = time.monotonic()
+                postprocess_started = None
                 with self.model.elastic_pp_weight_load(generation, layer_ids):
                     try:
                         with torch.no_grad(), context:
-                            loaded = self.model.load_weights(weights())
+                            if self.prepared is not None:
+                                entry = self.prepared.get(layer_ids, parameters)
+                                self.metrics["prepared_cpu_cache_hit"] = (
+                                    entry is not None
+                                )
+                                if entry is None:
+                                    bank_state = getattr(
+                                        self.runner, "_elastic_pp_prepared_graphs", None
+                                    )
+                                    if bank_state is None or not bank_state.building:
+                                        raise RuntimeError(
+                                            "CPU weights must be prepared before serving; runtime packing is disabled"
+                                        )
+                                    entry = self.prepared.prepare(
+                                        model=self.model,
+                                        layer_ids=layer_ids,
+                                        parameters=parameters,
+                                        weights=weights(),
+                                        counters=self.metrics,
+                                        expected_counts=(
+                                            sum(
+                                                item.nbytes
+                                                for item in expected.values()
+                                            ),
+                                            len(expected),
+                                        ),
+                                    )
+                                    self.metrics["cpu_prepare_seconds"] = (
+                                        entry.prepare_seconds
+                                    )
+                                else:
+                                    seen.update(expected)
+                                    self.metrics["checkpoint_bytes"] = (
+                                        entry.checkpoint_bytes
+                                    )
+                                    self.metrics["checkpoint_tensors"] = (
+                                        entry.checkpoint_tensors
+                                    )
+                                self.metrics.update(
+                                    self.prepared.copy(entry, parameters, self.stream)
+                                )
+                                loaded = entry.loaded
+                            else:
+                                copies = NativeCopyAccounting()
+                                native_started = time.monotonic()
+                                with copies:
+                                    loaded = self.model.load_weights(weights())
+                                elapsed = time.monotonic() - native_started
+                                self.metrics.update(
+                                    native_load_host_seconds=elapsed,
+                                    native_h2d_call_wall_seconds=copies.seconds,
+                                    native_h2d_copy_calls=copies.calls,
+                                    native_h2d_bytes=copies.bytes,
+                                    native_noncopy_host_seconds=max(
+                                        0.0, elapsed - copies.seconds
+                                    ),
+                                )
                             # GDN passes A_log/dt_bias Parameters into its
                             # RadixLinearAttention child. Both names appear in
                             # named_parameters(remove_duplicate=False), while
@@ -202,6 +299,7 @@ class CanonicalCpuWeightReloader:
                             # Match ordinary loading, including optional
                             # in-place BF16 SwiGLU interleaving. Reprocess only
                             # incoming layers; active weights must not change.
+                            postprocess_started = time.monotonic()
                             for name, module in self.model.named_modules():
                                 method = getattr(module, "quant_method", None)
                                 if (
@@ -215,6 +313,10 @@ class CanonicalCpuWeightReloader:
                         # including partial-copy failures. Never mark ready on
                         # failure, partial coverage, or a changed Graph address.
                         self._drain()
+                        if postprocess_started is not None:
+                            self.metrics["postprocess_seconds"] += (
+                                time.monotonic() - postprocess_started
+                            )
                     self.metrics["checkpoint_load_seconds"] += (
                         time.monotonic() - started
                     )

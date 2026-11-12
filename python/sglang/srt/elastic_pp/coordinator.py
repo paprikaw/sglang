@@ -115,11 +115,20 @@ class ElasticPPMigrationCoordinator:
         self._layers_precopied = False
         self._background_weight_bytes_sent = 0
         self._weight_stager = None
-        self._cpu_weight_reloader = None
+        # Startup Graph preparation and the serving coordinator share the CPU
+        # bank. It contains host tensors only, never retained candidate weights.
+        self._cpu_weight_reloader = getattr(
+            model_runner, "_elastic_pp_cpu_weight_reloader", None
+        )
         self.weight_staging = getattr(args, "elastic_pp_weight_staging", "legacy")
-        if self.weight_staging not in {"legacy", "pinned", "cpu_cache"}:
+        if self.weight_staging not in {
+            "legacy",
+            "pinned",
+            "cpu_cache",
+            "cpu_prepacked",
+        }:
             raise ValueError("unknown elastic PP weight staging policy")
-        if self.weight_staging == "cpu_cache" and (
+        if self.weight_staging in {"cpu_cache", "cpu_prepacked"} and (
             self.strategy not in {"background", "sync"} or self.backing != "overlap"
         ):
             raise ValueError(
@@ -470,7 +479,7 @@ class ElasticPPMigrationCoordinator:
             "background_weight_bytes_sent": self._background_weight_bytes_sent,
             "weight_staging": self.weight_staging,
             "weight_staging_metrics": (
-                dict(self._cpu_weight_reloader.metrics)
+                self._cpu_weight_reloader.metrics_snapshot()
                 if self._cpu_weight_reloader is not None
                 else (
                     dict(self._weight_stager.metrics)
@@ -618,7 +627,7 @@ class ElasticPPMigrationCoordinator:
         One layer is live in host staging at a time. KV/GDN remain authoritative
         at the final fence, since their rows can change during serving.
         """
-        if self.weight_staging == "cpu_cache":
+        if self.weight_staging in {"cpu_cache", "cpu_prepacked"}:
             return self._precopy_cpu_cached_weights(transition)
         if self.weight_staging == "pinned":
             return self._precopy_pinned_weights(transition)
@@ -700,6 +709,9 @@ class ElasticPPMigrationCoordinator:
             self._cpu_weight_reloader = CanonicalCpuWeightReloader(
                 model_runner=self.model_runner,
                 stream=self.layer_transport._migration_stream,
+            )
+            self.model_runner._elastic_pp_cpu_weight_reloader = (
+                self._cpu_weight_reloader
             )
         incoming = {
             layer_id
@@ -973,7 +985,10 @@ class ElasticPPMigrationCoordinator:
             # Startup's private Graph walk uses synchronous transitions. It
             # must use the same CPU bank, and reach agreement before any KV
             # P2P operation if a rank cannot restore its target checkpoint.
-            if self.weight_staging == "cpu_cache" and not self._layers_precopied:
+            if (
+                self.weight_staging in {"cpu_cache", "cpu_prepacked"}
+                and not self._layers_precopied
+            ):
                 local_error = None
                 try:
                     self._timed(

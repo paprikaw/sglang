@@ -508,11 +508,14 @@ def test_synchronous_policies_snapshot_before_target_allocation(strategy):
 
 
 @pytest.mark.parametrize("failure", [None, "local", "peer"])
-def test_cpu_cache_startup_sync_reaches_weight_consensus_before_kv_copy(failure):
+@pytest.mark.parametrize("weight_source", ["cpu_cache", "cpu_prepacked"])
+def test_cpu_cache_startup_sync_reaches_weight_consensus_before_kv_copy(
+    failure, weight_source
+):
     group = _Group(fail_stage="fence_cpu_cached_weights" if failure == "peer" else None)
     coordinator, transition, runner, kv = _coordinator(group)
     coordinator.strategy = "sync"
-    coordinator.weight_staging = "cpu_cache"
+    coordinator.weight_staging = weight_source
     calls = []
 
     def restore(target):

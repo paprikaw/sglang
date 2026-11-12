@@ -71,7 +71,9 @@ def test_prepared_graph_config_projects_and_rejects_unknown_target():
         bank.check_topology(PPTopology.from_layer_counts((14, 12, 14)))
 
 
-@pytest.mark.parametrize("weight_source", ["legacy", "pinned", "cpu_cache"])
+@pytest.mark.parametrize(
+    "weight_source", ["legacy", "pinned", "cpu_cache", "cpu_prepacked"]
+)
 def test_private_startup_coordinator_disables_online_patch_without_changing_args(
     weight_source,
 ):

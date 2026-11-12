@@ -1,5 +1,9 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-12：CPU提前打包候选，CPU检查
+
+新增`cpu_prepacked`：启动期独立CPU参数承接原生融合／Expert切片，pinned CPU缓存有明确上限；运行时仅允许缓存命中，再H2D到Graph稳定地址并执行目标后处理。新增CPU检查覆盖活跃模型不被替换、参数别名、内存上限先行、原生覆盖／布局错误拒绝、CPU操作限定及启动准备后复用；扩展同步启动共识和非驻留验收检查。230项专项通过；完整CPU清单1112项通过，零失败／错误／跳过，整体135.032秒。只检查了代码及CPU协议，真实GPU切换和加速尚待本轮对照；不据此取得GPU资格。Ruff专项通过，server_args的既有F722/F841未作为本次修复范围。证据位于`weight-cpu-prepacked-20261112/cpu-full-r1.*`。
+
 ## 2026-11-12：CPU缓存直接恢复，GDN参数别名修正
 
 最终冻结`521b14cb725e0429b54999f1622250e65a7bc154`，tag `experiment/sglang/pp-direct-cpu-cache-weights-20261112-r2`。完整CPU回归1084项通过，零失败／错误／跳过，pytest 115.32秒；源码未变化。同一069节点、35B BF16／B1／native／HiCache／NIXL／prepared Graph、offload，直接CPU bank和同源legacy各一次PP2→PP3→PP2通过。完整扩／缩分别5.088962／2.978069秒与20.102884／20.884594秒；最后交接分别241.622／258.253 ms与231.269／287.113 ms。客户端跨已记录fence的相邻token到达间隔分别269.381／272.757 ms与257.468／301.757 ms，含正常Decode和传输，不是额外暂停的精确扣除值。

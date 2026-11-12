@@ -737,7 +737,7 @@ def test_prepared_graph_acceptance_rejects_recapture_and_incomplete_bank(
     "fault",
     [None, "resident", "reuse", "no_transfer", "export", "fallback", "unverified"],
 )
-@pytest.mark.parametrize("weight_source", ["legacy", "cpu_cache"])
+@pytest.mark.parametrize("weight_source", ["legacy", "cpu_cache", "cpu_prepacked"])
 def test_nonresident_graph_acceptance_requires_real_transfer_and_eviction(
     acceptance, generation, fault, weight_source
 ):
@@ -771,13 +771,17 @@ def test_nonresident_graph_acceptance_requires_real_transfer_and_eviction(
             "prepared_weight_bytes_reused": 0,
             "background_weight_bytes_sent": 4096 if rank in senders else 0,
         }
-        if weight_source == "cpu_cache":
+        if weight_source in {"cpu_cache", "cpu_prepacked"}:
             receives = rank in ({1} if generation == 1 else {0, 2})
             metrics.update(
-                weight_staging="cpu_cache",
+                weight_staging=weight_source,
                 background_weight_bytes_sent=0,
                 weight_staging_metrics=dict(
-                    kind="canonical_cpu_cache",
+                    kind=(
+                        "prepared_cpu_cache"
+                        if weight_source == "cpu_prepacked"
+                        else "canonical_cpu_cache"
+                    ),
                     cache_key="initial-bank",
                     cache_key_matches_initial_load=receives,
                     gpu_export_bytes=0,
@@ -789,6 +793,14 @@ def test_nonresident_graph_acceptance_requires_real_transfer_and_eviction(
                     checkpoint_load_seconds=0.1 if receives else 0,
                     layers_loaded=[1] if receives else [],
                     storage_verified=receives,
+                    prepared_cpu_cache_hit=receives,
+                    cpu_prepare_seconds=0,
+                    canonical_checkpoint_read_bytes=0,
+                    h2d_bytes=4096 if receives else 0,
+                    h2d_wall_seconds=0.1 if receives else 0,
+                    h2d_stream_seconds=0.09 if receives else 0,
+                    prepared_cpu_cache_bytes=4096,
+                    prepared_cpu_cache_cap_bytes=8192,
                 ),
             )
         if generation == 2:
@@ -810,7 +822,7 @@ def test_nonresident_graph_acceptance_requires_real_transfer_and_eviction(
     elif fault == "reuse":
         metrics["prepared_weight_bytes_reused"] = 4096
     elif fault == "no_transfer":
-        if weight_source == "cpu_cache":
+        if weight_source in {"cpu_cache", "cpu_prepacked"}:
             receiver = next(
                 row["transition_metrics"]
                 for row in states
@@ -820,7 +832,7 @@ def test_nonresident_graph_acceptance_requires_real_transfer_and_eviction(
         else:
             metrics["background_weight_bytes_sent"] = 0
     elif fault in {"export", "fallback", "unverified"}:
-        if weight_source == "cpu_cache":
+        if weight_source in {"cpu_cache", "cpu_prepacked"}:
             receiver = next(
                 row["transition_metrics"]
                 for row in states
