@@ -1,5 +1,11 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-12：CPU缓存直接恢复，GDN参数别名修正
+
+`2b77805f03c4`的1081项去重CPU检查均有通过记录：整批1072通过，9项因测试机cgroup内存余量耗尽被缓存daemon拒绝后，在相同源码独立复核全部通过，未放宽安全检查。不能称为一次零失败整批运行。
+
+069节点已有35B BF16 canonical CPU bank，首轮在启动Graph预热时，原生loader报告名称与GDN的重复注册Parameter别名不全相等，被覆盖检查拒绝。三rank初次缓存读取、134项冻结输入、owned cleanup和正常release通过；完整监督101.123秒，没有运行时转换性能结果。按Parameter对象核对别名覆盖并去重加载字节，仍检查完整checkpoint及所有对象／地址／shape／stride，仍拒绝仅共享storage的独立Parameter。新增三项回归中，两项在修正前失败，修正后本文件22项通过。原始记录位于`weight-direct-cpu-cache-20261111/gpu-direct-069-r1-20261112`；完整回归及GPU修正候选另记，不覆盖失败记录，无独立reviewer。
+
 ## 2026-11-11：有界pinned权重暂存，CPU通过／新GPU路径待验证
 
 任务分支 `codex/pp-weight-host-pipeline-20261111`，冻结 `fcefe8604c659180075fae0d4939dec49eb603ad`／tag `experiment/sglang/pp-pinned-weight-staging-20261111-r1`。1036项完整CPU检查通过，零失败／错误／跳过，120.55秒；新增12项包含跨块、混合dtype、转置、错误元数据拒绝、目标地址保持、失败排空与完成后标记。首次测试夹具错误保留，修正后完整回归通过。

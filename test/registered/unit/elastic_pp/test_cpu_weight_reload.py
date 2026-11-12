@@ -150,6 +150,45 @@ def test_direct_bank_restores_fused_target_without_touching_active_storage(bank)
     assert bank.reloader.metrics["gloo_weight_bytes"] == 0
 
 
+@pytest.mark.parametrize("reported_alias", [False, True])
+def test_shared_gdn_parameter_alias_is_covered_once(bank, reported_alias):
+    # RadixLinearAttention registers the enclosing GDN's A_log/dt_bias again.
+    # Native loading reports one name for the same Parameter, not both names.
+    layer = bank.model.model.layers[1]
+    layer.attn = nn.Module()
+    layer.attn.A_log = layer.weight
+    original = bank.model.load_weights
+
+    def load(weights):
+        names = original(weights)
+        if reported_alias:
+            assert names == {"model.layers.1.weight"}
+            return {"model.layers.1.attn.A_log"}
+        return names
+
+    bank.model.load_weights = load
+    bank.reloader.reload(generation=2, layer_ids={1})
+    assert layer.attn.A_log is layer.weight
+    assert torch.equal(
+        layer.weight[:2], bank.model.checkpoint["model.layers.1.q_proj.weight"]
+    )
+    assert bank.reloader.metrics["target_weight_bytes"] == 32
+    assert bank.reloader.metrics["storage_verified"]
+    assert bank.model.marked == [(2, frozenset({1}))]
+
+
+def test_distinct_parameter_sharing_storage_still_requires_loader_coverage(bank):
+    layer = bank.model.model.layers[1]
+    layer.attn = nn.Module()
+    layer.attn.A_log = nn.Parameter(layer.weight.detach())
+    assert layer.attn.A_log is not layer.weight
+    assert layer.attn.A_log.data_ptr() == layer.weight.data_ptr()
+    with pytest.raises(RuntimeError, match="did not cover all target weights"):
+        bank.reloader.reload(generation=2, layer_ids={1})
+    assert not bank.model.marked
+    assert not bank.reloader.metrics["storage_verified"]
+
+
 @pytest.mark.parametrize("fault", ["partial", "coverage", "copy", "storage", "stride"])
 def test_failed_copy_coverage_or_address_never_publishes_and_drains_before_unpin(
     bank, fault

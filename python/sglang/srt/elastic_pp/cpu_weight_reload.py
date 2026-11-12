@@ -177,12 +177,27 @@ class CanonicalCpuWeightReloader:
                     try:
                         with torch.no_grad(), context:
                             loaded = self.model.load_weights(weights())
-                            if (
-                                seen != expected.keys()
-                                or not parameters.keys() <= loaded
-                            ):
+                            # GDN passes A_log/dt_bias Parameters into its
+                            # RadixLinearAttention child. Both names appear in
+                            # named_parameters(remove_duplicate=False), while
+                            # the native loader reports only the owning name.
+                            # Cover aliases by Parameter identity, never just
+                            # by overlapping storage or equal data pointers.
+                            loaded_ids = {
+                                id(param)
+                                for name, param in parameters.items()
+                                if name in loaded
+                            }
+                            missing_names = [
+                                name
+                                for name, param in parameters.items()
+                                if id(param) not in loaded_ids
+                            ]
+                            if seen != expected.keys() or missing_names:
                                 raise RuntimeError(
-                                    "canonical CPU reload did not cover all target weights"
+                                    "canonical CPU reload did not cover all target weights: "
+                                    f"missing_checkpoint={sorted(expected.keys() - seen)[:8]}, "
+                                    f"missing_parameters={missing_names[:8]}"
                                 )
                             # Match ordinary loading, including optional
                             # in-place BF16 SwiGLU interleaving. Reprocess only
@@ -227,6 +242,7 @@ class CanonicalCpuWeightReloader:
                         )
                     self.metrics["storage_verified"] = True
                     self.metrics["target_weight_bytes"] = sum(
-                        p.numel() * p.element_size() for p in parameters.values()
+                        p.numel() * p.element_size()
+                        for p in {id(p): p for p in parameters.values()}.values()
                     )
                     self.metrics["layers_loaded"] = sorted(layer_ids)
