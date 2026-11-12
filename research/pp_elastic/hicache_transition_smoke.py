@@ -115,6 +115,9 @@ def validate_transition_states(states, generation, source_ranks, backing):
             raise AssertionError("transition backing differs from the frozen config")
     sent = sum(
         state["transition_metrics"].get("host", {}).get("host_bytes_sent", 0)
+        + state["transition_metrics"]
+        .get("host", {})
+        .get("host_background_bytes_sent", 0)
         for state in ranks.values()
     )
     if sent <= 0:
@@ -685,7 +688,12 @@ def engine_entry(cfg, row):
                 else []
             )
             + (
-                ["--elastic-pp-hicache-fast-copy"]
+                (
+                    ["--elastic-pp-hicache-background"]
+                    if cfg.get("hicache_background")
+                    else []
+                )
+                + ["--elastic-pp-hicache-fast-copy"]
                 if cfg.get("hicache_fast_copy")
                 else []
             )
@@ -1351,6 +1359,7 @@ def prepare(args):
         migration_profile=getattr(args, "migration_profile", False),
         hicache_allocator=getattr(args, "hicache_allocator", "mmap"),
         hicache_fast_copy=getattr(args, "hicache_fast_copy", False),
+        hicache_background=getattr(args, "hicache_background", False),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
         context_length=(
             4096 if getattr(args, "active_output_tokens", 256) > 1024 else 2048
@@ -1453,6 +1462,8 @@ def prepare(args):
         base.desc(run / "config.json"),
         base.desc(__file__),
         base.desc(ENGINE / "python/sglang/srt/elastic_pp/hicache_transition.py"),
+        base.desc(ENGINE / "python/sglang/srt/elastic_pp/hicache_precopy.py"),
+        base.desc(ENGINE / "python/sglang/srt/mem_cache/pool_host/base.py"),
     ]
     if getattr(args, "supervised_lifecycle", False):
         spec["frozen_inputs"] += [
@@ -1612,6 +1623,7 @@ def main():
     parser.add_argument("--cpu-weight-cache-gib", type=int, default=24)
     parser.add_argument("--profile-native-weight-load", action="store_true")
     parser.add_argument("--hicache-fast-copy", action="store_true")
+    parser.add_argument("--hicache-background", action="store_true")
     parser.add_argument(
         "--hicache-allocator", choices=["mmap", "pytorch"], default="mmap"
     )

@@ -525,6 +525,15 @@ def test_complete_current_transition_and_fresh_restore_are_accepted(acceptance):
     }
 
 
+def test_completed_background_host_payload_counts_when_fence_delta_is_empty(acceptance):
+    evidence = states()
+    for state in evidence:
+        host = state["transition_metrics"]["host"]
+        host["host_background_bytes_sent"] = host.pop("host_bytes_sent")
+        host["host_bytes_sent"] = 0
+    acceptance["validate_transition_states"](evidence, 2, (0, 1, 2), "overlap")
+
+
 @pytest.mark.parametrize("fault", ["stale_generation", "duplicate_rank", "no_bytes"])
 def test_old_or_incomplete_host_transfer_cannot_pass(acceptance, fault):
     evidence = states()

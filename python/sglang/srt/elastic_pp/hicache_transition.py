@@ -164,6 +164,7 @@ class HiCacheTransitionAdapter:
         self._undo = []
         self._generation = None
         self._snapshot = None
+        self.precopy = None
         self.metrics = {
             "snapshot_bytes": 0,
             "host_bytes_sent": 0,
@@ -186,7 +187,22 @@ class HiCacheTransitionAdapter:
             for layer, tensors in self.pools.get(component, {}).items():
                 if layer not in outgoing:
                     continue
-                snapshot[(identity, component, layer)] = {
+                key = (identity, component, layer)
+                if self.precopy is not None:
+                    from sglang.srt.elastic_pp.hicache_precopy import rows_match
+
+                    original = self.precopy.records.get(key)
+                    if original is not None and rows_match(
+                        tensors, original, node.slots
+                    ):
+                        self.metrics[
+                            "host_verified_unchanged_bytes"
+                        ] = self.metrics.get("host_verified_unchanged_bytes", 0) + sum(
+                            t.numel() * t.element_size()
+                            for t in original.tensors.values()
+                        )
+                        continue
+                snapshot[key] = {
                     name: _gather_host_rows(t, node.slots, fast_copy=self.fast_copy)
                     for name, t in tensors.items()
                 }
@@ -211,6 +227,18 @@ class HiCacheTransitionAdapter:
         assert_host_quiescent(self.cache)
         nodes = host_nodes(self.cache)
         receive_errors = []
+        if self.precopy is not None:
+            incoming = {
+                layer
+                for e in transition.kv_transfers
+                if e.dst_rank == self.rank
+                for layer in range(e.layer_range.start, e.layer_range.end)
+            }
+            self._staged = {
+                key: record.tensors
+                for key, record in self.precopy.preloaded.items()
+                if key[2] in incoming and key[:2] in nodes
+            }
         for edge in sorted(
             transition.kv_transfers,
             key=lambda e: (
@@ -224,7 +252,10 @@ class HiCacheTransitionAdapter:
                 payload = {"generation": self._generation, "records": []}
                 for (identity, component), node in sorted(nodes.items()):
                     for layer, tensors in sorted(self.pools.get(component, {}).items()):
-                        if edge.layer_range.start <= layer < edge.layer_range.end:
+                        if edge.layer_range.start <= layer < edge.layer_range.end and (
+                            self._snapshot is None
+                            or (identity, component, layer) in self._snapshot
+                        ):
                             payload["records"].append(
                                 (
                                     identity,
@@ -280,6 +311,7 @@ class HiCacheTransitionAdapter:
                         "HiCache source/target host prefix manifests differ"
                     )
                     continue
+                seen = set()
                 for i, (identity, component, layer, names) in enumerate(
                     wire["manifest"]
                 ):
@@ -287,9 +319,10 @@ class HiCacheTransitionAdapter:
                         receive_errors.append("HiCache layer outside transfer")
                         continue
                     key = (identity, component, layer)
-                    if key in self._staged:
+                    if key in seen:
                         receive_errors.append("duplicate HiCache state")
                         continue
+                    seen.add(key)
                     self._staged[key] = {name: wire[f"{i}:{name}"] for name in names}
                     self.metrics["host_bytes_received"] += sum(
                         t.numel() * t.element_size() for t in self._staged[key].values()
@@ -346,10 +379,26 @@ class HiCacheTransitionAdapter:
                         == source.untyped_storage().data_ptr()
                     ):
                         raise RuntimeError("private HiCache target aliases staged rows")
-                operations.append((target, slots, source))
+                preloaded = (
+                    self.precopy.preloaded.get((identity, component, layer))
+                    if self.precopy is not None
+                    else None
+                )
+                reuse = (
+                    preloaded is not None
+                    and preloaded.tensors.get(name) is source
+                    and torch.equal(preloaded.slots, node.slots)
+                )
+                operations.append((target, slots, source, reuse))
         # Validate everything before the first mutation; retain overwritten rows
         # until publication so abort also repairs a partially failed scatter.
-        for target, slots, source in operations:
+        for target, slots, source, reuse in operations:
+            if reuse:
+                self.metrics["host_preloaded_incoming_bytes_reused"] = (
+                    self.metrics.get("host_preloaded_incoming_bytes_reused", 0)
+                    + source.numel() * source.element_size()
+                )
+                continue
             if private_target:
                 # The scheduler owns this newly allocated, unpublished pool.
                 # Abort discards it; no serving tensor depends on its old rows.
@@ -506,7 +555,16 @@ def cache_host_views(cache, device_pool=None):
 
 
 def prepare_target_host_cache(
-    cache, *, device_pool, target, generation, fast_copy=False, metrics=None
+    cache,
+    *,
+    device_pool,
+    target,
+    generation,
+    fast_copy=False,
+    metrics=None,
+    allocation_only=False,
+    prepared=None,
+    preloaded=None,
 ):
     """Build target L2 while keeping allocation failures safe for GPU rollback."""
     try:
@@ -517,6 +575,9 @@ def prepare_target_host_cache(
             generation=generation,
             fast_copy=fast_copy,
             metrics=metrics,
+            allocation_only=allocation_only,
+            prepared=prepared,
+            preloaded=preloaded,
         )
     except BaseException as exc:
         from sglang.srt.elastic_pp.backing_spill import discard_tensor_tracebacks
@@ -616,8 +677,49 @@ def prewarm_host_allocator(scheduler):
     }
 
 
+def adopt_prepared_host_stack(clone, prepared, *, allocator, params):
+    """Move unused backing into a fresh fence-metadata clone, without allocation."""
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _COMPONENT_HOST_ATTR,
+    )
+    from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
+
+    if prepared.host_pool_group is None or prepared.cache_controller is None:
+        raise RuntimeError("background HiCache backing has already been consumed")
+    assert_host_quiescent(prepared)
+    clone.host_pool_group = prepared.host_pool_group
+    clone.cache_controller = prepared.cache_controller
+    clone.load_cache_event = prepared.load_cache_event
+    clone.token_to_kv_pool_host = clone.host_pool_group
+    for ct, (cache_attr, component_attr) in _COMPONENT_HOST_ATTR.items():
+        if ct in clone.components:
+            host = getattr(prepared, cache_attr, None)
+            setattr(clone, cache_attr, host)
+            setattr(clone.components[ct], component_attr, host)
+    clone.cache_controller.mem_pool_device_allocator = allocator
+    clone._hicache_init_params = params
+    clone._storage_attachment = StorageAttachment(clone)
+    # No destructor may later retire the backing now owned by clone.
+    prepared.host_pool_group = None
+    prepared.cache_controller = None
+    prepared.token_to_kv_pool_host = None
+    for ct, (cache_attr, component_attr) in _COMPONENT_HOST_ATTR.items():
+        setattr(prepared, cache_attr, None)
+        if ct in prepared.components:
+            setattr(prepared.components[ct], component_attr, None)
+
+
 def _prepare_target_host_cache(
-    cache, *, device_pool, target, generation, fast_copy=False, metrics=None
+    cache,
+    *,
+    device_pool,
+    target,
+    generation,
+    fast_copy=False,
+    metrics=None,
+    allocation_only=False,
+    prepared=None,
+    preloaded=None,
 ):
     """Build replacement L2 backing without resetting the live radix tree.
 
@@ -631,7 +733,8 @@ def _prepare_target_host_cache(
 
     metrics = {} if metrics is None else metrics
     started = time.monotonic()
-    assert_host_quiescent(cache)
+    if not allocation_only:
+        assert_host_quiescent(cache)
     projected, req = project_target_device_pool(
         device_pool, target=target, generation=generation
     )
@@ -651,13 +754,20 @@ def _prepare_target_host_cache(
     metrics["host_target_metadata_seconds"] = time.monotonic() - started
     try:
         started = time.monotonic()
-        if target.size == 0:
+        if prepared is not None:
+            adopt_prepared_host_stack(
+                clone, prepared, allocator=allocator, params=params
+            )
+        elif target.size == 0:
             build_dormant_host_stack(
                 clone, source=cache, projected=projected, params=params
             )
         else:
             clone.init_hicache(cache._hicache_init_server_args, params)
         metrics["host_target_init_seconds"] = time.monotonic() - started
+        if allocation_only:
+            clone._elastic_pp_projected_pool = projected
+            return clone
         started = time.monotonic()
         for old_entry in cache.host_pool_group.entries:
             new_pool = clone.host_pool_group.get_pool(old_entry.name)
@@ -695,6 +805,18 @@ def _prepare_target_host_cache(
                 old_views.get(component, {}).keys()
                 & new_views.get(component, {}).keys()
             ):
+                record = (preloaded or {}).get((node.identity, component, layer))
+                if record is not None:
+                    from sglang.srt.elastic_pp.hicache_precopy import rows_match
+
+                    if rows_match(old_views[component][layer], record, node.slots):
+                        metrics["host_preloaded_retained_bytes_reused"] = metrics.get(
+                            "host_preloaded_retained_bytes_reused", 0
+                        ) + sum(
+                            t.numel() * t.element_size()
+                            for t in record.tensors.values()
+                        )
+                        continue
                 for name, source in old_views[component][layer].items():
                     dest = new_views[component][layer][name]
                     start = _contiguous_host_rows(node.slots) if fast_copy else None
@@ -796,6 +918,135 @@ class SchedulerHiCacheTransition:
             )
         )
         self._released_device_aliases_generation = None
+        self.background = bool(
+            getattr(
+                getattr(model_runner, "server_args", None),
+                "elastic_pp_hicache_background",
+                False,
+            )
+        )
+        if self.background and (
+            not self.fast_copy
+            or getattr(model_runner.server_args, "elastic_pp_transition_strategy", None)
+            != "background"
+            or getattr(model_runner.server_args, "elastic_pp_transition_backing", None)
+            != "overlap"
+        ):
+            raise ValueError(
+                "background HiCache requires fast-copy and background/overlap"
+            )
+        self.precopy = None
+        self.prepared_host = None
+        self._background_metrics = {}
+
+    def begin_background(self, transition):
+        """Scheduler-only CPU snapshot. Never drain or mutate active HiCache I/O."""
+        if not self.background:
+            return
+        if self.precopy is not None or self.prepared_host is not None:
+            raise RuntimeError("previous background HiCache generation still owned")
+        self._background_metrics = {}
+        self._last_metrics = {}
+        from sglang.srt.elastic_pp.hicache_precopy import HiCachePrecopy
+
+        cache = self.scheduler.tree_cache
+        try:
+            self.precopy = HiCachePrecopy.capture(
+                cache,
+                (
+                    cache_host_views(cache)
+                    if self.rank in transition.source.active_ranks
+                    else {}
+                ),
+                transition.target.generation,
+            )
+        except Exception as exc:
+            # A busy I/O epoch is not safe to snapshot. All peers select the
+            # existing full-fence path instead; never read it speculatively.
+            self._background_metrics["host_background_fallback"] = (
+                type(exc).__name__ + ": " + str(exc)
+            )
+
+    def allocate_background(self, transition, *, enabled):
+        if not enabled:
+            self._reset_precopy()
+            self._background_metrics["host_background_used"] = False
+            return
+        if (
+            self.precopy is None
+            or self.precopy.generation != transition.target.generation
+        ):
+            raise RuntimeError("missing background HiCache snapshot")
+        from sglang.srt.elastic_pp.hicache_precopy import copy_records
+        from sglang.srt.mem_cache.pool_host.base import hicache_capacity_group
+
+        metrics = self._background_metrics
+        metrics.update(self.precopy.metrics)
+        started = time.monotonic()
+        with hicache_capacity_group(self.group):
+            self.prepared_host = prepare_target_host_cache(
+                self.precopy.metadata_cache,
+                device_pool=self.model_runner.token_to_kv_pool,
+                target=transition.target.layer_range(self.rank),
+                generation=transition.target.generation,
+                fast_copy=True,
+                metrics=metrics,
+                allocation_only=True,
+            )
+        metrics["host_background_pool_init_seconds"] = metrics.pop(
+            "host_target_init_seconds"
+        )
+        metrics["host_background_pool_metadata_seconds"] = metrics.pop(
+            "host_target_metadata_seconds"
+        )
+        views = cache_host_views(
+            self.prepared_host, self.prepared_host._elastic_pp_projected_pool
+        )
+        source_storage = {
+            t.untyped_storage().data_ptr()
+            for layers in cache_host_views(self.precopy.metadata_cache).values()
+            for tensors in layers.values()
+            for t in tensors.values()
+            if t.numel()
+        }
+        if any(
+            t.numel() and t.untyped_storage().data_ptr() in source_storage
+            for layers in views.values()
+            for tensors in layers.values()
+            for t in tensors.values()
+        ):
+            raise RuntimeError("background HiCache backing aliases live source")
+        self.precopy.preloaded.update(copy_records(views, self.precopy.records))
+        metrics["host_background_allocate_seconds"] = time.monotonic() - started
+        metrics["host_background_used"] = True
+
+    def copy_background(self, transition):
+        if self.precopy is None:
+            return
+        started = time.monotonic()
+        self.precopy.exchange(
+            transition,
+            group=self.group,
+            rank=self.rank,
+            target_pools=cache_host_views(
+                self.prepared_host, self.prepared_host._elastic_pp_projected_pool
+            ),
+        )
+        self._background_metrics.update(self.precopy.metrics)
+        self._background_metrics["host_background_exchange_seconds"] = (
+            time.monotonic() - started
+        )
+
+    def _reset_precopy(self):
+        if self.precopy is not None:
+            self.precopy.reset()
+        self.precopy = None
+        if (
+            self.prepared_host is not None
+            and self.prepared_host.host_pool_group is not None
+        ):
+            discard_host_cache(self.prepared_host)
+        self.prepared_host = None
 
     def release_source_device_aliases(self, transition):
         """Fence-only: retire projected owners and invalidate raw GDN addresses."""
@@ -849,7 +1100,7 @@ class SchedulerHiCacheTransition:
         from types import SimpleNamespace
 
         cache = self.scheduler.tree_cache
-        self._phase_metrics = {}
+        self._phase_metrics = dict(self._background_metrics)
         started = time.monotonic()
         drain_host_io_at_fence(cache, self.group)
         self._phase_metrics["host_io_drain_seconds"] = time.monotonic() - started
@@ -937,6 +1188,7 @@ class SchedulerHiCacheTransition:
             rank=self.rank,
             fast_copy=self.fast_copy,
         )
+        self.adapter.precopy = self.precopy
         self.adapter.prepare_transition(transition)
         started = time.monotonic()
         self.adapter.snapshot_at_fence(transition)
@@ -953,7 +1205,10 @@ class SchedulerHiCacheTransition:
             generation=transition.target.generation,
             fast_copy=self.fast_copy,
             metrics=self._phase_metrics,
+            prepared=self.prepared_host,
+            preloaded=self.precopy.preloaded if self.precopy is not None else None,
         )
+        self.prepared_host = None
         started = time.monotonic()
         self.adapter.apply_staged(
             transition,
@@ -1000,6 +1255,7 @@ class SchedulerHiCacheTransition:
         self.adapter.commit(transition)
         self.target_cache = None
         self.adapter = None
+        self._reset_precopy()
 
     def abort(self, transition):
         if self.adapter is not None:
@@ -1008,6 +1264,7 @@ class SchedulerHiCacheTransition:
             discard_host_cache(self.target_cache)
         self.target_cache = None
         self.adapter = None
+        self._reset_precopy()
 
     def metrics(self):
         return dict(

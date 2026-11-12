@@ -887,3 +887,60 @@ def test_cpu_spill_preserves_bounded_wire_chunks(strategy):
     coordinator.finalize_at_fence(lambda target: None)
     assert observed == [("bulk", 2), ("delta", 2)]
     assert kv.slot_chunk_size == 2
+
+
+@pytest.mark.parametrize("failure", [None, "local", "peer", "busy"])
+def test_background_host_allocation_consensus_precedes_exchange_and_arm(failure):
+    group = _Group(fail_stage="host_background_allocate" if failure == "peer" else None)
+    coordinator, transition, runner, _ = _coordinator(group)
+    coordinator.strategy = "background"
+    coordinator._preflight_capacity = lambda _: None
+    coordinator._precopy_immutable_weights = lambda _: None
+    events = []
+
+    class Host:
+        background = True
+        precopy = None
+
+        def begin_background(self, transition):
+            assert not runner.committed
+            self.precopy = None if failure == "busy" else object()
+            events.append("capture")
+
+        def allocate_background(self, transition, *, enabled):
+            assert "host_background_capture" in group.stages
+            events.append("allocate" if enabled else "fallback")
+            if failure == "local":
+                raise RuntimeError("host allocation failed")
+
+        def copy_background(self, transition):
+            assert "host_background_allocate" in group.stages
+            assert "arm_fence" not in group.stages
+            events.append("copy")
+
+        def abort(self, transition):
+            events.append("abort")
+
+    coordinator.cache_transition = Host()
+    coordinator.begin(transition)
+    if failure in {"local", "peer"}:
+        coordinator._thread.join(timeout=3)
+        assert coordinator.phase == ElasticPPMigrationPhase.FAILED
+        assert "background host allocation" in coordinator.snapshot().error
+        assert events == ["capture", "allocate", "abort"]
+        assert coordinator.snapshot().source_usable and not runner.committed
+        assert (
+            "host_background_copy" not in group.stages
+            and "arm_fence" not in group.stages
+        )
+    else:
+        coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+        assert events == [
+            "capture",
+            "fallback" if failure == "busy" else "allocate",
+            "copy",
+        ]
+        assert group.stages.index("host_background_copy") < group.stages.index(
+            "arm_fence"
+        )
+        assert not runner.committed

@@ -1149,6 +1149,13 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = False
+    elastic_pp_hicache_background: A[
+        bool,
+        Arg(
+            help="Prepare private CPU HiCache backing and stable rows in the background; compare fence contents and exchange deltas before publication."
+        ),
+        NS("parallel"),
+    ] = False
     elastic_pp_kv_backend: A[
         str,
         Arg(

@@ -274,6 +274,10 @@ class ElasticPPMigrationCoordinator:
             self._weights_reused = False
             self._drain_consensus_tensor = None
             self._drain_consensus_work = None
+            if self.cache_transition is not None:
+                capture = getattr(self.cache_transition, "begin_background", None)
+                if capture is not None:
+                    capture(transition)
             if self.enable_kv_patch:
                 # This caller is the scheduler; allocator snapshots must never
                 # be taken from the preparation worker.
@@ -786,17 +790,20 @@ class ElasticPPMigrationCoordinator:
                 generation,
                 self.rank,
             )
+            prepare_policy = {
+                "reuse_weights": self._weights_reused,
+                "background_host": bool(
+                    getattr(self.cache_transition, "background", False)
+                ),
+            }
             reports = self._consensus(
                 "prepare_allocations",
                 success=local_error is None,
                 error=local_error,
-                details={"reuse_weights": self._weights_reused},
+                details=prepare_policy,
             )
             self._raise_peer_failures("prepare allocations", reports)
-            if any(
-                r.get("details") != {"reuse_weights": self._weights_reused}
-                for r in reports
-            ):
+            if any(r.get("details") != prepare_policy for r in reports):
                 raise RuntimeError("prepared weight policy differs across ranks")
             # Never enter P2P pre-copy before all peers have allocated backing:
             # a peer allocation failure must not strand a sender/receiver.
@@ -816,6 +823,46 @@ class ElasticPPMigrationCoordinator:
                     "background_copy", success=local_error is None, error=local_error
                 )
                 self._raise_peer_failures("background copy", reports)
+            if self.cache_transition is not None and getattr(
+                self.cache_transition, "background", False
+            ):
+                reports = self._consensus(
+                    "host_background_capture",
+                    success=True,
+                    details=self.cache_transition.precopy is not None,
+                )
+                enabled = all(r.get("details") is True for r in reports)
+                local_error = None
+                try:
+                    self._timed(
+                        "background_host_allocate",
+                        self.cache_transition.allocate_background,
+                        transition,
+                        enabled=enabled,
+                    )
+                except BaseException as exc:
+                    local_error = f"{type(exc).__name__}: {exc}"
+                reports = self._consensus(
+                    "host_background_allocate",
+                    success=local_error is None,
+                    error=local_error,
+                )
+                self._raise_peer_failures("background host allocation", reports)
+                local_error = None
+                try:
+                    self._timed(
+                        "background_host_copy",
+                        self.cache_transition.copy_background,
+                        transition,
+                    )
+                except BaseException as exc:
+                    local_error = f"{type(exc).__name__}: {exc}"
+                reports = self._consensus(
+                    "host_background_copy",
+                    success=local_error is None,
+                    error=local_error,
+                )
+                self._raise_peer_failures("background host copy", reports)
             logger.info(
                 "Elastic PP generation=%d rank=%d allocation consensus complete",
                 generation,

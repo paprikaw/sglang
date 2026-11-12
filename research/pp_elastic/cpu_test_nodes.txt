@@ -1027,3 +1027,4 @@ test/registered/unit/elastic_pp/test_coordinator.py::test_prepared_weight_policy
 
 test/registered/unit/elastic_pp/test_prepared_decode_graph.py::test_fixed_output_frontier_drops_spare_heads_without_touching_decoder_weights
 test/registered/unit/elastic_pp/test_hicache_fast_copy.py
+test/registered/unit/elastic_pp/test_hicache_precopy.py
