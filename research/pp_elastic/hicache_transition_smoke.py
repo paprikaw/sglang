@@ -680,6 +680,11 @@ def engine_entry(cfg, row):
                 else ["--disable-cuda-graph"]
             )
             + (
+                ["--elastic-pp-profile-weight-load"]
+                if cfg.get("profile_native_weight_load")
+                else []
+            )
+            + (
                 [
                     "--elastic-pp-graph-partitions",
                     ";".join(
@@ -1337,6 +1342,7 @@ def prepare(args):
         prepared_weight_policy=getattr(args, "prepared_weight_policy", "offload"),
         weight_staging=getattr(args, "weight_staging", "legacy"),
         cpu_weight_cache_gib=getattr(args, "cpu_weight_cache_gib", 24),
+        profile_native_weight_load=getattr(args, "profile_native_weight_load", False),
         migration_profile=getattr(args, "migration_profile", False),
         hicache_allocator=getattr(args, "hicache_allocator", "mmap"),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
@@ -1594,6 +1600,7 @@ def main():
         default="pinned",
     )
     parser.add_argument("--cpu-weight-cache-gib", type=int, default=24)
+    parser.add_argument("--profile-native-weight-load", action="store_true")
     parser.add_argument(
         "--hicache-allocator", choices=["mmap", "pytorch"], default="mmap"
     )

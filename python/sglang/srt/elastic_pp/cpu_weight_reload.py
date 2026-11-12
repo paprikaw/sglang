@@ -89,10 +89,11 @@ class CanonicalCpuWeightReloader:
             prepared_cpu_cache_hit=False,
             canonical_checkpoint_read_bytes=0,
             native_load_host_seconds=0.0,
-            native_h2d_call_wall_seconds=0.0,
-            native_h2d_copy_calls=0,
-            native_h2d_bytes=0,
-            native_noncopy_host_seconds=0.0,
+            native_profile_enabled=False,
+            native_h2d_call_wall_seconds=None,
+            native_h2d_copy_calls=None,
+            native_h2d_bytes=None,
+            native_noncopy_host_seconds=None,
             postprocess_seconds=0.0,
             gpu_export_bytes=0,
             gloo_weight_bytes=0,
@@ -260,20 +261,29 @@ class CanonicalCpuWeightReloader:
                                 )
                                 loaded = entry.loaded
                             else:
-                                copies = NativeCopyAccounting()
+                                profile = getattr(
+                                    self.runner.server_args,
+                                    "elastic_pp_profile_weight_load",
+                                    False,
+                                )
+                                copies = (
+                                    NativeCopyAccounting() if profile else nullcontext()
+                                )
                                 native_started = time.monotonic()
                                 with copies:
                                     loaded = self.model.load_weights(weights())
                                 elapsed = time.monotonic() - native_started
-                                self.metrics.update(
-                                    native_load_host_seconds=elapsed,
-                                    native_h2d_call_wall_seconds=copies.seconds,
-                                    native_h2d_copy_calls=copies.calls,
-                                    native_h2d_bytes=copies.bytes,
-                                    native_noncopy_host_seconds=max(
-                                        0.0, elapsed - copies.seconds
-                                    ),
-                                )
+                                self.metrics["native_load_host_seconds"] = elapsed
+                                if profile:
+                                    self.metrics.update(
+                                        native_profile_enabled=True,
+                                        native_h2d_call_wall_seconds=copies.seconds,
+                                        native_h2d_copy_calls=copies.calls,
+                                        native_h2d_bytes=copies.bytes,
+                                        native_noncopy_host_seconds=max(
+                                            0.0, elapsed - copies.seconds
+                                        ),
+                                    )
                             # GDN passes A_log/dt_bias Parameters into its
                             # RadixLinearAttention child. Both names appear in
                             # named_parameters(remove_duplicate=False), while

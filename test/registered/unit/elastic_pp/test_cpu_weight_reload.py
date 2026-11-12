@@ -150,6 +150,20 @@ def test_direct_bank_restores_fused_target_without_touching_active_storage(bank)
     assert bank.reloader.metrics["gloo_weight_bytes"] == 0
 
 
+def test_copy_call_instrumentation_is_opt_in(bank, monkeypatch):
+    monkeypatch.setattr(
+        reload_module,
+        "NativeCopyAccounting",
+        lambda: pytest.fail(
+            "production native reload must not dispatch through the diagnostic profiler"
+        ),
+    )
+    bank.reloader.reload(generation=1, layer_ids={1})
+    assert not bank.reloader.metrics["native_profile_enabled"]
+    assert bank.reloader.metrics["native_h2d_call_wall_seconds"] is None
+    assert bank.reloader.metrics["native_noncopy_host_seconds"] is None
+
+
 @pytest.mark.parametrize("reported_alias", [False, True])
 def test_shared_gdn_parameter_alias_is_covered_once(bank, reported_alias):
     # RadixLinearAttention registers the enclosing GDN's A_log/dt_bias again.

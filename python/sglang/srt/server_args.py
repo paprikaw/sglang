@@ -1127,6 +1127,13 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = 24
+    elastic_pp_profile_weight_load: A[
+        bool,
+        Arg(
+            help="Diagnose native H2D copy-call host times; adds Python dispatch overhead and is disabled for performance comparison."
+        ),
+        NS("parallel"),
+    ] = False
     elastic_pp_hicache_allocator: A[
         str,
         Arg(
