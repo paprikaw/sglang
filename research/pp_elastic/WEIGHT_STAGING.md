@@ -1,5 +1,7 @@
 # 加速真实权重搬运
 
+**后续：最终交接暂停。** CPU装载优化后的约264 ms已进一步拆分并优化HiCache复制；同源新旧正式对照的扩／缩暂停253.4／296.3→160.0／195.9 ms，候选GPU权重继续offload，权重加载机制不变。见[HiCache交接优化](HICACHE_FENCE_COPY.md)。下面保留前一阶段权重装载数据。
+
 **2026-11-12最新结果：CPU提前打包。** 同源`20d7e1970e98`、同一A100节点、35B BF16／B1的正式无诊断对照中，13层单GPU装载4.584→0.896秒；完整扩／缩5.139／3.025→1.221／0.833秒，减少76.2%／72.5%。优化后H2D为218次、壁钟0.894秒，运行时CPU打包为0。最后交接仍约264 ms，没有证明暂停更短。两种策略每方向2048输出token一致，实际Graph replay、运行时capture=0、CPU前缀loadback及非活跃权重物理页为0通过，缩回释放20.37890625 GiB权重显存。1117项完整CPU检查通过；每策略一次往返，整卡归还仍未实现。[完整指标与来源](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_cpu_prepacked_weights_20261112/summary.md)。
 
 **CPU准备。** `cpu_prepacked`在启动Graph预热时，用同一个canonical CPU bank和原生loader在独立CPU参数上完成融合／Expert切片，直接写入pinned CPU内存；不读取源GPU值、不替换正在推理的模型参数。有限候选布局准备完成后，运行时只允许命中，按整张Parameter及必要派生buffer异步H2D，再执行原生post-load处理并检查Graph地址及完整覆盖。接手13层的worker启动分配6.026秒、CPU打包5.843秒，总准备11.869秒；三worker额外CPU张量40.739 GiB，不是RSS或峰值。每worker默认24 GiB上限，三worker在Guard中额外预留72 GiB，与原20 GiB预算一起按92 GiB准入；不扩大每rank 1 GiB的HiCache本身，不改canonical bank。缓存随worker退出，不是跨进程持久缓存。smoke显式使用`--weight-staging cpu_prepacked --cpu-weight-cache-gib 24`，同时要求prepared Graph和offload。

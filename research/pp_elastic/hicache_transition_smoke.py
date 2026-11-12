@@ -1449,7 +1449,11 @@ def prepare(args):
     spec["frozen_inputs"] = [
         x for x in spec["frozen_inputs"] if x["path"] != str(run / "config.json")
     ]
-    spec["frozen_inputs"] += [base.desc(run / "config.json"), base.desc(__file__)]
+    spec["frozen_inputs"] += [
+        base.desc(run / "config.json"),
+        base.desc(__file__),
+        base.desc(ENGINE / "python/sglang/srt/elastic_pp/hicache_transition.py"),
+    ]
     if getattr(args, "supervised_lifecycle", False):
         spec["frozen_inputs"] += [
             base.desc(ROOT / name)

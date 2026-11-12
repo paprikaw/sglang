@@ -4,7 +4,7 @@
 
 ## 当前：减少迁移、最终暂停及推理干扰
 
-- [ ] **2026-11-12：继续减少最终264 ms暂停。** 已有分项定位到HiCache CPU快照／目标准备／写入，Graph选择仅约2 ms。新增显式fast-copy候选：连续host行直接复制，快照只保留一次独立副本，全新且与源不共享storage的私有目标不做无用undo；仍保留源缓存至发布，失败丢弃目标。增加host初始化／保留行／新接收行等分项，保持HiCache、NIXL、Graph和候选权重offload不变。待CPU检查和同源GPU对照；未获得更短暂停资格。
+- [x] **2026-11-12：减少最终264 ms暂停，有限GPU对照通过。** 冻结`7dda6e42a012`，1130项完整CPU检查通过。同源／同A100节点／35B BF16／B1，旧→fast-copy最终扩／缩暂停253.351／296.300→159.983／195.916 ms（少36.9%／33.9%），客户端跨已记录fence的相邻token间隔281.795／310.296→184.816／210.630 ms。目标接收行导入111.0→20.7 ms，Graph选择仍约2 ms；连续行直接复制、快照只留一份，新私有池不做无用undo，保留源至发布、失败丢弃目标。CPU前缀快照／传输／保留行字节数相同，HiCache容量不变，候选GPU权重offload，缩回释放20.37890625 GiB。每方向2048输出一致、实际Graph replay、runtime capture=0、CPU loadback、136项冻结输入及清理／release通过。每模式一次正式往返；初步未开客户端计时的一轮单独保留，不混算。整卡归还、更多模型／batch及独立review未扩展。[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_fence_copy_20261112/summary.md) · [机制说明](HICACHE_FENCE_COPY.md)。
 
 - [x] **2026-11-12：拆分单GPU装载，CPU提前打包及有限GPU对照通过。** 冻结`20d7e1970e98`，1117项完整CPU检查通过。原生路径单独诊断为10,223次H2D、调用内3.882秒、剩余host路径1.840秒；含pageable等待与诊断成本，不能当纯DMA／纯打包。正式同源／同节点／无诊断对照，13层单GPU装载4.584→0.896秒、H2D变218次；完整扩／缩5.139／3.025→1.221／0.833秒，最后暂停264／264 ms。CPU准备前移至启动，接收卡对应分配6.026秒＋打包5.843秒；三worker额外CPU张量40.739 GiB，每worker上限24 GiB，联合Guard预留92 GiB，HiCache容量不变。两策略每方向2048输出token一致，实际Graph replay、运行时capture=0、CPU loadback及135项冻结输入各自通过；缩回中间GPU物理权重为0、驱动可用显存增加20.37890625 GiB，无GPU候选权重复用。首次Gemma派生buffer拒绝已通过独立CPU owner修正，失败与清理记录保留。每策略一次往返、35B／B1／native TP1／EP1 Triton范围；整卡归还与独立review未扩展。[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_cpu_prepacked_weights_20261112/summary.md)。
 
