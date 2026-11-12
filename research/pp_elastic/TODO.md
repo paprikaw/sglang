@@ -4,7 +4,8 @@
 
 ## 当前：减少迁移、最终暂停及推理干扰
 
-- [ ] **2026-11-13：目标CPU池与HiCache稳定行后台预搬。** 调度线程只捕获独立CPU快照；后台分配未发布的目标池、使用独立迁移通信组预搬；最终按实际行内容核验并补增量。保持HiCache容量、候选GPU权重offload和完整输出检查，同时记录后台期间及最后交接的客户端token间隔，避免将暂停挪到更早后宣称无干扰。待CPU／A100同源开关对照。见[机制说明](HICACHE_BACKGROUND.md)。
+- [x] **2026-11-13：目标CPU池与HiCache稳定行后台预搬，有界验收通过。** 同源A100／35B BF16／B1，各模式一次正式往返，扩／缩暂停157.9／193.6→115.2／189.6 ms；客户端跨切换间隔183.7／207.3→141.0／203.2 ms。准备期间最大token间隔25.0／22.5→76.4／67.8 ms，完整扩／缩1.115／0.725→1.336／0.912秒。每方向117,309,440 B稳定CPU前缀预搬、最后CPU数据补传0 B。1162项完整CPU检查、两个方向各2048输出及两模式逐token一致、实际CPU前缀恢复、Graph replay和正常清理通过；候选GPU物理权重仍为0。初始CPU快照和最终内容核验仍消耗调度／暂停时间，缩容另有最新GDN／KV收尾；不宣称无中断、整体吞吐提高或整卡归还。 代际结束清除临时快照／传输引用，新代重置计数；历史、HiCache及CPU权重缓存保留。源码 b5467d3a432d，138项冻结输入各自一致。见[机制说明](HICACHE_BACKGROUND.md)及[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_background_20261113/summary.md)。
+- [ ] **进一步降低准备期与缩容干扰。** 初始CPU独立快照仍阻塞调度，最终行内容核验和最新GDN／KV仍需暂停；先验证可靠的写入版本或分块快照等方案，再决定优化，不能仅以后台字节已搬完推断暂停消失。
 
 - [x] **2026-11-12：减少最终264 ms暂停，有限GPU对照通过。** 冻结`7dda6e42a012`，1130项完整CPU检查通过。同源／同A100节点／35B BF16／B1，旧→fast-copy最终扩／缩暂停253.351／296.300→159.983／195.916 ms（少36.9%／33.9%），客户端跨已记录fence的相邻token间隔281.795／310.296→184.816／210.630 ms。目标接收行导入111.0→20.7 ms，Graph选择仍约2 ms；连续行直接复制、快照只留一份，新私有池不做无用undo，保留源至发布、失败丢弃目标。CPU前缀快照／传输／保留行字节数相同，HiCache容量不变，候选GPU权重offload，缩回释放20.37890625 GiB。每方向2048输出一致、实际Graph replay、runtime capture=0、CPU loadback、136项冻结输入及清理／release通过。每模式一次正式往返；初步未开客户端计时的一轮单独保留，不混算。整卡归还、更多模型／batch及独立review未扩展。[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_fence_copy_20261112/summary.md) · [机制说明](HICACHE_FENCE_COPY.md)。
 

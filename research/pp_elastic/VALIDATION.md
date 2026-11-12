@@ -1,5 +1,11 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-13：CPU HiCache后台准备与增量交接
+
+冻结 b5467d3a432d23be55538f78d40f38f30259a52b，tag experiment/sglang/pp-hicache-background-20261113-r3。1162项完整CPU检查通过，零失败／错误／跳过，pytest109.334秒，监督124.924秒，源码未变。同源A100／35B BF16／B1，各模式一次正式往返，扩／缩暂停157.9／193.6→115.2／189.6 ms；客户端跨切换间隔183.7／207.3→141.0／203.2 ms。准备期间最大token间隔25.0／22.5→76.4／67.8 ms，完整扩／缩1.115／0.725→1.336／0.912秒。每方向稳定CPU载荷117,309,440 B提前发送，最终CPU补传0 B，保留层不再重写；内容仍逐行核验，最新树／分配器／请求状态仍在fence取得。独立目标池使用迁移CPU组做容量同步；源池保留到发布，失败丢弃目标。代际临时引用被重置。1162项完整CPU检查、两个方向各2048输出及两模式逐token一致、实际CPU前缀恢复、Graph replay和正常清理通过；候选GPU物理权重仍为0。初始CPU快照和最终内容核验仍消耗调度／暂停时间，缩容另有最新GDN／KV收尾；不宣称无中断、整体吞吐提高或整卡归还。
+
+两模式138项冻结输入各自一致，后台／对照监督173.578／165.782秒完成正常清理与release。首个pre-worker入口失败、首个安全回退后台往返及CPU夹具／选择器错误单列，不混入正式性能比较。主agent实施与自行审查，无新增独立reviewer。[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_background_20261113/summary.md)。
+
 ## 2026-11-12：HiCache复制与最终暂停优化
 
 冻结`7dda6e42a012bc8e02a5424d245ff7f2ec72fc8c`／tag `experiment/sglang/pp-hicache-fast-copy-20261112-r1`。1130项完整CPU检查通过，零失败／错误／跳过，pytest135.87秒，含监督168.453秒，源码未变化。新CPU检查覆盖连续／稀疏／非连续stride、快照独立、源storage别名拒绝、共享目标回滚、私有导入失败清理；首轮专项夹具缺少layer_range，修正后34项专项通过，之后完整回归通过。
