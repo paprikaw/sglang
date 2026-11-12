@@ -685,6 +685,11 @@ def engine_entry(cfg, row):
                 else []
             )
             + (
+                ["--elastic-pp-hicache-fast-copy"]
+                if cfg.get("hicache_fast_copy")
+                else []
+            )
+            + (
                 [
                     "--elastic-pp-graph-partitions",
                     ";".join(
@@ -1345,6 +1350,7 @@ def prepare(args):
         profile_native_weight_load=getattr(args, "profile_native_weight_load", False),
         migration_profile=getattr(args, "migration_profile", False),
         hicache_allocator=getattr(args, "hicache_allocator", "mmap"),
+        hicache_fast_copy=getattr(args, "hicache_fast_copy", False),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
         context_length=(
             4096 if getattr(args, "active_output_tokens", 256) > 1024 else 2048
@@ -1601,6 +1607,7 @@ def main():
     )
     parser.add_argument("--cpu-weight-cache-gib", type=int, default=24)
     parser.add_argument("--profile-native-weight-load", action="store_true")
+    parser.add_argument("--hicache-fast-copy", action="store_true")
     parser.add_argument(
         "--hicache-allocator", choices=["mmap", "pytorch"], default="mmap"
     )

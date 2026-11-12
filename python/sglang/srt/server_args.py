@@ -1142,6 +1142,13 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "mmap"
+    elastic_pp_hicache_fast_copy: A[
+        bool,
+        Arg(
+            help="Reduce fenced CPU HiCache row copies into a verified private target; keep the source intact until publication."
+        ),
+        NS("parallel"),
+    ] = False
     elastic_pp_kv_backend: A[
         str,
         Arg(

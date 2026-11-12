@@ -1026,3 +1026,4 @@ test/registered/unit/elastic_pp/test_hicache_acceptance.py::test_nonresident_gra
 test/registered/unit/elastic_pp/test_coordinator.py::test_prepared_weight_policy_skips_only_verified_resident_weights[offload]
 
 test/registered/unit/elastic_pp/test_prepared_decode_graph.py::test_fixed_output_frontier_drops_spare_heads_without_touching_decoder_weights
+test/registered/unit/elastic_pp/test_hicache_fast_copy.py
