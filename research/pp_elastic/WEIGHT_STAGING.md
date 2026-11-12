@@ -4,6 +4,8 @@
 
 **新增计时。** CPU准备拆为pinned分配、CPU原生打包；运行时分开记录H2D壁钟／CUDA迁移流跨度、后处理及完整转换。直接checkpoint对照记录H2D调用次数、调用内壁钟及剩余CPU dispatch时间；pageable拷贝调用内含驱动整理与等待，不能称为纯DMA，也不能把异步阶段任意相加。候选GPU权重仍采用offload，硬件验收必须继续检查物理释放、完整输出、实际Graph replay及最终暂停。GPU结果另记。
 
+**首轮诊断及修正。** 带逐调用诊断的直接路径通过往返，扩容的10,223次H2D调用内壁钟3.882秒，剩余host时间1.840秒，后处理约1 ms；诊断增加了dispatch开销，正式测速改为默认关闭的显式开关。CPU预打包首次GPU在启动期被CPU-only检查拒绝：GemmaRMSNorm原生loader还写入绑定模块的gemma_weight缓冲。现在为加载器建立独立CPU owner，连同该派生buffer一起准备、计入CPU预算并H2D恢复；不放宽CPU-only检查。失败78.894秒内完成owned cleanup和正常release，135项输入一致，没有运行时性能样本。未启动的旧配置保留为not_run，新版本另建tag／run。
+
 **2026-11-12结果。** 同一069节点、同源`521b14cb725e`、35B BF16／B1／HiCache／NIXL／预热Graph，直接CPU bank的完整扩／缩5.089／2.978秒，旧路径20.103／20.885秒，分别减少74.7%／85.7%。最后交接仍为242／258 ms，客户端跨fence相邻token间隔269／273 ms；主要缩短后台权重装载，没有消除最后同步。每方向恢复约21.87 GB；GPU导出、Gloo权重传输及候选权重复用均为0。缩回中间GPU物理权重为0，驱动可用显存增加20.37890625 GiB。两策略的2048-token输出逐一一致；每策略一次往返，未扩大到重复均值或其他模型／batch。[完整指标、来源与限制](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_direct_cpu_cache_weights_20261111/summary.md)。
 
 **新增：直接使用已有CPU缓存。** 用户要求避免源GPU导出。显式选择`--elastic-pp-weight-staging cpu_cache`后，各目标rank直接打开初次加载使用的canonical CPU bank，只读取自己新接手的层，调用模型原生checkpoint loader将融合／切片后的值写入目标既有参数地址。源rank不发送权重，不经Gloo，也不新增常驻GPU候选副本或从GPU建立新的CPU权重快照。当前资格范围是native Qwen3.5、TP1／EP1、Triton、无量化、overlap；运行时使用background，启动Graph预热的同步转换也使用同一CPU bank。通用默认暂保留legacy，实验显式选择新路径。

@@ -4,7 +4,7 @@
 
 ## 当前：减少迁移、最终暂停及推理干扰
 
-- [ ] **2026-11-12：拆分单GPU装载，并在CPU提前打包。** 分开记录原生loader的CPU整理／调用时间、H2D调用和后处理；新增有界、启动时准备的pinned CPU目标格式缓存，运行时只恢复目标权重并执行必要后处理。候选GPU权重仍offload，复测PP2→PP3→PP2的完整准备、最终暂停和输出；CPU额外占用单独计入Guard预算。代码、CPU检查和GPU结果分别记录。
+- [ ] **2026-11-12：拆分单GPU装载，并在CPU提前打包。** 原生路径诊断已通过往返；逐调用测量默认关闭，避免其CPU开销影响正式对比。新增有界、启动期pinned CPU目标格式缓存，保留offload；首个GPU在GemmaRMSNorm派生buffer的CPU-only检查处退出，78.894秒正常清理、135项输入一致，未产生运行时样本。已为native loader独立准备CPU owner及派生buffer并计入预算，235项专项通过。需继续验收GPU完整输出、物理释放、正式切换时间及暂停；不把CPU通过当作GPU资格。
 
 - [x] **2026-11-12：目标GPU直接从已有CPU权重缓存恢复，有限验收通过。** 冻结`521b14cb725e`，完整CPU回归1084项全过；069节点35B BF16／B1／HiCache／NIXL／预热Graph的PP2→PP3→PP2通过。同源同节点旧路径完整扩／缩20.103／20.885秒，直接CPU bank为5.089／2.978秒；最后交接242／258 ms，客户端跨fence相邻token间隔269／273 ms。无GPU导出或Gloo权重传输，每方向约21.87 GB真实恢复；缩回中间GPU模型参数及物理权重为0，释放20.37890625 GiB。两种路径每方向2048输出token一致，运行时capture=0、实际Graph replay和CPU前缀loadback通过；134／131个输入、清理及正常release通过。保留首轮GDN别名拒绝及其CPU复现，按Parameter身份修正，未放宽地址／覆盖检查。每策略一次往返，不是重复均值；固定native TP1／EP1 Triton，冷暖生成等价、更多batch／模型及整卡归还未扩展，无独立reviewer。见[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_direct_cpu_cache_weights_20261111/summary.md)。
 

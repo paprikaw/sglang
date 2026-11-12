@@ -219,7 +219,9 @@ class CanonicalCpuWeightReloader:
                     try:
                         with torch.no_grad(), context:
                             if self.prepared is not None:
-                                entry = self.prepared.get(layer_ids, parameters)
+                                entry = self.prepared.get(
+                                    layer_ids, parameters, buffers
+                                )
                                 self.metrics["prepared_cpu_cache_hit"] = (
                                     entry is not None
                                 )
@@ -235,6 +237,7 @@ class CanonicalCpuWeightReloader:
                                         model=self.model,
                                         layer_ids=layer_ids,
                                         parameters=parameters,
+                                        buffers=buffers,
                                         weights=weights(),
                                         counters=self.metrics,
                                         expected_counts=(
@@ -257,7 +260,9 @@ class CanonicalCpuWeightReloader:
                                         entry.checkpoint_tensors
                                     )
                                 self.metrics.update(
-                                    self.prepared.copy(entry, parameters, self.stream)
+                                    self.prepared.copy(
+                                        entry, parameters, self.stream, buffers
+                                    )
                                 )
                                 loaded = entry.loaded
                             else:

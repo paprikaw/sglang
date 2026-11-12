@@ -10,7 +10,9 @@ after the H2D copy; their optional runtime permutation is not cached here.
 from __future__ import annotations
 
 import time
+from copy import copy
 from dataclasses import dataclass
+from types import MethodType
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -29,7 +31,9 @@ class CpuOnlyPacking(TorchDispatchMode):
             kwargs.get("device") is not None
             and torch.device(kwargs["device"]).type != "cpu"
         ):
-            raise RuntimeError("CPU weight packing attempted a non-CPU operation")
+            raise RuntimeError(
+                f"CPU weight packing attempted a non-CPU operation: {func}"
+            )
         return func(*args, **kwargs)
 
 
@@ -100,6 +104,7 @@ class _CpuLoaderView:
 class PreparedCpuEntry:
     signature: tuple
     parameters: dict
+    buffers: dict
     loaded: frozenset
     checkpoint_bytes: int
     checkpoint_tensors: int
@@ -122,20 +127,55 @@ class PreparedCpuWeights:
         self.allocation_seconds = 0.0
         self.pack_seconds = 0.0
 
-    def get(self, layer_ids, parameters):
+    def get(self, layer_ids, parameters, buffers):
         entry = self.entries.get(frozenset(layer_ids))
-        if entry is not None and entry.signature != layout_signature(parameters):
+        if entry is not None and entry.signature != layout_signature(
+            dict(parameters, **buffers)
+        ):
             raise RuntimeError("prepared CPU weight layout changed")
         return entry
 
     def prepare(
-        self, *, model, layer_ids, parameters, weights, counters, expected_counts
+        self,
+        *,
+        model,
+        layer_ids,
+        parameters,
+        buffers,
+        weights,
+        counters,
+        expected_counts,
     ):
         key = frozenset(layer_ids)
         if key in self.entries:
             raise RuntimeError("prepared CPU weight entry already exists")
         unique = {id(p): p for p in parameters.values()}
-        needed = sum(p.numel() * p.element_size() for p in unique.values())
+        # GemmaRMSNorm's bound native loader writes both the supplied Parameter
+        # and self.gemma_weight. Rebind that owner to an independent CPU module;
+        # otherwise even a CPU Parameter would update the live GPU buffer.
+        owners = {}
+        buffer_names = {id(b): name for name, b in buffers.items()}
+        derived = {}
+        for parameter in unique.values():
+            for attr in ("weight_loader", "_weight_loader"):
+                loader = getattr(parameter, attr, None)
+                if not isinstance(loader, MethodType) or not isinstance(
+                    loader.__self__, torch.nn.Module
+                ):
+                    continue
+                owner = loader.__self__
+                owners[id(owner)] = owner
+                for name, buf in owner.named_buffers(recurse=False):
+                    if id(buf) not in buffer_names:
+                        raise ValueError("CPU loader owns an unaccounted buffer")
+                    if type(owner).__name__ != "GemmaRMSNorm" or name != "gemma_weight":
+                        raise ValueError("CPU loader has an unqualified derived buffer")
+                    derived[buffer_names[id(buf)]] = buf
+        unique_buffers = {id(b): b for b in derived.values()}
+        needed = sum(
+            p.numel() * p.element_size()
+            for p in [*unique.values(), *unique_buffers.values()]
+        )
         if self.nbytes + needed > self.max_bytes:
             raise RuntimeError("prepared CPU weight memory cap exceeded")
         if any(not p.is_contiguous() for p in unique.values()):
@@ -156,6 +196,34 @@ class PreparedCpuWeights:
             cpu.__dict__.update(parameter.__dict__)
             copied[ident] = cpu
         cpu_parameters = {name: copied[id(p)] for name, p in parameters.items()}
+        cpu_buffer_ids = {
+            ident: torch.empty_strided(
+                b.shape, b.stride(), dtype=b.dtype, device="cpu", pin_memory=self.pinned
+            )
+            for ident, b in unique_buffers.items()
+        }
+        cpu_buffers = {name: cpu_buffer_ids[id(buf)] for name, buf in derived.items()}
+        cpu_owners = {}
+        for ident, owner in owners.items():
+            shadow = copy(owner)
+            shadow._parameters = {
+                name: copied.get(id(p), p) for name, p in owner._parameters.items()
+            }
+            shadow._buffers = {
+                name: cpu_buffer_ids.get(id(b), b) for name, b in owner._buffers.items()
+            }
+            cpu_owners[ident] = shadow
+        for parameter in copied.values():
+            for attr in ("weight_loader", "_weight_loader"):
+                # BasevLLMParameter exposes weight_loader as a read-only
+                # property backed by _weight_loader. Rebind stored attributes.
+                loader = parameter.__dict__.get(attr)
+                if isinstance(loader, MethodType) and id(loader.__self__) in cpu_owners:
+                    setattr(
+                        parameter,
+                        attr,
+                        MethodType(loader.__func__, cpu_owners[id(loader.__self__)]),
+                    )
         view = _CpuLoaderView(model, cpu_parameters, layer_ids)
         allocated = time.monotonic()
         with torch.no_grad(), CpuOnlyPacking():
@@ -173,8 +241,9 @@ class PreparedCpuWeights:
             raise RuntimeError("CPU packing changed target Parameter layout")
         elapsed = time.monotonic() - started
         entry = PreparedCpuEntry(
-            signature=layout_signature(parameters),
+            signature=layout_signature(dict(parameters, **buffers)),
             parameters=cpu_parameters,
+            buffers=cpu_buffers,
             loaded=loaded,
             checkpoint_bytes=counters["checkpoint_bytes"],
             checkpoint_tensors=counters["checkpoint_tensors"],
@@ -190,8 +259,8 @@ class PreparedCpuWeights:
         self.pack_seconds += entry.pack_seconds
         return entry
 
-    def copy(self, entry, parameters, stream):
-        if entry.signature != layout_signature(parameters):
+    def copy(self, entry, parameters, stream, buffers):
+        if entry.signature != layout_signature(dict(parameters, **buffers)):
             raise RuntimeError("prepared CPU weight layout changed before H2D")
         started = time.monotonic()
         begin = end = None
@@ -200,11 +269,13 @@ class PreparedCpuWeights:
             begin.record(stream)
         seen = set()
         count = 0
-        for name, target in parameters.items():
+        sources = dict(entry.parameters, **entry.buffers)
+        targets = dict(parameters, **{name: buffers[name] for name in entry.buffers})
+        for name, target in targets.items():
             if id(target) in seen:
                 continue
             seen.add(id(target))
-            source = entry.parameters[name]
+            source = sources[name]
             if source.device.type != "cpu" or (self.pinned and not source.is_pinned()):
                 raise RuntimeError("prepared CPU source lost pinned host backing")
             target.copy_(source, non_blocking=True)

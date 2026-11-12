@@ -104,6 +104,7 @@ def test_prepare_on_cpu_preserves_live_model_aliases_and_addresses(pack_bank):
         model=b.model,
         layer_ids={0},
         parameters=parameters,
+        buffers={},
         weights=iter(b.model.checkpoint.items()),
         counters=counters,
         expected_counts=(32, 2),
@@ -117,7 +118,7 @@ def test_prepare_on_cpu_preserves_live_model_aliases_and_addresses(pack_bank):
     assert cache.nbytes == 32
     assert not b.model.ready
     with torch.no_grad():
-        metrics = cache.copy(entry, parameters, None)
+        metrics = cache.copy(entry, parameters, None, {})
     assert metrics["h2d_copy_calls"] == 1
     assert metrics["h2d_bytes"] == 32
     assert b.model.model.layers[0].weight.data_ptr() == address
@@ -214,6 +215,137 @@ def test_cpu_packing_rejects_gpu_allocation_without_initializing_cuda():
     with pytest.raises(RuntimeError, match="non-CPU"):
         with CpuOnlyPacking():
             torch.empty(4, device="meta")
+
+
+class GemmaRMSNorm(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(4, 2))
+        self.register_buffer("gemma_weight", torch.full((4, 2), -10.0))
+        self.weight.weight_loader = self._weight_loader
+
+    def _weight_loader(self, parameter, value):
+        parameter.data.copy_(value)
+        torch.add(parameter.data, 1, out=self.gemma_weight)
+
+
+class Qwen3_5DerivedCpuPackingFixture(Qwen3_5CpuPackingFixture):
+    def load_weights(self, weights):
+        values = dict(weights)
+        parameter = dict(self.named_parameters(remove_duplicate=False))[
+            "model.layers.0.weight"
+        ]
+        parameter.weight_loader(
+            parameter,
+            torch.cat([values[name] for name in sorted(values, reverse=True)]),
+        )
+        return {"model.layers.0.weight"}
+
+
+def test_bound_norm_loader_packs_derived_buffer_without_touching_live_buffer(pack_bank):
+    model = Qwen3_5DerivedCpuPackingFixture()
+    model.model.layers[0] = GemmaRMSNorm()
+    parameters = dict(model.named_parameters(remove_duplicate=False))
+    buffers = dict(model.named_buffers(remove_duplicate=False))
+    before = model.model.layers[0].gemma_weight.clone()
+    cache = PreparedCpuWeights(cache_key="key", max_bytes=64, pinned=False)
+    entry = cache.prepare(
+        model=model,
+        layer_ids={0},
+        parameters=parameters,
+        buffers=buffers,
+        weights=iter(model.checkpoint.items()),
+        counters=dict(checkpoint_bytes=32, checkpoint_tensors=2),
+        expected_counts=(32, 2),
+    )
+    assert torch.equal(model.model.layers[0].gemma_weight, before)
+    assert torch.count_nonzero(model.model.layers[0].weight) == 0
+    assert cache.nbytes == 64
+    assert (
+        entry.parameters["model.layers.0.weight"].weight_loader.__self__
+        is not model.model.layers[0]
+    )
+    with torch.no_grad():
+        metrics = cache.copy(entry, parameters, None, buffers)
+    expected = torch.arange(8).float().view(4, 2)
+    assert torch.equal(model.model.layers[0].weight, expected)
+    assert torch.equal(model.model.layers[0].gemma_weight, expected + 1)
+    assert metrics["h2d_bytes"] == 64 and metrics["h2d_copy_calls"] == 2
+
+
+class ReadOnlyLoaderParameter(nn.Parameter):
+    @property
+    def weight_loader(self):
+        return self._weight_loader
+
+
+def test_native_readonly_loader_property_is_rebound_through_backing_attribute(
+    pack_bank,
+):
+    model = Qwen3_5DerivedCpuPackingFixture()
+    layer = model.model.layers[0] = GemmaRMSNorm()
+    layer.weight = ReadOnlyLoaderParameter(torch.zeros(4, 2))
+    layer.weight._weight_loader = layer._weight_loader
+    cache = PreparedCpuWeights(cache_key="key", max_bytes=64, pinned=False)
+    entry = cache.prepare(
+        model=model,
+        layer_ids={0},
+        parameters=dict(model.named_parameters()),
+        buffers=dict(model.named_buffers()),
+        weights=iter(model.checkpoint.items()),
+        counters=dict(checkpoint_bytes=32, checkpoint_tensors=2),
+        expected_counts=(32, 2),
+    )
+    assert entry.parameters["model.layers.0.weight"].weight_loader.__self__ is not layer
+    assert torch.equal(layer.gemma_weight, torch.full((4, 2), -10.0))
+
+
+def test_warm_model_reload_restores_derived_buffer_without_native_loader(
+    pack_bank, monkeypatch
+):
+    b = pack_bank
+    model = Qwen3_5DerivedCpuPackingFixture()
+    layer = model.model.layers[0] = GemmaRMSNorm()
+    b.runner.model = model
+    loader = CanonicalCpuWeightReloader(model_runner=b.runner, stream=None)
+    loader.reload(generation=1, layer_ids={0})
+    layer.weight.data.zero_()
+    layer.gemma_weight.zero_()
+    b.runner._elastic_pp_prepared_graphs.building = False
+    monkeypatch.setattr(
+        Qwen3_5DerivedCpuPackingFixture,
+        "load_weights",
+        lambda *args: pytest.fail("warm native loader must not run"),
+    )
+    loader.reset_metrics()
+    loader.reload(generation=2, layer_ids={0})
+    assert model.ready == [1, 2]
+    assert loader.metrics["prepared_cpu_cache_hit"]
+    assert loader.metrics["h2d_bytes"] == 64
+    assert torch.equal(layer.gemma_weight, torch.arange(8).float().view(4, 2) + 1)
+
+
+def test_derived_buffer_bytes_are_admitted_before_any_allocation(
+    pack_bank, monkeypatch
+):
+    model = Qwen3_5DerivedCpuPackingFixture()
+    model.model.layers[0] = GemmaRMSNorm()
+    cache = PreparedCpuWeights(cache_key="key", max_bytes=63, pinned=False)
+    monkeypatch.setattr(
+        torch,
+        "empty_strided",
+        lambda *args, **kwargs: pytest.fail("must reject buffer budget first"),
+    )
+    with pytest.raises(RuntimeError, match="memory cap"):
+        cache.prepare(
+            model=model,
+            layer_ids={0},
+            parameters=dict(model.named_parameters()),
+            buffers=dict(model.named_buffers()),
+            weights=iter(model.checkpoint.items()),
+            counters=dict(checkpoint_bytes=32, checkpoint_tensors=2),
+            expected_counts=(32, 2),
+        )
 
 
 @pytest.mark.parametrize("cap", [0, -1])
