@@ -4,7 +4,7 @@
 
 ## 当前：减少迁移、最终暂停及推理干扰
 
-- [ ] **2026-11-12：目标GPU直接从已有CPU权重缓存恢复。** 显式`cpu_cache`路径复用初次加载的canonical CPU bank，只恢复新增层，跳过源GPU导出和Gloo，保持Graph地址及非活跃物理权重页释放。先前1081项去重CPU检查均有通过记录（9项内存准入失败后独立复核）。069节点首轮在启动Graph预热时拒绝GDN共享参数的名称别名，尚未进入运行时切换；101.123秒内正常清理并release，134项输入一致。已改按同一Parameter对象核对覆盖，仍拒绝仅共享storage的不同对象；新增回归先复现2个失败，修正后本文件22项通过。完整CPU及真实往返待验证，不能引用旧legacy耗时作为新结果。见[权重恢复设计](WEIGHT_STAGING.md)。
+- [x] **2026-11-12：目标GPU直接从已有CPU权重缓存恢复，有限验收通过。** 冻结`521b14cb725e`，完整CPU回归1084项全过；069节点35B BF16／B1／HiCache／NIXL／预热Graph的PP2→PP3→PP2通过。同源同节点旧路径完整扩／缩20.103／20.885秒，直接CPU bank为5.089／2.978秒；最后交接242／258 ms，客户端跨fence相邻token间隔269／273 ms。无GPU导出或Gloo权重传输，每方向约21.87 GB真实恢复；缩回中间GPU模型参数及物理权重为0，释放20.37890625 GiB。两种路径每方向2048输出token一致，运行时capture=0、实际Graph replay和CPU前缀loadback通过；134／131个输入、清理及正常release通过。保留首轮GDN别名拒绝及其CPU复现，按Parameter身份修正，未放宽地址／覆盖检查。每策略一次往返，不是重复均值；固定native TP1／EP1 Triton，冷暖生成等价、更多batch／模型及整卡归还未扩展，无独立reviewer。见[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_direct_cpu_cache_weights_20261111/summary.md)。
 
 - [ ] **2026-11-11：加速真实搬权重，保持非驻留要求。** 在 `codex/pp-weight-host-pipeline-20261111` 将逐张量pageable中转改为256 MiB有界pinned分块，经独立CUDA流异步D2H／H2D，CPU／Gloo传输，直接写入目标已准入权重页；不缓存候选GPU权重。冻结 `fcefe8604c65` 的1036项完整CPU回归通过（120.55秒），含12项新协议检查。同版本A100 legacy对照通过：完整扩／缩19.758／20.824秒；缩容源D2H约10.007秒、发送及等待10.235秒，目标H2D各1.026／0.861秒。pinned首个启动被Guard因另一正常实验占两台A100而拒绝，未启动模型；后续候选未运行。保留失败和准备记录，[PR #10](https://github.com/paprikaw/sglang/pull/10)保持Draft；新路径GPU正确性及提速尚未验证。下一次从新ID和源标签继续，不覆盖旧配置。见[设计与结果](WEIGHT_STAGING.md)。
 

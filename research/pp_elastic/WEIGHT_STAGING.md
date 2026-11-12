@@ -1,12 +1,14 @@
 # 加速真实权重搬运
 
+**2026-11-12结果。** 同一069节点、同源`521b14cb725e`、35B BF16／B1／HiCache／NIXL／预热Graph，直接CPU bank的完整扩／缩5.089／2.978秒，旧路径20.103／20.885秒，分别减少74.7%／85.7%。最后交接仍为242／258 ms，客户端跨fence相邻token间隔269／273 ms；主要缩短后台权重装载，没有消除最后同步。每方向恢复约21.87 GB；GPU导出、Gloo权重传输及候选权重复用均为0。缩回中间GPU物理权重为0，驱动可用显存增加20.37890625 GiB。两策略的2048-token输出逐一一致；每策略一次往返，未扩大到重复均值或其他模型／batch。[完整指标、来源与限制](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_direct_cpu_cache_weights_20261111/summary.md)。
+
 **新增：直接使用已有CPU缓存。** 用户要求避免源GPU导出。显式选择`--elastic-pp-weight-staging cpu_cache`后，各目标rank直接打开初次加载使用的canonical CPU bank，只读取自己新接手的层，调用模型原生checkpoint loader将融合／切片后的值写入目标既有参数地址。源rank不发送权重，不经Gloo，也不新增常驻GPU候选副本或从GPU建立新的CPU权重快照。当前资格范围是native Qwen3.5、TP1／EP1、Triton、无量化、overlap；运行时使用background，启动Graph预热的同步转换也使用同一CPU bank。通用默认暂保留legacy，实验显式选择新路径。
 
 **正确性边界。** 核对初次加载的cache key和完整checkpoint元数据，保持daemon pin及mmap至CUDA流结束，确认目标参数全部覆盖、对象／地址／shape／stride不变后才标记就绪。CPU bank缺失或身份变化直接失败，不回退磁盘或源GPU。Graph预热和候选物理权重页释放继续独立生效。计时区分打开缓存、原生加载（含CPU打包及H2D）、prepare、最后暂停和完整切换；原生加载时间不能解释为纯PCIe带宽。
 
 目标层同样执行原生post-load处理（例如可选的BF16 SwiGLU交错），处理后再核对地址；不重处理活跃层。候选层映射失败时保留Graph缓存模块的原生loader，允许在原地址重试。3项新增检查已在修正前复现遗漏，原失败记录保留。
 
-**2026-11-12：GPU发现及修正。** 069节点已有完整35B CPU bank，首轮初次加载的三rank缓存记录通过，但启动Graph预热在覆盖检查处退出。GDN的A_log／dt_bias同时注册在外层和RadixLinearAttention，原生loader仅报告一个名字；现在按同一Parameter对象核对覆盖，不能仅凭共享地址或storage认定已加载，实际加载字节同样按对象去重。新增回归在修正前复现两个拒绝，修正后本文件22项通过。首轮101.123秒内正常清理并release，134项输入一致；没有运行时切换耗时。完整CPU及A100往返继续验证，下述legacy仍是历史对照。
+**保留的GPU发现及修正。** 首轮初次加载的三rank缓存记录通过，但启动Graph预热在覆盖检查处退出。GDN的A_log／dt_bias同时注册在外层和RadixLinearAttention，原生loader仅报告一个名字；现在按同一Parameter对象核对覆盖，不能仅凭共享地址或storage认定已加载，实际加载字节同样按对象去重。新增回归在修正前复现两个拒绝，修正后本文件22项、完整CPU 1084项通过。首轮101.123秒内正常清理并release，134项输入一致；修正后新候选和同源旧路径对照均通过，分别163.951／168.954秒内完成监督清理，134／131项输入一致。下述旧节点legacy数据仍作历史对照，不覆盖新实测。
 
 **问题。** 原先约20秒测的不是纯CPU加载：每次重新从源GPU导出，经普通CPU内存／Gloo，再逐张量装入目标GPU。35B BF16每方向实际搬21.87 GB；这条链路的耗时不能直接当作PCIe的CPU→GPU带宽。
 
@@ -18,4 +20,4 @@ CPU缓存预算另含每worker最多256 MiB暂存；当前三worker最多768 MiB
 
 **已取得的证据。** 冻结 `fcefe8604c65`，1036项完整CPU检查通过，120.55秒。相同源版本／A100节点的legacy对照通过暖缓存连续性、实际Graph replay、非驻留权重及正常清理；完整扩／缩19.758／20.824秒。缩容源rank1的D2H累计10.007秒，发送及等待10.235秒；两个目标rank0／2的H2D各1.026／0.861秒。前两项说明导出和中转占大头；发送／接收含对端等待，不是独立链路带宽。监督含清理194.694秒，130个冻结输入一致。
 
-**尚未完成。** 新路径首个GPU尝试因两台A100被另一正常前台实验占用，被Guard在模型启动前拒绝；后续候选保持未运行，不打断该实验。原记录保留，不能宣称新路径GPU正确或提速。[PR #10](https://github.com/paprikaw/sglang/pull/10)保持Draft，未合入共同基线。[专题报告与指标](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_pinned_weight_staging_20261111/summary.md)。
+**pinned中转路径尚未验收。** 其首个GPU尝试因两台A100被另一正常前台实验占用，被Guard在模型启动前拒绝；后续pinned候选未运行。保留原记录，不能把上面的直接CPU bank结果作为pinned／Gloo路径的GPU资格。[PR #10](https://github.com/paprikaw/sglang/pull/10)记录当前范围，尚未合入共同基线。[历史中转诊断](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_pinned_weight_staging_20261111/summary.md)。

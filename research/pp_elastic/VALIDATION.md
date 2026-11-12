@@ -2,6 +2,10 @@
 
 ## 2026-11-12：CPU缓存直接恢复，GDN参数别名修正
 
+最终冻结`521b14cb725e0429b54999f1622250e65a7bc154`，tag `experiment/sglang/pp-direct-cpu-cache-weights-20261112-r2`。完整CPU回归1084项通过，零失败／错误／跳过，pytest 115.32秒；源码未变化。同一069节点、35B BF16／B1／native／HiCache／NIXL／prepared Graph、offload，直接CPU bank和同源legacy各一次PP2→PP3→PP2通过。完整扩／缩分别5.088962／2.978069秒与20.102884／20.884594秒；最后交接分别241.622／258.253 ms与231.269／287.113 ms。客户端跨已记录fence的相邻token到达间隔分别269.381／272.757 ms与257.468／301.757 ms，含正常Decode和传输，不是额外暂停的精确扣除值。
+
+两个方向各2048个输出token在两种路径间逐一一致，同版本暖缓存参考、实际Graph replay、运行时capture=0、在线KV及最终CPU前缀loadback通过。直接路径无源GPU导出／Gloo权重传输／GPU候选权重复用；缩回中间GPU模型参数及物理权重页为0，驱动可用显存增加21,881,683,968字节。直接／legacy的134／131项输入一致，监督163.951／168.954秒内正常清理并release。仅该模型／batch和一次往返；接班token位置随准备速度变化，不能把请求TPOT差异全归因于较少推理干扰。冷暖生成等价、更多batch／模型／量化、跨节点RDMA及整卡归还未扩展，无独立reviewer。精简报告、CSV、配置差异及跨路径输出核对见[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_direct_cpu_cache_weights_20261111/summary.md)。
+
 `2b77805f03c4`的1081项去重CPU检查均有通过记录：整批1072通过，9项因测试机cgroup内存余量耗尽被缓存daemon拒绝后，在相同源码独立复核全部通过，未放宽安全检查。不能称为一次零失败整批运行。
 
 069节点已有35B BF16 canonical CPU bank，首轮在启动Graph预热时，原生loader报告名称与GDN的重复注册Parameter别名不全相等，被覆盖检查拒绝。三rank初次缓存读取、134项冻结输入、owned cleanup和正常release通过；完整监督101.123秒，没有运行时转换性能结果。按Parameter对象核对别名覆盖并去重加载字节，仍检查完整checkpoint及所有对象／地址／shape／stride，仍拒绝仅共享storage的独立Parameter。新增三项回归中，两项在修正前失败，修正后本文件22项通过。原始记录位于`weight-direct-cpu-cache-20261111/gpu-direct-069-r1-20261112`；完整回归及GPU修正候选另记，不覆盖失败记录，无独立reviewer。
