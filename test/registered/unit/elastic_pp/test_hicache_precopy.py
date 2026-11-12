@@ -222,6 +222,49 @@ def test_prepared_backing_is_moved_without_reusing_stale_tree_or_live_source():
         adopt_prepared_host_stack(clone, prepared, allocator=allocator, params=params)
 
 
+def test_background_snapshot_leaves_pp_control_sends_owned_by_live_scheduler(
+    monkeypatch,
+):
+    from sglang.srt.elastic_pp import hicache_transition as module
+
+    live = cache()
+    work = object()  # Snapshot must neither wait for nor steal this handle.
+    live.work_list = [work]
+    monkeypatch.setattr(
+        module, "clone_cache_runtime_metadata", lambda _: NS(components={})
+    )
+    with pytest.raises(RuntimeError, match="retired work_list"):
+        module.assert_host_quiescent(live)
+    captured = HiCachePrecopy.capture(live, {}, 1)
+    assert live.work_list == [work]
+    assert captured.metadata_cache.work_list == []
+
+
+@pytest.mark.parametrize(
+    "owner,name",
+    [
+        ("cache", name)
+        for name in (
+            "ongoing_backup",
+            "ongoing_load_back",
+            "ongoing_prefetch",
+            "ongoing_write_through",
+        )
+    ]
+    + [
+        ("controller", name)
+        for name in ("load_queue", "write_queue", "ack_load_queue", "ack_write_queue")
+    ],
+)
+def test_background_snapshot_still_rejects_pending_cache_io(owner, name):
+    live = cache()
+    live.work_list = [object()]
+    live.cache_controller = NS()
+    setattr(live if owner == "cache" else live.cache_controller, name, [object()])
+    with pytest.raises(RuntimeError, match="requires retired"):
+        HiCachePrecopy.capture(live, {}, 1)
+
+
 def test_abort_discards_private_background_backing_and_resets_usage(monkeypatch):
     from sglang.srt.elastic_pp import hicache_transition as module
 

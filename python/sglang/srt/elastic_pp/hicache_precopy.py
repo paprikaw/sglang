@@ -112,7 +112,7 @@ class HiCachePrecopy:
         )
 
         started = time.monotonic()
-        assert_host_quiescent(cache)
+        assert_host_quiescent(cache, allow_pp_control_sends=True)
         nodes = host_nodes(cache)
         estimated = sum(
             node.slots.numel() * (t.numel() // max(1, t.shape[0])) * t.element_size()
@@ -133,10 +133,14 @@ class HiCachePrecopy:
             for (identity, component), node in nodes.items()
             for layer, tensors in pools.get(component, {}).items()
         }
+        metadata = clone_cache_runtime_metadata(cache)
+        # This private allocation template owns no serving control messages.
+        # The live scheduler keeps and retires its own send handles normally.
+        metadata.work_list = []
         return cls(
             generation=generation,
             records=records,
-            metadata_cache=clone_cache_runtime_metadata(cache),
+            metadata_cache=metadata,
             captured_seconds=time.monotonic() - started,
         )
 

@@ -127,7 +127,7 @@ def host_layer_views(pool, layer_ids):
     return views
 
 
-def assert_host_quiescent(cache):
+def assert_host_quiescent(cache, *, allow_pp_control_sends=False):
     if getattr(cache, "enable_session_radix_cache", False):
         raise NotImplementedError(
             "elastic HiCache session-radix frontier migration unsupported"
@@ -143,10 +143,18 @@ def assert_host_quiescent(cache):
         "ongoing_load_back",
         "ongoing_prefetch",
         "ongoing_write_through",
-        "work_list",
     ):
         if getattr(cache, name, None):
             raise RuntimeError(f"elastic HiCache requires retired {name}")
+    # PP readiness packets do not read or write CPU cache rows. A scheduler
+    # snapshot may leave those sends in flight; waiting here can deadlock the
+    # serving ring. Fence-time callers must still retire the old communicator.
+    if not allow_pp_control_sends and getattr(cache, "work_list", None):
+        raise RuntimeError("elastic HiCache requires retired work_list")
+    controller = getattr(cache, "cache_controller", None)
+    for name in ("load_queue", "write_queue", "ack_load_queue", "ack_write_queue"):
+        if getattr(controller, name, None):
+            raise RuntimeError(f"elastic HiCache requires retired controller {name}")
 
 
 class HiCacheTransitionAdapter:
