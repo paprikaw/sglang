@@ -1,4 +1,4 @@
-"""One Guard-owned 122B/A100 P2 + D(PP2->PP3->PP2) qualification.
+"""One Guard-owned 122B/A100 P2 + D(PP2->PP3) qualification.
 
 Not an autoscaling benchmark. Admission is quiescent during each synchronous
 transition. The physical metadata workers stay resident; a separate process
@@ -57,7 +57,7 @@ def memory_size_json(value):
     return int(value)
 
 
-def prepare(run):
+def prepare(run, *, roundtrip=False):
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
     dirty = subprocess.check_output(["git", "-C", str(ENGINE), "status", "--porcelain"], text=True)
@@ -67,8 +67,8 @@ def prepare(run):
     key = run / "admin.key"
     key.write_text(secrets.token_hex(32)); key.chmod(0o600)
     spec = json.loads((PRIOR / "dashboard_spec.json").read_text())
-    spec.update(id=run.name, port=29470, runtime_dir=str(run / "dashboard_guard"),
-                gpu_lease_ttl_s=30, title="122B A100 P/D PP2→PP3→PP2 qualification")
+    spec.update(id=run.name, port=29570, runtime_dir=str(run / "dashboard_guard"),
+                gpu_lease_ttl_s=30, title="122B A100 P/D retained-HiCache PP2→PP3 qualification")
     cache = spec["model_cache"]
     cache["usage_logs"] = {}
     cache["node_specs"] = {}
@@ -85,8 +85,8 @@ def prepare(run):
         cfg.update(id=run.name, engine_root=str(ENGINE), engine_commit=revision,
                    guard_scripts=str(GUARD), admin_key_file=str(key), code_root=str(ROOT),
                    usage_audit_hostname=socket.gethostname().split('.')[0],
-                   role=role, layouts=[row], port=29481 + index * 10,
-                   dist_port=29482 + index * 10, bootstrap_port=29479)
+                   role=role, layouts=[row], port=29581 + index * 10,
+                   dist_port=29582 + index * 10, bootstrap_port=29579)
         nodes[node] = cfg
         node_spec = json.loads((PRIOR / "cache" / f"{node}.json").read_text())
         node_path = run / "cache" / f"{node}.json"
@@ -101,8 +101,9 @@ def prepare(run):
                   admin_key_file=str(key), engine_commit=revision,
                   engine_root=str(ENGINE), output_tokens=2048,
                   admission="quiescent P/D transfers during synchronous fences",
-                  logical_gpu_counts=[4, 5, 4], resident_worker_gpus=5,
-                  reserved_gpus=8, gpu_reuse_probe_gib=64)
+                  logical_gpu_counts=[4, 5, 4] if roundtrip else [4, 5],
+                  resident_worker_gpus=5, reserved_gpus=8,
+                  roundtrip=roundtrip, gpu_reuse_probe_gib=64 if roundtrip else 0)
     save(run / "config.json", config)
     spec["tasks"] = [dict(id="qualification", label="Request/cache/reuse acceptance",
         root=str(run / "task"), expected=1, nodes=list(nodes), controller_script=str(Path(__file__).resolve()))]
@@ -118,7 +119,7 @@ def prepare(run):
     save(run / "dashboard_spec.json", spec)
     save(run / "preparation.json", dict(command=[PYTHON, str(GUARD / "dashboard_guard.py"),
         "run", "--spec", str(run / "dashboard_spec.json"), "--resource-choice", "auto",
-        "--exit-after-run", "--", PYTHON, str(Path(__file__).resolve()), "--run", str(run)]))
+        "--", PYTHON, str(Path(__file__).resolve()), "--run", str(run)]))
     print(json.dumps({"run": str(run), "source": revision, "frozen_files": len(paths)}))
 
 
@@ -385,7 +386,10 @@ def controller(run, root):
         try:
             with cf.ThreadPoolExecutor(max_workers=1) as executor:
                 active = executor.submit(replay.request_one, p, d, key, prompt, root["output_tokens"], 0, True)
-                for generation, counts in ((1, [16, 16, 16]), (2, [24, 0, 24])):
+                transitions = [(1, [16, 16, 16])]
+                if root.get("roundtrip"):
+                    transitions.append((2, [24, 0, 24]))
+                for generation, counts in transitions:
                     minimum = 8 if generation == 1 else events[-1][0] + 8
                     deadline = time.monotonic() + 90
                     while not events or events[-1][0] < minimum:
@@ -413,22 +417,26 @@ def controller(run, root):
                         time.sleep(.1)
                     probe.validate_fenced_decode(after, generation, (0, 2) if generation == 1 else (0, 1, 2), root["output_tokens"])
                     results["transitions"][-1]["after"] = after
-                (run / "probe.trigger").touch(mode=0o600)
-                wait_file(run / "gpu_reuse_started.json", 90)
+                if root.get("roundtrip"):
+                    (run / "probe.trigger").touch(mode=0o600)
+                    wait_file(run / "gpu_reuse_started.json", 90)
                 results["active"] = active.result(timeout=240)
         finally:
             replay.stream = original_stream
         results["stream_events"] = events
         completed = state("completed")
+        continuity_paths = [(1, (0, 2), (0, 1, 2))]
+        if root.get("roundtrip"):
+            continuity_paths.append((2, (0, 1, 2), (0, 2)))
         results["continuity"] = [probe.validate_uninterrupted_decode(
             completed, generation, results["active"], sources, targets
-        ) for generation, sources, targets in (
-            (1, (0, 2), (0, 1, 2)), (2, (0, 1, 2), (0, 2))) ]
+        ) for generation, sources, targets in continuity_paths]
         results["exact_output_match"] = results["reference"]["output_ids"] == results["active"]["output_ids"]
         if not results["exact_output_match"] or not results["active"]["output_ids"]:
             raise AssertionError("Transition output IDs differ from unchanged-layout warm reference")
-        wait_file(run / "gpu_reuse_done.json", 60)
-        results["gpu_reuse"] = json.loads((run / "gpu_reuse_started.json").read_text())
+        if root.get("roundtrip"):
+            wait_file(run / "gpu_reuse_done.json", 60)
+            results["gpu_reuse"] = json.loads((run / "gpu_reuse_started.json").read_text())
         results["after_handoff"] = replay.request_one(p, d, key, prompt, 32, 0, True)
         results["demote"] = probe.demote_cpu_prefixes(http)
         results["cpu_restore"] = replay.request_one(p, d, key, prompt, 32, 0, True)
@@ -436,9 +444,11 @@ def controller(run, root):
         results["restore_ids_match"] = results["cpu_restore"]["output_ids"] == results["after_handoff"]["output_ids"]
         if not results["restore_ids_match"]:
             raise AssertionError("HiCache CPU restore changed output IDs")
-        restored = probe.fresh_prefix_restores(final, results["demote"]["commanded_at"], (0, 2), 512)
+        target_ranks = (0, 2) if root.get("roundtrip") else (0, 1, 2)
+        restored = probe.fresh_prefix_restores(final, results["demote"]["commanded_at"], target_ranks, 512)
         results.update(passed=True, cpu_restores=restored, final_state=final,
-                       whole_worker_gpu_exit=False, independent_gpu_reuse_verified=True)
+                       whole_worker_gpu_exit=False,
+                       independent_gpu_reuse_verified=bool(root.get("roundtrip")))
     except BaseException as error:
         results.update(error=f"{type(error).__name__}: {error}", traceback=traceback.format_exc())
         raise
@@ -481,10 +491,11 @@ def main():
     parser.add_argument("--run", type=Path, required=True)
     for option in ("prepare", "worker", "engine", "probe"):
         parser.add_argument("--" + option, action="store_true")
+    parser.add_argument("--roundtrip", action="store_true")
     args = parser.parse_args()
     run = args.run.resolve()
     if args.prepare:
-        return prepare(run)
+        return prepare(run, roundtrip=args.roundtrip)
     root = json.loads((run / "config.json").read_text())
     if args.worker:
         return worker(run, root)
