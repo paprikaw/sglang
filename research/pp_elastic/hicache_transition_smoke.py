@@ -1209,7 +1209,7 @@ def worker(run, cfg):
                         generation,
                         (0, 2) if generation == 1 else (0, 1, 2),
                         cfg.get("backing", "overlap"),
-                        shared_host=cfg.get("hicache_shared_host", False),
+                        cfg.get("hicache_shared_host", False),
                     )
                     if cfg.get("cuda_graph"):
                         validate_decode_graph_states(
