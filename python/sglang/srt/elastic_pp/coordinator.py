@@ -101,6 +101,11 @@ class ElasticPPMigrationCoordinator:
         if self.backing == "cpu_spill" and self.strategy not in {"sync", "batched"}:
             raise ValueError("CPU-spill backing requires sync or batched transition")
         self.cache_transition = cache_transition
+        # P/D transports pin registered CUDA addresses independently of the
+        # allocator.  Hooks run only on the scheduler thread at the fence.
+        self.before_backing_release = None
+        self.after_backing_restore = None
+        self.after_topology_commit = None
         self.enable_kv_patch = (
             bool(getattr(args, "enable_elastic_pp_kv_patch", False))
             if enable_kv_patch is None
@@ -623,6 +628,8 @@ class ElasticPPMigrationCoordinator:
         before = sample() if device.type == "cuda" else None
         # Partial release failures also require source reconstruction.
         self._source_backing_attempted = True
+        if self.before_backing_release is not None:
+            self.before_backing_release()
         invalidate = getattr(
             self.model_runner, "invalidate_elastic_pp_attention_state_views", None
         )
@@ -1233,6 +1240,8 @@ class ElasticPPMigrationCoordinator:
                 # From this point onward the local source generation cannot be
                 # restored, even if route publication or peer commit fails.
                 self._timed("fence_route_publish", commit_topology, transition.target)
+                if self.after_topology_commit is not None:
+                    self.after_topology_commit()
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
             reports = self._consensus(
@@ -1335,6 +1344,10 @@ class ElasticPPMigrationCoordinator:
                 if release_snapshot is not None:
                     release_snapshot(transition)
                 if cuda_cleanup:
+                    if transition.target.layer_range(self.rank).empty:
+                        # Return freed layer/KV allocator blocks to the driver;
+                        # residual resident control/context memory is separate.
+                        torch.cuda.empty_cache()
                     logger.info(
                         "Elastic PP generation=%d rank=%d cleanup CUDA allocated "
                         "%.3f -> %.3f GiB",
@@ -1404,6 +1417,8 @@ class ElasticPPMigrationCoordinator:
                         transition
                     ),
                 )
+            if self.after_backing_restore is not None:
+                attempt("source P/D registration restore", self.after_backing_restore)
         if errors:
             raise RuntimeError("; ".join(errors))
 

@@ -202,6 +202,16 @@ class KVArgsRegisterInfo:
 
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     AUX_DATA_HEADER = b"AUX_DATA"
+    supports_partial_pp_transfer = True
+
+    def _partial_layer_transfer(self, session_id):
+        peer = getattr(self, "decode_kv_args_table", {}).get(session_id)
+        return (
+            peer is not None
+            and getattr(peer, "dst_pp_size", 1) > 1
+            and peer.dst_pp_size != self.pp_size
+            and self.pp_size > 1
+        )
 
     def _supports_pp1_to_pp_decode(self, info) -> bool:
         # This path uses global per-buffer layer IDs, never a positional slice
@@ -702,6 +712,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_data_indices: Optional[npt.NDArray[np.int32]] = None,
         dst_device_data_ptrs: Optional[set[int]] = None,
         allow_destination_subset: bool = False,
+        allow_partial_overlap: bool = False,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -746,6 +757,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     len(dst_data_ptrs),
                     allow_positional_fallback=self.pp_size == 1,
                     allow_destination_subset=allow_destination_subset,
+                    allow_partial_overlap=allow_partial_overlap or self._partial_layer_transfer(mooncake_session_id),
                 )
                 layers_params = [
                     (src_data_ptrs[i], dst_data_ptrs[j], item_lens[i]) for i, j in pairs
@@ -948,6 +960,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_device_data_indices=dst_device_kv_indices,
             dst_device_data_ptrs=dst_device_kv_ptrs,
             allow_destination_subset=self.pp_size == 1 and dst_pp_size > 1,
+            allow_partial_overlap=self._partial_layer_transfer(mooncake_session_id),
         )
 
     def send_kvcache_dcp(
@@ -1531,6 +1544,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             len(dst_state_data_ptrs),
             allow_positional_fallback=self.pp_size == 1,
             allow_destination_subset=self.pp_size == 1 and dst_pp_size > 1,
+            allow_partial_overlap=self._partial_layer_transfer(req.mooncake_session_id),
         )
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]
@@ -1604,6 +1618,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             len(dst_state_data_ptrs),
             allow_positional_fallback=self.pp_size == 1,
             allow_destination_subset=self.pp_size == 1 and dst_pp_size > 1,
+            allow_partial_overlap=self._partial_layer_transfer(req.mooncake_session_id),
         )
         for i, j in pairs:
             dst_state_ptr = dst_state_data_ptrs[j]

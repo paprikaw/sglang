@@ -875,6 +875,7 @@ def build_transfer_entry_pairs(
     n_dst: int,
     allow_positional_fallback: bool = False,
     allow_destination_subset: bool = False,
+    allow_partial_overlap: bool = False,
 ) -> List[Tuple[int, int]]:
     """Pair transfer entries by layer id, preserving tensor occurrences.
 
@@ -884,6 +885,11 @@ def build_transfer_entry_pairs(
     """
     if allow_destination_subset and (not src_layer_ids or not dst_layer_ids):
         raise RuntimeError("PP expansion requires layer metadata on both PD peers")
+    if allow_partial_overlap:
+        if len(src_layer_ids) != n_src or len(dst_layer_ids) != n_dst:
+            raise RuntimeError("Partial PP transfer requires complete global layer ids")
+        if n_dst == 0:
+            return []
     if n_src == 0:
         return []
     if bool(src_layer_ids) != bool(dst_layer_ids):
@@ -907,7 +913,7 @@ def build_transfer_entry_pairs(
             dst_pos.setdefault(lid, deque()).append(j)
         pairs = []
         for i, lid in enumerate(src_layer_ids):
-            if allow_destination_subset and lid not in dst_pos:
+            if (allow_destination_subset or allow_partial_overlap) and lid not in dst_pos:
                 continue
             if not dst_pos.get(lid):
                 raise RuntimeError(

@@ -1094,6 +1094,11 @@ class ServerArgs:
         "Enable generation-stamped elastic pipeline parallelism over the fixed resident PP group.",
         NS("parallel"),
     ] = False
+    elastic_pp_disagg_decode: A[
+        bool,
+        "Experimental fenced Decode PP migration; requires quiescent P/D transfers, sync CPU-spill and Eager execution.",
+        NS("parallel"),
+    ] = False
     elastic_pp_initial_partition: A[
         Optional[str],
         "Comma-separated initial layer counts for every resident elastic PP rank.",
@@ -8138,10 +8143,9 @@ class ServerArgs:
                 "and batch-local PP routing are being validated"
             )
         if self.disaggregation_mode != "null":
-            raise ValueError(
-                "elastic PP currently requires colocated serving; the separate "
-                "prefill/decode PP drain loops are not yet wired to the topology fence"
-            )
+            from sglang.srt.elastic_pp.pd_registration import validate_decode_args
+
+            validate_decode_args(self)
         if self.elastic_pp_kv_backend == "kvcached" and os.getenv(
             "KVCACHED_AUTOPATCH", ""
         ).lower() in {"1", "true", "yes", "on"}:
