@@ -1,5 +1,7 @@
 # CPU HiCache后台准备与增量交接
 
+历史 CPU 缓存能否不随切换全部交接、而在切换后按需读取，见[候选设计](DISTRIBUTED_HICACHE.md)。该路径尚未实现，下文描述的仍是完整目标 CPU 池交接。
+
 2026-11-13。在[已有复制优化](HICACHE_FENCE_COPY.md)上增加显式`--elastic-pp-hicache-background`，要求fast-copy和background／overlap。HiCache继续开启，候选GPU权重维持offload。状态见[统一清单](TODO.md)。
 
 **先取安全快照。** 调度线程在无在途HiCache读写时，复制CPU前缀的独立行和逻辑身份；后台不遍历活跃树，也不保留可被复用的源行视图。PP就绪控制消息仍由活跃调度器持有和收尾，不阻塞CPU行快照；真正的HiCache队列／ack必须清空，最终切换仍退休旧通信。快照每rank上限1 GiB，分配前检查；忙碌或超限时整组回退到已有完整交接。首次快照仍可能短暂占用调度线程，必须记录后台期间的实际token间隔，不能只报告最终暂停。

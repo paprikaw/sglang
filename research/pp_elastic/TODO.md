@@ -4,6 +4,8 @@
 
 ## 当前：减少迁移、最终暂停及推理干扰
 
+- [ ] **候选：历史 CPU HiCache 按需读取，移出全量交接。** 已核对当前代码：历史 CPU 行仍需映射到完整目标 CPU 池，发布后旧池退休，尚无旧池远程读取；弹性路径也拒绝 L3。先考虑同节点 PP2↔PP3 保留旧 CPU 缓存与目录引用，活跃 GPU 状态正确交接后恢复，再按请求读取／后台整理；补齐全局层定位、块版本／租约、GDN 完整性和独立 CPU 所有者。保持 HiCache 与候选权重 offload。见[简要设计](DISTRIBUTED_HICACHE.md)。本条只完成调研，代码及 GPU 验证均未开始。
+
 - [x] **2026-11-13：拆解后台准备卡顿与缩容190 ms，CPU批量及旧KV基础复制有界通过。** 第一组同源对照，CPU批量处理使扩／缩最终暂停113.3／184.4→104.7／138.0 ms；复用同一冻结交接的精确核验，省去保留层重复扫描。第二组同源且两边均启用CPU批量，仅切换旧GPU KV基础复制，缩容最终暂停136.0→87.0 ms，完整转换0.885→0.844秒，最终待补2103→55行、复制等待50.5→6.1 ms，接收确认仍约5.9 ms。扩容103.8→106.1 ms，无额外提速；准备期扩／缩最大token间隔74.6／131.2→72.7／135.7 ms，缩容平均11.73→11.85 ms，未改善。时间线定位到各阶段先后的调度线程CPU快照，而非把整段后台权重加载算成暂停。1181项完整CPU检查及两组各模式2048-token暖输出／CPU前缀loadback／Graph replay／清理通过；四次各138项冻结输入匹配，每次含清理均小于5分钟。HiCache、CPU权重缓存及候选权重offload保持；源为a0b42990d36e／67df645bc2b8，两组不混成重复均值。旧67.5 ms属于在线KV补丁收尾，非GDN独占。见[分项报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_batch_io_20261113/summary.md)和[实现说明](HICACHE_BACKGROUND.md)。
 
 - [x] **2026-11-13：目标CPU池与HiCache稳定行后台预搬，有界验收通过。** 同源A100／35B BF16／B1，各模式一次正式往返，扩／缩暂停157.9／193.6→115.2／189.6 ms；客户端跨切换间隔183.7／207.3→141.0／203.2 ms。准备期间最大token间隔25.0／22.5→76.4／67.8 ms，完整扩／缩1.115／0.725→1.336／0.912秒。每方向117,309,440 B稳定CPU前缀预搬、最后CPU数据补传0 B。1162项完整CPU检查、两个方向各2048输出及两模式逐token一致、实际CPU前缀恢复、Graph replay和正常清理通过；候选GPU物理权重仍为0。初始CPU快照和最终内容核验仍消耗调度／暂停时间，缩容另有最新GDN／KV收尾；不宣称无中断、整体吞吐提高或整卡归还。 代际结束清除临时快照／传输引用，新代重置计数；历史、HiCache及CPU权重缓存保留。源码 b5467d3a432d，138项冻结输入各自一致。见[机制说明](HICACHE_BACKGROUND.md)及[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_background_20261113/summary.md)。
