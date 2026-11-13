@@ -1385,9 +1385,30 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
             if st == StateType.MAMBA:
+                src_layout = list(src_item_lens)
+                dst_layout = list(dst_item_lens)
+                destination_subset = (
+                    self.pp_size == 1
+                    and getattr(target_rank_registration_info, "dst_pp_size", 1) > 1
+                )
+                if destination_subset or self._partial_layer_transfer(req.mooncake_session_id):
+                    pairs = build_transfer_entry_pairs(
+                        src_state_layer_ids, dst_state_layer_ids,
+                        len(src_data_ptrs), len(dst_data_ptrs),
+                        allow_destination_subset=destination_subset,
+                        allow_partial_overlap=not destination_subset,
+                    )
+                    if (len(src_item_lens) != len(src_data_ptrs)
+                            or len(dst_item_lens) != len(dst_data_ptrs)):
+                        raise RuntimeError("Mamba per-layer pointer/byte metadata is incomplete")
+                    # Unequal PP stages contain different layers. Compare only
+                    # the tensors this sender actually transfers, including
+                    # the valid empty intersection of a dormant Decode stage.
+                    src_layout = [src_item_lens[source] for source, _ in pairs]
+                    dst_layout = [dst_item_lens[target] for _, target in pairs]
                 if (not src_dim_per_tensor or not dst_dim_per_tensor) and list(
-                    src_item_lens
-                ) != list(dst_item_lens):
+                    src_layout
+                ) != list(dst_layout):
                     raise RuntimeError(
                         "Mamba state layouts differ between prefill and decode "
                         f"(src item_lens={src_item_lens}, dst item_lens="
