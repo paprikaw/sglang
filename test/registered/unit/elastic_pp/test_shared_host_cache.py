@@ -369,7 +369,7 @@ def test_failed_shared_target_construction_never_retires_source(monkeypatch):
     ct = ComponentType.FULL
     pool, controller, group = object(), object(), object()
     params_type = make_dataclass(
-        "Params", ["token_to_kv_pool_allocator", "req_to_token_pool"]
+        "Params", ["token_to_kv_pool_allocator", "req_to_token_pool", "pp_cache_group"]
     )
     source = NS(
         host_pool_group=group,
@@ -379,7 +379,7 @@ def test_failed_shared_target_construction_never_retires_source(monkeypatch):
         components={ct: NS(_full_kv_pool_host=pool)},
         req_to_token_pool=object(),
         token_to_kv_pool_allocator=NS(),
-        _hicache_init_params=params_type(None, None),
+        _hicache_init_params=params_type(None, None, object()),
         _hicache_init_server_args=NS(),
     )
     clone = copy.copy(source)
@@ -388,6 +388,7 @@ def test_failed_shared_target_construction_never_retires_source(monkeypatch):
     clone.release_host_resources = lambda: retired.append(clone.host_pool_group)
 
     def fail_init(*args):
+        assert args[1].pp_cache_group is None
         assert clone.host_pool_group is None
         assert clone.cache_controller is None
         assert clone.full_kv_pool_host is None
@@ -408,3 +409,61 @@ def test_failed_shared_target_construction_never_retires_source(monkeypatch):
     assert source.host_pool_group is group
     assert source.cache_controller is controller
     assert source.full_kv_pool_host is source.components[ct]._full_kv_pool_host is pool
+    assert source._hicache_init_params.pp_cache_group is not None
+
+
+def test_dormant_shared_view_uses_bank_capacity_without_a_collective(bank, monkeypatch):
+    from sglang.srt.elastic_pp.hicache_transition import build_dormant_host_stack
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.hybrid_cache import (
+        hybrid_cache_controller,
+        hybrid_pool_assembler,
+    )
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+    source = NS(
+        host_pool_group=NS(
+            entries=[
+                NS(
+                    name=name,
+                    host_pool=NS(page_size=1, layout="page_first"),
+                    is_primary_index_anchor=name == PoolName.KV,
+                )
+                for name in (PoolName.KV, PoolName.MAMBA)
+            ]
+        ),
+        cache_controller=NS(
+            write_policy="write_through_selective", io_backend="kernel"
+        ),
+        host_memory_mode="cache",
+    )
+    clone = NS(
+        components={ct: NS() for ct in (ComponentType.FULL, ComponentType.MAMBA)}
+    )
+    params = NS(
+        token_to_kv_pool_allocator=NS(),
+        page_size=1,
+        tp_cache_group=None,
+        attn_cp_cache_group=None,
+        attn_tp_cache_group=None,
+        pp_cache_group=None,
+    )
+    projected = NS(full_kv_pool=NS(size=4), mamba_pool=NS(size=4))
+    monkeypatch.setattr(
+        hybrid_pool_assembler,
+        "_logical_host_pool_size",
+        lambda *a: pytest.fail("unexpected capacity collective"),
+    )
+
+    def controller(*args, **kwargs):
+        assert kwargs["pp_group"] is None
+        return NS()
+
+    monkeypatch.setattr(hybrid_cache_controller, "HybridCacheController", controller)
+    with use_shared_host_bank(bank):
+        build_dormant_host_stack(
+            clone, source=source, projected=projected, params=params
+        )
+    assert clone.host_pool_group.get_pool(PoolName.KV).size == 32
+    assert clone.host_pool_group.get_pool(PoolName.MAMBA).size == 8
+    assert bank.leases == 0

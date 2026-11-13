@@ -8,6 +8,7 @@
 - [ ] **本轮实施中：同节点共享 CPU backing。** 优先在服务启动时建立按全局层管理的共享内存，PP 切换重建受控视图和设备映射，历史载荷不重新复制。先限定 page-first、kernel I/O、单节点固定 TP1／EP1、预热 Graph 和 native KV；显式检查前缀槽位与回收状态一致，跨 rank 不一致时拒绝提交。共享内存持有者、CUDA 注册、GDN stride 及回滚需分别检查；尚无新 GPU 结果。
 
 - [x] **同节点 CPU HiCache 原位复用的首版代码及定向 CPU 检查。** 启动建立 memfd 共享存储，按层借用视图并保留物理行间距；切换跳过历史载荷复制，核对原阶段槽位及回收状态一致后交接。107项定向检查通过，覆盖创建者退出后仍可访问、真实 host pool／GDN stride、元数据拒绝和目标准备失败保护；完整 CPU 回归及 GPU 验收未完成，不能宣称暂停收益。见[接入范围](SHARED_HOST_CACHE.md)。
+- [ ] **共享池 GPU 启动与往返验收。** 首版 `e8cea6e148b1` 的1205项完整 CPU 回归通过，冻结期间源码不变；A100 `gpu-shared-069-r1` 在启动建立视图时阻塞，未进入请求测试，254.904秒内完成 owned cleanup 和正常租约释放，142项冻结输入匹配。定位到只在活跃阶段重建 controller，却创建要求全组进入的 L3 Gloo 组；L2-only 共享视图现改为不建这类组，空阶段直接沿用共享容量、不进入旧容量 MIN。修正候选正在检查，失败保留于 `hicache-shared-host-20261113/gpu-shared-069-r1`；[PR #11](https://github.com/paprikaw/sglang/pull/11)保持 Draft。
 
 - [x] **2026-11-13：拆解后台准备卡顿与缩容190 ms，CPU批量及旧KV基础复制有界通过。** 第一组同源对照，CPU批量处理使扩／缩最终暂停113.3／184.4→104.7／138.0 ms；复用同一冻结交接的精确核验，省去保留层重复扫描。第二组同源且两边均启用CPU批量，仅切换旧GPU KV基础复制，缩容最终暂停136.0→87.0 ms，完整转换0.885→0.844秒，最终待补2103→55行、复制等待50.5→6.1 ms，接收确认仍约5.9 ms。扩容103.8→106.1 ms，无额外提速；准备期扩／缩最大token间隔74.6／131.2→72.7／135.7 ms，缩容平均11.73→11.85 ms，未改善。时间线定位到各阶段先后的调度线程CPU快照，而非把整段后台权重加载算成暂停。1181项完整CPU检查及两组各模式2048-token暖输出／CPU前缀loadback／Graph replay／清理通过；四次各138项冻结输入匹配，每次含清理均小于5分钟。HiCache、CPU权重缓存及候选权重offload保持；源为a0b42990d36e／67df645bc2b8，两组不混成重复均值。旧67.5 ms属于在线KV补丁收尾，非GDN独占。见[分项报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_batch_io_20261113/summary.md)和[实现说明](HICACHE_BACKGROUND.md)。
 

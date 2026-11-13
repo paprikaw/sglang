@@ -771,6 +771,10 @@ def _prepare_target_host_cache(
         token_to_kv_pool_allocator=allocator,
         req_to_token_pool=clone.req_to_token_pool,
     )
+    if reuse_shared:
+        from sglang.srt.elastic_pp.shared_host_cache import shared_host_params
+
+        params = shared_host_params(params)
     metrics["host_target_metadata_seconds"] = time.monotonic() - started
     try:
         started = time.monotonic()
@@ -1503,6 +1507,7 @@ def build_dormant_host_stack(clone, *, source, projected, params):
     import copy
     import threading
 
+    from sglang.srt.elastic_pp.shared_host_cache import shared_pool_capacity
     from sglang.srt.mem_cache.hicache_storage import PoolName
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         HybridCacheController,
@@ -1528,8 +1533,17 @@ def build_dormant_host_stack(clone, *, source, projected, params):
         # --hicache-size is fixed. The dormant target must join the same
         # collectives with a neutral value and adopt the new topology's
         # capacity, rather than retaining the source topology's capacity.
+        shared_size = shared_pool_capacity(
+            "full" if entry.name == PoolName.KV else "mamba"
+        )
         entry.host_pool = LogicalHostPool(
-            _logical_host_pool_size(entry.device_pool.size, old.host_pool.page_size),
+            (
+                shared_size
+                if shared_size is not None
+                else _logical_host_pool_size(
+                    entry.device_pool.size, old.host_pool.page_size
+                )
+            ),
             old.host_pool.page_size,
             old.host_pool.layout,
         )

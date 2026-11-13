@@ -1,5 +1,11 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-13：共享 CPU HiCache，GPU 资格进行中
+
+PR #10 已以 `8570a9153a76` 合入项目分支。新任务 [PR #11](https://github.com/paprikaw/sglang/pull/11) 的首版 `e8cea6e148b1` 通过1205项完整 CPU 回归（117.94秒），源码未变。首次完整检查的两个旧验证替身接口失败已经修复，原记录保留。Black通过；scheduler和unified cache中两处旧导入的isort欠账在基点也存在，没有宣称全仓CI通过。
+
+A100 `gpu-shared-069-r1` 在启动共享视图时阻塞，未进入请求，最终由250秒工作时限终止；完整监督254.904秒，owned cleanup／正常release通过，142项冻结输入一致。源 controller 会为 L3 建 PP Gloo 组，只有活跃rank重建时不能进入该collective；共享 L2-only 候选现去掉这类建组，空阶段使用共享容量、跳过旧容量MIN。修正后CPU／GPU资格单列后续结果，不复用首版CPU通过为新GPU通过。原始证据位于 `artifacts/source_integration/sglang-pp-elastic-20261105/hicache-shared-host-20261113`；[接入说明](SHARED_HOST_CACHE.md)。
+
 ## 2026-11-13：CPU批量HiCache及旧GPU KV基础复制
 
 两组独立同源开关对照均为同A100节点／35B BF16／B1／TP1 EP1 Triton、HiCache／CPU预打包权重／NIXL／启动Graph／候选权重offload，每模式一次PP2→PP3→PP2、每方向2048输出。第一组冻结a0b42990d36e37459ae1e4dc3353fc75ff96b116／tag experiment/sglang/pp-hicache-batch-io-20261113-r1，1173项CPU检查，批量I/O将扩／缩最终暂停113.3／184.4→104.7／138.0 ms。第二组冻结67df645bc2b833400405d19026959f57f56f260f／tag experiment/sglang/pp-hicache-batch-io-20261113-r2，1181项CPU检查全过、零失败／错误／跳过，pytest117.830秒、监督134.252秒、源码不变。两边保留CPU批量，仅切换旧KV基础复制，缩容最终暂停136.0→87.0 ms，完整转换0.885→0.844秒，客户端跨fence间隔186.2→100.9 ms；最终待补2103→55行、复制等待50.5→6.1 ms，接收确认约5.9 ms。扩容103.8→106.1 ms，无额外提速。

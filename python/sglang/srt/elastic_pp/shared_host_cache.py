@@ -8,6 +8,7 @@ historical payload or free the bank when a source cache generation retires.
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import mmap
 import os
@@ -18,6 +19,7 @@ from pathlib import Path
 import torch
 
 _active_bank = ContextVar("elastic_pp_shared_host_bank", default=None)
+logger = logging.getLogger(__name__)
 
 
 def _boot_identity():
@@ -281,6 +283,23 @@ def shared_pool_allocator(kind, device_pool):
     return None if bank is None else bank.allocator(kind, device_pool)
 
 
+def shared_pool_capacity(kind):
+    bank = _active_bank.get()
+    return None if bank is None else bank.schema["capacities"][kind]
+
+
+def shared_host_params(params):
+    """L2-only view construction must not create new PP storage groups.
+
+    Dormant ranks do not rebuild physical views at startup. Entering new_group
+    from only active ranks deadlocks. These groups serve L3, which this mode
+    explicitly excludes; normal L2 event consensus belongs to the scheduler.
+    """
+    import dataclasses
+
+    return dataclasses.replace(params, pp_cache_group=None)
+
+
 def validate_shared_host_args(args):
     if not (
         args.enable_elastic_pp
@@ -448,6 +467,7 @@ def initialize_scheduler_shared_host(scheduler):
         peers = group.all_gather_object(report)
         if len(peers) != group.world_size or any(not r["ok"] for r in peers):
             raise RuntimeError(f"shared CPU startup {stage} failed: {peers}")
+        logger.info("ELASTIC_PP_SHARED_HOST rank=%d startup_stage=%s", rank, stage)
         return [r["value"] for r in peers]
 
     def inspect_source():
@@ -512,7 +532,8 @@ def initialize_scheduler_shared_host(scheduler):
                 detach_inherited_host_stack(clone)
                 with use_shared_host_bank(bank):
                     clone.init_hicache(
-                        source._hicache_init_server_args, source._hicache_init_params
+                        source._hicache_init_server_args,
+                        shared_host_params(source._hicache_init_params),
                     )
                 clone._elastic_pp_shared_host_bank = bank
             return True
