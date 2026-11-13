@@ -1,6 +1,6 @@
 # SGLang 研究基线
 
-2026-11-13：PR #10 已以 `8570a9153a76` 合入项目分支。后续[同节点共享 CPU HiCache](SHARED_HOST_CACHE.md)在独立任务分支实现，切换时复用历史存储、更新按层视图；GPU 正确性和暂停收益待验证。
+2026-11-13：PR #10 已以 `8570a9153a76` 合入项目分支。[同节点共享 CPU HiCache](SHARED_HOST_CACHE.md)已通过1206项CPU及有界A100暖缓存往返检查。同源开关对照，扩／缩最后暂停105.2／88.5→43.8／39.0 ms，候选权重继续offload；每模式一次，更多负载及整卡归还未验证。见[结果与边界](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_shared_host_20261113/summary.md)；任务PR #11仍待合入项目。
 
 2026-11-11范围修正与验收：用户要求候选权重不得常驻GPU。默认offload将Graph稳定地址与权重物理页分开；35B／A100两次独立往返通过，真实搬权重后的完整扩／缩均值19.98／20.65秒，最后暂停239／285 ms，运行时capture=0。缩回后中间GPU权重为0、释放20.37890625 GiB；1024项完整CPU回归通过。KV／GDN、工作区和worker仍占资源，没有归还整个GPU。见[非驻留权重](NONRESIDENT_GRAPH_WEIGHTS.md)。历史约0.3秒仅为resident诊断结果。
 
