@@ -327,6 +327,7 @@ def state_evidence(info):
         "elastic_pp_transition_backing",
         "enable_elastic_pp_kv_patch",
         "elastic_pp_kv_patch_transport",
+        "elastic_pp_kv_base_precopy",
     )
     return {
         "internal_states": [
@@ -688,6 +689,7 @@ def engine_entry(cfg, row):
                 else []
             )
             + (["--elastic-pp-hicache-batch-io"] if cfg.get("hicache_batch_io") else [])
+            + (["--elastic-pp-kv-base-precopy"] if cfg.get("kv_base_precopy") else [])
             + (
                 (
                     ["--elastic-pp-hicache-background"]
@@ -1362,6 +1364,7 @@ def prepare(args):
         hicache_fast_copy=getattr(args, "hicache_fast_copy", False),
         hicache_background=getattr(args, "hicache_background", False),
         hicache_batch_io=getattr(args, "hicache_batch_io", False),
+        kv_base_precopy=getattr(args, "kv_base_precopy", False),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
         context_length=(
             4096 if getattr(args, "active_output_tokens", 256) > 1024 else 2048
@@ -1609,6 +1612,7 @@ def main():
         "--strategy", choices=["sync", "background", "batched"], default="sync"
     )
     parser.add_argument("--live-kv-patch", action="store_true")
+    parser.add_argument("--kv-base-precopy", action="store_true")
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--prepared-graphs", action="store_true")
     parser.add_argument(

@@ -531,6 +531,10 @@ class ElasticPPKVTransport:
             # Every rank must still enter the common prepare consensus.
             self._live_patch_error = f"{type(exc).__name__}: {exc}"
 
+    def seed_initial_live_base(self):
+        if self._live_patch is not None:
+            self._live_patch.seed_initial_base()
+
     def check_live_patch(self):
         error = self._live_patch_error
         if self._live_patch is not None:

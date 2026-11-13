@@ -1204,6 +1204,11 @@ class ServerArgs:
         "Experimental forward-ready KV copies during background PP preparation; recurrent state still migrates at the fence.",
         NS("parallel"),
     ] = False
+    elastic_pp_kv_base_precopy: A[
+        bool,
+        "Pre-copy initial live KV incarnations after quiescent HiCache capture and the first forward completion.",
+        NS("parallel"),
+    ] = False
     elastic_pp_kv_patch_transport: A[
         str,
         Arg(
@@ -8043,6 +8048,14 @@ class ServerArgs:
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
 
+        if self.elastic_pp_kv_base_precopy and not (
+            self.enable_elastic_pp_kv_patch
+            and self.enable_hierarchical_cache
+            and self.elastic_pp_hicache_background
+        ):
+            raise ValueError(
+                "initial KV base pre-copy requires KV patch and background HiCache"
+            )
         if self.elastic_pp_kv_patch_transport == "nixl":
             if not self.enable_elastic_pp_kv_patch:
                 raise ValueError("NIXL migration requires --enable-elastic-pp-kv-patch")

@@ -151,6 +151,9 @@ class LiveKVSnapshot:
         self.online_submissions = self.online_completed_rows = self.free_waits = 0
         self.fence_metrics = {}
         self.forward_checkpoints = 0
+        self.initial_base = None
+        self.initial_base_enabled = False
+        self.initial_base_rows_published = 0
         self.copier = (
             copier
             if copier is not None
@@ -168,6 +171,35 @@ class LiveKVSnapshot:
         self.published = set()
         self._allocate(allocator.elastic_pp_live_slots())
         allocator.attach_elastic_pp_live_patch(self)
+
+    def seed_initial_base(self):
+        """Scheduler-only: HiCache writers were quiescent at transition start.
+
+        Do not mark later asynchronous loadback allocations ready. The first
+        forward completion supplies the event for the captured incarnations;
+        every subsequent rewrite still uses prepare_writes before GPU access.
+        """
+        with self.lock:
+            if not self.active or self.forward_checkpoints or self.initial_base_enabled:
+                raise RuntimeError("initial KV base must be seeded once before forward")
+            self.initial_base = dict(self.epochs)
+            self.initial_base_enabled = True
+
+    def _publish_initial_base(self, ready):
+        if self.initial_base is None:
+            return
+        for slot, incarnation in self.initial_base.items():
+            if (
+                slot
+                and self.epochs.get(slot) == incarnation
+                and slot not in self.published
+            ):
+                self.session.publish(
+                    slot, incarnation, ready=ready, generation=self.generation
+                )
+                self.published.add(slot)
+                self.initial_base_rows_published += 1
+        self.initial_base = None
 
     def _allocate(self, slots):
         for slot in slots.detach().cpu().tolist():
@@ -253,6 +285,7 @@ class LiveKVSnapshot:
                 return
             try:
                 self.forward_checkpoints += 1
+                self._publish_initial_base(ready)
                 self._publish(slots, ready)
                 if self.session.poll(generation=self.generation):
                     self.online_completed_rows = self.session.rows_copied
@@ -315,6 +348,7 @@ class LiveKVSnapshot:
                 self.active = False
             self.allocator.detach_elastic_pp_live_patch(self)
             self.copier.source = {}
+            self.initial_base = None
 
     def metrics(self):
         with self.lock:
@@ -329,6 +363,8 @@ class LiveKVSnapshot:
                 complete=self.complete,
                 error=self.error,
                 forward_checkpoints=self.forward_checkpoints,
+                initial_base_enabled=self.initial_base_enabled,
+                initial_base_rows_published=self.initial_base_rows_published,
                 online_submissions=self.online_submissions,
                 online_completed_rows=self.online_completed_rows,
                 total_rounds=self.session.rounds,

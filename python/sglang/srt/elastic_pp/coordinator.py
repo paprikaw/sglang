@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from threading import Condition, RLock, Thread
+from threading import Condition, RLock, Thread, current_thread
 from typing import Any
 
 import torch
@@ -164,6 +164,7 @@ class ElasticPPMigrationCoordinator:
         self._drain_consensus_tensor: torch.Tensor | None = None
         self._drain_consensus_work: Any = None
         self._stage_seconds: dict[str, float] = {}
+        self._stage_intervals = []
         self._prepared_weight_bytes_reused = 0
         self._weights_reused = False
 
@@ -172,9 +173,18 @@ class ElasticPPMigrationCoordinator:
         try:
             return action(*args, **kwargs)
         finally:
+            ended = time.monotonic()
             with self._condition:
                 self._stage_seconds[name] = self._stage_seconds.get(name, 0.0) + (
-                    time.monotonic() - started
+                    ended - started
+                )
+                self._stage_intervals.append(
+                    dict(
+                        name=name,
+                        start=started,
+                        end=ended,
+                        thread=current_thread().name,
+                    )
                 )
 
     @property
@@ -270,6 +280,7 @@ class ElasticPPMigrationCoordinator:
             self._source_backing_attempted = False
             self._source_backing_metrics = {}
             self._stage_seconds = {}
+            self._stage_intervals = []
             self._prepared_weight_bytes_reused = 0
             self._weights_reused = False
             self._drain_consensus_tensor = None
@@ -277,11 +288,23 @@ class ElasticPPMigrationCoordinator:
             if self.cache_transition is not None:
                 capture = getattr(self.cache_transition, "begin_background", None)
                 if capture is not None:
-                    capture(transition)
+                    self._timed("host_background_capture", capture, transition)
             if self.enable_kv_patch:
                 # This caller is the scheduler; allocator snapshots must never
                 # be taken from the preparation worker.
                 self.kv_transport.begin_live_patch(transition)
+                if (
+                    getattr(
+                        getattr(self.model_runner, "server_args", None),
+                        "elastic_pp_kv_base_precopy",
+                        False,
+                    )
+                    and getattr(self.cache_transition, "precopy", None) is not None
+                ):
+                    # Successful capture proved HiCache writers quiescent. A
+                    # later forward event covers earlier inference writes; new
+                    # asynchronous loadback allocations remain unpublished.
+                    self.kv_transport.seed_initial_live_base()
             self._thread = Thread(
                 target=self._prepare_worker,
                 name=f"elastic-pp-prepare-g{transition.target.generation}-r{self.rank}",
@@ -493,6 +516,7 @@ class ElasticPPMigrationCoordinator:
             ),
             "prepared_weight_bytes_reused": self._prepared_weight_bytes_reused,
             "stage_seconds": dict(self._stage_seconds),
+            "stage_intervals": [dict(item) for item in self._stage_intervals],
             "stage_timing_scope": "rank-local wall time; nested stages and parallel ranks must not be summed",
             "observed_cuda_allocated_peak_bytes": self._observed_cuda_allocated_peak,
             "peak_scope": "sampled at prepare/copy/commit; not allocator peak proof",
