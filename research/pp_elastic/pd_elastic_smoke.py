@@ -50,6 +50,13 @@ def describe(path):
     return {"path": str(path), "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
 
 
+def memory_size_json(value):
+    """Pool byte counters can contain NumPy scalars; keep HTTP diagnostics JSON-safe."""
+    if isinstance(value, (tuple, list)):
+        return [memory_size_json(item) for item in value]
+    return int(value)
+
+
 def prepare(run):
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
@@ -185,7 +192,7 @@ def install_hooks():
                 free_bytes=torch.cuda.mem_get_info()[0], total_bytes=torch.cuda.mem_get_info()[1],
                 model_bytes=bytes_of(list(scheduler.tp_worker.model_runner.model.parameters()) +
                                     list(scheduler.tp_worker.model_runner.model.buffers())),
-                kv_bytes=pool.get_kv_size_bytes(), pid=os.getpid())
+                kv_bytes=memory_size_json(pool.get_kv_size_bytes()), pid=os.getpid())
             return result
         Scheduler.get_internal_state = state
 
