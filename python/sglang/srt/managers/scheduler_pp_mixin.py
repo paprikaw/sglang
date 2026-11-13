@@ -565,6 +565,19 @@ class SchedulerPPMixin:
             self._pp_microstep,
             self.pp_loop_size,
         )
+        if (
+            getattr(getattr(self, "server_args", None), "elastic_pp_disagg_decode", False)
+            and self.enable_decode_hicache
+        ):
+            from sglang.srt.elastic_pp.pd_registration import (
+                align_decode_hicache_polls_at_fence,
+            )
+
+            self._pp_pd_hicache_fence_alignment = align_decode_hicache_polls_at_fence(
+                self, coordinator.group
+            )
+            logger.info("Elastic PD HiCache fence alignment: %s",
+                        self._pp_pd_hicache_fence_alignment)
         try:
             coordinator.finalize_at_fence(self._pp_install_topology)
         except BaseException:

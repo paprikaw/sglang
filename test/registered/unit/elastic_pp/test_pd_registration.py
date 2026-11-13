@@ -4,6 +4,7 @@ import pytest
 
 from sglang.srt.elastic_pp.pd_registration import (
     DecodeRegistrationTransaction,
+    align_decode_hicache_polls_at_fence,
     pending_pd_work,
     validate_decode_args,
 )
@@ -97,6 +98,57 @@ def test_two_senders_cover_a_repartitioned_or_dormant_decode_stage():
 
 def test_explicit_narrow_profile():
     validate_decode_args(_args())
+
+
+@pytest.mark.parametrize("counts", [(4, 2, 2), (3, 3, 2), (3, 3, 3)])
+def test_fence_catches_up_receivers_without_sending_an_extra_cache_round(counts):
+    import concurrent.futures
+    import threading
+
+    condition = threading.Condition()
+    rendezvous = threading.Barrier(3)
+    sent = list(counts[:2])
+    received = [0, counts[1], counts[2]]
+    reports = [{"polls": count, "microsteps": count} for count in counts]
+
+    def rank_worker(rank):
+        def poll():
+            with condition:
+                if rank:
+                    assert condition.wait_for(
+                        lambda: received[rank] < sent[rank - 1], timeout=2
+                    ), "the previous rank did not send this cache round"
+                    received[rank] += 1
+                if rank < 2:
+                    sent[rank] += 1
+                condition.notify_all()
+
+        def gather(local):
+            assert local == reports[rank]
+            rendezvous.wait(timeout=2)
+            return reports
+
+        scheduler = NS(
+            _pp_pd_hicache_polls=counts[rank], _pp_pd_microsteps=counts[rank],
+            tree_cache=NS(check_hicache_events_pp_decode=poll,
+                          check_hicache_events=lambda: pytest.fail("blocking poll")),
+        )
+        result = align_decode_hicache_polls_at_fence(scheduler, NS(all_gather_object=gather))
+        # The old fence blocks here on a leading rank's unmatched isends.
+        # With catch-up, every actual packet is consumed before proceeding.
+        with condition:
+            if rank < 2:
+                assert condition.wait_for(lambda: received[rank + 1] == sent[rank], timeout=2)
+        assert scheduler._pp_pd_hicache_polls == max(counts)
+        assert scheduler._pp_pd_microsteps == max(counts)
+        assert result["catchup_rounds"] == max(counts) - counts[rank]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(rank_worker, rank) for rank in range(3)]
+        for future in futures:
+            future.result(timeout=3)
+    assert sent == [max(counts)] * 2
+    assert received[1:] == [max(counts)] * 2
 
 
 @pytest.mark.parametrize("name,value", [

@@ -192,7 +192,8 @@ def install_hooks():
                 free_bytes=torch.cuda.mem_get_info()[0], total_bytes=torch.cuda.mem_get_info()[1],
                 model_bytes=bytes_of(list(scheduler.tp_worker.model_runner.model.parameters()) +
                                     list(scheduler.tp_worker.model_runner.model.buffers())),
-                kv_bytes=memory_size_json(pool.get_kv_size_bytes()), pid=os.getpid())
+                kv_bytes=memory_size_json(pool.get_kv_size_bytes()), pid=os.getpid(),
+                hicache_alignment=getattr(scheduler, "_pp_pd_hicache_fence_alignment", None))
             return result
         Scheduler.get_internal_state = state
 

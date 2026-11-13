@@ -43,6 +43,34 @@ def pending_pd_work(scheduler):
     )
 
 
+def align_decode_hicache_polls_at_fence(scheduler, group):
+    """Consume each pre-fence HiCache round before blocking on its sends.
+
+    Native PD ranks may advance different numbers of idle slots while the
+    request/output rings drain. Cache packets follow physical PP ranks and
+    outlive those rings. Catch up lagging receivers without creating another
+    round at the leading rank; only then can ordinary host-I/O drain wait.
+    """
+    before = scheduler._pp_pd_hicache_polls
+    reports = group.all_gather_object({
+        "polls": before, "microsteps": scheduler._pp_pd_microsteps,
+    })
+    if not reports or any(
+        not isinstance(row.get(name), int) or row[name] < 0
+        for row in reports for name in ("polls", "microsteps")
+    ):
+        raise RuntimeError("invalid PD HiCache fence poll counts")
+    target = max(row["polls"] for row in reports)
+    poll = getattr(scheduler.tree_cache, "check_hicache_events_pp_decode",
+                   scheduler.tree_cache.check_hicache_events)
+    while scheduler._pp_pd_hicache_polls < target:
+        poll()
+        scheduler._pp_pd_hicache_polls += 1
+    # Preserve the same polling cadence after resuming, including intervals >1.
+    scheduler._pp_pd_microsteps = max(row["microsteps"] for row in reports)
+    return {"before": before, "target": target, "catchup_rounds": target - before}
+
+
 class DecodeRegistrationTransaction:
     def __init__(self, scheduler):
         self.scheduler = scheduler
