@@ -2437,14 +2437,14 @@ def broadcast_pyobj(
 
 
 def point_to_point_pyobj(
-    data: List[Any],
+    data: Optional[List[Any]],
     rank: int,
     group: Optional[torch.distributed.ProcessGroup] = None,
     src: int = 0,
     dst: int = 1,
     async_send: bool = False,
 ):
-    """Send data from src to dst in group."""
+    """Send a list or an explicit None queue-fence marker from src to dst."""
     from sglang.srt.distributed.parallel_state import P2PWork
 
     if async_send:
@@ -2453,7 +2453,7 @@ def point_to_point_pyobj(
         send_func = dist.send
     if rank == src:
         p2p_works = []
-        if len(data) == 0:
+        if data is not None and len(data) == 0:
             tensor_size = torch.tensor(
                 [0],
                 dtype=torch.long,

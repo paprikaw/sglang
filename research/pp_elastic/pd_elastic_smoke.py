@@ -99,7 +99,7 @@ def prepare(run):
         cfg["model_cache"] = cache
     config = dict(id=run.name, python=PYTHON, node_configs=nodes,
                   admin_key_file=str(key), engine_commit=revision,
-                  engine_root=str(ENGINE), output_tokens=2048,
+                  engine_root=str(ENGINE), output_tokens=512,
                   admission="quiescent P/D transfers during synchronous fences",
                   logical_gpu_counts=[4, 5, 4], resident_worker_gpus=5,
                   reserved_gpus=8, gpu_reuse_probe_gib=64)
@@ -443,6 +443,11 @@ def controller(run, root):
         results.update(error=f"{type(error).__name__}: {error}", traceback=traceback.format_exc())
         raise
     finally:
+        # A repeated cancellation must not interrupt owned cleanup and lose its
+        # receipts after the first signal has already unwound the controller.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        save(run / "results.json", results)
         save(run / "stop.json", dict(timestamp=time.time()))
         for remote in workers:
             remote.stdin.close()
