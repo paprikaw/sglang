@@ -175,7 +175,7 @@ def install_hooks():
         def state(scheduler, *args, **kwargs):
             import torch
             result = old_state(scheduler, *args, **kwargs)
-            pool = scheduler.token_to_kv_pool
+            pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
             def bytes_of(values):
                 storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
                             for t in values if t.is_cuda and t.numel()}
