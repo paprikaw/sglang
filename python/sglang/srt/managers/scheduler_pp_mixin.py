@@ -1467,7 +1467,18 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(self.send_proxy_work)
+                # A dormant physical stage delays native PD consensus by one
+                # metadata hop, while activations skip it. On an idle slot,
+                # waiting for the previous activation here can prevent the
+                # last stage from completing its consensus send and reaching
+                # the matching activation receive. Retain the P2PWork owners
+                # until those consensus rounds have progressed. The initial
+                # elastic PD profile admits one request, leaving idle slots.
+                defer_proxy_completion = (
+                    self._pp_topology() is not None and cur_batch is None
+                )
+                if not defer_proxy_completion:
+                    self._pp_commit_comm_work(self.send_proxy_work)
                 self._pp_commit_comm_work(self.send_output_handoff_work)
 
                 if cur_batch:
@@ -1544,6 +1555,9 @@ class SchedulerPPMixin:
                         next_release_rids
                     )
                 self._pp_commit_comm_work(send_release_work)
+
+                if defer_proxy_completion:
+                    self._pp_commit_comm_work(self.send_proxy_work)
 
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:

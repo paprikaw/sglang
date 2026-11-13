@@ -212,9 +212,9 @@ def engine_entry(run, cfg):
         "--dist-init-addr", f"127.0.0.1:{cfg['dist_port']}", "--tp-size", "1", "--ep-size", "1",
         "--pp-size", str(cfg["layouts"][0]["pp"]), "--dtype", "bfloat16", "--quantization", "fp8",
         "--kv-cache-dtype", "bfloat16", "--context-length", "8192", "--max-total-tokens", "8192",
-        "--max-running-requests", "4", "--max-mamba-cache-size", "16", "--mamba-ssm-dtype", "float32",
+        "--max-running-requests", "1" if cfg["role"] == "decode" else "4", "--max-mamba-cache-size", "16", "--mamba-ssm-dtype", "float32",
         "--mamba-max-states-per-path", "1", "--mem-fraction-static", ".90", "--page-size", "64",
-        "--chunked-prefill-size", "512", "--max-prefill-tokens", "1024", "--pp-max-micro-batch-size", "4",
+        "--chunked-prefill-size", "512", "--max-prefill-tokens", "1024", "--pp-max-micro-batch-size", "1" if cfg["role"] == "decode" else "4",
         "--pp-async-batch-depth", "0", "--attention-backend", "triton", "--linear-attn-backend", "triton",
         "--moe-runner-backend", "marlin", "--moe-a2a-backend", "none", "--disable-cuda-graph",
         "--skip-server-warmup", "--json-model-override-args", '{"language_model_only":true}',
@@ -374,7 +374,7 @@ def controller(run, root):
         progress(run, root, "reference_and_roundtrip")
         tokens = [1000 + (i * 31) % 20000 for i in range(512)]
         results["warmup"] = replay.request_one(p, d, key, tokens, 1, 0, True)
-        prompt = tokens + [198]
+        prompt = tokens + [20000 + i for i in range(64)]
         results["reference"] = replay.request_one(p, d, key, prompt, root["output_tokens"], 0, True)
         save(run / "results.partial.json", results)
         events = []

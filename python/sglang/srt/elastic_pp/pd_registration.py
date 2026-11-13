@@ -18,6 +18,8 @@ def validate_decode_args(args):
         disable_cuda_graph=True,
         enable_hierarchical_cache=True,
         pp_async_batch_depth=0,
+        max_running_requests=1,
+        pp_max_micro_batch_size=1,
     )
     mismatches = [
         f"{name}={getattr(args, name, None)!r} (requires {value!r})"

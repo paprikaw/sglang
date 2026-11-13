@@ -77,7 +77,8 @@ def _args():
               disaggregation_transfer_backend="mooncake",
               elastic_pp_transition_strategy="sync",
               elastic_pp_transition_backing="cpu_spill", disable_cuda_graph=True,
-              enable_hierarchical_cache=True, pp_async_batch_depth=0)
+              enable_hierarchical_cache=True, pp_async_batch_depth=0,
+              max_running_requests=1, pp_max_micro_batch_size=1)
 
 
 def test_two_senders_cover_a_repartitioned_or_dormant_decode_stage():
@@ -104,6 +105,7 @@ def test_explicit_narrow_profile():
     ("elastic_pp_transition_strategy", "background"),
     ("elastic_pp_transition_backing", "overlap"),
     ("disaggregation_transfer_backend", "nixl"), ("pp_async_batch_depth", 1),
+    ("max_running_requests", 2), ("pp_max_micro_batch_size", 2),
 ])
 def test_unwired_modes_fail_before_loading(name, value):
     args = _args()
