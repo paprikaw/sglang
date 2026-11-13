@@ -576,6 +576,7 @@ def prepare_target_host_cache(
     prepared=None,
     preloaded=None,
     verified_preloaded=None,
+    reuse_shared=False,
 ):
     """Build target L2 while keeping allocation failures safe for GPU rollback."""
     try:
@@ -590,6 +591,7 @@ def prepare_target_host_cache(
             prepared=prepared,
             preloaded=preloaded,
             verified_preloaded=verified_preloaded,
+            reuse_shared=reuse_shared,
         )
     except BaseException as exc:
         from sglang.srt.elastic_pp.backing_spill import discard_tensor_tracebacks
@@ -733,6 +735,7 @@ def _prepare_target_host_cache(
     prepared=None,
     preloaded=None,
     verified_preloaded=None,
+    reuse_shared=False,
 ):
     """Build replacement L2 backing without resetting the live radix tree.
 
@@ -758,6 +761,10 @@ def _prepare_target_host_cache(
     clone = clone_cache_runtime_metadata(cache)
     clone.sidecar_pool_specs = []
     clone.token_to_kv_pool_allocator = allocator
+    if reuse_shared:
+        from sglang.srt.elastic_pp.shared_host_cache import detach_inherited_host_stack
+
+        detach_inherited_host_stack(clone)
     clone.req_to_token_pool = req or cache.req_to_token_pool
     params = dataclasses.replace(
         cache._hicache_init_params,
@@ -789,6 +796,25 @@ def _prepare_target_host_cache(
                 metadata.get(old_entry.name, old_entry.host_pool), new_pool
             )
         metrics["host_target_allocator_seconds"] = time.monotonic() - started
+        if reuse_shared:
+            if not hasattr(cache, "_elastic_pp_shared_host_bank"):
+                raise RuntimeError("missing shared CPU backing owner")
+            for entry in clone.host_pool_group.entries:
+                host = entry.host_pool
+                if getattr(host, "layer_num", getattr(host, "num_mamba_layers", 0)):
+                    allocator = getattr(host, "allocator", None)
+                    if (
+                        not getattr(allocator, "shared_host_backing", False)
+                        or allocator.bank is not cache._elastic_pp_shared_host_bank
+                    ):
+                        raise RuntimeError(
+                            "target host pool does not borrow shared backing"
+                        )
+            clone._elastic_pp_shared_host_bank = cache._elastic_pp_shared_host_bank
+            clone._elastic_pp_projected_pool = projected
+            metrics["host_shared_reuse"] = True
+            metrics["host_historical_payload_copied_bytes"] = 0
+            return clone
         started = time.monotonic()
         old_views = (
             {}
@@ -928,6 +954,18 @@ class SchedulerHiCacheTransition:
         self._source_cache = None
         self._last_metrics = {}
         self._phase_metrics = {}
+        self.shared_host = bool(
+            getattr(
+                getattr(model_runner, "server_args", None),
+                "elastic_pp_hicache_shared_host",
+                False,
+            )
+        )
+        self.shared_bank = getattr(model_runner, "_elastic_pp_shared_host_bank", None)
+        if self.shared_host and self.shared_bank is None:
+            raise RuntimeError("shared CPU backing must be installed at startup")
+        self.initial_base_ready = False
+        self._shared_verified_generation = None
         self.fast_copy = bool(
             getattr(
                 getattr(model_runner, "server_args", None),
@@ -965,9 +1003,26 @@ class SchedulerHiCacheTransition:
         self.precopy = None
         self.prepared_host = None
         self._background_metrics = {}
+        if self.shared_host:
+            # The shared path never snapshots or precopies historical CPU data.
+            self.background = False
+            self.batch_io = False
 
     def begin_background(self, transition):
         """Scheduler-only CPU snapshot. Never drain or mutate active HiCache I/O."""
+        if self.shared_host:
+            self._background_metrics = {}
+            self._shared_verified_generation = None
+            self.initial_base_ready = False
+            try:
+                assert_host_quiescent(
+                    self.scheduler.tree_cache, allow_pp_control_sends=True
+                )
+                self.initial_base_ready = True
+            except RuntimeError:
+                # A busy loadback must not mark newly allocated GPU rows ready.
+                pass
+            return
         if not self.background:
             return
         if self.precopy is not None or self.prepared_host is not None:
@@ -1211,7 +1266,7 @@ class SchedulerHiCacheTransition:
             cache=cache,
             pools=(
                 cache_host_views(cache)
-                if self.rank in transition.source.active_ranks
+                if self.rank in transition.source.active_ranks and not self.shared_host
                 else {}
             ),
             group=self.group,
@@ -1220,14 +1275,65 @@ class SchedulerHiCacheTransition:
         )
         self.adapter.precopy = self.precopy
         self.adapter.prepare_transition(transition)
+        if self.shared_host:
+            return
         started = time.monotonic()
         self.adapter.snapshot_at_fence(transition)
         self._phase_metrics["host_snapshot_gather_seconds"] = time.monotonic() - started
 
     def exchange_at_fence(self, transition):
+        if self.shared_host:
+            from sglang.srt.elastic_pp.shared_host_cache import metadata_signature
+
+            try:
+                signature = (
+                    metadata_signature(self._source_cache)
+                    if self.rank in transition.source.active_ranks
+                    else None
+                )
+                report = dict(rank=self.rank, signature=signature, error=None)
+            except Exception as exc:
+                report = dict(rank=self.rank, signature=None, error=str(exc))
+            reports = self.group.all_gather_object(report)
+            if len(reports) != transition.source.max_pp_size or any(
+                x["error"] for x in reports
+            ):
+                raise RuntimeError(f"shared CPU metadata inspection failed: {reports}")
+            if {x["rank"] for x in reports} != set(
+                range(transition.source.max_pp_size)
+            ):
+                raise RuntimeError("shared CPU metadata ranks are incomplete")
+            signatures = {
+                x["signature"]
+                for x in reports
+                if x["rank"] in transition.source.active_ranks
+            }
+            if len(signatures) != 1 or None in signatures:
+                raise RuntimeError(
+                    "shared CPU prefix slots or allocator state differ across ranks"
+                )
+            self._shared_verified_generation = transition.target.generation
+            return
         self.adapter.exchange_at_fence(transition)
 
     def apply_staged(self, transition):
+        if self.shared_host:
+            from sglang.srt.elastic_pp.shared_host_cache import use_shared_host_bank
+
+            if self._shared_verified_generation != transition.target.generation:
+                raise RuntimeError(
+                    "shared CPU layer views require validated slot metadata"
+                )
+            with use_shared_host_bank(self.shared_bank):
+                self.target_cache = prepare_target_host_cache(
+                    self.adapter.cache,
+                    device_pool=self.model_runner.token_to_kv_pool,
+                    target=transition.target.layer_range(self.rank),
+                    generation=transition.target.generation,
+                    metrics=self._phase_metrics,
+                    reuse_shared=True,
+                )
+            return
         self.target_cache = prepare_target_host_cache(
             self.adapter.cache,
             device_pool=self.model_runner.token_to_kv_pool,
