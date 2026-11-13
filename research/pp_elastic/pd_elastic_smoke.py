@@ -105,6 +105,8 @@ def prepare(run):
     tracked = subprocess.check_output(["git", "-C", str(ENGINE), "ls-files", "python/sglang", "research/pp_elastic"], text=True).splitlines()
     paths.extend(ENGINE / p for p in tracked if p.endswith((".py", ".json")))
     paths.extend(GUARD.glob("*.py"))
+    bank = Path("/data/gpfs/projects/punim2715/vllm_workbench/sglang-memory-bank/src/sglang_memory_bank")
+    paths.extend(bank / name for name in ("__init__.py", "memory_budget.py", "memory_bank.py"))
     spec["frozen_inputs"] = [describe(p) for p in dict.fromkeys(paths)]
     save(run / "dashboard_spec.json", spec)
     save(run / "preparation.json", dict(command=[PYTHON, str(GUARD / "dashboard_guard.py"),
