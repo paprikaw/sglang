@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from threading import Condition, RLock, Thread
+from threading import Condition, RLock, Thread, current_thread
 from typing import Any
 
 import torch
@@ -114,6 +114,26 @@ class ElasticPPMigrationCoordinator:
         self._source_backing_metrics: dict[str, Any] = {}
         self._layers_precopied = False
         self._background_weight_bytes_sent = 0
+        self._weight_stager = None
+        # Startup Graph preparation and the serving coordinator share the CPU
+        # bank. It contains host tensors only, never retained candidate weights.
+        self._cpu_weight_reloader = getattr(
+            model_runner, "_elastic_pp_cpu_weight_reloader", None
+        )
+        self.weight_staging = getattr(args, "elastic_pp_weight_staging", "legacy")
+        if self.weight_staging not in {
+            "legacy",
+            "pinned",
+            "cpu_cache",
+            "cpu_prepacked",
+        }:
+            raise ValueError("unknown elastic PP weight staging policy")
+        if self.weight_staging in {"cpu_cache", "cpu_prepacked"} and (
+            self.strategy not in {"background", "sync"} or self.backing != "overlap"
+        ):
+            raise ValueError(
+                "CPU cache reload requires background or sync with overlap backing"
+            )
         self._observed_cuda_allocated_peak = 0
         self.rank = int(rank)
         self.current_topology = current_topology
@@ -144,6 +164,7 @@ class ElasticPPMigrationCoordinator:
         self._drain_consensus_tensor: torch.Tensor | None = None
         self._drain_consensus_work: Any = None
         self._stage_seconds: dict[str, float] = {}
+        self._stage_intervals = []
         self._prepared_weight_bytes_reused = 0
         self._weights_reused = False
 
@@ -152,9 +173,18 @@ class ElasticPPMigrationCoordinator:
         try:
             return action(*args, **kwargs)
         finally:
+            ended = time.monotonic()
             with self._condition:
                 self._stage_seconds[name] = self._stage_seconds.get(name, 0.0) + (
-                    time.monotonic() - started
+                    ended - started
+                )
+                self._stage_intervals.append(
+                    dict(
+                        name=name,
+                        start=started,
+                        end=ended,
+                        thread=current_thread().name,
+                    )
                 )
 
     @property
@@ -244,18 +274,37 @@ class ElasticPPMigrationCoordinator:
             self._kv_prepared = False
             self._layers_precopied = False
             self._background_weight_bytes_sent = 0
+            if self._cpu_weight_reloader is not None:
+                self._cpu_weight_reloader.reset_metrics()
             self._observed_cuda_allocated_peak = 0
             self._source_backing_attempted = False
             self._source_backing_metrics = {}
             self._stage_seconds = {}
+            self._stage_intervals = []
             self._prepared_weight_bytes_reused = 0
             self._weights_reused = False
             self._drain_consensus_tensor = None
             self._drain_consensus_work = None
+            if self.cache_transition is not None:
+                capture = getattr(self.cache_transition, "begin_background", None)
+                if capture is not None:
+                    self._timed("host_background_capture", capture, transition)
             if self.enable_kv_patch:
                 # This caller is the scheduler; allocator snapshots must never
                 # be taken from the preparation worker.
                 self.kv_transport.begin_live_patch(transition)
+                if (
+                    getattr(
+                        getattr(self.model_runner, "server_args", None),
+                        "elastic_pp_kv_base_precopy",
+                        False,
+                    )
+                    and getattr(self.cache_transition, "precopy", None) is not None
+                ):
+                    # Successful capture proved HiCache writers quiescent. A
+                    # later forward event covers earlier inference writes; new
+                    # asynchronous loadback allocations remain unpublished.
+                    self.kv_transport.seed_initial_live_base()
             self._thread = Thread(
                 target=self._prepare_worker,
                 name=f"elastic-pp-prepare-g{transition.target.generation}-r{self.rank}",
@@ -455,8 +504,19 @@ class ElasticPPMigrationCoordinator:
             "fence_seconds": snapshot.fence_seconds,
             "total_seconds": snapshot.total_seconds,
             "background_weight_bytes_sent": self._background_weight_bytes_sent,
+            "weight_staging": self.weight_staging,
+            "weight_staging_metrics": (
+                self._cpu_weight_reloader.metrics_snapshot()
+                if self._cpu_weight_reloader is not None
+                else (
+                    dict(self._weight_stager.metrics)
+                    if self._weight_stager is not None
+                    else {}
+                )
+            ),
             "prepared_weight_bytes_reused": self._prepared_weight_bytes_reused,
             "stage_seconds": dict(self._stage_seconds),
+            "stage_intervals": [dict(item) for item in self._stage_intervals],
             "stage_timing_scope": "rank-local wall time; nested stages and parallel ranks must not be summed",
             "observed_cuda_allocated_peak_bytes": self._observed_cuda_allocated_peak,
             "peak_scope": "sampled at prepare/copy/commit; not allocator peak proof",
@@ -589,12 +649,16 @@ class ElasticPPMigrationCoordinator:
         self._observe_memory()
 
     def _precopy_immutable_weights(self, transition: DynamicPPTransition) -> None:
-        """Stage immutable weights over Gloo while the old pipeline executes.
+        """Restore immutable weights while the old pipeline executes.
 
         CPU payloads deliberately avoid launching NCCL from a second host thread.
         One layer is live in host staging at a time. KV/GDN remain authoritative
         at the final fence, since their rows can change during serving.
         """
+        if self.weight_staging in {"cpu_cache", "cpu_prepacked"}:
+            return self._precopy_cpu_cached_weights(transition)
+        if self.weight_staging == "pinned":
+            return self._precopy_pinned_weights(transition)
         for edge in sorted(transition.kv_transfers, key=self.layer_transport._sort_key):
             for layer_id in range(edge.layer_range.start, edge.layer_range.end):
                 transfer = LayerTransfer(
@@ -602,12 +666,18 @@ class ElasticPPMigrationCoordinator:
                 )
                 if self.rank == edge.src_rank:
                     state = self.model_runner.export_elastic_pp_layer_state([layer_id])
+                    started = time.monotonic()
                     cpu_state = {
                         layer_id: {
                             name: tensor.detach().to("cpu", copy=True)
                             for name, tensor in state[layer_id].items()
                         }
                     }
+                    self._stage_seconds["weight_legacy_d2h"] = (
+                        self._stage_seconds.get("weight_legacy_d2h", 0.0)
+                        + time.monotonic()
+                        - started
+                    )
                     payload = flatten_layer_states(
                         generation=transition.target.generation,
                         transfer=transfer,
@@ -618,12 +688,22 @@ class ElasticPPMigrationCoordinator:
                         for values in cpu_state.values()
                         for t in values.values()
                     )
+                    started = time.monotonic()
                     works = self.group.send_tensor_dict(
                         payload, dst=edge.dst_rank, async_send=True
                     )
                     self.layer_transport.wait(works or ())
+                    self._stage_seconds["weight_legacy_send"] = (
+                        self._stage_seconds.get("weight_legacy_send", 0.0)
+                        + time.monotonic()
+                        - started
+                    )
                 elif self.rank == edge.dst_rank:
-                    payload = self.group.recv_tensor_dict(src=edge.src_rank)
+                    payload = self._timed(
+                        "weight_legacy_recv",
+                        self.group.recv_tensor_dict,
+                        src=edge.src_rank,
+                    )
                     state = unflatten_layer_states(
                         payload,
                         generation=transition.target.generation,
@@ -637,12 +717,81 @@ class ElasticPPMigrationCoordinator:
                         raise RuntimeError(
                             "background weight transport requires CPU payloads"
                         )
+                    started = time.monotonic()
                     with self.layer_transport._stream_context():
                         self.model_runner.import_elastic_pp_layer_state(
                             generation=transition.target.generation, layer_states=state
                         )
                         if self.layer_transport._migration_stream is not None:
                             self.layer_transport._migration_stream.synchronize()
+                    self._stage_seconds["weight_legacy_h2d"] = (
+                        self._stage_seconds.get("weight_legacy_h2d", 0.0)
+                        + time.monotonic()
+                        - started
+                    )
+
+    def _precopy_cpu_cached_weights(self, transition):
+        from sglang.srt.elastic_pp.cpu_weight_reload import CanonicalCpuWeightReloader
+
+        if self._cpu_weight_reloader is None:
+            self._cpu_weight_reloader = CanonicalCpuWeightReloader(
+                model_runner=self.model_runner,
+                stream=self.layer_transport._migration_stream,
+            )
+            self.model_runner._elastic_pp_cpu_weight_reloader = (
+                self._cpu_weight_reloader
+            )
+        incoming = {
+            layer_id
+            for edge in transition.kv_transfers
+            if edge.dst_rank == self.rank
+            for layer_id in range(edge.layer_range.start, edge.layer_range.end)
+        }
+        self._cpu_weight_reloader.reload(
+            generation=transition.target.generation, layer_ids=incoming
+        )
+
+    def _precopy_pinned_weights(self, transition):
+        from sglang.srt.elastic_pp.weight_staging import (
+            PinnedWeightStager,
+            WeightPacketPlan,
+        )
+
+        if self._weight_stager is None:
+            self._weight_stager = PinnedWeightStager(
+                device=self.model_runner.device,
+                stream=self.layer_transport._migration_stream,
+            )
+        self._weight_stager.reset_metrics()
+        for edge in sorted(transition.kv_transfers, key=self.layer_transport._sort_key):
+            if self.rank not in {edge.src_rank, edge.dst_rank}:
+                continue
+            for layer_id in range(edge.layer_range.start, edge.layer_range.end):
+                transfer = LayerTransfer(
+                    edge.src_rank, edge.dst_rank, LayerRange(layer_id, layer_id + 1)
+                )
+                plan = WeightPacketPlan(
+                    generation=transition.target.generation,
+                    transfer=transfer,
+                    layer_states=self.model_runner.export_elastic_pp_layer_state(
+                        [layer_id]
+                    ),
+                )
+                if self.rank == edge.src_rank:
+                    self._weight_stager.send(
+                        plan=plan,
+                        group=self.group,
+                        destination=edge.dst_rank,
+                        wait=self.layer_transport.wait,
+                    )
+                    self._background_weight_bytes_sent += plan.total_bytes
+                else:
+                    self._weight_stager.receive(
+                        plan=plan, group=self.group, source=edge.src_rank
+                    )
+                    self.model_runner.mark_elastic_pp_layers_loaded(
+                        generation=transition.target.generation, layer_ids={layer_id}
+                    )
 
     def _prepare_worker(self) -> None:
         transition = self._require_transition()
@@ -665,17 +814,23 @@ class ElasticPPMigrationCoordinator:
                 generation,
                 self.rank,
             )
+            prepare_policy = {
+                "reuse_weights": self._weights_reused,
+                "background_host": bool(
+                    getattr(self.cache_transition, "background", False)
+                ),
+                "host_batch_io": bool(
+                    getattr(self.cache_transition, "batch_io", False)
+                ),
+            }
             reports = self._consensus(
                 "prepare_allocations",
                 success=local_error is None,
                 error=local_error,
-                details={"reuse_weights": self._weights_reused},
+                details=prepare_policy,
             )
             self._raise_peer_failures("prepare allocations", reports)
-            if any(
-                r.get("details") != {"reuse_weights": self._weights_reused}
-                for r in reports
-            ):
+            if any(r.get("details") != prepare_policy for r in reports):
                 raise RuntimeError("prepared weight policy differs across ranks")
             # Never enter P2P pre-copy before all peers have allocated backing:
             # a peer allocation failure must not strand a sender/receiver.
@@ -695,6 +850,46 @@ class ElasticPPMigrationCoordinator:
                     "background_copy", success=local_error is None, error=local_error
                 )
                 self._raise_peer_failures("background copy", reports)
+            if self.cache_transition is not None and getattr(
+                self.cache_transition, "background", False
+            ):
+                reports = self._consensus(
+                    "host_background_capture",
+                    success=True,
+                    details=self.cache_transition.precopy is not None,
+                )
+                enabled = all(r.get("details") is True for r in reports)
+                local_error = None
+                try:
+                    self._timed(
+                        "background_host_allocate",
+                        self.cache_transition.allocate_background,
+                        transition,
+                        enabled=enabled,
+                    )
+                except BaseException as exc:
+                    local_error = f"{type(exc).__name__}: {exc}"
+                reports = self._consensus(
+                    "host_background_allocate",
+                    success=local_error is None,
+                    error=local_error,
+                )
+                self._raise_peer_failures("background host allocation", reports)
+                local_error = None
+                try:
+                    self._timed(
+                        "background_host_copy",
+                        self.cache_transition.copy_background,
+                        transition,
+                    )
+                except BaseException as exc:
+                    local_error = f"{type(exc).__name__}: {exc}"
+                reports = self._consensus(
+                    "host_background_copy",
+                    success=local_error is None,
+                    error=local_error,
+                )
+                self._raise_peer_failures("background host copy", reports)
             logger.info(
                 "Elastic PP generation=%d rank=%d allocation consensus complete",
                 generation,
@@ -860,6 +1055,30 @@ class ElasticPPMigrationCoordinator:
                             "cannot migrate GDN state without request-slot remapping"
                         )
             assert fence_slots is not None
+
+            # Startup's private Graph walk uses synchronous transitions. It
+            # must use the same CPU bank, and reach agreement before any KV
+            # P2P operation if a rank cannot restore its target checkpoint.
+            if (
+                self.weight_staging in {"cpu_cache", "cpu_prepacked"}
+                and not self._layers_precopied
+            ):
+                local_error = None
+                try:
+                    self._timed(
+                        "fence_cpu_cached_weights",
+                        self._precopy_cpu_cached_weights,
+                        transition,
+                    )
+                except BaseException as exc:
+                    local_error = f"{type(exc).__name__}: {exc}"
+                reports = self._consensus(
+                    "fence_cpu_cached_weights",
+                    success=local_error is None,
+                    error=local_error,
+                )
+                self._raise_peer_failures("fence CPU cached weights", reports)
+                self._layers_precopied = True
 
             local_error = None
             works = ()

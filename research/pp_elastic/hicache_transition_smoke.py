@@ -115,6 +115,9 @@ def validate_transition_states(states, generation, source_ranks, backing):
             raise AssertionError("transition backing differs from the frozen config")
     sent = sum(
         state["transition_metrics"].get("host", {}).get("host_bytes_sent", 0)
+        + state["transition_metrics"]
+        .get("host", {})
+        .get("host_background_bytes_sent", 0)
         for state in ranks.values()
     )
     if sent <= 0:
@@ -324,6 +327,7 @@ def state_evidence(info):
         "elastic_pp_transition_backing",
         "enable_elastic_pp_kv_patch",
         "elastic_pp_kv_patch_transport",
+        "elastic_pp_kv_base_precopy",
     )
     return {
         "internal_states": [
@@ -336,7 +340,20 @@ def state_evidence(info):
 def validate_decode_graph_states(
     states, generation, source_ranks, target_ranks, *, prepared=False
 ):
-    for rank, state in rank_states(states).items():
+    ranked = rank_states(states)
+    cached = [
+        state["transition_metrics"]
+        for state in ranked.values()
+        if state["transition_metrics"].get("weight_staging")
+        in {"cpu_cache", "cpu_prepacked"}
+    ]
+    if cached and (
+        len(cached) != len(ranked)
+        or len({m.get("weight_staging_metrics", {}).get("cache_key") for m in cached})
+        != 1
+    ):
+        raise AssertionError("CPU cache weights came from inconsistent rank banks")
+    for rank, state in ranked.items():
         history = state["transition_metrics"]["decode_graph"]
         entries = {row["generation"]: row for row in history}
         if set(entries) != set(range(generation + 1)):
@@ -382,7 +399,64 @@ def validate_decode_graph_states(
                     )
                 if bank.get("inactive_registered_weight_bytes", -1) != 0:
                     raise AssertionError("inactive worker retains spare model weights")
-                if (
+                if metrics.get("weight_staging") in {"cpu_cache", "cpu_prepacked"}:
+                    reload = metrics.get("weight_staging_metrics", {})
+                    if (
+                        reload.get("kind")
+                        != (
+                            "prepared_cpu_cache"
+                            if metrics["weight_staging"] == "cpu_prepacked"
+                            else "canonical_cpu_cache"
+                        )
+                        or not reload.get("cache_key")
+                        or metrics.get("background_weight_bytes_sent", -1) != 0
+                        or reload.get("gpu_export_bytes", -1) != 0
+                        or reload.get("gloo_weight_bytes", -1) != 0
+                        or reload.get("fallback_count", -1) != 0
+                    ):
+                        raise AssertionError(
+                            "CPU cache weights used an export or fallback path"
+                        )
+                    incoming = {1} if generation == 1 else {0, 2}
+                    if (
+                        metrics["weight_staging"] == "cpu_prepacked"
+                        and rank in incoming
+                    ):
+                        if (
+                            not reload.get("prepared_cpu_cache_hit")
+                            or reload.get("cpu_prepare_seconds", -1) != 0
+                            or reload.get("canonical_checkpoint_read_bytes", -1) != 0
+                            or reload.get("h2d_bytes", 0) <= 0
+                            or reload.get("h2d_wall_seconds", 0) <= 0
+                            or reload.get("h2d_stream_seconds", 0) <= 0
+                            or not 0
+                            < reload.get("prepared_cpu_cache_bytes", 0)
+                            <= reload.get("prepared_cpu_cache_cap_bytes", 0)
+                        ):
+                            raise AssertionError(
+                                "runtime CPU prepacked weights were not reused within budget"
+                            )
+                    if rank in incoming and (
+                        reload.get("target_weight_bytes", 0) <= 0
+                        or reload.get("checkpoint_bytes", 0) <= 0
+                        or reload.get("checkpoint_tensors", 0) <= 0
+                        or not reload.get("cache_key_matches_initial_load")
+                        or not reload.get("storage_verified")
+                        or not reload.get("layers_loaded")
+                        or reload.get("checkpoint_load_seconds", 0) <= 0
+                    ):
+                        raise AssertionError(
+                            "CPU cache target weights were not fully restored"
+                        )
+                    if rank not in incoming and (
+                        reload.get("target_weight_bytes", -1) != 0
+                        or reload.get("checkpoint_bytes", -1) != 0
+                        or reload.get("layers_loaded") != []
+                    ):
+                        raise AssertionError(
+                            "CPU cache reload touched non-target weights"
+                        )
+                elif (
                     rank in ({0, 2} if generation == 1 else {1})
                     and metrics.get("background_weight_bytes_sent", 0) <= 0
                 ):
@@ -610,6 +684,23 @@ def engine_entry(cfg, row):
                 else ["--disable-cuda-graph"]
             )
             + (
+                ["--elastic-pp-profile-weight-load"]
+                if cfg.get("profile_native_weight_load")
+                else []
+            )
+            + (["--elastic-pp-hicache-batch-io"] if cfg.get("hicache_batch_io") else [])
+            + (["--elastic-pp-kv-base-precopy"] if cfg.get("kv_base_precopy") else [])
+            + (
+                (
+                    ["--elastic-pp-hicache-background"]
+                    if cfg.get("hicache_background")
+                    else []
+                )
+                + ["--elastic-pp-hicache-fast-copy"]
+                if cfg.get("hicache_fast_copy")
+                else []
+            )
+            + (
                 [
                     "--elastic-pp-graph-partitions",
                     ";".join(
@@ -630,6 +721,10 @@ def engine_entry(cfg, row):
                 cfg["initial_partition"],
                 "--elastic-pp-transition-strategy",
                 cfg["strategy"],
+                "--elastic-pp-weight-staging",
+                cfg.get("weight_staging", "legacy"),
+                "--elastic-pp-cpu-weight-cache-gib",
+                str(cfg.get("cpu_weight_cache_gib", 24)),
                 "--elastic-pp-transition-backing",
                 cfg.get("backing", "overlap"),
                 "--max-total-tokens",
@@ -1261,8 +1356,15 @@ def prepare(args):
         cuda_graph=getattr(args, "cuda_graph", False),
         prepared_graphs=getattr(args, "prepared_graphs", False),
         prepared_weight_policy=getattr(args, "prepared_weight_policy", "offload"),
+        weight_staging=getattr(args, "weight_staging", "legacy"),
+        cpu_weight_cache_gib=getattr(args, "cpu_weight_cache_gib", 24),
+        profile_native_weight_load=getattr(args, "profile_native_weight_load", False),
         migration_profile=getattr(args, "migration_profile", False),
         hicache_allocator=getattr(args, "hicache_allocator", "mmap"),
+        hicache_fast_copy=getattr(args, "hicache_fast_copy", False),
+        hicache_background=getattr(args, "hicache_background", False),
+        hicache_batch_io=getattr(args, "hicache_batch_io", False),
+        kv_base_precopy=getattr(args, "kv_base_precopy", False),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
         context_length=(
             4096 if getattr(args, "active_output_tokens", 256) > 1024 else 2048
@@ -1330,6 +1432,22 @@ def prepare(args):
             root=str(root), tree=tree, native=base.desc(binaries[0])
         )
     cfg["model_cache"]["usage_logs"] = {args.node: [use]}
+    if cfg["weight_staging"] == "cpu_prepacked":
+        if not cfg["prepared_graphs"] or cfg["prepared_weight_policy"] != "offload":
+            raise ValueError(
+                "CPU prepacking requires startup Graphs and nonresident weights"
+            )
+        if cfg["cpu_weight_cache_gib"] <= 0:
+            raise ValueError("CPU prepacking needs a positive per-rank cap")
+        # This admission pool is a conservative combined upper bound, not a
+        # larger HiCache allocation: the engine retains the same 1 GiB/rank
+        # HiCache configuration plus the separately capped CPU weight buffers.
+        cfg["prepared_cpu_weight_reserve_bytes"] = (
+            3 * cfg["cpu_weight_cache_gib"] * 1024**3
+        )
+        cfg["model_cache"]["hicache_reserve_bytes_per_node"][args.node] += cfg[
+            "prepared_cpu_weight_reserve_bytes"
+        ]
     h.save(run / "config.json", cfg)
     spec = json.loads((run / "dashboard_spec.json").read_text())
     spec.update(
@@ -1345,7 +1463,13 @@ def prepare(args):
     spec["frozen_inputs"] = [
         x for x in spec["frozen_inputs"] if x["path"] != str(run / "config.json")
     ]
-    spec["frozen_inputs"] += [base.desc(run / "config.json"), base.desc(__file__)]
+    spec["frozen_inputs"] += [
+        base.desc(run / "config.json"),
+        base.desc(__file__),
+        base.desc(ENGINE / "python/sglang/srt/elastic_pp/hicache_transition.py"),
+        base.desc(ENGINE / "python/sglang/srt/elastic_pp/hicache_precopy.py"),
+        base.desc(ENGINE / "python/sglang/srt/mem_cache/pool_host/base.py"),
+    ]
     if getattr(args, "supervised_lifecycle", False):
         spec["frozen_inputs"] += [
             base.desc(ROOT / name)
@@ -1364,6 +1488,15 @@ def prepare(args):
             base.desc(ENGINE / "python/sglang/srt/elastic_pp" / name)
             for name in ("kv_patch.py", "live_kv_patch.py")
         ]
+    if cfg["weight_staging"] in {"cpu_cache", "cpu_prepacked"}:
+        spec["frozen_inputs"] += [
+            base.desc(ENGINE / "python/sglang/srt/weight_cache" / name)
+            for name in (
+                "cpu_canonical.py",
+                "cpu_protocol.py",
+                "cpu_canonical_loader.py",
+            )
+        ]
     if cfg["cuda_graph"]:
         spec["frozen_inputs"] += [
             base.desc(ENGINE / path)
@@ -1378,6 +1511,9 @@ def prepare(args):
                 "python/sglang/srt/model_executor/model_runner_components/cuda_graph_setup.py",
                 "python/sglang/srt/elastic_pp/prepared_decode_graph.py",
                 "python/sglang/srt/elastic_pp/weight_backing.py",
+                "python/sglang/srt/elastic_pp/weight_staging.py",
+                "python/sglang/srt/elastic_pp/cpu_weight_reload.py",
+                "python/sglang/srt/elastic_pp/prepared_cpu_weights.py",
                 "python/sglang/srt/cuda_vmm_utils.py",
                 "python/sglang/srt/elastic_pp/model.py",
                 "python/sglang/srt/elastic_pp/model_wrapper.py",
@@ -1476,6 +1612,7 @@ def main():
         "--strategy", choices=["sync", "background", "batched"], default="sync"
     )
     parser.add_argument("--live-kv-patch", action="store_true")
+    parser.add_argument("--kv-base-precopy", action="store_true")
     parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--prepared-graphs", action="store_true")
     parser.add_argument(
@@ -1484,6 +1621,16 @@ def main():
         default="offload",
     )
     parser.add_argument("--migration-profile", action="store_true")
+    parser.add_argument(
+        "--weight-staging",
+        choices=["cpu_cache", "cpu_prepacked", "legacy", "pinned"],
+        default="pinned",
+    )
+    parser.add_argument("--cpu-weight-cache-gib", type=int, default=24)
+    parser.add_argument("--profile-native-weight-load", action="store_true")
+    parser.add_argument("--hicache-fast-copy", action="store_true")
+    parser.add_argument("--hicache-background", action="store_true")
+    parser.add_argument("--hicache-batch-io", action="store_true")
     parser.add_argument(
         "--hicache-allocator", choices=["mmap", "pytorch"], default="mmap"
     )

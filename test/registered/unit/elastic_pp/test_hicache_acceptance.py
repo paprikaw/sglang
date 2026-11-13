@@ -525,6 +525,15 @@ def test_complete_current_transition_and_fresh_restore_are_accepted(acceptance):
     }
 
 
+def test_completed_background_host_payload_counts_when_fence_delta_is_empty(acceptance):
+    evidence = states()
+    for state in evidence:
+        host = state["transition_metrics"]["host"]
+        host["host_background_bytes_sent"] = host.pop("host_bytes_sent")
+        host["host_bytes_sent"] = 0
+    acceptance["validate_transition_states"](evidence, 2, (0, 1, 2), "overlap")
+
+
 @pytest.mark.parametrize("fault", ["stale_generation", "duplicate_rank", "no_bytes"])
 def test_old_or_incomplete_host_transfer_cannot_pass(acceptance, fault):
     evidence = states()
@@ -733,9 +742,13 @@ def test_prepared_graph_acceptance_rejects_recapture_and_incomplete_bank(
 
 
 @pytest.mark.parametrize("generation", [1, 2])
-@pytest.mark.parametrize("fault", [None, "resident", "reuse", "no_transfer"])
+@pytest.mark.parametrize(
+    "fault",
+    [None, "resident", "reuse", "no_transfer", "export", "fallback", "unverified"],
+)
+@pytest.mark.parametrize("weight_source", ["legacy", "cpu_cache", "cpu_prepacked"])
 def test_nonresident_graph_acceptance_requires_real_transfer_and_eviction(
-    acceptance, generation, fault
+    acceptance, generation, fault, weight_source
 ):
     senders = {0, 2} if generation == 1 else {1}
     targets = (0, 1, 2) if generation == 1 else (0, 2)
@@ -767,6 +780,38 @@ def test_nonresident_graph_acceptance_requires_real_transfer_and_eviction(
             "prepared_weight_bytes_reused": 0,
             "background_weight_bytes_sent": 4096 if rank in senders else 0,
         }
+        if weight_source in {"cpu_cache", "cpu_prepacked"}:
+            receives = rank in ({1} if generation == 1 else {0, 2})
+            metrics.update(
+                weight_staging=weight_source,
+                background_weight_bytes_sent=0,
+                weight_staging_metrics=dict(
+                    kind=(
+                        "prepared_cpu_cache"
+                        if weight_source == "cpu_prepacked"
+                        else "canonical_cpu_cache"
+                    ),
+                    cache_key="initial-bank",
+                    cache_key_matches_initial_load=receives,
+                    gpu_export_bytes=0,
+                    gloo_weight_bytes=0,
+                    fallback_count=0,
+                    target_weight_bytes=4096 if receives else 0,
+                    checkpoint_bytes=4096 if receives else 0,
+                    checkpoint_tensors=2 if receives else 0,
+                    checkpoint_load_seconds=0.1 if receives else 0,
+                    layers_loaded=[1] if receives else [],
+                    storage_verified=receives,
+                    prepared_cpu_cache_hit=receives,
+                    cpu_prepare_seconds=0,
+                    canonical_checkpoint_read_bytes=0,
+                    h2d_bytes=4096 if receives else 0,
+                    h2d_wall_seconds=0.1 if receives else 0,
+                    h2d_stream_seconds=0.09 if receives else 0,
+                    prepared_cpu_cache_bytes=4096,
+                    prepared_cpu_cache_cap_bytes=8192,
+                ),
+            )
         if generation == 2:
             metrics["decode_graph"].append(
                 {
@@ -786,7 +831,30 @@ def test_nonresident_graph_acceptance_requires_real_transfer_and_eviction(
     elif fault == "reuse":
         metrics["prepared_weight_bytes_reused"] = 4096
     elif fault == "no_transfer":
-        metrics["background_weight_bytes_sent"] = 0
+        if weight_source in {"cpu_cache", "cpu_prepacked"}:
+            receiver = next(
+                row["transition_metrics"]
+                for row in states
+                if row["transition_rank"] not in senders
+            )
+            receiver["weight_staging_metrics"]["checkpoint_bytes"] = 0
+        else:
+            metrics["background_weight_bytes_sent"] = 0
+    elif fault in {"export", "fallback", "unverified"}:
+        if weight_source in {"cpu_cache", "cpu_prepacked"}:
+            receiver = next(
+                row["transition_metrics"]
+                for row in states
+                if row["transition_rank"] not in senders
+            )
+            key, value = {
+                "export": ("gpu_export_bytes", 4),
+                "fallback": ("fallback_count", 1),
+                "unverified": ("storage_verified", False),
+            }[fault]
+            receiver["weight_staging_metrics"][key] = value
+        else:
+            metrics["background_weight_bytes_sent"] = 0
     if fault:
         with pytest.raises(AssertionError, match="weights|transfer"):
             acceptance["validate_decode_graph_states"](

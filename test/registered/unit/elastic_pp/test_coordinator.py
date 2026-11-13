@@ -507,6 +507,41 @@ def test_synchronous_policies_snapshot_before_target_allocation(strategy):
     assert runner.committed
 
 
+@pytest.mark.parametrize("failure", [None, "local", "peer"])
+@pytest.mark.parametrize("weight_source", ["cpu_cache", "cpu_prepacked"])
+def test_cpu_cache_startup_sync_reaches_weight_consensus_before_kv_copy(
+    failure, weight_source
+):
+    group = _Group(fail_stage="fence_cpu_cached_weights" if failure == "peer" else None)
+    coordinator, transition, runner, kv = _coordinator(group)
+    coordinator.strategy = "sync"
+    coordinator.weight_staging = weight_source
+    calls = []
+
+    def restore(target):
+        assert coordinator.layer_transport.prepared
+        assert not kv.phases
+        calls.append("cpu_cache")
+        if failure == "local":
+            raise RuntimeError("bank unavailable")
+
+    coordinator._precopy_cpu_cached_weights = restore
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    if failure:
+        with pytest.raises(RuntimeError, match="fence CPU cached weights failed"):
+            coordinator.finalize_at_fence(lambda target: None)
+        assert not runner.committed
+        assert not kv.phases
+        assert coordinator.snapshot().source_usable
+        assert group.stages[-2:] == ["fence_cpu_cached_weights", "abort_restore"]
+    else:
+        coordinator.finalize_at_fence(lambda target: calls.append("publish"))
+        assert calls == ["cpu_cache", "publish"]
+        assert runner.committed and kv.phases
+    assert not coordinator.layer_transport.received
+
+
 @pytest.mark.parametrize("failure_stage", ["prepare", "apply", "commit"])
 def test_host_cache_transaction_failure_obeys_publication_boundary(failure_stage):
     coordinator, transition, runner, kv = _coordinator()
@@ -852,3 +887,60 @@ def test_cpu_spill_preserves_bounded_wire_chunks(strategy):
     coordinator.finalize_at_fence(lambda target: None)
     assert observed == [("bulk", 2), ("delta", 2)]
     assert kv.slot_chunk_size == 2
+
+
+@pytest.mark.parametrize("failure", [None, "local", "peer", "busy"])
+def test_background_host_allocation_consensus_precedes_exchange_and_arm(failure):
+    group = _Group(fail_stage="host_background_allocate" if failure == "peer" else None)
+    coordinator, transition, runner, _ = _coordinator(group)
+    coordinator.strategy = "background"
+    coordinator._preflight_capacity = lambda _: None
+    coordinator._precopy_immutable_weights = lambda _: None
+    events = []
+
+    class Host:
+        background = True
+        precopy = None
+
+        def begin_background(self, transition):
+            assert not runner.committed
+            self.precopy = None if failure == "busy" else object()
+            events.append("capture")
+
+        def allocate_background(self, transition, *, enabled):
+            assert "host_background_capture" in group.stages
+            events.append("allocate" if enabled else "fallback")
+            if failure == "local":
+                raise RuntimeError("host allocation failed")
+
+        def copy_background(self, transition):
+            assert "host_background_allocate" in group.stages
+            assert "arm_fence" not in group.stages
+            events.append("copy")
+
+        def abort(self, transition):
+            events.append("abort")
+
+    coordinator.cache_transition = Host()
+    coordinator.begin(transition)
+    if failure in {"local", "peer"}:
+        coordinator._thread.join(timeout=3)
+        assert coordinator.phase == ElasticPPMigrationPhase.FAILED
+        assert "background host allocation" in coordinator.snapshot().error
+        assert events == ["capture", "allocate", "abort"]
+        assert coordinator.snapshot().source_usable and not runner.committed
+        assert (
+            "host_background_copy" not in group.stages
+            and "arm_fence" not in group.stages
+        )
+    else:
+        coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+        assert events == [
+            "capture",
+            "fallback" if failure == "busy" else "allocate",
+            "copy",
+        ]
+        assert group.stages.index("host_background_copy") < group.stages.index(
+            "arm_fence"
+        )
+        assert not runner.committed

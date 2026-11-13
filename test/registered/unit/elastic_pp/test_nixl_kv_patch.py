@@ -201,6 +201,9 @@ def test_real_allocator_patch_applies_online_and_seals_exact_coverage(endpoints,
             assert torch.equal(actual[slots], expected[slots])
     assert patch.copier.shadow_bytes == 0
     assert allocator._elastic_pp_live_patch is None
+    fence = patch.metrics()["fence"]
+    assert fence["seal_seconds"] >= 0
+    assert set(fence["transport"]["peer_seal_seconds"]) == set(peers)
 
 
 def test_source_slot_remains_pinned_until_application_ack_not_network_done(endpoints):

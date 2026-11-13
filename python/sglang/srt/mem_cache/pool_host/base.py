@@ -3,6 +3,8 @@ from __future__ import annotations
 import abc
 import logging
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
 from typing import Optional
 
@@ -19,6 +21,19 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import is_cuda, is_hip
 
 logger = logging.getLogger(__name__)
+
+_capacity_group_override = ContextVar("hicache_capacity_group", default=None)
+
+
+@contextmanager
+def hicache_capacity_group(group):
+    """Keep speculative host-pool MINs off the serving PP CPU communicator."""
+    token = _capacity_group_override.set(group)
+    try:
+        yield
+    finally:
+        _capacity_group_override.reset(token)
+
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -77,7 +92,9 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
     try:
         from sglang.srt.distributed.parallel_state import get_pp_group
 
-        pp_group = get_pp_group()
+        pp_group = _capacity_group_override.get()
+        if pp_group is None:
+            pp_group = get_pp_group()
     except AssertionError:
         return size
 

@@ -1112,6 +1112,28 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "offload"
+    elastic_pp_weight_staging: A[
+        str,
+        Arg(
+            help="Background immutable weights: cpu_cache uses the canonical RAM checkpoint; cpu_prepacked prepares native load-layout weights in bounded pinned CPU RAM during Graph startup (native Qwen3.5 TP1/EP1 Triton). pinned/legacy export through CPU/Gloo. No candidate GPU weight cache.",
+            choices=["cpu_cache", "cpu_prepacked", "pinned", "legacy"],
+        ),
+        NS("parallel"),
+    ] = "legacy"
+    elastic_pp_cpu_weight_cache_gib: A[
+        int,
+        Arg(
+            help="Per-worker CPU prepared-weight cap in GiB; reserve the sum in the experiment host-memory budget."
+        ),
+        NS("parallel"),
+    ] = 24
+    elastic_pp_profile_weight_load: A[
+        bool,
+        Arg(
+            help="Diagnose native H2D copy-call host times; adds Python dispatch overhead and is disabled for performance comparison."
+        ),
+        NS("parallel"),
+    ] = False
     elastic_pp_hicache_allocator: A[
         str,
         Arg(
@@ -1120,6 +1142,27 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "mmap"
+    elastic_pp_hicache_fast_copy: A[
+        bool,
+        Arg(
+            help="Reduce fenced CPU HiCache row copies into a verified private target; keep the source intact until publication."
+        ),
+        NS("parallel"),
+    ] = False
+    elastic_pp_hicache_background: A[
+        bool,
+        Arg(
+            help="Prepare private CPU HiCache backing and stable rows in the background; compare fence contents and exchange deltas before publication."
+        ),
+        NS("parallel"),
+    ] = False
+    elastic_pp_hicache_batch_io: A[
+        bool,
+        Arg(
+            help="Batch CPU HiCache layer snapshots, transfers and exact fence comparisons; requires background HiCache."
+        ),
+        NS("parallel"),
+    ] = False
     elastic_pp_kv_backend: A[
         str,
         Arg(
@@ -1159,6 +1202,11 @@ class ServerArgs:
     enable_elastic_pp_kv_patch: A[
         bool,
         "Experimental forward-ready KV copies during background PP preparation; recurrent state still migrates at the fence.",
+        NS("parallel"),
+    ] = False
+    elastic_pp_kv_base_precopy: A[
+        bool,
+        "Pre-copy initial live KV incarnations after quiescent HiCache capture and the first forward completion.",
         NS("parallel"),
     ] = False
     elastic_pp_kv_patch_transport: A[
@@ -8000,6 +8048,14 @@ class ServerArgs:
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
 
+        if self.elastic_pp_kv_base_precopy and not (
+            self.enable_elastic_pp_kv_patch
+            and self.enable_hierarchical_cache
+            and self.elastic_pp_hicache_background
+        ):
+            raise ValueError(
+                "initial KV base pre-copy requires KV patch and background HiCache"
+            )
         if self.elastic_pp_kv_patch_transport == "nixl":
             if not self.enable_elastic_pp_kv_patch:
                 raise ValueError("NIXL migration requires --enable-elastic-pp-kv-patch")
