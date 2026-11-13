@@ -687,6 +687,7 @@ def engine_entry(cfg, row):
                 if cfg.get("profile_native_weight_load")
                 else []
             )
+            + (["--elastic-pp-hicache-batch-io"] if cfg.get("hicache_batch_io") else [])
             + (
                 (
                     ["--elastic-pp-hicache-background"]
@@ -1360,6 +1361,7 @@ def prepare(args):
         hicache_allocator=getattr(args, "hicache_allocator", "mmap"),
         hicache_fast_copy=getattr(args, "hicache_fast_copy", False),
         hicache_background=getattr(args, "hicache_background", False),
+        hicache_batch_io=getattr(args, "hicache_batch_io", False),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
         context_length=(
             4096 if getattr(args, "active_output_tokens", 256) > 1024 else 2048
@@ -1624,6 +1626,7 @@ def main():
     parser.add_argument("--profile-native-weight-load", action="store_true")
     parser.add_argument("--hicache-fast-copy", action="store_true")
     parser.add_argument("--hicache-background", action="store_true")
+    parser.add_argument("--hicache-batch-io", action="store_true")
     parser.add_argument(
         "--hicache-allocator", choices=["mmap", "pytorch"], default="mmap"
     )

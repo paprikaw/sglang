@@ -191,17 +191,19 @@ class HiCacheTransitionAdapter:
             if edge.src_rank == self.rank
             for layer in range(edge.layer_range.start, edge.layer_range.end)
         }
-        for (identity, component), node in host_nodes(self.cache).items():
+        nodes = host_nodes(self.cache)
+        if self.precopy is not None and self.precopy.batch_io:
+            self.precopy.verify_at_fence(self.pools, nodes)
+            self.metrics.update(self.precopy.metrics)
+        for (identity, component), node in nodes.items():
             for layer, tensors in self.pools.get(component, {}).items():
                 if layer not in outgoing:
                     continue
                 key = (identity, component, layer)
                 if self.precopy is not None:
-                    from sglang.srt.elastic_pp.hicache_precopy import rows_match
-
                     original = self.precopy.records.get(key)
-                    if original is not None and rows_match(
-                        tensors, original, node.slots
+                    if original is not None and self.precopy.matches(
+                        key, tensors, node.slots
                     ):
                         self.metrics[
                             "host_verified_unchanged_bytes"
@@ -573,6 +575,7 @@ def prepare_target_host_cache(
     allocation_only=False,
     prepared=None,
     preloaded=None,
+    verified_preloaded=None,
 ):
     """Build target L2 while keeping allocation failures safe for GPU rollback."""
     try:
@@ -586,6 +589,7 @@ def prepare_target_host_cache(
             allocation_only=allocation_only,
             prepared=prepared,
             preloaded=preloaded,
+            verified_preloaded=verified_preloaded,
         )
     except BaseException as exc:
         from sglang.srt.elastic_pp.backing_spill import discard_tensor_tracebacks
@@ -728,6 +732,7 @@ def _prepare_target_host_cache(
     allocation_only=False,
     prepared=None,
     preloaded=None,
+    verified_preloaded=None,
 ):
     """Build replacement L2 backing without resetting the live radix tree.
 
@@ -817,7 +822,12 @@ def _prepare_target_host_cache(
                 if record is not None:
                     from sglang.srt.elastic_pp.hicache_precopy import rows_match
 
-                    if rows_match(old_views[component][layer], record, node.slots):
+                    verified = (verified_preloaded or {}).get(
+                        (node.identity, component, layer)
+                    )
+                    if verified is record or rows_match(
+                        old_views[component][layer], record, node.slots
+                    ):
                         metrics["host_preloaded_retained_bytes_reused"] = metrics.get(
                             "host_preloaded_retained_bytes_reused", 0
                         ) + sum(
@@ -933,6 +943,15 @@ class SchedulerHiCacheTransition:
                 False,
             )
         )
+        self.batch_io = bool(
+            getattr(
+                getattr(model_runner, "server_args", None),
+                "elastic_pp_hicache_batch_io",
+                False,
+            )
+        )
+        if self.batch_io and not self.background:
+            raise ValueError("batched HiCache I/O requires background HiCache")
         if self.background and (
             not self.fast_copy
             or getattr(model_runner.server_args, "elastic_pp_transition_strategy", None)
@@ -967,6 +986,7 @@ class SchedulerHiCacheTransition:
                     else {}
                 ),
                 transition.target.generation,
+                batch_io=self.batch_io,
             )
         except Exception as exc:
             # A busy I/O epoch is not safe to snapshot. All peers select the
@@ -1024,7 +1044,9 @@ class SchedulerHiCacheTransition:
             for t in tensors.values()
         ):
             raise RuntimeError("background HiCache backing aliases live source")
-        self.precopy.preloaded.update(copy_records(views, self.precopy.records))
+        self.precopy.preloaded.update(
+            copy_records(views, self.precopy.records, batch_io=self.batch_io)
+        )
         metrics["host_background_allocate_seconds"] = time.monotonic() - started
         metrics["host_background_used"] = True
 
@@ -1215,6 +1237,11 @@ class SchedulerHiCacheTransition:
             metrics=self._phase_metrics,
             prepared=self.prepared_host,
             preloaded=self.precopy.preloaded if self.precopy is not None else None,
+            verified_preloaded=(
+                self.precopy.verified
+                if self.precopy is not None and self.batch_io
+                else None
+            ),
         )
         self.prepared_host = None
         started = time.monotonic()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import threading
+import time
 
 import torch
 
@@ -148,6 +149,7 @@ class LiveKVSnapshot:
         self.active = True
         self.complete = False
         self.online_submissions = self.online_completed_rows = self.free_waits = 0
+        self.fence_metrics = {}
         self.forward_checkpoints = 0
         self.copier = (
             copier
@@ -263,6 +265,7 @@ class LiveKVSnapshot:
 
     def finish_at_fence(self, slots, ready):
         with self.lock:
+            started = time.monotonic()
             if self.error is not None:
                 raise RuntimeError("online KV snapshot failed: " + self.error)
             if not self.active:
@@ -270,15 +273,29 @@ class LiveKVSnapshot:
             current = set(slots.detach().cpu().tolist())
             if current != set(self.epochs):
                 raise RuntimeError("KV allocator and patch live sets diverged")
+            self.fence_metrics["slot_validation_seconds"] = time.monotonic() - started
+            started = time.monotonic()
             self._publish(slots, ready)
+            self.fence_metrics["publish_seconds"] = time.monotonic() - started
+            self.fence_metrics["dirty_rows_before_finish"] = len(
+                self.session.dirty_rows()
+            )
+            rows_before = self.session.rows_copied
+            started = time.monotonic()
             self.session.finish_at_fence(
                 generation=self.generation,
                 max_rounds=math.ceil(self.session.capacity / self.session.max_rows) + 1,
             )
+            self.fence_metrics["session_finish_seconds"] = time.monotonic() - started
+            self.fence_metrics["rows_copied_at_fence"] = (
+                self.session.rows_copied - rows_before
+            )
             self.active = False
             self.allocator.detach_elastic_pp_live_patch(self)
             if hasattr(self.copier, "finish"):
+                started = time.monotonic()
                 self.copier.finish(self.epochs)
+                self.fence_metrics["seal_seconds"] = time.monotonic() - started
             self.complete = True
             self.copier.source = {}  # Do not pin retired GPU storage after commit.
 
@@ -318,4 +335,8 @@ class LiveKVSnapshot:
                 total_rows=self.session.rows_copied,
                 free_waits=self.free_waits,
                 shadow_bytes=self.copier.shadow_bytes,
+                fence=dict(
+                    self.fence_metrics,
+                    transport=getattr(self.copier, "fence_metrics", {}),
+                ),
             )

@@ -795,6 +795,9 @@ class ElasticPPMigrationCoordinator:
                 "background_host": bool(
                     getattr(self.cache_transition, "background", False)
                 ),
+                "host_batch_io": bool(
+                    getattr(self.cache_transition, "batch_io", False)
+                ),
             }
             reports = self._consensus(
                 "prepare_allocations",

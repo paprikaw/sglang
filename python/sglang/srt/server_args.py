@@ -1156,6 +1156,13 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = False
+    elastic_pp_hicache_batch_io: A[
+        bool,
+        Arg(
+            help="Batch CPU HiCache layer snapshots, transfers and exact fence comparisons; requires background HiCache."
+        ),
+        NS("parallel"),
+    ] = False
     elastic_pp_kv_backend: A[
         str,
         Arg(

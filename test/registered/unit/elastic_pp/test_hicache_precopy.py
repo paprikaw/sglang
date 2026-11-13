@@ -56,17 +56,26 @@ class Wire:
 @pytest.mark.parametrize(
     "change", ["unchanged", "overwrite", "remap", "split", "new_prefix"]
 )
-def test_background_then_fence_sends_only_unchanged_proven_rows(change):
+@pytest.mark.parametrize("batch_io", [False, True])
+def test_background_then_fence_sends_only_unchanged_proven_rows(change, batch_io):
     source_cache, target_cache = cache(), cache()
     identity, component = next(iter(host_nodes(source_cache)))
     values = torch.arange(24).reshape(6, 4).float()
     original = HostRecord(torch.tensor([1, 2]), {"k": values[1:3].clone()})
     key = (identity, component, 3)
     src = HiCachePrecopy(
-        generation=1, records={key: original}, metadata_cache=None, captured_seconds=0
+        generation=1,
+        records={key: original},
+        metadata_cache=None,
+        captured_seconds=0,
+        batch_io=batch_io,
     )
     dst = HiCachePrecopy(
-        generation=1, records={}, metadata_cache=None, captured_seconds=0
+        generation=1,
+        records={},
+        metadata_cache=None,
+        captured_seconds=0,
+        batch_io=batch_io,
     )
     target = torch.full_like(values, -1)
     pools = {0: {3: {"k": target}}}
@@ -323,3 +332,83 @@ def test_capacity_collective_override_is_thread_local_and_restored(monkeypatch):
             assert executor.submit(sync_fixed_hicache_size, 8, 1).result() == 8
     assert sync_fixed_hicache_size(8, 1) == 8
     assert groups == ["migration", "serving", "serving"]
+
+
+@pytest.mark.parametrize("layout", ["page_first", "layer_first"])
+@pytest.mark.parametrize("slots", [(1, 2), (1, 4)])
+def test_batched_layers_preserve_owned_rows_and_detect_single_layer_overwrite(
+    monkeypatch, layout, slots
+):
+    from sglang.srt.elastic_pp import hicache_transition as module
+    from sglang.srt.elastic_pp.hicache_precopy import pack_records, unpack_records
+
+    live = cache(slots)
+    monkeypatch.setattr(
+        module, "clone_cache_runtime_metadata", lambda _: NS(components={})
+    )
+    shape = (6, 4, 8) if layout == "page_first" else (4, 6, 8)
+    buffers = {
+        name: torch.arange(192).reshape(shape).float() + shift
+        for name, shift in [("k", 0), ("v", 500)]
+    }
+
+    def views(buffers):
+        return {
+            0: {
+                3
+                + i: {
+                    n: (t[:, i] if layout == "page_first" else t[i])
+                    for n, t in buffers.items()
+                }
+                for i in range(4)
+            }
+        }
+
+    pools = views(buffers)
+    snapshot = HiCachePrecopy.capture(live, pools, 1, batch_io=True)
+    assert snapshot.metrics["host_snapshot_copy_calls"] == 2
+    snapshot.verify_at_fence(pools, host_nodes(live))
+    assert set(snapshot.verified) == set(snapshot.records)
+    assert snapshot.metrics["host_fence_bulk_comparisons"] == 2
+    pools[0][4]["k"][slots[0]].fill_(-10)
+    snapshot.verify_at_fence(pools, host_nodes(live))
+    assert {k[2] for k in snapshot.verified} == {3, 5, 6}
+    # Packing and importing preserve both CPU layouts and sparse slot order.
+    decoded = unpack_records(pack_records(snapshot.records))
+    targets = views({n: torch.full_like(t, -1) for n, t in buffers.items()})
+    copy_records(targets, decoded, batch_io=True)
+    for (_, component, layer), record in snapshot.records.items():
+        for name, data in record.tensors.items():
+            assert torch.equal(targets[component][layer][name][list(slots)], data)
+            assert (
+                data.untyped_storage().data_ptr()
+                != pools[component][layer][name].untyped_storage().data_ptr()
+            )
+    assert pools[0][4]["k"][slots[0]].eq(-10).all()
+
+
+def test_batched_layout_detection_rejects_unrelated_or_reversed_storage():
+    from sglang.srt.elastic_pp.hicache_precopy import layer_stack
+
+    values = torch.arange(48).reshape(2, 6, 4)
+    assert layer_stack([values[0], values[1]]) is not None
+    assert layer_stack([values[1], values[0]]) is None
+    assert layer_stack([values[0], values[1].clone()]) is None
+
+
+def test_packed_payload_rejects_bad_dimensions_and_duplicate_records():
+    from sglang.srt.elastic_pp.hicache_precopy import pack_records, unpack_records
+
+    records = {
+        ("id", 0, layer): HostRecord(torch.tensor([1, 2]), {"k": torch.ones(2, 4)})
+        for layer in [3, 4]
+    }
+    wire = pack_records(records)
+    wire["0:k"] = wire["0:k"][:1]
+    with pytest.raises(ValueError, match="dimensions"):
+        unpack_records(wire)
+    wire = pack_records(records)
+    wire["blocks"].append(wire["blocks"][0])
+    wire["1:slots"], wire["1:k"] = wire["0:slots"], wire["0:k"]
+    with pytest.raises(ValueError, match="duplicate packed"):
+        unpack_records(wire)
