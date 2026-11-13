@@ -1175,6 +1175,13 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "native"
+    elastic_pp_hicache_shared_host: A[
+        bool,
+        Arg(
+            help="Keep node-local page-first HiCache backing shared across PP layouts; requires kernel I/O, native KV, TP1/EP1 and prepared Graphs."
+        ),
+        NS("parallel"),
+    ] = False
     elastic_pp_transition_strategy: A[
         str,
         Arg(
@@ -6925,9 +6932,7 @@ class ServerArgs:
                     "KDA, as the linear-attn decode backend; got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
-            from sglang.srt.arg_groups.overrides import (
-                mamba_extra_buffer_of,
-            )
+            from sglang.srt.arg_groups.overrides import mamba_extra_buffer_of
 
             if mamba_extra_buffer_of(resolved_view(self)):
                 raise ValueError(
@@ -7940,9 +7945,7 @@ class ServerArgs:
                 raise ValueError("--pp-layer-partition requires --pp-stage-tp-sizes")
             return
 
-        from sglang.srt.distributed.heterogeneous_pp import (
-            HeterogeneousPPTopology,
-        )
+        from sglang.srt.distributed.heterogeneous_pp import HeterogeneousPPTopology
 
         topology = HeterogeneousPPTopology.parse(self.pp_stage_tp_sizes)
         # Keep the first runtime deliberately narrow while the dynamic join and
@@ -8047,6 +8050,13 @@ class ServerArgs:
         )
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
+
+        if self.elastic_pp_hicache_shared_host:
+            from sglang.srt.elastic_pp.shared_host_cache import (
+                validate_shared_host_args,
+            )
+
+            validate_shared_host_args(self)
 
         if self.elastic_pp_kv_base_precopy and not (
             self.enable_elastic_pp_kv_patch
@@ -10208,9 +10218,7 @@ class ServerArgs:
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass
         view so declared fields resolve from the declaration stash."""
-        from sglang.srt.arg_groups.overrides import (
-            attention_backends_of,
-        )
+        from sglang.srt.arg_groups.overrides import attention_backends_of
 
         return attention_backends_of(resolved_view(self))
 
@@ -10337,9 +10345,7 @@ class ServerArgs:
         )
         # Check parallel size constraints
         if self.pp_stage_tp_sizes is not None:
-            from sglang.srt.distributed.heterogeneous_pp import (
-                HeterogeneousPPTopology,
-            )
+            from sglang.srt.distributed.heterogeneous_pp import HeterogeneousPPTopology
 
             HeterogeneousPPTopology.parse(self.pp_stage_tp_sizes).placements_for_node(
                 nnodes=self.nnodes, node_rank=self.node_rank

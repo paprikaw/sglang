@@ -399,9 +399,7 @@ def prewarm_scheduler_graph_bank(scheduler):
     bank = getattr(mr, "_elastic_pp_prepared_graphs", None)
     if bank is None:
         return
-    from sglang.srt.elastic_pp.coordinator import (
-        ElasticPPMigrationCoordinator,
-    )
+    from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
     from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationPhase as Phase
     from sglang.srt.elastic_pp.decode_graph import ElasticPPDecodeGraphState
     from sglang.srt.elastic_pp.topology import DynamicPPTransition
@@ -471,5 +469,8 @@ def prewarm_scheduler_graph_bank(scheduler):
     else:
         bank.select(mr, entry)
         bank.runtime_selections = 0
+    from sglang.srt.elastic_pp.shared_host_cache import initialize_scheduler_shared_host
+
+    initialize_scheduler_shared_host(scheduler)
     scheduler.init_elastic_pp_migration_coordinator()
     logger.info("ELASTIC_PP_PREPARED_GRAPHS %s", bank.metrics())

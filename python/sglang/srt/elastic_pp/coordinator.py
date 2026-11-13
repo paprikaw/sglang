@@ -293,13 +293,13 @@ class ElasticPPMigrationCoordinator:
                 # This caller is the scheduler; allocator snapshots must never
                 # be taken from the preparation worker.
                 self.kv_transport.begin_live_patch(transition)
-                if (
-                    getattr(
-                        getattr(self.model_runner, "server_args", None),
-                        "elastic_pp_kv_base_precopy",
-                        False,
-                    )
-                    and getattr(self.cache_transition, "precopy", None) is not None
+                if getattr(
+                    getattr(self.model_runner, "server_args", None),
+                    "elastic_pp_kv_base_precopy",
+                    False,
+                ) and (
+                    getattr(self.cache_transition, "precopy", None) is not None
+                    or getattr(self.cache_transition, "initial_base_ready", False)
                 ):
                     # Successful capture proved HiCache writers quiescent. A
                     # later forward event covers earlier inference writes; new

@@ -1,5 +1,13 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-13：共享CPU HiCache，有限同源对照通过
+
+PR #10已以`8570a9153a76`合入项目。新任务[PR #11](https://github.com/paprikaw/sglang/pull/11)的冻结源码`d9a5731c1222f7b77d3a9c497da005ffd08fc94f`／tag `experiment/sglang/pp-hicache-shared-host-20261113-r2`通过1206项完整CPU检查，零失败／错误／跳过，监督139.131秒，源码未变。Black通过；两处既有import的isort欠账在基点也存在，不宣称全仓CI通过。
+
+同A100节点、35B BF16／B1、HiCache、NIXL、CPU预打包权重、候选权重offload、启动Graph，只改变共享CPU开关，各一次PP2→PP3→PP2。私有→共享扩／缩最终暂停105.2／88.5→43.8／39.0 ms、完整转换1.342／0.879→1.007／0.610秒；客户端跨fence间隔129.6／102.0→70.6／52.4 ms，准备期最大间隔74.1／96.2→26.5／58.0 ms。共享模式各rank历史CPU快照／发送／复制均0，物理region身份贯穿往返一致；每方向2048输出与各自同进程暖参考及配对模式逐token一致，真实CPU前缀loadback、在线KV、Graph replay和runtime capture=0通过。非活跃GPU权重页为0，缩回中间GPU释放20.37890625 GiB权重显存。共享／私有142／138项冻结输入匹配，监督含清理242.341／189.582秒，owned清理、节点GPU空闲观测及正常release通过。每模式一次，不作重复均值或整体吞吐结论。
+
+首版`e8cea6e148b1`的A100启动被额外L3 Gloo建组阻塞，没有请求或性能结果，254.904秒内清理及release通过。修正版L2-only视图不建这类组，空阶段采用共享容量；失败及此前两项CPU替身接口失败均保留。当前限定单节点TP1／EP1 native page_first/kernel L2，CPU容量固定；独立review、更多模型／并发、跨节点、冷暖生成等价及整卡归还未扩展。见[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_shared_host_20261113/summary.md)及[接入说明](SHARED_HOST_CACHE.md)。任务PR仍Draft，总PR #12尚未包括该变更。
+
 ## 2026-11-13：CPU批量HiCache及旧GPU KV基础复制
 
 两组独立同源开关对照均为同A100节点／35B BF16／B1／TP1 EP1 Triton、HiCache／CPU预打包权重／NIXL／启动Graph／候选权重offload，每模式一次PP2→PP3→PP2、每方向2048输出。第一组冻结a0b42990d36e37459ae1e4dc3353fc75ff96b116／tag experiment/sglang/pp-hicache-batch-io-20261113-r1，1173项CPU检查，批量I/O将扩／缩最终暂停113.3／184.4→104.7／138.0 ms。第二组冻结67df645bc2b833400405d19026959f57f56f260f／tag experiment/sglang/pp-hicache-batch-io-20261113-r2，1181项CPU检查全过、零失败／错误／跳过，pytest117.830秒、监督134.252秒、源码不变。两边保留CPU批量，仅切换旧KV基础复制，缩容最终暂停136.0→87.0 ms，完整转换0.885→0.844秒，客户端跨fence间隔186.2→100.9 ms；最终待补2103→55行、复制等待50.5→6.1 ms，接收确认约5.9 ms。扩容103.8→106.1 ms，无额外提速。
