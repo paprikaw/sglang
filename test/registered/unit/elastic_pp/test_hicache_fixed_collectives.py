@@ -10,7 +10,6 @@ from sglang.srt.distributed import parallel_state
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler as assembler
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
-from sglang.srt.mem_cache.pool_host import base
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -129,8 +128,9 @@ def test_ratio_logical_capacity_has_no_fixed_collective(monkeypatch):
 @pytest.mark.parametrize(
     ("hicache_size", "live_high_slot"), [(1, False), (1, True), (0, False)]
 )
+@pytest.mark.parametrize("preallocate", [False, True])
 def test_shrinking_host_constructor_keeps_dormant_rank_in_capacity_protocol(
-    hybrid_pool_factory, monkeypatch, hicache_size, live_high_slot
+    hybrid_pool_factory, monkeypatch, hicache_size, live_high_slot, preallocate
 ):
     from sglang.srt.elastic_pp.hicache_transition import prepare_target_host_cache
     from sglang.srt.elastic_pp.topology import LayerRange
@@ -262,12 +262,25 @@ def test_shrinking_host_constructor_keeps_dormant_rank_in_capacity_protocol(
                     )
                 continue
             else:
+                prepared = None
+                if preallocate:
+                    prepared = prepare_target_host_cache(
+                        source,
+                        device_pool=source_pool,
+                        target=LayerRange(2, 2),
+                        generation=1,
+                        allocation_only=True,
+                    )
                 target = prepare_target_host_cache(
                     source,
                     device_pool=source_pool,
                     target=LayerRange(2, 2),
                     generation=1,
+                    prepared=prepared,
                 )
+                if prepared is not None:
+                    assert prepared.host_pool_group is None
+                    assert prepared.cache_controller is None
                 group = target.host_pool_group
                 target_groups.append(group)
                 assert all(

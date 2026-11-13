@@ -52,6 +52,8 @@ def test_real_allocator_online_snapshot_and_fence_include_unpublished_loadback()
     assert patch.online_submissions == 2
     assert patch.complete and allocator._elastic_pp_live_patch is None
     assert patch.copier.source == {}
+    assert patch.metrics()["fence"]["rows_copied_at_fence"] >= 1
+    assert patch.metrics()["fence"]["session_finish_seconds"] >= 0
 
 
 @pytest.mark.parametrize("need_sort", [False, True])

@@ -279,6 +279,7 @@ class NixlKVPatchCopier:
             raise ValueError("one KV row exceeds the fixed NIXL GPU staging buffer")
         self.lock, self.retired = threading.Lock(), {}
         self.pending = []
+        self.fence_metrics = {}
 
     @property
     def ready_to_submit(self):
@@ -366,11 +367,19 @@ class NixlKVPatchCopier:
 
     def finish(self, epochs):
         versions = dict(epochs)
+        queued = time.monotonic()
 
         def seal():
+            self.fence_metrics["queue_seconds"] = time.monotonic() - queued
+            started = time.monotonic()
             self._wait_ready()
+            self.fence_metrics["ready_seconds"] = time.monotonic() - started
+            started = time.monotonic()
             self._flush_retired()
+            self.fence_metrics["retired_seconds"] = time.monotonic() - started
+            self.fence_metrics["peer_seal_seconds"] = {}
             for peer in self.targets:
+                started = time.monotonic()
                 self.endpoint.rpc(
                     peer,
                     dict(
@@ -379,6 +388,9 @@ class NixlKVPatchCopier:
                         count=len(versions),
                         signature=_signature(versions),
                     ),
+                )
+                self.fence_metrics["peer_seal_seconds"][peer] = (
+                    time.monotonic() - started
                 )
 
         completion = self.endpoint.submit(seal)
