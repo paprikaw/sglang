@@ -1,6 +1,6 @@
 # CPU HiCache后台准备与增量交接
 
-历史 CPU 缓存能否不随切换全部交接、而在切换后按需读取，见[候选设计](DISTRIBUTED_HICACHE.md)。该路径尚未实现，下文描述的仍是完整目标 CPU 池交接。
+同节点 CPU 缓存能否原位复用、把按层访问映射交接与后台整理分开，见[候选设计](DISTRIBUTED_HICACHE.md)。该路径尚未实现，下文描述的仍是完整目标 CPU 池交接。
 
 2026-11-13。在[已有复制优化](HICACHE_FENCE_COPY.md)上增加显式`--elastic-pp-hicache-background`，要求fast-copy和background／overlap。HiCache继续开启，候选GPU权重维持offload。状态见[统一清单](TODO.md)。
 
