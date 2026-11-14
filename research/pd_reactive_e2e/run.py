@@ -54,6 +54,9 @@ def prepare(run, mechanism):
         cfg['hicache_size_gib']=32
         cfg['layouts'][0]['usage_logs']=[dict(id=f'{run.name}.{sid}',path=str(run/'cache'/f'{sid}.log'),expected_ranks=[f'PP{i} TP0' for i in range(pp)])]
         cfg['launch_env'].update(CUDA_MODULE_LOADING='EAGER',CUDA_MODULE_DATA_LOADING='EAGER')
+        cfg['launch_env']['ELASTIC_PD_LIGHTWEIGHT_STATUS']='1'
+        cfg['launch_env']['ELASTIC_PD_STATUS_STACKS']=str(run/'status_stacks')
+        cfg['launch_env']['ELASTIC_PD_STATIC_DECODE']=str(int(sid.startswith('d') and not cfg['optimized_elastic_pp']))
         servers[sid]=cfg
     if mechanism=='replica':
         cfg=copy.deepcopy(servers['d0']); cfg.update(server_id='d1',port=29501,dist_port=29502)
@@ -162,7 +165,20 @@ def engine(run, root, sid):
     q.engine_entry(run,cfg)
 
 def install_telemetry():
+    import faulthandler
     from sglang.srt.managers.scheduler import Scheduler
+    directory=os.environ.get('ELASTIC_PD_STATUS_STACKS')
+    if directory:
+        Path(directory).mkdir(parents=True,exist_ok=True)
+        stack_file=(Path(directory)/f'pid{os.getpid()}.log').open('a')
+        from sglang.srt.managers.scheduler_components.request_receiver import SchedulerRequestReceiver
+        old_receive=SchedulerRequestReceiver.recv_requests
+        def receive(receiver,*args,**kw):
+            # Native watchdog still runs if a CUDA binding retains the GIL.
+            # No signals or external ptrace; only owned worker stacks are saved.
+            faulthandler.dump_traceback_later(20,repeat=True,file=stack_file)
+            return old_receive(receiver,*args,**kw)
+        SchedulerRequestReceiver.recv_requests=receive
     old=Scheduler.get_internal_state
     def state(scheduler,*args,**kw):
         result=old(scheduler,*args,**kw)
@@ -245,7 +261,7 @@ def client(run,root):
     try:
         proc=subprocess.Popen(cmd,env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,start_new_session=True)
         identity=h.process_record(proc.pid)
-        thread=threading.Thread(target=h.stream_log,args=(proc.stdout,str(run/'replay_driver.log'),''),daemon=True)
+        thread=threading.Thread(target=h.stream_log,args=(proc.stdout,str(run/'replay_driver.log'),Path(root['admin_key_file']).read_text().strip()),daemon=True)
         thread.start();children=[dict(process=proc,identity=identity,log_thread=thread)]
         while proc.poll() is None:
             if stop.wait(1):raise InterruptedError('owned replay stopped')
@@ -298,7 +314,7 @@ def coordinator(run,root):
         return visible(run/'servers'/sid/'cleanup.json',20,shutdown=True)
     def info(sid):
         cfg=root['servers'][sid]
-        return replay.http(cfg['node'],cfg['port'],'/get_server_info',key,None,10)
+        return replay.http(cfg['node'],cfg['port'],'/get_server_info',key,None,30)
     def rhttp(path,body=None):
         return replay.http(router['host'],router['port'],path,key,body,10)
     def action(decision):

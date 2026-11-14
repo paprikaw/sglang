@@ -1,3 +1,7 @@
+# 2026-11-14：短 reactive 试跑诊断
+
+r6完成4608-token长Prefill启动检查、两个AgentX暖会话预热并进入正式流量，随后10秒状态查询超时；停止前Decode仍有输出，无伸缩完成。GPU进程清理与Guard缓存审计通过，正式数据不完整，不用于性能比较。新诊断候选将高频状态查询中的CUDA显存遍历移出、查询deadline改30秒，并为调度停滞保留原生watchdog栈；尚未证明查询是根因。静态PP2对照不安装PP3专用诊断通信。
+
 # 2026-11-14：122B P/D 权重恢复与在线 Decode 重叠
 
 r23冻结`5856c9ea8528a13decdc3393f8e782dcdfcba3d1`／tag `experiment/sglang/122b-pd-pp-eager-modules-20261114-r23`，固定P2、D PP2→PP3→PP2，HiCache／Graph／真实CPU权重offload保留。D启动预加载CUDA模块和数据，驱动确认三个rank均EAGER；与r20的`python/sglang`完全相同。新增rank1恢复38.04 GiB／1.671秒，同一RID输出12→101；准备期最大间隔34.0 ms，整轮最大177.8 ms，之前r20为1684.2 ms。扩／缩控制1.917／1.279秒、fence124.0／103.0 ms，客户端跨fence177.8／127.0 ms。每方向一次；未单独计量预加载冷启动／显存增量。

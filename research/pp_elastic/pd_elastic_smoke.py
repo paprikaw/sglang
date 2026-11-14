@@ -216,6 +216,10 @@ def install_hooks():
     if os.environ["ELASTIC_PD_ROLE"] == "decode":
         import cache_probe
         cache_probe.install()
+        if os.environ.get("ELASTIC_PD_STATIC_DECODE") == "1":
+            # Ordinary PP2 replicas do not have the qualification's PP3-only
+            # diagnostic sockets or elastic transition objects.
+            return
         import hicache_transition_smoke as probe
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
@@ -263,6 +267,10 @@ def install_hooks():
             coordinator = getattr(scheduler, "elastic_pp_migration_coordinator", None)
             result.internal_state["transition_weight_copy_progress"] = getattr(
                 coordinator, "_smoke_weight_copy_progress", [])
+            # High-frequency policy observations must not enter CUDA allocator
+            # inspection. Keep the qualification's explicit memory audit opt-in.
+            if os.environ.get("ELASTIC_PD_LIGHTWEIGHT_STATUS") == "1":
+                return result
             pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
             def bytes_of(values):
                 storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
