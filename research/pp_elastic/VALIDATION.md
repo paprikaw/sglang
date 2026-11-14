@@ -1,5 +1,11 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-14：122B A100原生P/D下的最小D侧PP扩缩
+
+冻结 `d8c614d14e6c7844df780a8f513e16f3afad7e1e`，tag `experiment/sglang/122b-pd-pp2-pp3-roundtrip-20261114-r16`，Draft PR #13。完整Qwen3.5-122B-A10B-FP8／A100 Marlin W8A16，EP1、Eager、HiCache每rank 8 GiB、确定性模式、同步CPU spill；P固定PP2，D为24/0/24→16/16/16→24/0/24。最终移除逐层同步和Expert复算钩子后，静态重复、同一请求跨两次转换的512-token完整暖输出、新P→D交接和CPU恢复后32-token输出均与相应暖参考逐个一致，无retraction／重新Prefill。两个活跃D rank实际从CPU恢复576 token。182项相关CPU检查与28项保存结果复算通过；不扩大为冷暖生成等价、真实任务质量或长期稳定性。
+
+缩回后独立进程在GPU1分配／写入64 GiB、矩阵乘并保持5秒，原Decode同期继续；中间rank的KV为0，allocated约1.51 GiB、reserved约2.98 GiB，控制worker与边界张量仍驻留，因此是实际显存复用资格，不是完整worker退出。扩／缩控制8.573／8.061秒，fence约8.306／7.747秒，各一次；不作为重复均值或性能收益。固定P2加上D的活跃计算卡数4→5→4，物理worker5卡，Guard整节点8卡。4183项冻结输入、缓存使用审计、owned清理及Guard postcheck通过，租约正常释放。P伸缩、在途P→D、多请求、Graph、可用KV容量增加及E2E尚未验证。r1–r14原失败与带诊断的r15成功原样保留。[精简报告与证据](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/qwen122b_pd_elastic_roundtrip_20261114/summary.md)。
+
 ## 2026-11-13：CPU批量HiCache及旧GPU KV基础复制
 
 两组独立同源开关对照均为同A100节点／35B BF16／B1／TP1 EP1 Triton、HiCache／CPU预打包权重／NIXL／启动Graph／候选权重offload，每模式一次PP2→PP3→PP2、每方向2048输出。第一组冻结a0b42990d36e37459ae1e4dc3353fc75ff96b116／tag experiment/sglang/pp-hicache-batch-io-20261113-r1，1173项CPU检查，批量I/O将扩／缩最终暂停113.3／184.4→104.7／138.0 ms。第二组冻结67df645bc2b833400405d19026959f57f56f260f／tag experiment/sglang/pp-hicache-batch-io-20261113-r2，1181项CPU检查全过、零失败／错误／跳过，pytest117.830秒、监督134.252秒、源码不变。两边保留CPU批量，仅切换旧KV基础复制，缩容最终暂停136.0→87.0 ms，完整转换0.885→0.844秒，客户端跨fence间隔186.2→100.9 ms；最终待补2103→55行、复制等待50.5→6.1 ms，接收确认约5.9 ms。扩容103.8→106.1 ms，无额外提速。
