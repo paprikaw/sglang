@@ -1096,7 +1096,7 @@ class ServerArgs:
     ] = False
     elastic_pp_disagg_decode: A[
         bool,
-        "Experimental single-request Decode PP migration with quiescent P/D transfers: sync CPU-spill/Eager or background overlap/prepared Graphs/shared CPU HiCache/NIXL.",
+        "Experimental Decode PP migration with quiescent P/D transfers: single-request sync CPU-spill/Eager or bounded (up to four requests) background overlap/prepared Graphs/shared CPU HiCache/NIXL.",
         NS("parallel"),
     ] = False
     elastic_pp_initial_partition: A[

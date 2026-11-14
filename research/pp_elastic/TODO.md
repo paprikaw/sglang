@@ -1,5 +1,9 @@
 # PP 原地伸缩＋HiCache：实现与实验清单
 
+## 短 AgentX＋BurstGPT reactive E2E 对照（2026-11-14）
+
+- [ ] 固定 P2，比较 D 的 PP2→PP3 与新增 PP2，继承 r23 CUDA 模块预加载、真实权重 offload、HiCache 和 NIXL。复用同一有限到达流、缓存亲和与队列 reactive 规则；分别记录启动／待命 worker、整节点预约与逻辑布局的 GPU 时间。单请求资格不等同于多请求 E2E；先完成小规模正确性与一对试跑，保留未触发、负结果和失败。
+
 ## 122B／A100：P/D 下的最小扩缩容（2026-11-14）
 
 - [x] **权重恢复与在线Decode实际重叠。** r20轮询等待的负结果保留：130项相关CPU及最小往返通过，但query曾阻塞1.658秒。r21采样晚到；r22独立进程原生栈抓到NIXL首次gather卡在cudaLaunchKernel、权重query等runtime锁。r23（`5856c9ea8528`）把CUDA模块／数据加载前移，Graph继续开启，38.04 GiB／1.671秒真实H2D期间同一RID从12→101、增加89 token；准备期最大间隔34.0 ms，整轮最大177.8 ms，之前1684.2 ms。扩／缩控制1.917／1.279秒、最终fence124／103 ms。512-token一致、HiCache CPU恢复576 token、新P→D、独立64 GiB复用及Guard清理／release通过。每条件一次、固定P2、单D请求和固定缓存容量；worker仍reserved1.78 GiB，不是整卡退出或E2E资格。见[重叠验证报告](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/WEIGHT_DECODE_OVERLAP.md)。

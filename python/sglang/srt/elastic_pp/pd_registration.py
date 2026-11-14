@@ -15,7 +15,6 @@ def validate_decode_args(args):
         disaggregation_transfer_backend="mooncake",
         enable_hierarchical_cache=True,
         pp_async_batch_depth=0,
-        max_running_requests=1,
         pp_max_micro_batch_size=1,
     )
     mismatches = [
@@ -40,6 +39,9 @@ def validate_decode_args(args):
         and getattr(args, "elastic_pp_kv_patch_transport", None) == "nixl"
         and getattr(args, "elastic_pp_kv_backend", None) == "native"
     )
+    count = getattr(args, "max_running_requests", None)
+    if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= (4 if optimized else 1):
+        mismatches.append(f"max_running_requests={count!r}: requires 1 (sync) or 1..4 (bounded optimized pilot)")
     if not (sync or optimized):
         mismatches.append(
             f"elastic_pp_transition_strategy={args.elastic_pp_transition_strategy!r}, "

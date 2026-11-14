@@ -198,3 +198,18 @@ def test_unwired_modes_fail_before_loading(name, value):
     setattr(args, name, value)
     with pytest.raises(ValueError, match=name):
         validate_decode_args(args)
+
+
+@pytest.mark.parametrize("count", [1, 2, 4])
+def test_bounded_optimized_multi_request_profile(count):
+    args = _optimized_args()
+    args.max_running_requests = count
+    validate_decode_args(args)
+
+
+@pytest.mark.parametrize("count", [0, 5, True, None])
+def test_unsupported_optimized_request_count_fails_closed(count):
+    args = _optimized_args()
+    args.max_running_requests = count
+    with pytest.raises(ValueError, match="max_running_requests"):
+        validate_decode_args(args)

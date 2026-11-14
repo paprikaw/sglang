@@ -209,3 +209,9 @@ PR #10已以`8570a9153a76`合入项目。新任务[PR #11](https://github.com/pa
 [完整报告](/data/gpfs/projects/punim2715/vllm_workbench/artifacts/source_integration/sglang-pp-elastic-20261105/kv-live-foundation-20261109/nixl-gpu-r2/REPORT.md)及同目录的`post_run_audit.json`、`supervisor_outcome.json`、`controller_results_visibility.json`保留证据；结果SHA256 `c56f58fd6505c73bf5f5388f5a63a8db8b8ffb6ef26163ae26f5031c4b0d6dfa`。后续文档更新不改变此运行源码。
 
 **边界。** 本轮只验收native／eager／HiCache路径的有界正确性；完整模型Graph、KVCacheD／GDN／HiCache组合、真实GPU故障注入、跨节点RDMA和性能收益仍未验收。常驻空阶段不等于在转换期间归还GPU。CPU shadow保持可选正确性对照，冷暖生成等价资格不扩大。
+
+## 2026-11-14 reactive E2E pilot candidate
+
+The r23 single-request GPU evidence does not qualify the new four-request, 65K context profile. This task preserves the microbatch-one/native P/D/Graph/HiCache/offload/NIXL restrictions, exposes real queue and transfer counters, and requires quiescent new handoffs at each transition. The first paired AgentX/BurstGPT run is exploratory; no E2E speedup or physical GPU saving has yet been measured. Replica startup uses the admitted canonical CPU bank; standby/startup costs remain in the resource ledger.
+
+Targeted CPU gate: 54 tests passed (reactive hysteresis/serialization, bounded P/D validation, router gating/affinity/cancellation and queue-inclusive latency). The default conda environment lacked orjson; the qualified serving Python completed the suite. This is not GPU qualification.
