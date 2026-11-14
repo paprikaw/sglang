@@ -102,6 +102,7 @@ def prepare(run, mechanism):
         shutil.copyfile(source,run/'harness'/source.name)
     shutil.copyfile(HERE/'router.py',run/'harness/reactive_router.py')
     shutil.copyfile(HERE/'stable_placement.py',run/'harness/stable_placement.py')
+    shutil.copyfile(HERE/'lifecycle.py',run/'harness/reactive_lifecycle.py')
     p=run/'harness/sglang_adapter.py'
     s=p.read_text()+ '\nfrom reactive_router import install as install_reactive\ninstall_reactive(Adapter)\n'
     s=s.replace('first_content_s = time.monotonic() - started','first_content_s = time.monotonic() - started\n                            self.reactive.streaming.add(rid)')
@@ -110,6 +111,11 @@ def prepare(run, mechanism):
     p=run/'harness/run.py';s=p.read_text()
     s=s.replace('web.TCPSite(server, "127.0.0.1", 0)','web.TCPSite(server, "0.0.0.0", 0)')
     s=s.replace('port = site._server.sockets[0].getsockname()[1]', 'port = site._server.sockets[0].getsockname()[1]\n        (args.output.parent / "router_ready.json").write_text(json.dumps(dict(host=socket.gethostname().split(".")[0],port=port,unix=__import__("time").time())))')
+    marker='        return code\n'
+    if s.count(marker)!=1:raise RuntimeError('unknown AgentX harness return boundary')
+    s=s.replace(marker,'        from reactive_lifecycle import hold_control_after_workload\n        await hold_control_after_workload(args.output.parent, code)\n'+marker)
+    s=s.replace('"stable_placement.py", "mixed_replay.py", "sitecustomize.py")',
+                '"stable_placement.py", "mixed_replay.py", "sitecustomize.py", "reactive_lifecycle.py")')
     p.write_text(s)
     ep=dict(mode='pd',require_hicache=True,api_key_file=root['admin_key_file'],
         prefill=[endpoint(servers['p'])],decode=[endpoint(c) for n,c in servers.items() if n.startswith('d')],
@@ -405,8 +411,17 @@ def coordinator(run,root):
                         row=json.loads(line)
                         if row['event']=='phase_start':formal_start=row['unix_ns']/1e9
                 if formal_start:save(run/'formal_start.json',dict(unix=formal_start))
+            if completed_at is None and (run/'replay_workload_done.json').exists():
+                finished=visible(run/'replay_workload_done.json',5)
+                if finished['exit_code']:raise RuntimeError('AgentX workload failed')
+                completed_at=finished['unix'];save(run/'replay_done.json',dict(unix=completed_at))
             route=rhttp('/reactive/state')
-            state=info('d0');last_state=state
+            # Final migration fences temporarily stop scheduler RPC handling.
+            # Keep the independent router/lease live; do not turn that expected
+            # pause into an unrelated status-query timeout or fresh observation.
+            metrics_fresh=future is None
+            state=info('d0') if metrics_fresh else last_state
+            last_state=state
             runtime=[s['e2e_runtime'] for s in state['internal_states']]
             pending=max(s['pd_pending'] for s in runtime)
             # Router slots include TTFT. Only call it Decode overload once all
@@ -414,7 +429,8 @@ def coordinator(run,root):
             overloaded=(route['waiting']>0 and route['oldest_wait_s']>=2 and route['streaming']>=root['per_instance_admission'])
             internal_overloaded=max(s['waiting'] for s in runtime)>0 and pending==0
             sample=dict(unix=time.time(),monotonic=now,formal=bool(formal_start),route=route,
-                decode_runtime=runtime,expanded=expanded,operation_pending=future is not None)
+                decode_runtime=runtime,decode_metrics_fresh=metrics_fresh,
+                expanded=expanded,operation_pending=future is not None)
             samples.append(sample)
             with (run/'telemetry.jsonl').open('a') as f:f.write(json.dumps(sample)+'\n')
             fits=(route['waiting']==0 and sum(route['active'].values())<=1 and pending==0)
@@ -422,15 +438,15 @@ def coordinator(run,root):
             observation=Observation('decode',now,expanded=expanded,compute_queue=route['waiting'],
                 overloaded=overloaded or internal_overloaded,next_layout_improves=True,
                 target_fits_state=True,target_fits_load=fits,in_flight_handoff=bool(pending or route['prefilling']),
-                metrics_valid=bool(formal_start) and cycles<root['max_scale_cycles'])
+                metrics_valid=bool(formal_start) and metrics_fresh and cycles<root['max_scale_cycles'])
             decision=policy.observe([observation],now=now,occupied_gpus=4+(1 if root['mechanism']=='inplace' else 2)*int(expanded),
                 free_by_role=dict(decode=4,prefill=0))
             if decision:
                 future=pool.submit(action,decision)
                 progress('reactive_'+decision.direction)
             if client_process.poll() is not None:
-                if client_process.returncode:raise RuntimeError('AgentX client failed')
-                if completed_at is None:completed_at=time.time();save(run/'replay_done.json',dict(unix=completed_at))
+                raise RuntimeError('AgentX router exited before controller release')
+            if completed_at is not None:
                 if not expanded and future is None:break
                 if time.time()-completed_at>75 and future is None:
                     raise RuntimeError('normal reactive down did not become safe after drain')
@@ -440,6 +456,8 @@ def coordinator(run,root):
             raise AssertionError('post-scaling P/D warm output mismatch')
         save(run/'post_smoke.json',dict(passed=True,response=post_smoke))
         save(run/'state.final.json',info('d0'))
+        (run/'release_router').write_text(str(time.time())+'\n')
+        if client_process.wait(timeout=30):raise RuntimeError('AgentX client cleanup failed')
         save(run/'completed.json',dict(passed=True,formal_start=formal_start,replay_done=completed_at,
             comparison_finished=time.time(),mechanism=root['mechanism'],actions=len(actions),
             scaling_exercised=any(a['decision']['direction']=='up' and a['success'] for a in actions),
