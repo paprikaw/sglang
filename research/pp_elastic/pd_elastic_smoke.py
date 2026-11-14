@@ -79,7 +79,8 @@ def install_prefill_trace(runner):
         def before(module, args, kwargs, name=name, first=index == 0):
             if first:
                 counter[0] += 1
-            record(name, "in", (args, kwargs.get("positions")))
+            record(name, "in", (args, kwargs.get("hidden_states"),
+                                kwargs.get("residual"), kwargs.get("positions")))
         def after(module, args, output, name=name):
             record(name, "out", output)
         layer.register_forward_pre_hook(before, with_kwargs=True)
@@ -99,13 +100,13 @@ def install_expert_repeat_check(runner, local):
         if ".layers.2." not in name:
             continue
         original = module.quant_method.apply
-        def checked(layer, dispatch, original=original, name=name):
-            first = original(layer, dispatch)
-            if dispatch.hidden_states.shape[0] == 64:
+        def checked(layer, dispatch_output, original=original, name=name):
+            first = original(layer, dispatch_output)
+            if dispatch_output.hidden_states.shape[0] == 64:
                 baseline = first.hidden_states.clone()
-                repeated = original(layer, dispatch).hidden_states
-                topk = dispatch.topk_output
-                inputs = (dispatch.hidden_states, topk.topk_ids, topk.topk_weights)
+                repeated = original(layer, dispatch_output).hidden_states
+                topk = dispatch_output.topk_output
+                inputs = (dispatch_output.hidden_states, topk.topk_ids, topk.topk_weights)
                 hashes = [hashlib.sha256(t.contiguous().view(torch.uint8)
                     .cpu().numpy().tobytes()).hexdigest() for t in inputs]
                 delta = (baseline.float() - repeated.float()).abs()
