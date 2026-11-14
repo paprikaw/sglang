@@ -135,7 +135,7 @@ def engine(run, root, sid):
     original=server_args.prepare_server_args
     def arguments(argv):
         values={'--context-length':str(root['context_length']),'--max-total-tokens':str(root['max_total_tokens']),
-            '--max-running-requests':'4','--max-mamba-cache-size':'64','--hicache-size':'32'}
+            '--max-running-requests':'4','--max-mamba-cache-size':'48','--hicache-size':'32'}
         flags=[]
         remove={'--enable-elastic-pp','--elastic-pp-disagg-decode','--disable-cuda-graph'} if sid.startswith('d') and not cfg['optimized_elastic_pp'] else set()
         pairs={'--elastic-pp-initial-partition','--elastic-pp-transition-strategy','--elastic-pp-transition-backing'} if remove else set()
