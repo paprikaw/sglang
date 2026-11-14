@@ -84,12 +84,38 @@ def install_prefill_trace(runner):
             record(name, "out", output)
         layer.register_forward_pre_hook(before, with_kwargs=True)
         layer.register_forward_hook(after)
-        if index == 0:
+        if index in (0, 2):
             for subname in ("linear_attn", "self_attn", "mlp"):
                 sub = getattr(layer, subname, None)
                 if sub is not None:
                     sub.register_forward_pre_hook(lambda module, args, n=name + "." + subname: record(n, "in", args))
                     sub.register_forward_hook(lambda module, args, output, n=name + "." + subname: record(n, "out", output))
+
+
+def install_expert_repeat_check(runner, local):
+    """Repeat one real Expert call with its exact input, routes and weights."""
+    import torch
+    for name, module in local:
+        if ".layers.2." not in name:
+            continue
+        original = module.quant_method.apply
+        def checked(layer, dispatch, original=original, name=name):
+            first = original(layer, dispatch)
+            if dispatch.hidden_states.shape[0] == 64:
+                baseline = first.hidden_states.clone()
+                repeated = original(layer, dispatch).hidden_states
+                topk = dispatch.topk_output
+                inputs = (dispatch.hidden_states, topk.topk_ids, topk.topk_weights)
+                hashes = [hashlib.sha256(t.contiguous().view(torch.uint8)
+                    .cpu().numpy().tobytes()).hexdigest() for t in inputs]
+                delta = (baseline.float() - repeated.float()).abs()
+                print("ELASTIC_PD_EXPERT_REPEAT", json.dumps(dict(rank=runner.ps.pp_rank,
+                    module=name, input_sha256=hashes,
+                    equal=torch.equal(baseline, repeated),
+                    different_elements=int(torch.count_nonzero(delta).item()),
+                    max_abs_difference=float(delta.max().item()))), flush=True)
+            return first
+        module.quant_method.apply = checked
 
 
 def prepare(run):
@@ -204,6 +230,7 @@ def install_hooks():
               layers=len(local), start=runner.model.start_layer, end=runner.model.end_layer)), flush=True)
         if os.environ["ELASTIC_PD_ROLE"] == "prefill":
             install_prefill_trace(runner)
+            install_expert_repeat_check(runner, local)
         return result
     ModelRunner.load_model = load
     if os.environ["ELASTIC_PD_ROLE"] == "prefill":
