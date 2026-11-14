@@ -1127,7 +1127,8 @@ class KVCacheDTokenToKVPoolAllocator(
             self.free_group.append(self._copy_for_free_group(free_index))
             return
         if self._elastic_pp_live_patch is not None:
-            self._elastic_pp_live_patch.freed(free_index)
+            # Drain any in-flight copy before making the source row reusable.
+            self._elastic_pp_live_patch.freeing(free_index)
         page_ids = self._record_freed_pages(self._as_int_list(free_index))
         if getattr(self, "serving_capacity", None):
             self.release_pages = torch.cat((self.release_pages, free_index))

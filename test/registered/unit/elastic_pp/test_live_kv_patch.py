@@ -7,13 +7,20 @@ from sglang.srt.elastic_pp.kv_transport import ElasticPPKVTransport
 from sglang.srt.elastic_pp.live_kv_patch import LiveKVSnapshot
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.kvcached_pool import KVCacheDTokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def fixture(*, size=4, max_rows=2, need_sort=False):
-    allocator = TokenToKVPoolAllocator(size, torch.float32, "cpu", object(), need_sort)
+def fixture(*, size=4, max_rows=2, need_sort=False, backend="native"):
+    if backend == "kvcached":
+        pool = SimpleNamespace(kvcached_allocator=SimpleNamespace(clear=lambda: None),
+            attach_logical_allocator=lambda allocator: None)
+        allocator = KVCacheDTokenToKVPoolAllocator(size, torch.float32, "cpu", pool, need_sort)
+        allocator.set_serving_capacity(size, initialize=True)
+    else:
+        allocator = TokenToKVPoolAllocator(size, torch.float32, "cpu", object(), need_sort)
     source = {
         7: (
             torch.arange((size + 1) * 2).view(size + 1, 2).float(),
@@ -57,8 +64,9 @@ def test_real_allocator_online_snapshot_and_fence_include_unpublished_loadback()
 
 
 @pytest.mark.parametrize("need_sort", [False, True])
-def test_free_waits_for_snapshot_then_reused_slot_gets_a_new_epoch(need_sort):
-    allocator, source, slots, patch = fixture(size=2, need_sort=need_sort)
+@pytest.mark.parametrize("backend", ["native", "kvcached"])
+def test_free_waits_for_snapshot_then_reused_slot_gets_a_new_epoch(need_sort, backend):
+    allocator, source, slots, patch = fixture(size=2, need_sort=need_sort, backend=backend)
     patch.progress(slots, ready())
     allocator.free(slots[:1])
     assert patch.free_waits == 1
@@ -71,8 +79,9 @@ def test_free_waits_for_snapshot_then_reused_slot_gets_a_new_epoch(need_sort):
     assert patch.export(7, again)[0].tolist() == [[123, 123]]
 
 
-def test_grouped_frees_pin_until_the_actual_allocator_release():
-    allocator, source, slots, patch = fixture(size=2)
+@pytest.mark.parametrize("backend", ["native", "kvcached"])
+def test_grouped_frees_pin_until_the_actual_allocator_release(backend):
+    allocator, source, slots, patch = fixture(size=2, backend=backend)
     patch.progress(slots, ready())
     allocator.free_group_begin()
     allocator.free(slots[:1])
