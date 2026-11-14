@@ -58,7 +58,8 @@ def memory_size_json(value):
     return int(value)
 
 
-def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False):
+def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
+            lazy_cuda_modules=False):
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
     dirty = subprocess.check_output(["git", "-C", str(ENGINE), "status", "--porcelain"], text=True)
@@ -94,6 +95,12 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False)
                    native_prepare_dir=str(run / "native_stacks") if native_prepare and role == "decode" else None,
                    cpu_weight_cache_gib=64 if optimized and role == "decode" else 0,
                    nixl_root=str(NIXL_ROOT) if optimized and role == "decode" else None)
+        cfg["launch_env"] = dict(cfg["launch_env"])
+        if optimized and role == "decode" and not lazy_cuda_modules:
+            # First-use NIXL gather kernels on the dormant rank must not load
+            # CUDA modules while the real CPU weight restore is in flight.
+            cfg["launch_env"].update(CUDA_MODULE_LOADING="EAGER",
+                                     CUDA_MODULE_DATA_LOADING="EAGER")
         nodes[node] = cfg
         node_spec = json.loads((PRIOR / "cache" / f"{node}.json").read_text())
         node_path = run / "cache" / f"{node}.json"
@@ -111,6 +118,7 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False)
                   optimized_elastic_pp=optimized,
                   diagnostic_prepare=diagnostic_prepare,
                   native_prepare=native_prepare,
+                  eager_cuda_modules=optimized and not lazy_cuda_modules,
                   logical_gpu_counts=[4, 5, 4], resident_worker_gpus=5,
                   reserved_gpus=8, gpu_reuse_probe_gib=64)
     config["deterministic_inference"] = True
@@ -193,6 +201,16 @@ def install_hooks():
             raise RuntimeError(f"Incomplete native FP8 coverage: {len(local)} != {count}")
         print("ELASTIC_PD_FP8_COVERAGE", json.dumps(dict(pp_rank=runner.ps.pp_rank,
               layers=len(local), start=runner.model.start_layer, end=runner.model.end_layer)), flush=True)
+        import ctypes
+        driver = ctypes.CDLL("libcuda.so.1")
+        mode = ctypes.c_int()
+        status = driver.cuModuleGetLoadingMode(ctypes.byref(mode))
+        if status:
+            raise RuntimeError(f"cuModuleGetLoadingMode failed: {status}")
+        print("ELASTIC_PD_CUDA_LOADING", json.dumps(dict(pp_rank=runner.ps.pp_rank,
+              driver_module_mode=mode.value,
+              module=os.environ.get("CUDA_MODULE_LOADING"),
+              data=os.environ.get("CUDA_MODULE_DATA_LOADING"))), flush=True)
         return result
     ModelRunner.load_model = load
     if os.environ["ELASTIC_PD_ROLE"] == "decode":
@@ -600,13 +618,14 @@ def main():
     parser.add_argument("--sync-baseline", action="store_true")
     parser.add_argument("--diagnostic-prepare", action="store_true")
     parser.add_argument("--native-prepare", action="store_true")
+    parser.add_argument("--lazy-cuda-modules", action="store_true")
     for option in ("prepare", "worker", "engine", "probe"):
         parser.add_argument("--" + option, action="store_true")
     args = parser.parse_args()
     run = args.run.resolve()
     if args.prepare:
         return prepare(run, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare,
-                       native_prepare=args.native_prepare)
+                       native_prepare=args.native_prepare, lazy_cuda_modules=args.lazy_cuda_modules)
     root = json.loads((run / "config.json").read_text())
     if args.worker:
         return worker(run, root)
