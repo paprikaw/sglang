@@ -7,18 +7,18 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import threading
 import time
 
 
-def capture(directory):
+def start(directory, delay=0.3):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     evidence = dict(pid=os.getpid(), start=time.monotonic(), wall=time.time())
     libc = ctypes.CDLL(None, use_errno=True)
     libc.prctl.argtypes = [ctypes.c_int, *([ctypes.c_ulong] * 4)]
     ptracer = 0x59616D61  # PR_SET_PTRACER, linux/prctl.h
-    wrapper = "import os,sys;sys.stdin.buffer.read(1);os.execv(sys.argv[1],sys.argv[1:])"
+    wrapper = ("import os,sys,time;sys.stdin.buffer.read(1);"
+               f"time.sleep({delay!r});os.execv(sys.argv[1],sys.argv[1:])")
     command = [sys.executable, "-c", wrapper,
                "/data/gpfs/projects/punim2715/vllm_workbench/.venv/bin/py-spy",
                "dump", "--native", "--pid", str(os.getpid())]
@@ -30,15 +30,28 @@ def capture(directory):
             if libc.prctl(ptracer, process.pid, 0, 0, 0):
                 error = ctypes.get_errno()
                 raise OSError(error, os.strerror(error))
-            process.communicate(input=b"1", timeout=5)
-            evidence["returncode"] = process.returncode
-        except BaseException as error:
-            evidence["error"] = f"{type(error).__name__}: {error}"
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=2)
+            process.stdin.write(b"1")
+            process.stdin.flush()
+            return directory, evidence, libc, process
+        except BaseException:
+            process.kill()
+            process.wait(timeout=2)
             libc.prctl(ptracer, 0, 0, 0, 0)
+            raise
+
+
+def finish(capture):
+    directory, evidence, libc, process = capture
+    try:
+        process.communicate(timeout=5)
+        evidence["returncode"] = process.returncode
+    except BaseException as error:
+        evidence["error"] = f"{type(error).__name__}: {error}"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        libc.prctl(0x59616D61, 0, 0, 0, 0)
     evidence["end"] = time.monotonic()
     (directory / "rank1.g1.native.json").write_text(json.dumps(evidence) + "\n")
 
@@ -51,18 +64,12 @@ def install(coordinator_class, directory):
         if (self.cache_transition is None or self.rank != 1
                 or self._transition.target.generation != 1):
             return original(self)
-        done = threading.Event()
-
-        def sample():
-            if not done.wait(0.3):
-                capture(directory)
-
-        sampler = threading.Thread(target=sample, name="native-stack-once", daemon=True)
-        sampler.start()
+        # Start before CUDA work: a Python sampler thread can itself be delayed
+        # by a long CUDA binding that retains the GIL. The child owns its timer.
+        capture = start(directory)
         try:
             return original(self)
         finally:
-            done.set()
-            sampler.join(timeout=7)
+            finish(capture)
 
     coordinator_class._prepare_worker = traced
