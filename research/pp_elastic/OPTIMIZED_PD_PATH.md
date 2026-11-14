@@ -8,7 +8,7 @@
 
 **验收要求。** 同暖前缀的完整输出逐token一致，同一RID跨两次转换且无重试／重新Prefill；转换后新的P→D请求及真实CPU恢复正确。核对共享底层身份不变、历史CPU载荷不复制、运行时Graph不捕获且有实际replay、非活跃候选权重物理页为0。缩回后独立进程实际分配／写入64 GiB并计算，报告仍驻留的worker、Graph／KV及剩余显存。分别报告控制面完整时间、最终暂停及准备期推理间隔，每方向一次，不作为重复均值。
 
-**当前状态。** r18（`dccbefa3c9c7`）GPU最小往返通过：512-token同暖参考、真实CPU恢复及独立64 GiB复用正确；1275项组合CPU、随后74项相关检查及73项保存结果复算通过。扩／缩控制1.940／1.262秒，最终暂停129／103毫秒；准备期仍有1.683秒出token间隔。退役rank权重／KV为0，worker及约1.78 GiB reserved仍驻留。启动预热约28.2秒单列；不是完整E2E、P侧、多请求、容量扩展或整卡归还证明。见[本轮报告](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/OPTIMIZED_PP_VALIDATION.md)。默认入口为`pd_elastic_smoke.py --prepare`；同步参考必须显式使用`--sync-baseline`。旧r16保持不变。
+**当前状态。** r23（`5856c9ea8528`）最小往返通过：启动前预加载CUDA模块及数据，首次NIXL gather不再等待整段权重H2D。38.04 GiB／1.671秒恢复期间同一请求12→101，新增89个token；最长客户端间隔由r20的1684.2降到177.8 ms，准备期最大约34.0 ms。扩／缩控制1.917／1.279秒、最终fence124／103 ms；512-token一致、CPU恢复576 token和独立64 GiB复用通过，Graph仍开启、运行时capture=0。130项相关CPU检查复用于相同引擎代码；退役rank权重／KV为0，worker及约1.78 GiB reserved仍驻留。每条件一次，不是完整E2E、P侧、多请求、容量扩展或整卡退出证明。见[重叠验证报告](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/WEIGHT_DECODE_OVERLAP.md)。默认`pd_elastic_smoke.py --prepare`选择预加载；`--lazy-cuda-modules`保留旧加载行为用于诊断，`--sync-baseline`保留同步参考。r16／r18原件不改。
 
 首轮r17在启动期将已加载权重转换为VMM backing时OOM，未开始请求；失败与清理记录保留。旧PyTorch空闲块只在全部层转换后归还，改为逐层归还，避免累计保留第二份权重；同配置r18通过。旧后端释放夹具未初始化P/D钩子的CPU失败也保留。
 

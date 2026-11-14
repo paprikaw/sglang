@@ -1,3 +1,11 @@
+# 2026-11-14：122B P/D 权重恢复与在线 Decode 重叠
+
+r23冻结`5856c9ea8528a13decdc3393f8e782dcdfcba3d1`／tag `experiment/sglang/122b-pd-pp-eager-modules-20261114-r23`，固定P2、D PP2→PP3→PP2，HiCache／Graph／真实CPU权重offload保留。D启动预加载CUDA模块和数据，驱动确认三个rank均EAGER；与r20的`python/sglang`完全相同。新增rank1恢复38.04 GiB／1.671秒，同一RID输出12→101；准备期最大间隔34.0 ms，整轮最大177.8 ms，之前r20为1684.2 ms。扩／缩控制1.917／1.279秒、fence124.0／103.0 ms，客户端跨fence177.8／127.0 ms。每方向一次；未单独计量预加载冷启动／显存增量。
+
+512-token同暖参考逐个一致、无重算／retraction，新P→D、CPU恢复576 token、Graph运行时capture=0及原Decode继续时独立64 GiB复用通过。退役rank物理层权重／KV为0，仍allocated1.03／reserved1.78 GiB，worker未退出。Guard后检查、CPU缓存审计、owned cleanup及release通过，未运行完整E2E。
+
+130项相关CPU检查覆盖r20恢复完成前不得发布、查询错误及中途copy失败后排空；r20至r23引擎代码相同，不重复跑未变套件。r21／r22仅增加opt-in原生采样，CPU精确PID ptrace smoke和外部定时在父进程持GIL时采样通过；GPU两个诊断往返亦通过，但采样耗时不作性能重复。r22栈显示NIXL的首次gather卡在cudaLaunchKernel驱动路径、权重线程query等runtime mutex；r23只前移模块／数据加载后长停顿消失，支持首次加载同步解释，未逐一拆分内部驱动调用。r19原退出根因仍未定。五轮成功原件的512-token序号、511个间隔、两个fence、HiCache／Graph、目标权重／KV归零和数据哈希已复算。[简洁报告及图](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/WEIGHT_DECODE_OVERLAP.md) · [原值及SHA256](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/qwen122b_pd_weight_decode_overlap_20261114/overlap_evidence.json)。P侧、多请求、在途交接、固定容量外的扩展、完整E2E及整卡退出资格保持未验证。
+
 # EP／PP／P/D 集成基线验证
 
 ## 2026-11-14：迁移开销审计与准备期长间隔定位
