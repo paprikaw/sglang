@@ -534,6 +534,41 @@ def test_completed_background_host_payload_counts_when_fence_delta_is_empty(acce
     acceptance["validate_transition_states"](evidence, 2, (0, 1, 2), "overlap")
 
 
+@pytest.mark.parametrize(
+    "fault", [None, "private_region", "copied", "no_mapping", "not_shared"]
+)
+def test_shared_cpu_acceptance_requires_physical_identity_and_no_payload_copy(
+    acceptance, fault
+):
+    evidence = states()
+    for state in evidence:
+        state["transition_metrics"]["host"] = dict(
+            host_shared_reuse=True, host_historical_payload_copied_bytes=0
+        )
+        state["transition_shared_host"] = dict(
+            logical_bytes=4096, regions={"full.kv": {"inode": 42, "device": 1}}
+        )
+    if fault == "private_region":
+        evidence[1]["transition_shared_host"]["regions"]["full.kv"]["inode"] = 43
+    elif fault == "copied":
+        evidence[1]["transition_metrics"]["host"][
+            "host_historical_payload_copied_bytes"
+        ] = 128
+    elif fault == "no_mapping":
+        evidence[1].pop("transition_shared_host")
+    elif fault == "not_shared":
+        evidence[1]["transition_metrics"]["host"]["host_shared_reuse"] = False
+    if fault:
+        with pytest.raises(AssertionError):
+            acceptance["validate_transition_states"](
+                evidence, 2, (0, 1, 2), "overlap", shared_host=True
+            )
+    else:
+        acceptance["validate_transition_states"](
+            evidence, 2, (0, 1, 2), "overlap", shared_host=True
+        )
+
+
 @pytest.mark.parametrize("fault", ["stale_generation", "duplicate_rank", "no_bytes"])
 def test_old_or_incomplete_host_transfer_cannot_pass(acceptance, fault):
     evidence = states()
