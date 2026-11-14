@@ -1509,6 +1509,8 @@ def publish_scheduler_cache(scheduler, clone, model_runner):
         "policy",
         "schedule_policy",
         "session_controller",
+        "disagg_decode_prealloc_queue",
+        "disagg_decode_transfer_queue",
         "running_batch",
         "last_batch",
         "running_mbs",
