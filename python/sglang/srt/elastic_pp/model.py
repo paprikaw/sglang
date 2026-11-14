@@ -69,11 +69,13 @@ class ElasticPPModelMixin:
                     "nonresident quantized weights require processed Qwen FP8 Marlin layers"
                 )
         bank = self._elastic_pp_weight_backing = EvictableWeightBank()
+        # VMM allocations bypass PyTorch's allocator. Return loader scratch
+        # before the first copy and each converted layer's old blocks before
+        # allocating the next, otherwise conversion can reserve a second model.
+        torch.cuda.empty_cache()
         for layer_id in sorted(self._resident_elastic_layer_ids()):
             bank.prepare(layer_id, self.layers[layer_id])
-        # Converted parameters no longer own the loader's caching-allocator
-        # allocations. Return those old free blocks to the CUDA driver too.
-        torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
         return bank
 
     @staticmethod

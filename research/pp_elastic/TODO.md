@@ -4,6 +4,8 @@
 
 - [ ] **端到端主实验优先接入最新优化（用户已确认）。** 已合入共享CPU HiCache，并接入后台／NIXL增量KV、Graph启动预热、非驻留FP8 Marlin CPU权重及P/D注册地址交接；1275项组合CPU检查通过，GPU尚未验收。FP8缓存由启动期处理后的GPU权重导出到CPU，与旧BF16纯CPU packing分开记录。保留Marlin确定性修复；先验证同一请求跨扩缩、真实CPU恢复与独立GPU复用，本轮不铺开E2E。见[实现和验收范围](OPTIMIZED_PD_PATH.md)及[端到端计划](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/EXPERIMENT_PLAN.md)。
 
+  优化路径r17在启动期VMM权重转换OOM，未开始请求；Guard确认进程清理及租约释放。修复为转换前及逐层归还旧PyTorch空闲块，避免额外显存累计，新增受限显存模拟回归；74项相关CPU检查通过。仍待同配置GPU往返验收。
+
 - [x] **最小D侧资格通过。** 主agent在 `codex/qwen122b-pd-elastic-20261114` 实施，固定P2，D以 `24,0,24→16,16,16→24,0,24` 改变层归属；FP8 Marlin、Eager、同步CPU spill、HiCache及原生确定性模式。最终无临时诊断r16（`d8c614d14e6c`）完整512-token输出与同暖参考一致，无retraction／重新Prefill；转换后真实P→D新请求、CPU实际恢复576 token及独立进程64 GiB复用通过，原Decode继续。扩／缩控制8.573／8.061秒，各一次；退役rank仍reserved约2.98 GiB，worker未退出。182项相关CPU、28项结果复算、Guard／缓存使用审计及正常清理／release通过。P伸缩、在途交接、Graph、多请求、可用KV容量增益及E2E性能不在本轮资格。见[简洁报告](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/PP_ELASTIC_VALIDATION.md)与[原始复算](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/runs/pd_elastic_roundtrip_20261114_r16/analysis/completion_audit.json)。以下保留各轮诊断历史，以最终r16范围为准。
 
   11月14日继续：按层 GDN 传输已允许合法的零层目标，并保留对应字节数检查。首次完整多 token P/D 路径在转换前卡住；栈显示空闲槽等待上一激活完成，阻塞下游控制消息共识。将弹性 P/D 空闲槽的激活完成等待移到三轮共识之后，保留发送缓冲区所有权；资格范围显式限制一个活跃请求、微批上限1。142项相关CPU检查通过。GPU往返、HiCache恢复和独立复用仍待验证，不能据此宣布打通。
