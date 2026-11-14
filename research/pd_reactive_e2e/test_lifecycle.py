@@ -49,3 +49,31 @@ def test_guard_cancellation_interrupts_router_hold(tmp_path):
         task.cancel()
         with pytest.raises(asyncio.CancelledError):await task
     asyncio.run(check())
+
+
+def finite_run(tmp_path, *, missing_last=False, cancelled=False, drained=True):
+    (tmp_path/'config.json').write_text(json.dumps(dict(expected_profile_requests=2, expected_tasks=1)))
+    directory=tmp_path/'replay'
+    (directory/'agentx').mkdir(parents=True)
+    (directory/'events').mkdir()
+    records=[dict(metadata=dict(benchmark_phase='profiling', x_request_id=str(i), was_cancelled=cancelled))
+             for i in range(1 if missing_last else 2)]
+    (directory/'agentx/profile_export.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in records))
+    events=[dict(event='tree_drained')]
+    if drained:events.append(dict(event='finite_stream_drained'))
+    (directory/'events/client.jsonl').write_text(''.join(json.dumps(r)+'\n' for r in events))
+    (directory/'routing.jsonl').write_text(''.join(json.dumps(dict(x_request_id=str(i),success=True))+'\n' for i in range(2)))
+
+
+def test_finite_replay_requires_all_successful_requests_and_native_drain(tmp_path):
+    finite_run(tmp_path)
+    assert m.validate_finite_replay(tmp_path)['passed']
+
+
+@pytest.mark.parametrize('change',[dict(missing_last=True),dict(cancelled=True),dict(drained=False)])
+def test_zero_harness_exit_does_not_qualify_a_partial_replay(tmp_path,change):
+    finite_run(tmp_path,**change)
+    with pytest.raises(RuntimeError,match='replay incomplete'):
+        asyncio.run(m.hold_control_after_workload(tmp_path,0,timeout_s=0))
+    assert not (tmp_path/'replay_workload_done.json').exists()
+    assert not json.loads((tmp_path/'replay_completion_audit.json').read_text())['passed']

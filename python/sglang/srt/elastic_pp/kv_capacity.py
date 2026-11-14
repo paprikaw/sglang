@@ -17,7 +17,10 @@ def capacity_frontier(args):
         raise ValueError("elastic KV capacities require the KVCacheD backend")
     if not getattr(args, "elastic_pp_graph_partitions", None):
         raise ValueError("elastic KV capacities require prepared PP partitions")
-    parts = parse_elastic_pp_partitions(args.elastic_pp_graph_partitions)
+    # A static replica uses the same backing/Graph path with one admitted layout.
+    parts = parse_elastic_pp_partitions(
+        args.elastic_pp_graph_partitions, allow_single=True
+    )
     try:
         caps = tuple(int(x.strip()) for x in raw.split(";"))
     except (TypeError, ValueError) as exc:

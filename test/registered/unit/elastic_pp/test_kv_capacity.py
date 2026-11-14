@@ -20,6 +20,11 @@ def test_capacity_frontier_fixes_virtual_maximum_and_layouts():
     assert topology_capacity(args(), PPTopology.from_layer_counts((16, 16, 16))) == 8
 
 
+def test_static_replica_admits_one_prepared_capacity():
+    config = args(elastic_pp_graph_partitions="24,24", elastic_pp_kv_capacities="8")
+    assert capacity_frontier(config) == {(24, 24): 8}
+
+
 @pytest.mark.parametrize("changes", [dict(max_total_tokens=7), dict(page_size=64),
     dict(elastic_pp_kv_capacities="4"), dict(elastic_pp_kv_capacities="0;8"),
     dict(elastic_pp_kv_backend="native"), dict(disaggregation_mode="prefill")])

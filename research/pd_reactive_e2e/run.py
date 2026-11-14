@@ -90,7 +90,8 @@ def prepare(run, mechanism, kvcached_capacity=False):
         qualification_scope='Single active request per Decode instance; client task concurrency retained. Multi-request dormant-stage PP is not qualified.',
         expected_tasks=4,expected_profile_requests=76,
         baseline_startup='new PP2 process using admitted ready node-local canonical CPU weights',
-        max_scale_cycles=1,full_drain=True,wall_timeout_s=1080)
+        max_scale_cycles=1,full_drain=True,profile_duration_s=1200,
+        profile_grace_s=150,client_wall_timeout_s=1530,wall_timeout_s=1560)
     root['kvcached_capacity']=kvcached_capacity
     if kvcached_capacity:
         root.update(max_total_tokens=98304,base_kv_capacity=65536)
@@ -292,8 +293,9 @@ def client(run,root):
     threading.Thread(target=lambda:(sys.stdin.read(),stop.set()),daemon=True).start()
     cmd=[root['agentx_python'],str(run/'harness/run.py'),'run','--config',str(run/'endpoints.json'),
         '--model',root['model_path'],'--tokenizer',root['agentx_tokenizer'],'--local-dataset',str(run/'data/traces.jsonl'),
-        '--output',str(run/'replay'),'--entries','1','--concurrency','10','--duration','720',
-        '--profile-grace','150','--warmup-grace','180','--warmup-prefill-limit','2','--wall-timeout','1050','--smoke']
+        '--output',str(run/'replay'),'--entries','1','--concurrency','10','--duration',str(root['profile_duration_s']),
+        '--profile-grace',str(root['profile_grace_s']),'--warmup-grace','180','--warmup-prefill-limit','2',
+        '--wall-timeout',str(root['client_wall_timeout_s']),'--smoke']
     children=[]
     try:
         proc=subprocess.Popen(cmd,env=env,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,start_new_session=True)

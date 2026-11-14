@@ -29,7 +29,9 @@ _BACKEND_FIELDS = (
 
 
 def validate_graph_partitions(args, initial):
-    partitions = parse_elastic_pp_partitions(args.elastic_pp_graph_partitions)
+    partitions = parse_elastic_pp_partitions(
+        args.elastic_pp_graph_partitions, allow_single=True
+    )
     if getattr(args, "elastic_pp_hicache_allocator", "mmap") == "pytorch" and (
         not args.enable_hierarchical_cache or args.hicache_storage_backend is not None
     ):
