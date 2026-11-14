@@ -103,6 +103,7 @@ def prepare(run):
                   admission="quiescent P/D transfers during synchronous fences",
                   logical_gpu_counts=[4, 5, 4], resident_worker_gpus=5,
                   reserved_gpus=8, gpu_reuse_probe_gib=64)
+    config["deterministic_inference"] = True
     save(run / "config.json", config)
     spec["tasks"] = [dict(id="qualification", label="Request/cache/reuse acceptance",
         root=str(run / "task"), expected=1, nodes=list(nodes), controller_script=str(Path(__file__).resolve()))]
@@ -168,6 +169,28 @@ def install_hooks():
               layers=len(local), start=runner.model.start_layer, end=runner.model.end_layer)), flush=True)
         return result
     ModelRunner.load_model = load
+    if os.environ["ELASTIC_PD_ROLE"] == "prefill":
+        from sglang.srt.mem_cache.unified_cache.components.mamba_component import MambaComponent
+        old_match = MambaComponent.finalize_match_result_in_cache
+
+        def match(component, params, result):
+            # Qualification-only evidence: distinguish a changing cached GDN
+            # checkpoint from variation in execution of an identical checkpoint.
+            source = component.tree_core.get_component_device_value(
+                result.best_match_node, component.component_type
+            )
+            if params.cow_mamba and source is not None and params.req is not None:
+                import torch
+                req_pool = component.cache.req_to_token_pool
+                slots = req_pool.translate_mamba_indices(source.reshape(-1)).long()
+                cached = req_pool.mamba_pool.mamba_cache
+                tensors = [*cached.conv, cached.temporal]
+                digests = [hashlib.sha256(t.index_select(1, slots).contiguous()
+                    .view(torch.uint8).cpu().numpy().tobytes()).hexdigest() for t in tensors]
+                print("ELASTIC_PD_CACHED_GDN", json.dumps(dict(rid=params.req.rid,
+                    prefix_tokens=len(result.device_indices), checkpoint_sha256=digests)), flush=True)
+            return old_match(component, params, result)
+        MambaComponent.finalize_match_result_in_cache = match
     if os.environ["ELASTIC_PD_ROLE"] == "decode":
         import cache_probe
         cache_probe.install()
@@ -218,6 +241,7 @@ def engine_entry(run, cfg):
         "--chunked-prefill-size", "512", "--max-prefill-tokens", "1024", "--pp-max-micro-batch-size", "1" if cfg["role"] == "decode" else "4",
         "--pp-async-batch-depth", "0", "--attention-backend", "triton", "--linear-attn-backend", "triton",
         "--moe-runner-backend", "marlin", "--moe-a2a-backend", "none", "--disable-cuda-graph",
+        "--enable-deterministic-inference",
         "--skip-server-warmup", "--json-model-override-args", '{"language_model_only":true}',
         "--enable-cache-report", "--enable-hierarchical-cache", "--hicache-size", "8",
         "--hicache-write-policy", "write_through", "--hicache-io-backend", "kernel",
