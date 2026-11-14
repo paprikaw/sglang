@@ -36,9 +36,9 @@ def endpoint(cfg):
         row.update(bootstrap_host=cfg['node'],bootstrap_port=cfg['bootstrap_port'])
     return row
 
-def prepare(run, mechanism):
+def prepare(run, mechanism, kvcached_capacity=False):
     # Reuse the authenticated canonical-cache contracts and qualified r23 profile.
-    q.prepare(run)
+    q.prepare(run, kvcached_capacity=kvcached_capacity)
     root = json.loads((run/'config.json').read_text())
     spec = json.loads((run/'dashboard_spec.json').read_text())
     old = json.loads((PRIOR/'config.json').read_text())
@@ -49,18 +49,25 @@ def prepare(run, mechanism):
         pp = len(gpus)
         cfg['server_id']=sid
         cfg['layouts'][0].update(pp=pp,gpu_groups=[gpus])
-        cfg['optimized_elastic_pp'] = sid=='d0' and mechanism=='inplace'
+        cfg['optimized_elastic_pp'] = (sid=='d0' and mechanism=='inplace') or (kvcached_capacity and sid.startswith('d'))
         cfg['cuda_graph'] = sid.startswith('d')
         cfg['hicache_size_gib']=32
+        if kvcached_capacity and sid.startswith('d'):
+            # One shared global bank versus two PP2 banks: preserve the same
+            # aggregate host KV budget, rather than giving replicas twice it.
+            cfg['hicache_size_gib']=64 if mechanism=='inplace' else 32
+            cfg['launch_env']['KVCACHED_IPC_NAME']=f'{run.name}-{sid}'
         cfg['layouts'][0]['usage_logs']=[dict(id=f'{run.name}.{sid}',path=str(run/'cache'/f'{sid}.log'),expected_ranks=[f'PP{i} TP0' for i in range(pp)])]
         cfg['launch_env'].update(CUDA_MODULE_LOADING='EAGER',CUDA_MODULE_DATA_LOADING='EAGER')
         cfg['launch_env']['ELASTIC_PD_LIGHTWEIGHT_STATUS']='1'
         cfg['launch_env']['ELASTIC_PD_STATUS_STACKS']=str(run/'status_stacks')
-        cfg['launch_env']['ELASTIC_PD_STATIC_DECODE']=str(int(sid.startswith('d') and not cfg['optimized_elastic_pp']))
+        cfg['launch_env']['ELASTIC_PD_STATIC_DECODE']=str(int(sid.startswith('d') and mechanism=='replica'))
         servers[sid]=cfg
     if mechanism=='replica':
-        cfg=copy.deepcopy(servers['d0']); cfg.update(server_id='d1',port=29501,dist_port=29502)
+        cfg=copy.deepcopy(servers['d0']); cfg.update(server_id='d1',port=29701 if kvcached_capacity else 29501,dist_port=29702 if kvcached_capacity else 29502)
         cfg['layouts'][0]['gpu_groups']=[[2,3]]
+        if kvcached_capacity:
+            cfg['launch_env']['KVCACHED_IPC_NAME']=f'{run.name}-d1'
         cfg['layouts'][0]['usage_logs']=[dict(id=f'{run.name}.d1',path=str(run/'cache/d1.log'),expected_ranks=['PP0 TP0','PP1 TP0'])]
         servers['d1']=cfg
     cache=spec['model_cache']
@@ -84,6 +91,9 @@ def prepare(run, mechanism):
         expected_tasks=4,expected_profile_requests=76,
         baseline_startup='new PP2 process using admitted ready node-local canonical CPU weights',
         max_scale_cycles=1,full_drain=True,wall_timeout_s=1080)
+    root['kvcached_capacity']=kvcached_capacity
+    if kvcached_capacity:
+        root.update(max_total_tokens=98304,base_kv_capacity=65536)
     save(run/'config.json',root)
     plan=json.loads((PRIOR/'plan.json').read_text())
     with Path(plan['source']['burstgpt_path']).open() as f:
@@ -102,6 +112,7 @@ def prepare(run, mechanism):
         shutil.copyfile(source,run/'harness'/source.name)
     shutil.copyfile(HERE/'router.py',run/'harness/reactive_router.py')
     shutil.copyfile(HERE/'stable_placement.py',run/'harness/stable_placement.py')
+    shutil.copyfile(HERE/'lifecycle.py',run/'harness/reactive_lifecycle.py')
     p=run/'harness/sglang_adapter.py'
     s=p.read_text()+ '\nfrom reactive_router import install as install_reactive\ninstall_reactive(Adapter)\n'
     s=s.replace('first_content_s = time.monotonic() - started','first_content_s = time.monotonic() - started\n                            self.reactive.streaming.add(rid)')
@@ -110,6 +121,11 @@ def prepare(run, mechanism):
     p=run/'harness/run.py';s=p.read_text()
     s=s.replace('web.TCPSite(server, "127.0.0.1", 0)','web.TCPSite(server, "0.0.0.0", 0)')
     s=s.replace('port = site._server.sockets[0].getsockname()[1]', 'port = site._server.sockets[0].getsockname()[1]\n        (args.output.parent / "router_ready.json").write_text(json.dumps(dict(host=socket.gethostname().split(".")[0],port=port,unix=__import__("time").time())))')
+    marker='        return code\n'
+    if s.count(marker)!=1:raise RuntimeError('unknown AgentX harness return boundary')
+    s=s.replace(marker,'        from reactive_lifecycle import hold_control_after_workload\n        await hold_control_after_workload(args.output.parent, code)\n'+marker)
+    s=s.replace('"stable_placement.py", "mixed_replay.py", "sitecustomize.py")',
+                '"stable_placement.py", "mixed_replay.py", "sitecustomize.py", "reactive_lifecycle.py")')
     p.write_text(s)
     ep=dict(mode='pd',require_hicache=True,api_key_file=root['admin_key_file'],
         prefill=[endpoint(servers['p'])],decode=[endpoint(c) for n,c in servers.items() if n.startswith('d')],
@@ -122,7 +138,7 @@ def prepare(run, mechanism):
     save(run/'checkpoint_lookup.json',dict(registry_path=str(registry),registry_sha256=q.describe(registry)['sha256'],
         reused=False,reason='Fresh AgentX first_turn_prefix namespace and changed engine fingerprint; native existing-cohort snapshot warmup retained',
         lookup_kind='registry inventory incompatibility audit',entries=len(registry_value.get('entries',registry_value.get('checkpoints',[])))))
-    spec.update(title=f'122B AgentX/BurstGPT reactive {mechanism}',port=29470)
+    spec.update(title=f'122B AgentX/BurstGPT reactive {mechanism}',port=29670 if kvcached_capacity else 29470)
     spec['tasks']=[dict(id='comparison',label=f'Short reactive {mechanism}',root=str(run/'task'),expected=1,
         nodes=list(root['node_configs']),controller_script=str(Path(__file__).resolve()))]
     paths=[Path(x['path']) for x in spec['frozen_inputs'] if Path(x['path'])!=run/'config.json']
@@ -142,8 +158,14 @@ def engine(run, root, sid):
     def arguments(argv):
         values={'--context-length':str(root['context_length']),'--max-total-tokens':str(root['max_total_tokens']),
             '--max-running-requests':str(root['max_running_requests'] if sid.startswith('d') else 4),
-            '--max-mamba-cache-size':'48','--hicache-size':'32',
+            '--max-mamba-cache-size':'48','--hicache-size':str(cfg['hicache_size_gib']),
             '--chunked-prefill-size':'4096','--max-prefill-tokens':'8192'}
+        if root.get('kvcached_capacity'):
+            values['--elastic-pp-initial-partition']='24,0,24' if root['mechanism']=='inplace' else '24,24'
+            values['--elastic-pp-graph-partitions']='24,0,24;16,16,16' if root['mechanism']=='inplace' else '24,24'
+            values['--elastic-pp-kv-capacities']='65536;98304' if root['mechanism']=='inplace' else '65536'
+            if sid.startswith('d') and root['mechanism']=='replica':
+                values['--max-total-tokens']='65536'
         flags=[]
         remove={'--enable-elastic-pp','--elastic-pp-disagg-decode','--disable-cuda-graph'} if sid.startswith('d') and not cfg['optimized_elastic_pp'] else set()
         pairs={'--elastic-pp-initial-partition','--elastic-pp-transition-strategy','--elastic-pp-transition-backing'} if remove else set()
@@ -192,6 +214,15 @@ def install_telemetry():
         if os.environ['ELASTIC_PD_ROLE']=='decode':
             from sglang.srt.elastic_pp.pd_registration import pending_pd_work
             pd_pending=pending_pd_work(scheduler)
+        if os.environ['ELASTIC_PD_ROLE']=='decode':
+            pool=scheduler.token_to_kv_pool_allocator.get_kvcache()
+            full=getattr(pool,'full_kv_pool',pool)
+            if getattr(full,'capacity_managed',False):
+                allocator=full._logical_allocator
+                result.internal_state['e2e_kv_capacity']=dict(
+                    capacity=full.serving_capacity, virtual_capacity=full.size,
+                    max_live_slot=max(allocator._live_page_ids,default=0),
+                    live_tokens=len(allocator._live_page_ids),free_tokens=allocator.available_size())
         result.internal_state['e2e_runtime']=dict(running=len(reqs),waiting=len(scheduler.waiting_queue),
             pd_pending=pd_pending,output_tokens={r:len(x.output_ids) for r,x in reqs.items()})
         return result
@@ -242,7 +273,10 @@ def worker(run,root,sid):
         save(directory/'failure.json',dict(error=repr(error),traceback=traceback.format_exc()))
         raise
     finally:
-        cleanup=h.cleanup(children)
+        # A retiring replica shares the node with the retained Decode instance.
+        # Verify this exact process group and every observed CUDA child here;
+        # the coordinator proves whole-node idle after all servers have stopped.
+        cleanup=h.cleanup(children,require_node_gpu_idle=False)
         lifecycle['engine_cleaned']=time.time();save(directory/'lifecycle.json',lifecycle)
         save(directory/'cleanup.json',cleanup)
         if not cleanup['cleanup_verified']:raise RuntimeError('owned GPU cleanup failed')
@@ -270,7 +304,9 @@ def client(run,root):
             if stop.wait(1):raise InterruptedError('owned replay stopped')
         if proc.returncode:raise RuntimeError('AgentX replay failed')
     finally:
-        save(run/'client_cleanup.json',h.cleanup(children))
+        cleanup=h.cleanup(children,require_node_gpu_idle=False)
+        save(run/'client_cleanup.json',cleanup)
+        if not cleanup['cleanup_verified']:raise RuntimeError('owned CPU replay cleanup failed')
 
 def coordinator(run,root):
     sys.path.insert(0,str(ENGINE/'python'))
@@ -318,6 +354,18 @@ def coordinator(run,root):
     def info(sid):
         cfg=root['servers'][sid]
         return replay.http(cfg['node'],cfg['port'],'/get_server_info',key,None,30)
+    def verify_node_idle(node):
+        path=run/'node_cleanup'/f'{node}.json'
+        code="""import json,subprocess,sys,time
+from pathlib import Path
+p=Path(sys.argv[1]);p.parent.mkdir(parents=True,exist_ok=True)
+result=subprocess.run(['nvidia-smi','--query-compute-apps=pid,gpu_uuid,used_gpu_memory','--format=csv,noheader,nounits'],check=True,text=True,capture_output=True,timeout=15)
+apps=[line.strip() for line in result.stdout.splitlines() if line.strip()]
+value=dict(node=sys.argv[2],unix=time.time(),query_passed=True,gpu_idle=not apps,observed_gpu_processes=apps)
+temporary=p.with_suffix('.tmp');temporary.write_text(json.dumps(value)+chr(10));temporary.replace(p)
+"""
+        subprocess.run(['ssh','-T','-o','BatchMode=yes',node,shlex.join([PYTHON,'-c',code,str(path),node])],check=True,timeout=25)
+        return visible(path,20,shutdown=True)
     def rhttp(path,body=None):
         return replay.http(router['host'],router['port'],path,key,body,10)
     def action(decision):
@@ -405,8 +453,17 @@ def coordinator(run,root):
                         row=json.loads(line)
                         if row['event']=='phase_start':formal_start=row['unix_ns']/1e9
                 if formal_start:save(run/'formal_start.json',dict(unix=formal_start))
+            if completed_at is None and (run/'replay_workload_done.json').exists():
+                finished=visible(run/'replay_workload_done.json',5)
+                if finished['exit_code']:raise RuntimeError('AgentX workload failed')
+                completed_at=finished['unix'];save(run/'replay_done.json',dict(unix=completed_at))
             route=rhttp('/reactive/state')
-            state=info('d0');last_state=state
+            # Final migration fences temporarily stop scheduler RPC handling.
+            # Keep the independent router/lease live; do not turn that expected
+            # pause into an unrelated status-query timeout or fresh observation.
+            metrics_fresh=future is None
+            state=info('d0') if metrics_fresh else last_state
+            last_state=state
             runtime=[s['e2e_runtime'] for s in state['internal_states']]
             pending=max(s['pd_pending'] for s in runtime)
             # Router slots include TTFT. Only call it Decode overload once all
@@ -414,23 +471,38 @@ def coordinator(run,root):
             overloaded=(route['waiting']>0 and route['oldest_wait_s']>=2 and route['streaming']>=root['per_instance_admission'])
             internal_overloaded=max(s['waiting'] for s in runtime)>0 and pending==0
             sample=dict(unix=time.time(),monotonic=now,formal=bool(formal_start),route=route,
-                decode_runtime=runtime,expanded=expanded,operation_pending=future is not None)
+                decode_runtime=runtime,decode_metrics_fresh=metrics_fresh,
+                expanded=expanded,operation_pending=future is not None)
             samples.append(sample)
             with (run/'telemetry.jsonl').open('a') as f:f.write(json.dumps(sample)+'\n')
             fits=(route['waiting']==0 and sum(route['active'].values())<=1 and pending==0)
             if root['mechanism']=='replica':fits=fits and route['active'].get('d1',0)==0
+            fits_state=True
+            if root.get('kvcached_capacity') and root['mechanism']=='inplace':
+                caps=[s.get('e2e_kv_capacity') or {} for s in state['internal_states']]
+                fits_state=len(caps)==3 and all(c.get('max_live_slot',float('inf'))<=root['base_kv_capacity'] for c in caps)
+                # Preserve CPU HiCache. Only evict idle device prefixes after
+                # every admitted request and P→D transfer has drained.
+                if expanded and not fits_state and not any(route['active'].values()) and pending==0 and not route['prefilling'] and future is None:
+                    import hicache_transition_smoke as cache_probe
+                    def cache_http(path,body=None):
+                        cfg=root['servers']['d0']
+                        return replay.http(cfg['node'],cfg['port'],path,key,body,30)
+                    demotion=cache_probe.demote_cpu_prefixes(cache_http)
+                    with (run/'capacity_demotions.jsonl').open('a') as f:f.write(json.dumps(demotion)+'\n')
+                    # Observe the freed slot set on the next iteration.
             observation=Observation('decode',now,expanded=expanded,compute_queue=route['waiting'],
                 overloaded=overloaded or internal_overloaded,next_layout_improves=True,
-                target_fits_state=True,target_fits_load=fits,in_flight_handoff=bool(pending or route['prefilling']),
-                metrics_valid=bool(formal_start) and cycles<root['max_scale_cycles'])
+                target_fits_state=fits_state,target_fits_load=fits,in_flight_handoff=bool(pending or route['prefilling']),
+                metrics_valid=bool(formal_start) and metrics_fresh and cycles<root['max_scale_cycles'])
             decision=policy.observe([observation],now=now,occupied_gpus=4+(1 if root['mechanism']=='inplace' else 2)*int(expanded),
                 free_by_role=dict(decode=4,prefill=0))
             if decision:
                 future=pool.submit(action,decision)
                 progress('reactive_'+decision.direction)
             if client_process.poll() is not None:
-                if client_process.returncode:raise RuntimeError('AgentX client failed')
-                if completed_at is None:completed_at=time.time();save(run/'replay_done.json',dict(unix=completed_at))
+                raise RuntimeError('AgentX router exited before controller release')
+            if completed_at is not None:
                 if not expanded and future is None:break
                 if time.time()-completed_at>75 and future is None:
                     raise RuntimeError('normal reactive down did not become safe after drain')
@@ -440,6 +512,8 @@ def coordinator(run,root):
             raise AssertionError('post-scaling P/D warm output mismatch')
         save(run/'post_smoke.json',dict(passed=True,response=post_smoke))
         save(run/'state.final.json',info('d0'))
+        (run/'release_router').write_text(str(time.time())+'\n')
+        if client_process.wait(timeout=30):raise RuntimeError('AgentX client cleanup failed')
         save(run/'completed.json',dict(passed=True,formal_start=formal_start,replay_done=completed_at,
             comparison_finished=time.time(),mechanism=root['mechanism'],actions=len(actions),
             scaling_exercised=any(a['decision']['direction']=='up' and a['success'] for a in actions),
@@ -465,16 +539,21 @@ def coordinator(run,root):
             try:clean.append(terminate(sid))
             except BaseException as e:errors.append('cleanup '+sid+': '+repr(e))
         for handle in handles:handle.close()
-        good=bool(clean) and all(c.get('cleanup_verified') for c in clean)
+        idle=[]
+        for node in root['node_configs']:
+            try:idle.append(verify_node_idle(node))
+            except BaseException as e:errors.append('node idle '+node+': '+repr(e))
+        nodes_idle=len(idle)==len(root['node_configs']) and all(c['gpu_idle'] for c in idle)
+        good=bool(clean) and all(c.get('cleanup_verified') for c in clean) and nodes_idle
         save(run/'task/cleanup.json',dict(experiment_id=root['id'],task_id='comparison',timestamp=time.time(),
             passed=good,model_processes_exited=good,gpu_idle=good,errors=errors))
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--run',type=Path,required=True)
-    p.add_argument('--prepare',action='store_true');p.add_argument('--mechanism',choices=['inplace','replica'])
+    p.add_argument('--kvcached-capacity',action='store_true');p.add_argument('--prepare',action='store_true');p.add_argument('--mechanism',choices=['inplace','replica'])
     p.add_argument('--worker',action='store_true');p.add_argument('--engine',action='store_true');p.add_argument('--client',action='store_true')
     p.add_argument('--server',choices=['p','d0','d1']);a=p.parse_args()
-    if a.prepare:prepare(a.run,a.mechanism)
+    if a.prepare:prepare(a.run,a.mechanism,a.kvcached_capacity)
     else:
         root=json.loads((a.run/'config.json').read_text())
         if a.engine:engine(a.run,root,a.server)

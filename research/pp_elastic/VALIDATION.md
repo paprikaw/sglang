@@ -1,11 +1,15 @@
 # 2026-11-14：CPU确认完整收发前移
 
-## 2026-11-14：122B P/D 的 KVCacheD 容量接入，GPU 待验收
+## 2026-11-14：122B P/D 的 KVCacheD 最小容量往返通过，E2E 待验证
 
 r3已通过启动 idle 容量检查，但首个 P→D 暖请求失败：Mooncake 对 KVCacheD VMM 区域注册报 `Bad address [14]`。没有请求正确性或扩缩结果；owned cleanup 与租约释放通过。候选修复在 `cuMemCreate` 显式请求 GPUDirect RDMA，并检查设备支持；原生扩展已在已预约 A100 上重编译，依赖补丁与 ABI 已固定。容量模式缺失该 ABI／环境标志时拒绝启动，注册地址注册失败立即报错。108项相关 CPU 检查通过；RDMA 修复仍待新 GPU 实验验证。
 
 r4显式 RDMA 标志未解决注册，Mooncake 返回 -202；启动即停止且清理通过。下一候选将 MR 限制在每个独立 VMM 物理分配内，并在加载 P、D 模型之前，用一个小子进程分别检查普通 CUDA、跨十页 VMM、单物理页注册；失败便不加载模型。诊断只证明注册条件，不能替代 P/D 数据正确性。
 
+
+r5冻结 `e9349b90d08f8a01351b976c6cce1c0a0e49715f`／tag `experiment/sglang/pd-kvcached-capacity-20261114-r5`，固定P2、D PP2↔PP3。真实容量8192→12288→8192，9216-token输入用到槽位10240，物理KV240→336→240 MiB；缩回中间rank KV与权重0、reserved1.72 GiB，独立64 GiB进程复用同时原Decode继续。扩与缩分别保持一个RID，两个512-token输出均与同暖参考逐token一致；中间插入容量探针与GPU前缀移至CPU，不冒称一个RID跨两次切换。实际CPU HiCache恢复576 token，新P→D、启动Graph及NIXL保持；控制1.951／1.073秒，三rank fence分别142.9–145.3／132.3–133.7 ms，各方向一次。Guard后检查、缓存审计、owned cleanup及release通过。页注册专项20项CPU通过；此前相关108项通过不相加。
+
+RDMA诊断中普通CUDA注册成功，跨十个VMM分配的20 MiB注册返回-202，逐个2 MiB分配十次均成功；正式池按实际4 MiB物理分配逐页注册后通过。原生页显式RDMA标志保留。完整模型结果与哈希见[专题结果](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/KVCACHED_CAPACITY.md)。当前只验收D侧、单请求及预定容量档位；P侧、多请求、完整worker退出和端到端性能仍待验证。
 
 首轮 GPU r2 在启动的两个布局 Graph 预捕获后，被正常 idle 内存检查拒绝：hybrid SSM 检查仍读分配器虚拟 `size=12288`，而实际可用8192。未关闭检查；将 allocator.size 改为提交容量、另存 virtual_capacity，并在提交时刷新 frozen pool observer 与检查器。新增真实 idle invariant 及统计 owner 更新的 CPU 检查。r2 未服务正式请求、未验证容量扩缩，两个节点的 owned cleanup 已通过。
 

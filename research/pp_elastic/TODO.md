@@ -2,7 +2,9 @@
 
 ## 122B／A100：KVCacheD 容量随 PP 扩缩（2026-11-14）
 
-- [ ] 主 agent 在独立 `codex/qwen122b-pd-kvcached-capacity-20261114` 接通固定 P2、D PP2↔PP3 的容量 frontier。保留 HiCache、预捕获 Graph、CPU 权重 offload／预打包和 NIXL patch；先验收小容量往返、真实页面回收和独立显存复用，之后跑短 AgentX＋BurstGPT 配对。当前为实现阶段，尚无 GPU 资格。依赖 PR #14 的 `313e2a2238`；不修改其活动 worktree。
+- [x] 独立任务 PR #15 的 r5 最小往返通过：固定 P2，D 容量8192→12288→8192；9216-token输入用到槽位10240，物理KV240→336→240 MiB，中间rank KV与权重归零，独立64 GiB复用成功。HiCache CPU恢复576 token；扩、缩各一个512-token持续请求与同暖参考逐token一致。控制1.951／1.073秒，各一次；worker仍reserved1.72 GiB。r2—r4失败及RDMA逐分配注册定位保留，Guard清理与release通过。
+
+- [ ] 将容量路径接入短 AgentX＋BurstGPT 配对，保留单活跃Decode资格限制、最新Graph／offload／NIXL／HiCache、同一reactive策略与相同到达。对比原地D2↔D3与新增／退出D2副本；固定P2。先作有界流程与成本验证，不将其当作多请求吞吐或最优伸缩结论。
 
 ## 短 AgentX＋BurstGPT reactive E2E 对照（2026-11-14）
 
