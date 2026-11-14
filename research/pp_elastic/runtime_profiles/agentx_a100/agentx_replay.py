@@ -70,7 +70,8 @@ def stream(endpoint, key, payload, timeout=600, *, event_sink=None):
                 output_tokens=count, meta_info=meta)
 
 
-def request_one(prefill, decode, key, tokens, output, lane, return_logprob=False):
+def request_one(prefill, decode, key, tokens, output, lane, return_logprob=False,
+                *, request_timeout_s=600):
     target = decode or prefill
     payload = dict(input_ids=tokens, stream=True, sampling_params={
         'temperature': 0, 'max_new_tokens': output, 'ignore_eos': True})
@@ -80,7 +81,7 @@ def request_one(prefill, decode, key, tokens, output, lane, return_logprob=False
     if target['ep'] > 1:
         payload['routed_dp_rank'] = target.get('rank', lane % target['ep'])
     if decode is None:
-        return stream(target, key, payload)
+        return stream(target, key, payload, timeout=request_timeout_s)
     payload.update(bootstrap_host=prefill['host'], bootstrap_port=prefill['bootstrap_port'],
                    bootstrap_room=random.randrange(1, 2**62), disagg_prefill_dp_rank=prefill.get('rank', lane % prefill['ep']))
     pre = dict(payload, stream=False)
@@ -90,8 +91,8 @@ def request_one(prefill, decode, key, tokens, output, lane, return_logprob=False
         pre.pop('routed_dp_rank', None)
     start = time.perf_counter()
     with cf.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(http, prefill['host'], prefill['port'], '/generate', key, pre, 600)
-        result = stream(decode, key, payload)
+        future = pool.submit(http, prefill['host'], prefill['port'], '/generate', key, pre, request_timeout_s)
+        result = stream(decode, key, payload, timeout=request_timeout_s)
         pre_result = future.result()
     if 'error' in pre_result:
         raise RuntimeError(str(pre_result['error']))

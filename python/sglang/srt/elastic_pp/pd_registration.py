@@ -37,7 +37,8 @@ def validate_decode_args(args):
         and getattr(args, "elastic_pp_weight_staging", None) == "cpu_prepacked"
         and getattr(args, "enable_elastic_pp_kv_patch", False)
         and getattr(args, "elastic_pp_kv_patch_transport", None) == "nixl"
-        and getattr(args, "elastic_pp_kv_backend", None) == "native"
+        and (getattr(args, "elastic_pp_kv_backend", None) == "native"
+             or getattr(args, "elastic_pp_kv_capacities", None))
     )
     count = getattr(args, "max_running_requests", None)
     if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= (4 if optimized else 1):
@@ -120,6 +121,9 @@ class DecodeRegistrationTransaction:
             return
         queue = self.scheduler.disagg_decode_prealloc_queue
         manager = queue.kv_manager
+        from sglang.srt.elastic_pp.kv_capacity import publish_scheduler_capacity
+
+        publish_scheduler_capacity(self.scheduler)
         # The pool object survives migration; its layer storage and addresses
         # do not.  Rebuild all KV/GDN/aux registrations from the committed pool.
         manager.kv_args = queue._build_kv_args()

@@ -39,7 +39,8 @@ def validate_graph_partitions(args, initial):
     if args.disable_cuda_graph:
         raise ValueError("prepared Decode Graph requires CUDA Graph enabled")
     if (
-        args.elastic_pp_kv_backend != "native"
+        (args.elastic_pp_kv_backend != "native"
+         and not getattr(args, "elastic_pp_kv_capacities", None))
         or args.elastic_pp_transition_backing != "overlap"
     ):
         raise ValueError("prepared Decode Graph requires native/overlap backing")

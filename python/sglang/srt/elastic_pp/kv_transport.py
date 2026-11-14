@@ -488,10 +488,12 @@ class ElasticPPKVTransport:
                 return
             from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
             from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+            from sglang.srt.mem_cache.kvcached_pool import KVCacheDTokenToKVPoolAllocator
 
             if type(self.allocator) not in (
                 TokenToKVPoolAllocator,
                 PagedTokenToKVPoolAllocator,
+                KVCacheDTokenToKVPoolAllocator,
             ):
                 raise NotImplementedError(
                     "online KV patch requires a standard native token/page allocator"

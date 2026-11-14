@@ -840,6 +840,9 @@ class ModelRunner:
         self.token_to_kv_pool = result.token_to_kv_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.memory_pool_config = result.memory_pool_config
+        from sglang.srt.elastic_pp.kv_capacity import configure_capacity
+
+        configure_capacity(self)
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = result.full_max_total_num_tokens
             self.swa_max_total_num_tokens = result.swa_max_total_num_tokens
@@ -1443,9 +1446,8 @@ class ModelRunner:
         if getattr(full, "is_kvcached_elastic_pool", False):
             if source_backing_released:
                 raise NotImplementedError("CPU-spill backing requires native KV pools")
-            # VMM physical commitment needs backend accounting, not logical
-            # tensor sizes. Preserve its existing transactional admission.
-            return {"backend": "kvcached", "native_overlap_checked": False}
+            if not getattr(full, "capacity_managed", False):
+                return {"backend": "kvcached", "native_overlap_checked": False}
         rank = self.ps.pp_rank
         source = transition.source.layer_range(rank)
         target = transition.target.layer_range(rank)
@@ -1501,12 +1503,21 @@ class ModelRunner:
             recurrent_bytes = 0
         if bank is not None and not bank.building:
             kv_bytes = recurrent_bytes = 0
+        if getattr(full, "capacity_managed", False):
+            from kvcached.tp_ipc_util import snapshot_worker_mapped_offsets
+            from sglang.srt.elastic_pp.kv_capacity import topology_capacity
+
+            attention_range = pool._attention_range(target) if hasattr(pool, "_attention_range") else target
+            capacity = topology_capacity(self.server_args, transition.target)
+            desired = full._capacity_offsets(attention_range, max(capacity, full.serving_capacity))
+            mapped = set(snapshot_worker_mapped_offsets(full._group_id))
+            kv_bytes = len(desired - mapped) * int(full.kvcached_allocator.physical_group_page_size)
         required = weights + kv_bytes + recurrent_bytes
         reserve = max(256 * 2**20, math.ceil(required * 0.05))
         device = torch.device(self.device)
         free = torch.cuda.mem_get_info(device)[0] if device.type == "cuda" else None
         report = {
-            "backend": "native",
+            "backend": "kvcached" if getattr(full, "capacity_managed", False) else "native",
             "native_overlap_checked": not source_backing_released,
             "source_backing_released": bool(source_backing_released),
             "weight_bytes": weights,
@@ -1536,6 +1547,33 @@ class ModelRunner:
             generation=generation,
             total_num_layers=self.model_config.num_hidden_layers,
         )
+
+    def prepare_elastic_pp_kv_capacity(self, transition):
+        from sglang.srt.elastic_pp.kv_capacity import full_pool, topology_capacity
+
+        capacity = topology_capacity(self.server_args, transition.target)
+        if capacity is not None:
+            pool = self.token_to_kv_pool
+            target = transition.target.layer_range(self.ps.pp_rank)
+            if hasattr(pool, "_attention_range"):
+                target = pool._attention_range(target)
+            full_pool(self).prepare_serving_capacity(target, capacity, transition.target.generation)
+
+    def reclaim_elastic_pp_kv_capacity_at_fence(self):
+        from sglang.srt.elastic_pp.kv_capacity import full_pool
+
+        full = full_pool(self)
+        if getattr(full, "capacity_managed", False):
+            full.reclaim_capacity_at_fence()
+
+    def validate_elastic_pp_kv_capacity_at_fence(self, transition):
+        from sglang.srt.elastic_pp.kv_capacity import full_pool, topology_capacity
+
+        full = full_pool(self)
+        if getattr(full, "capacity_managed", False):
+            full._logical_allocator.check_serving_capacity(
+                topology_capacity(self.server_args, transition.target)
+            )
 
     def invalidate_elastic_pp_attention_state_views(self):
         """Drop lazy GDN tracking views at a drained backing change.
@@ -1573,6 +1611,9 @@ class ModelRunner:
         target = self.token_to_kv_pool.commit_elastic_pp_kv_layers(
             generation=generation
         )
+        full = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
+        if getattr(full, "capacity_managed", False):
+            self.max_total_num_tokens = full.serving_capacity
         self.invalidate_elastic_pp_attention_state_views()
         return target
 

@@ -15,7 +15,8 @@ def validate_qwen35_elastic_args(args):
             "prefix caching without HiCache (pass --disable-radix-cache)"
         )
     if hicache:
-        if getattr(args, "elastic_pp_kv_backend", "native") != "native":
+        if (getattr(args, "elastic_pp_kv_backend", "native") != "native"
+                and not getattr(args, "elastic_pp_kv_capacities", None)):
             unsupported.append("HiCache requires native elastic KV backing")
         if getattr(args, "hicache_storage_backend", None):
             unsupported.append("HiCache L3 storage")

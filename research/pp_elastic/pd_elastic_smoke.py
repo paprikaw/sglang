@@ -33,6 +33,7 @@ GUARD = Path("/home/bxb1/.codex/skills/llm-experiment-guard/scripts")
 PRIOR = Path("/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/runs/p2d2_start_r1")
 PYTHON = "/data/gpfs/projects/punim2715/vllm_workbench/sglang_overlap_compare/venv-dd15fb57-cu12/bin/python"
 NIXL_ROOT = Path("/data/gpfs/projects/punim2715/vllm_workbench/.dependency-runtimes/sglang-nixl-cu12-1.5.2")
+KVCACHED_ROOT = Path("/data/gpfs/projects/punim2715/vllm_workbench/.dependency-worktrees/kvcached-stream-mapping-20261114")
 
 
 def save(path, value):
@@ -59,7 +60,7 @@ def memory_size_json(value):
 
 
 def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
-            lazy_cuda_modules=False):
+            lazy_cuda_modules=False, kvcached_capacity=False):
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
     dirty = subprocess.check_output(["git", "-C", str(ENGINE), "status", "--porcelain"], text=True)
@@ -69,7 +70,7 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
     key = run / "admin.key"
     key.write_text(secrets.token_hex(32)); key.chmod(0o600)
     spec = json.loads((PRIOR / "dashboard_spec.json").read_text())
-    spec.update(id=run.name, port=29470, runtime_dir=str(run / "dashboard_guard"),
+    spec.update(id=run.name, port=29670 if kvcached_capacity else 29470, runtime_dir=str(run / "dashboard_guard"),
                 gpu_lease_ttl_s=30, title="122B A100 P/D PP2→PP3→PP2 qualification")
     cache = spec["model_cache"]
     cache["usage_logs"] = {}
@@ -96,6 +97,16 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
                    cpu_weight_cache_gib=64 if optimized and role == "decode" else 0,
                    nixl_root=str(NIXL_ROOT) if optimized and role == "decode" else None)
         cfg["launch_env"] = dict(cfg["launch_env"])
+        cfg["kvcached_capacity"] = kvcached_capacity
+        if kvcached_capacity:
+            cfg.update(port=29681 + index * 10, dist_port=29682 + index * 10,
+                       bootstrap_port=29679)
+        if kvcached_capacity and role == "decode":
+            cfg["kvcached_root"] = str(KVCACHED_ROOT)
+            cfg["launch_env"].update(KVCACHED_LAYER_STACKING="true",
+                KVCACHED_PAGE_PREALLOC_ENABLED="false", KVCACHED_CONTIGUOUS_LAYOUT="true",
+                KVCACHED_PHYSICAL_BLOCK_SIZE_MB="2", KVCACHED_MIN_RESERVED_PAGES="0",
+                KVCACHED_MAX_RESERVED_PAGES="0")
         if optimized and role == "decode" and not lazy_cuda_modules:
             # First-use NIXL gather kernels on the dormant rank must not load
             # CUDA modules while the real CPU weight restore is in flight.
@@ -123,6 +134,10 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
                   reserved_gpus=8, gpu_reuse_probe_gib=64)
     config["deterministic_inference"] = True
     config["temporary_prefill_diagnostics"] = False
+    config["kvcached_capacity"] = kvcached_capacity
+    if kvcached_capacity:
+        config["capacity_frontier"] = [8192, 12288, 8192]
+        config["capacity_probe_input_tokens"] = 9216
     save(run / "config.json", config)
     spec["tasks"] = [dict(id="qualification", label="Request/cache/reuse acceptance",
         root=str(run / "task"), expected=1, nodes=list(nodes), controller_script=str(Path(__file__).resolve()))]
@@ -140,6 +155,22 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
             if not matched:
                 raise RuntimeError("Missing qualified NIXL dependency: " + pattern)
             paths.extend(matched)
+    if kvcached_capacity:
+        lock = json.loads((ROOT / "dependencies.lock.json").read_text())["kvcached"]
+        tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=KVCACHED_ROOT, text=True).strip()
+        if tree != lock["patched_tree"] or subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"], cwd=KVCACHED_ROOT, text=True).strip():
+            raise RuntimeError("KVCacheD dependency must match the clean source lock")
+        binaries = list((KVCACHED_ROOT / "kvcached").glob("vmm_ops*.so"))
+        if len(binaries) != 1:
+            raise RuntimeError("Expected one compiled KVCacheD extension")
+        dependency_files = subprocess.check_output(["git", "ls-files"], cwd=KVCACHED_ROOT, text=True).splitlines()
+        paths.extend(KVCACHED_ROOT / p for p in dependency_files if p.endswith((".py", ".cpp", ".h", ".hpp")))
+        paths.extend(binaries)
+        spec["sources"].append(dict(role="kv_backing", worktree=str(KVCACHED_ROOT),
+                                    commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=KVCACHED_ROOT, text=True).strip()))
+        save(run / "kvcached_dependency.json", dict(tree=tree, native=describe(binaries[0]),
+             build_node="spartan-gpgpu167", native_stream_mapping_abi=1))
     bank = Path("/data/gpfs/projects/punim2715/vllm_workbench/sglang-memory-bank/src/sglang_memory_bank")
     paths.extend(bank / name for name in ("__init__.py", "memory_budget.py", "memory_bank.py"))
     spec["frozen_inputs"] = [describe(p) for p in dict.fromkeys(paths)]
@@ -168,6 +199,9 @@ def environment(cfg):
     if cfg.get("optimized_elastic_pp"):
         env["PYTHONPATH"] = cfg["nixl_root"] + os.pathsep + env["PYTHONPATH"]
         env.update(UCX_PROTO_INFO="y", UCX_LOG_LEVEL="info")
+    if cfg.get("kvcached_root"):
+        env["PYTHONPATH"] = cfg["kvcached_root"] + os.pathsep + env["PYTHONPATH"]
+        env.pop("KVCACHED_AUTOPATCH", None)
     if cfg.get("prepare_diagnostic_dir"):
         env["ELASTIC_PD_PREPARE_DIAGNOSTICS"] = cfg["prepare_diagnostic_dir"]
     if cfg.get("native_prepare_dir"):
@@ -272,6 +306,14 @@ def install_hooks():
             if os.environ.get("ELASTIC_PD_LIGHTWEIGHT_STATUS") == "1":
                 return result
             pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
+            full = getattr(pool, "full_kv_pool", pool)
+            if getattr(full, "capacity_managed", False):
+                allocator = scheduler.token_to_kv_pool_allocator
+                result.internal_state["pd_kv_capacity"] = dict(
+                    **full.kvcached_physical_stats(), free_tokens=allocator.available_size(),
+                    max_live_slot=max(allocator._live_page_ids, default=0),
+                    scheduler_capacity=scheduler.max_total_num_tokens,
+                    preallocator_capacity=scheduler.disagg_decode_prealloc_queue.max_total_num_tokens)
             def bytes_of(values):
                 storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
                             for t in values if t.is_cuda and t.numel()}
@@ -317,6 +359,13 @@ def engine_entry(run, cfg):
     if cfg["role"] == "decode":
         argv += ["--enable-elastic-pp", "--elastic-pp-disagg-decode", "--elastic-pp-initial-partition", "24,0,24",
                  "--disaggregation-decode-enable-radix-cache", "--disaggregation-decode-extra-slots", "4"]
+    if cfg.get("kvcached_capacity"):
+        for option, value in (("--context-length", "16384"), ("--max-total-tokens", "12288"),
+                              ("--page-size", "1"), ("--chunked-prefill-size", "4096"),
+                              ("--max-prefill-tokens", "8192")):
+            argv[argv.index(option) + 1] = value
+        if cfg["role"] == "decode":
+            argv += ["--elastic-pp-kv-backend", "kvcached", "--elastic-pp-kv-capacities", "8192;12288"]
     if cfg.get("optimized_elastic_pp"):
         argv += ["--elastic-pp-transition-strategy", "background", "--elastic-pp-transition-backing", "overlap",
                  "--elastic-pp-graph-partitions", "24,0,24;16,16,16",
@@ -453,6 +502,7 @@ def controller(run, root):
         saved = probe.state_evidence(info)
         for source, target in zip(info["internal_states"], saved["internal_states"]):
             target["pd_release_memory"] = source.get("pd_release_memory")
+            target["pd_kv_capacity"] = source.get("pd_kv_capacity")
         save(run / f"state.{label}.json", saved)
         return saved["internal_states"]
     def wait_file(path, seconds=60):
@@ -465,6 +515,19 @@ def controller(run, root):
         subprocess.run([PYTHON, str(GUARD / "artifact_visibility.py"), str(path),
             "--timeout-s", "20", "--receipt", str(path.with_name(path.stem + ".visibility.json"))],
             check=True, stdout=subprocess.DEVNULL, timeout=25)
+    def capacity_evidence(states, expected):
+        if not root.get("kvcached_capacity"):
+            return None
+        ranks = probe.rank_states(states)
+        rows = [s.get("pd_kv_capacity") or {} for s in ranks.values()]
+        if len(rows) != 3 or any(
+            r.get("serving_capacity") != expected or r.get("scheduler_capacity") != expected
+            or r.get("preallocator_capacity") != expected or not r.get("physical_layer_partitioned")
+            or r.get("virtual_capacity") != 12288 for r in rows
+        ):
+            raise AssertionError("KV capacity was not published to every live admission owner")
+        return dict(capacity=expected, mapped_bytes=sum(r["mapped_memory_bytes"] for r in rows),
+                    ranks={str(rank): s["pd_kv_capacity"] for rank, s in ranks.items()})
     try:
         progress(run, root, "starting")
         packet = json.dumps(dict(environment={k: os.environ[k] for k in h.GUARD_KEYS})) + "\n"
@@ -512,7 +575,7 @@ def controller(run, root):
             with cf.ThreadPoolExecutor(max_workers=1) as executor:
                 active = executor.submit(replay.request_one, p, d, key, prompt, root["output_tokens"], 0, True)
                 for generation, counts in ((1, [16, 16, 16]), (2, [24, 0, 24])):
-                    minimum = 8 if generation == 1 else events[-1][0] + 8
+                    minimum = 8 if generation == 1 or not events else events[-1][0] + 8
                     deadline = time.monotonic() + 90
                     while not events or events[-1][0] < minimum:
                         health()
@@ -522,6 +585,8 @@ def controller(run, root):
                             raise TimeoutError("No progressing active Decode request")
                         time.sleep(.02)
                     before = state(f"before{generation}")
+                    if root.get("kvcached_capacity") and generation == 1:
+                        results["initial_capacity"] = capacity_evidence(before, 8192)
                     started = time.time()
                     answer = http("/reconfigure_elastic_pp", dict(layer_counts=counts, generation=generation))
                     results["transitions"].append(dict(generation=generation, started_at=started,
@@ -542,6 +607,33 @@ def controller(run, root):
                         probe.validate_transition_states(after, generation,
                             (0, 2) if generation == 1 else (0, 1, 2), "overlap", shared_host=True)
                     results["transitions"][-1]["after"] = after
+                    if root.get("kvcached_capacity"):
+                        results["transitions"][-1]["capacity"] = capacity_evidence(after, 12288 if generation == 1 else 8192)
+                        if generation == 1:
+                            results["active_grow"] = active.result(timeout=240)
+                            save(run / "stream_events.grow.json", events)
+                            # A real P→D request must consume slots that the old
+                            # PP2 ceiling could not admit. No cold-prefix timing
+                            # is compared with the warm reference.
+                            large = [30000 + (i * 7) % 15000 for i in range(root["capacity_probe_input_tokens"])]
+                            results["new_capacity_request"] = replay.request_one(p, d, key, large, 32, 0, True)
+                            used = state("new_capacity_used")
+                            proof = capacity_evidence(used, 12288)
+                            if not all(r["max_live_slot"] > 8192 for r in proof["ranks"].values()):
+                                raise AssertionError("No live/cache slot used the additional KV capacity")
+                            if proof["mapped_bytes"] <= results["initial_capacity"]["mapped_bytes"]:
+                                raise AssertionError("Capacity growth did not increase physical KV backing")
+                            results["grown_capacity"] = proof
+                            results["pre_shrink_demotion"] = probe.demote_cpu_prefixes(http)
+                            results["pre_shrink_rewarm"] = replay.request_one(p, d, key, prompt, 64, 0, True)
+                            events.clear()
+                            active = executor.submit(replay.request_one, p, d, key, prompt, root["output_tokens"], 0, True)
+                        else:
+                            shrunk = results["transitions"][-1]["capacity"]
+                            if shrunk["mapped_bytes"] >= results["grown_capacity"]["mapped_bytes"]:
+                                raise AssertionError("Shrink did not return any physical KV pages")
+                            if shrunk["ranks"]["1"]["mapped_memory_bytes"] != 0:
+                                raise AssertionError("Retired GPU retained KVCacheD physical pages")
                 (run / "probe.trigger").touch(mode=0o600)
                 wait_file(run / "gpu_reuse_started.json", 90)
                 results["active"] = active.result(timeout=240)
@@ -553,10 +645,12 @@ def controller(run, root):
         if root.get("optimized_elastic_pp"):
             probe.validate_decode_graph_states(completed, 2, (0, 1, 2), (0, 2), prepared=True)
         results["continuity"] = [probe.validate_uninterrupted_decode(
-            completed, generation, results["active"], sources, targets
+            completed, generation, results.get("active_grow", results["active"]) if generation == 1 else results["active"], sources, targets
         ) for generation, sources, targets in (
             (1, (0, 2), (0, 1, 2)), (2, (0, 1, 2), (0, 2))) ]
         results["exact_output_match"] = results["reference"]["output_ids"] == results["active"]["output_ids"]
+        if "active_grow" in results:
+            results["exact_output_match"] &= results["reference"]["output_ids"] == results["active_grow"]["output_ids"]
         results["warm_start_match"] = all(
             results["reference"][role].get("cached_tokens")
             == results["active"][role].get("cached_tokens")
@@ -627,13 +721,15 @@ def main():
     parser.add_argument("--diagnostic-prepare", action="store_true")
     parser.add_argument("--native-prepare", action="store_true")
     parser.add_argument("--lazy-cuda-modules", action="store_true")
+    parser.add_argument("--kvcached-capacity", action="store_true")
     for option in ("prepare", "worker", "engine", "probe"):
         parser.add_argument("--" + option, action="store_true")
     args = parser.parse_args()
     run = args.run.resolve()
     if args.prepare:
         return prepare(run, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare,
-                       native_prepare=args.native_prepare, lazy_cuda_modules=args.lazy_cuda_modules)
+                       native_prepare=args.native_prepare, lazy_cuda_modules=args.lazy_cuda_modules,
+                       kvcached_capacity=args.kvcached_capacity)
     root = json.loads((run / "config.json").read_text())
     if args.worker:
         return worker(run, root)

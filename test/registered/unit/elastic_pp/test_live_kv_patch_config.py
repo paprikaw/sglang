@@ -32,7 +32,7 @@ def args(**overrides):
         ({"enable_elastic_pp": False}, "requires --enable-elastic-pp"),
         ({"elastic_pp_transition_strategy": "sync"}, "background/overlap"),
         ({"elastic_pp_transition_backing": "cpu_spill"}, "background/overlap"),
-        ({"elastic_pp_kv_backend": "kvcached"}, "native KV"),
+        ({"elastic_pp_kv_backend": "kvcached"}, "capacity frontier"),
         ({"speculative_algorithm": "EAGLE"}, "no speculative"),
     ],
 )

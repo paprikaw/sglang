@@ -152,17 +152,22 @@
   "kvcached": {
     "upstream_url": "https://github.com/ovg-project/kvcached.git",
     "upstream_commit": "3cc92bec02fc77b72b86ed6f8d91dc454bbca154",
-    "patch": "dependencies/kvcached-layer-mapping-v1.patch",
-    "patch_sha256": "dbd6d41eaf8c603bc6a807a05b55482007b212a0a3cdbe53e6c59f2a2e8f2d75",
-    "patched_tree": "14c85a5f0701a5a7789683ee57f9cbf873ea4cc7",
+    "patch": "dependencies/kvcached-capacity-mapping-v1.patch",
+    "patch_sha256": "a7d6361ba67964602fe389ceed548c3ee468c55f479881fcde8e7c6113d45b41",
+    "patched_tree": "34e585c3240f3ebea23a9c39a5ea95c8b7d56db6",
     "python_layer_mapping_api": 1,
     "native_layer_mapping_abi": 1,
     "required_environment": {
       "KVCACHED_LAYER_STACKING": "true",
-      "KVCACHED_PAGE_PREALLOC_ENABLED": "false"
+      "KVCACHED_PAGE_PREALLOC_ENABLED": "false",
+      "KVCACHED_PHYSICAL_BLOCK_SIZE_MB": "2",
+      "KVCACHED_MIN_RESERVED_PAGES": "0",
+      "KVCACHED_MAX_RESERVED_PAGES": "0"
     },
     "build": "Apply patch to the pinned clean upstream tree and rebuild the native extension in an isolated checkout; select it explicitly with PYTHONPATH.",
-    "limits": "The bounded A100 gpu-r1 primitive check validates mapping/reclamation, retained addresses/values, packed-row copying and two small Graph replays. Full-model Graph reuse, hybrid HiCache on this backend, GDN stable addresses, online patch transport and returning working GPUs remain unqualified. Hybrid HiCache retains its native-backend-only guard."
+    "limits": "Capacity-managed Decode integration requires page-size 1, fixed EP/TP, the admitted PP/capacity frontier, and the stream mapping ABI. CPU checks cover control, allocation and wire paths; full-model HiCache, Graph reuse, growth and physical release await the recorded GPU qualification.",
+    "native_stream_mapping_abi": 1,
+    "patched_commit": "c55ce3df455e17ad16ca7437c4e1fd3229923458"
   },
   "nixl": {
     "packages": {

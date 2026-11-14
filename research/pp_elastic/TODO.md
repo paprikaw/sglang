@@ -1,5 +1,9 @@
 # PP 原地伸缩＋HiCache：实现与实验清单
 
+## 122B／A100：KVCacheD 容量随 PP 扩缩（2026-11-14）
+
+- [ ] 主 agent 在独立 `codex/qwen122b-pd-kvcached-capacity-20261114` 接通固定 P2、D PP2↔PP3 的容量 frontier。保留 HiCache、预捕获 Graph、CPU 权重 offload／预打包和 NIXL patch；先验收小容量往返、真实页面回收和独立显存复用，之后跑短 AgentX＋BurstGPT 配对。当前为实现阶段，尚无 GPU 资格。依赖 PR #14 的 `313e2a2238`；不修改其活动 worktree。
+
 ## 短 AgentX＋BurstGPT reactive E2E 对照（2026-11-14）
 
 - [ ] r7已抓到激活／输出／P/D队列确认的三rank循环等待；提前发送CPU队列确认，保留等待和缓冲所有权，先做受限GPU验证。此前失败不计入性能，未完成配对前不报告提速。

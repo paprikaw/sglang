@@ -390,6 +390,21 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if getattr(device_pool, "capacity_managed", False):
+            if io_backend != "kernel" or self.layout != "page_first" or not self.can_use_jit:
+                raise ValueError("capacity-managed packed KV requires page_first JIT HiCache I/O")
+            for layer in range(device_pool.layer_num):
+                host_layer = self._host_layer_index(layer)
+                jit_transfer_hicache_one_layer(
+                    k_cache_dst=self.k_data_refs[host_layer],
+                    v_cache_dst=self.v_data_refs[host_layer],
+                    indices_dst=host_indices,
+                    k_cache_src=device_pool.k_buffer[layer],
+                    v_cache_src=device_pool.v_buffer[layer],
+                    indices_src=device_indices,
+                    element_dim=self.element_dim,
+                )
+            return
         if io_backend == "kernel_ascend":
             # NPU pools use contiguous multi-layer tensors and intentionally do
             # not build the CUDA-style k_data_ptrs/v_data_ptrs arrays.

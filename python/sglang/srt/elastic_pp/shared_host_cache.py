@@ -310,7 +310,8 @@ def validate_shared_host_args(args):
         and args.tp_size == 1
         and args.ep_size == 1
         and args.pp_stage_tp_sizes is None
-        and args.elastic_pp_kv_backend == "native"
+        and (args.elastic_pp_kv_backend == "native"
+             or getattr(args, "elastic_pp_kv_capacities", None))
         and args.hicache_mem_layout == "page_first"
         and args.hicache_io_backend == "kernel"
         and args.hicache_storage_backend is None

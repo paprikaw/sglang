@@ -76,20 +76,22 @@ def prepare(run, mechanism):
         cfg['layouts']=[row for c in servers.values() if c['node']==n for row in c['layouts']]
     root.update(mechanism=mechanism,servers=servers,agentx_python=old['agentx_python'],
         agentx_tokenizer=old['agentx_tokenizer'],tokenizer_cache=old['tokenizer_cache'],
-        model_path=old['model_path'],client_node=cfgs[1]['node'],per_instance_admission=4,
+        model_path=old['model_path'],client_node=cfgs[1]['node'],per_instance_admission=1,
         policy=dict(high_wait_s=2,up_hold_s=2,down_hold_s=30,residence_s=15,max_gpus=8),
         slo=dict(ttft_s=15,tpot_s=.150,joint_target=.90),
-        context_length=65536,max_total_tokens=262144,max_running_requests=4,
+        context_length=65536,max_total_tokens=262144,max_running_requests=1,
+        qualification_scope='Single active request per Decode instance; client task concurrency retained. Multi-request dormant-stage PP is not qualified.',
+        expected_tasks=4,expected_profile_requests=76,
         baseline_startup='new PP2 process using admitted ready node-local canonical CPU weights',
         max_scale_cycles=1,full_drain=True,wall_timeout_s=1080)
     save(run/'config.json',root)
     plan=json.loads((PRIOR/'plan.json').read_text())
     with Path(plan['source']['burstgpt_path']).open() as f:
-        rows=list(x for i,x in enumerate(csv.DictReader(f)) if 109<=i<=114)
+        rows=list(x for i,x in enumerate(csv.DictReader(f)) if 109<=i<=110)
     stamps=[float(x['Timestamp']) for x in rows]
     plan['capacity']=10
-    plan['source'].update(burstgpt_rows_zero_based=list(range(109,115)),burstgpt_timestamps_s=stamps,
-        selection='Six consecutive original arrivals, no time compression; short pilot')
+    plan['source'].update(burstgpt_rows_zero_based=list(range(109,111)),burstgpt_timestamps_s=stamps,
+        selection='Two consecutive original arrivals, no time compression; bounded single-request workflow pilot')
     plan['arrivals']=[dict(id=f'new-{i}',at_s=45+t-stamps[0],trace_id=plan['source']['selected_family']) for i,t in enumerate(stamps)]
     save(run/'plan.json',plan)
     import shutil
@@ -111,7 +113,7 @@ def prepare(run, mechanism):
     p.write_text(s)
     ep=dict(mode='pd',require_hicache=True,api_key_file=root['admin_key_file'],
         prefill=[endpoint(servers['p'])],decode=[endpoint(c) for n,c in servers.items() if n.startswith('d')],
-        request_timeout_s=600,backend_force_close=True,provenance=dict(pilot=True),reactive_admission=4)
+        request_timeout_s=600,backend_force_close=True,provenance=dict(pilot=True),reactive_admission=root['per_instance_admission'])
     save(run/'endpoints.json',ep)
     registry=Path('/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/kv_checkpoints/registry.json')
     registry_value=json.loads(registry.read_text())
@@ -139,7 +141,8 @@ def engine(run, root, sid):
     original=server_args.prepare_server_args
     def arguments(argv):
         values={'--context-length':str(root['context_length']),'--max-total-tokens':str(root['max_total_tokens']),
-            '--max-running-requests':'4','--max-mamba-cache-size':'48','--hicache-size':'32',
+            '--max-running-requests':str(root['max_running_requests'] if sid.startswith('d') else 4),
+            '--max-mamba-cache-size':'48','--hicache-size':'32',
             '--chunked-prefill-size':'4096','--max-prefill-tokens':'8192'}
         flags=[]
         remove={'--enable-elastic-pp','--elastic-pp-disagg-decode','--disable-cuda-graph'} if sid.startswith('d') and not cfg['optimized_elastic_pp'] else set()
@@ -376,7 +379,7 @@ def coordinator(run,root):
         p,d=[dict(host=root['servers'][n]['node'],port=root['servers'][n]['port'],ep=1,
             bootstrap_port=root['servers'][n]['bootstrap_port']) for n in ['p','d0']]
         tokens=[1000+i%123 for i in range(4608)]
-        smoke=[replay.request_one(p,d,key,tokens,8,0,True) for _ in range(2)]
+        smoke=[replay.request_one(p,d,key,tokens,8,0,True,request_timeout_s=120) for _ in range(2)]
         if smoke[0]['output_ids']!=smoke[1]['output_ids']:raise AssertionError('static P/D warm output mismatch')
         save(run/'start_smoke.json',dict(passed=True,responses=smoke))
         cmd=[PYTHON,str(Path(__file__).resolve()),'--client','--run',str(run)]
@@ -432,7 +435,7 @@ def coordinator(run,root):
                 if time.time()-completed_at>75 and future is None:
                     raise RuntimeError('normal reactive down did not become safe after drain')
             stop.wait(1)
-        post_smoke=replay.request_one(p,d,key,tokens,8,0,True)
+        post_smoke=replay.request_one(p,d,key,tokens,8,0,True,request_timeout_s=120)
         if post_smoke['output_ids']!=smoke[0]['output_ids']:
             raise AssertionError('post-scaling P/D warm output mismatch')
         save(run/'post_smoke.json',dict(passed=True,response=post_smoke))
@@ -440,7 +443,8 @@ def coordinator(run,root):
         save(run/'completed.json',dict(passed=True,formal_start=formal_start,replay_done=completed_at,
             comparison_finished=time.time(),mechanism=root['mechanism'],actions=len(actions),
             scaling_exercised=any(a['decision']['direction']=='up' and a['success'] for a in actions),
-            expected_tasks=8,slo=root['slo']))
+            expected_tasks=root['expected_tasks'],expected_profile_requests=root['expected_profile_requests'],
+            qualification_scope=root['qualification_scope'],slo=root['slo']))
         progress('complete')
     except BaseException as error:
         errors.append(repr(error));save(run/'failure.json',dict(error=repr(error),traceback=traceback.format_exc()))

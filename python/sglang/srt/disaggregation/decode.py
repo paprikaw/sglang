@@ -540,6 +540,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        full_pool = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
+        if getattr(full_pool, "capacity_managed", False):
+            kv_args.kv_registration_regions = full_pool.pd_registration_regions()
+            kv_args.kv_row_strides = [int(t.stride(0)) * t.element_size()
+                                      for t in full_pool.k_buffer + full_pool.v_buffer]
         kv_args.kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
             if self.draft_token_to_kv_pool is None

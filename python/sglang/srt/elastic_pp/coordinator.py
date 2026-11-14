@@ -588,6 +588,9 @@ class ElasticPPMigrationCoordinator:
             self._weights_reused = True
             self._layers_precopied = True
         self._kv_prepared = True
+        prepare_capacity = getattr(self.model_runner, "prepare_elastic_pp_kv_capacity", None)
+        if prepare_capacity is not None:
+            self._timed("prepare_kv_capacity", prepare_capacity, transition)
         self._timed("prepare_kv", self.kv_transport.prepare_transition, transition)
         if self._source_backing_attempted:
             self._source_backing_metrics["target_restore"] = (
@@ -997,6 +1000,9 @@ class ElasticPPMigrationCoordinator:
             # Keep the source generation intact until all ranks can publish.
             local_error = None
             try:
+                validate_capacity = getattr(self.model_runner, "validate_elastic_pp_kv_capacity_at_fence", None)
+                if validate_capacity is not None:
+                    validate_capacity(transition)
                 if (
                     self.backing == "overlap"
                     and self.before_backing_release is not None
@@ -1305,6 +1311,18 @@ class ElasticPPMigrationCoordinator:
                 "decode_graph", success=local_error is None, error=local_error
             )
             self._raise_peer_failures("Decode Graph rebuild", reports)
+
+            # New-serving work has not resumed. Reclaim retired VMM ranges here;
+            # the background cleanup must not device-fence a later NCCL receive.
+            local_error = None
+            try:
+                reclaim = getattr(self.model_runner, "reclaim_elastic_pp_kv_capacity_at_fence", None)
+                if reclaim is not None:
+                    self._timed("fence_capacity_reclaim", reclaim)
+            except BaseException as exc:
+                local_error = f"{type(exc).__name__}: {exc}"
+            reports = self._consensus("capacity_reclaim", success=local_error is None, error=local_error)
+            self._raise_peer_failures("KV capacity reclaim", reports)
 
             with self._condition:
                 self.current_topology = transition.target

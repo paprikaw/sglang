@@ -1180,6 +1180,11 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "native"
+    elastic_pp_kv_capacities: A[
+        Optional[str],
+        Arg(help="Serving KV token capacities, semicolon-separated in prepared PP partition order; max-total-tokens reserves the stable virtual maximum."),
+        NS("parallel"),
+    ] = None
     elastic_pp_hicache_shared_host: A[
         bool,
         Arg(
@@ -8118,13 +8123,13 @@ class ServerArgs:
                 raise ValueError(
                     "online KV patch requires background/overlap transition"
                 )
-            if self.elastic_pp_kv_backend != "native":
-                raise ValueError("online KV patch currently requires native KV")
+            if self.elastic_pp_kv_backend != "native" and not self.elastic_pp_kv_capacities:
+                raise ValueError("KVCacheD online patch requires a capacity frontier")
             if self.speculative_algorithm is not None:
                 raise ValueError("online KV patch requires no speculative decoding")
         if not self.disable_cuda_graph:
-            if self.elastic_pp_kv_backend != "native":
-                raise ValueError("elastic PP Decode Graph currently requires native KV")
+            if self.elastic_pp_kv_backend != "native" and not self.elastic_pp_kv_capacities:
+                raise ValueError("KVCacheD Decode Graph requires a capacity frontier")
             if self.enable_torch_compile or self.speculative_algorithm is not None:
                 raise ValueError(
                     "elastic PP Decode Graph requires no torch.compile or speculative decoding"
@@ -8164,6 +8169,10 @@ class ServerArgs:
                 "KVCACHED_AUTOPATCH to avoid replacing the transactional pool "
                 "and allocator classes"
             )
+        if self.elastic_pp_kv_capacities is not None:
+            from sglang.srt.elastic_pp.kv_capacity import capacity_frontier
+
+            capacity_frontier(self)
 
         raw_partition = self.elastic_pp_initial_partition or os.getenv(
             "SGLANG_PP_LAYER_PARTITION"

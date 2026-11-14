@@ -150,6 +150,7 @@ class KVArgsRegisterInfo:
     staging_base_ptr: int = 0
     staging_total_size: int = 0
     dst_pp_size: int = 1
+    dst_kv_row_strides: Optional[List[int]] = None
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -197,6 +198,8 @@ class KVArgsRegisterInfo:
             dst_pp_size=(
                 int(msg[18].decode("ascii")) if len(msg) > 18 and msg[18] != b"" else 1
             ),
+            dst_kv_row_strides=(list(struct.unpack(f"{len(msg[19]) // 8}Q", msg[19]))
+                                if len(msg) > 19 and msg[19] else None),
         )
 
 
@@ -383,7 +386,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     seen.add((ptr, length))
                     regions.append((ptr, length))
 
-        add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
+        custom = getattr(self.kv_args, "kv_registration_regions", None)
+        if custom is not None:
+            add([p for p, _ in custom], [n for _, n in custom])
+        else:
+            add(self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens)
         add(self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens)
         for ptrs, lens in zip(
             self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
@@ -713,6 +720,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_device_data_ptrs: Optional[set[int]] = None,
         allow_destination_subset: bool = False,
         allow_partial_overlap: bool = False,
+        dst_row_strides: Optional[List[int]] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -736,6 +744,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         layers_params = None
+        if dst_row_strides is not None:
+            if len(dst_row_strides) != len(dst_data_ptrs) or any(s <= 0 for s in dst_row_strides):
+                raise ValueError("destination KV row stride count/value is invalid")
+            if not src_layer_ids or not dst_layer_ids:
+                raise ValueError("strided KV transfer requires explicit global layer IDs")
 
         if (
             self.is_mla_backend
@@ -809,6 +822,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
             transfer_blocks = []
+            if dst_row_strides is not None:
+                stride = dst_row_strides[dst_data_ptrs.index(dst_ptr)]
+                if stride < item_len:
+                    raise ValueError("destination KV row stride overlaps payload rows")
+                # K and V share one physical group, with independent wire
+                # pointers. Coalescing contiguous logical tokens would overwrite
+                # the other field; keep each payload row separate.
+                return [(src_ptr + int(s) * item_len, dst_ptr + int(d) * stride, item_len)
+                        for s, d in zip(prefill_data_indices, dst_data_indices)]
             if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
                 assert (
                     device_prefill_kv_blocks is not None
@@ -932,6 +954,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_item_len: Optional[int] = None,
         dst_attn_tp_size: Optional[int] = None,
         dst_pp_size: int = 1,
+        dst_kv_row_strides: Optional[List[int]] = None,
     ):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
@@ -961,6 +984,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_device_data_ptrs=dst_device_kv_ptrs,
             allow_destination_subset=self.pp_size == 1 and dst_pp_size > 1,
             allow_partial_overlap=self._partial_layer_transfer(mooncake_session_id),
+            dst_row_strides=dst_kv_row_strides,
         )
 
     def send_kvcache_dcp(
@@ -1885,6 +1909,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_kv_item_len=target_rank_registration_info.dst_kv_item_len,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                                 dst_pp_size=target_rank_registration_info.dst_pp_size,
+                                dst_kv_row_strides=getattr(target_rank_registration_info, "dst_kv_row_strides", None),
                             )
                         elif (
                             self.enable_staging
@@ -2576,6 +2601,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             dst_dcp_size,
                             dst_dcp_rank,
                             str(self.kv_mgr.pp_size).encode("ascii"),
+                            b"".join(struct.pack("Q", s) for s in getattr(self.kv_mgr.kv_args, "kv_row_strides", ())),
                         ]
                     )
             except zmq.ZMQError:

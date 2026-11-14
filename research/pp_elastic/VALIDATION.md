@@ -1,5 +1,14 @@
 # 2026-11-14：CPU确认完整收发前移
 
+## 2026-11-14：122B P/D 的 KVCacheD 容量接入，GPU 待验收
+
+独立任务分支 `codex/qwen122b-pd-kvcached-capacity-20261114`，依赖 [P/D 接入 PR #14](https://github.com/paprikaw/sglang/pull/14)。沿用其 `2a8f799737` 中撤回未验收调度改序的执行顺序；不采用此前失败的多请求试验作基线。固定 P2，D 的容量前沿为 PP2 8192／PP3 12288 token，Graph 地址按最高容量预留。注册真实 packed K/V 行步长；HiCache、GDN、CPU 权重 offload、准备期权重恢复和 NIXL 保留。
+
+首次相关组合165项CPU通过。扩大检查891项通过、7项异步检查因插件关闭跳过；唯一失败是旧错误文案断言（无 frontier 仍被正确拒绝），随后更新断言并复测相关控制与容量路径。KVCacheD 扩展已在已预约167节点按 A100 架构、MAX_JOBS=1 编译；使用独立流初始化新物理页。源码与完整补丁固定于 `dependencies.lock.json`。这些不代表真实GPU扩缩验收。
+
+最小验证及后续比较见 [KVCacheD P/D 容量记录](KVCACHED_PD_CAPACITY.md)。要求真实请求用到 >8192 槽位、缩回回收物理页、HiCache CPU 恢复及独立显存复用；通过后才开展短 AgentX＋BurstGPT。
+
+
 r8仅前移发送仍复现：rank2在确认send完成处等待rank0，rank0等激活send，空rank1等输出。候选进一步将三类CPU确认的接收和发送完成等待也前移，实际队列更新仍在原模型／输出之后应用，GPU发送工作仍由原对象持有；静态PP路径不变。新增有待接收确认／空环、忙／空闲、各rank的组合测试，114项相关CPU检查通过。有限流量结束并缩回后，再对相同4608-token暖输入核对8个输出。GPU试跑前未取得多请求或端到端资格。
 
 # 2026-11-14：空阶段多请求P/D循环等待
