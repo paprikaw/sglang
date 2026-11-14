@@ -553,11 +553,12 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
                 [t[0].numel() * t.element_size() for t in tensors])
 
     def pd_registration_regions(self):
-        """Register complete mapped K/V groups, avoiding overlapping K/V spans."""
+        """Register each mapped physical allocation without overlapping K/V."""
         manager = self.kvcached_allocator
         step = int(manager.physical_group_page_size)
         pages = math.ceil((self.serving_capacity + 1) / manager.blocks_per_physical_page)
-        return [(k.data_ptr(), pages * step) for k in self.k_buffer]
+        return [(k.data_ptr() + page * step, step)
+                for k in self.k_buffer for page in range(pages)]
 
     def _physical_page_ids_for_slots(self, slot_ids: torch.Tensor) -> set[int]:
         if not self.physical_layer_partitioned:

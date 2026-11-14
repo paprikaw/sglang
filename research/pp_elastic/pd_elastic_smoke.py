@@ -426,6 +426,34 @@ def worker(run, root):
         topology = subprocess.run(["nvidia-smi", "topo", "-m"], capture_output=True,
                                   text=True, check=True, timeout=20)
         save(directory / "topology.json", dict(stdout=topology.stdout))
+        if cfg.get("kvcached_capacity") and cfg["role"] == "decode":
+            diagnostic = subprocess.Popen([PYTHON, str(ROOT / "kvcached_rdma_probe.py"),
+                "--output", str(run / "rdma_registration_probe.json")],
+                env=environment(cfg), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, start_new_session=True)
+            diagnostic_thread = threading.Thread(target=h.stream_log, args=(diagnostic.stdout,
+                str(directory / "rdma_probe.log"), key), daemon=True)
+            diagnostic_thread.start()
+            children.append(dict(process=diagnostic, identity=h.process_record(diagnostic.pid),
+                                 log_thread=diagnostic_thread))
+            diagnostic_deadline = time.monotonic() + 120
+            while diagnostic.poll() is None:
+                if stop.wait(.25) or time.monotonic() > diagnostic_deadline:
+                    raise RuntimeError("RDMA startup diagnostic cancelled or timed out")
+            if diagnostic.returncode:
+                raise RuntimeError("RDMA startup diagnostic failed before model load")
+        elif cfg.get("kvcached_capacity"):
+            diagnostic_deadline = time.monotonic() + 130
+            while True:
+                diagnostic_path = run / "rdma_registration_probe.json"
+                if diagnostic_path.exists():
+                    result = json.loads(diagnostic_path.read_text())
+                    if "passed" in result:
+                        if not result["passed"]:
+                            raise RuntimeError("RDMA diagnostic failed; do not load Prefill model")
+                        break
+                if stop.wait(.25) or time.monotonic() > diagnostic_deadline:
+                    raise RuntimeError("RDMA startup diagnostic cancelled or timed out")
         command = [PYTHON, str(GUARD / "model_cache_adapter.py"), "exec-local", "--bindings",
             os.environ[h.GUARD_KEYS[3]], "--", PYTHON, str(Path(__file__).resolve()), "--engine", "--run", str(run)]
         proc = subprocess.Popen(command, env=environment(cfg), cwd=ENGINE, stdin=subprocess.DEVNULL,
@@ -453,7 +481,7 @@ def worker(run, root):
             h.authenticate(run, cfg, os.environ, local=True)
             if proc.poll() is not None:
                 raise RuntimeError("Engine exited while serving")
-            if cfg["role"] == "decode" and (run / "probe.trigger").exists() and len(children) == 1:
+            if cfg["role"] == "decode" and (run / "probe.trigger").exists() and not any(c.get("gpu_reuse_probe") for c in children):
                 probe_env = dict(os.environ, **cfg["launch_env"], CUDA_VISIBLE_DEVICES="1")
                 probe = subprocess.Popen([PYTHON, str(Path(__file__).resolve()), "--probe", "--run", str(run)],
                     env=probe_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -461,7 +489,7 @@ def worker(run, root):
                 probe_thread = threading.Thread(target=h.stream_log,
                     args=(probe.stdout, str(directory / "probe.log"), key), daemon=True)
                 probe_thread.start()
-                children.append(dict(process=probe, identity=h.process_record(probe.pid),
+                children.append(dict(process=probe, identity=h.process_record(probe.pid), gpu_reuse_probe=True,
                                      log_thread=probe_thread))
             if (run / "stop.json").exists():
                 break

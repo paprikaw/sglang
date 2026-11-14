@@ -182,3 +182,13 @@ def test_pd_registration_must_succeed_before_serving(status):
             MooncakeKVManager.register_buffer_to_engine(manager)
     else:
         MooncakeKVManager.register_buffer_to_engine(manager)
+
+
+def test_pd_regions_do_not_span_separate_vmm_allocations_or_virtual_tail():
+    from sglang.srt.mem_cache.kvcached_pool import KVCacheDMHATokenToKVPool
+
+    pool = NS(kvcached_allocator=NS(physical_group_page_size=128, blocks_per_physical_page=4),
+              serving_capacity=8, k_buffer=[NS(data_ptr=lambda: 1024), NS(data_ptr=lambda: 2048)])
+    regions = KVCacheDMHATokenToKVPool.pd_registration_regions(pool)
+    assert regions == [(1024, 128), (1152, 128), (1280, 128),
+                       (2048, 128), (2176, 128), (2304, 128)]
