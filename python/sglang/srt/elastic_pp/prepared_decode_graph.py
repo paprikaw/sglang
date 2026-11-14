@@ -399,9 +399,7 @@ def prewarm_scheduler_graph_bank(scheduler):
     bank = getattr(mr, "_elastic_pp_prepared_graphs", None)
     if bank is None:
         return
-    from sglang.srt.elastic_pp.coordinator import (
-        ElasticPPMigrationCoordinator,
-    )
+    from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
     from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationPhase as Phase
     from sglang.srt.elastic_pp.decode_graph import ElasticPPDecodeGraphState
     from sglang.srt.elastic_pp.topology import DynamicPPTransition
@@ -413,6 +411,12 @@ def prewarm_scheduler_graph_bank(scheduler):
     ):
         raise RuntimeError("prepared Graph warmup requires startup with no requests")
     original = scheduler._pp_topology()
+    registration = None
+    if getattr(mr.server_args, "elastic_pp_disagg_decode", False):
+        from sglang.srt.elastic_pp.pd_registration import DecodeRegistrationTransaction
+
+        registration = DecodeRegistrationTransaction(scheduler)
+        registration.suspend()
     initial = tuple(r.size for r in original.layer_ranges)
     started = time.monotonic()
     before = torch.cuda.memory_allocated()
@@ -471,5 +475,10 @@ def prewarm_scheduler_graph_bank(scheduler):
     else:
         bank.select(mr, entry)
         bank.runtime_selections = 0
+    from sglang.srt.elastic_pp.shared_host_cache import initialize_scheduler_shared_host
+
+    initialize_scheduler_shared_host(scheduler)
+    if registration is not None:
+        registration.refresh()
     scheduler.init_elastic_pp_migration_coordinator()
     logger.info("ELASTIC_PP_PREPARED_GRAPHS %s", bank.metrics())

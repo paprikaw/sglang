@@ -162,6 +162,7 @@ def fused_marlin_moe(
     gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -243,7 +244,17 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
-    if (
+    if deterministic and M > 1:
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+            moe_align_block_size_deterministic,
+        )
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            moe_align_block_size_deterministic(
+                topk_ids, block_size_m, global_num_experts
+            )
+        )
+    elif (
         M == 1
         and topk <= 32
         and expert_map is None

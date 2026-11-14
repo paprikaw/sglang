@@ -191,6 +191,10 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
             allocator=self.allocator,
         )
+        if self.layout == "page_first":
+            # A PP view spans only some layers of a full-model shared slab.
+            # Its token-row pitch still spans all physical layers in that slab.
+            self.layout_dim = buffer[0].stride(0) * buffer.element_size()
         return buffer
 
     def _init_write_back_staging_buffers(self):
@@ -198,6 +202,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.staging_token_capacity = 0
         self.staging_k_buffer = None
         self.staging_v_buffer = None
+        if getattr(self.allocator, "shared_host_backing", False):
+            self.can_use_write_back_jit = False
+            return
         self.can_use_write_back_jit = False
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return

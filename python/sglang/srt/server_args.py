@@ -1094,6 +1094,11 @@ class ServerArgs:
         "Enable generation-stamped elastic pipeline parallelism over the fixed resident PP group.",
         NS("parallel"),
     ] = False
+    elastic_pp_disagg_decode: A[
+        bool,
+        "Experimental Decode PP migration with quiescent P/D transfers: single-request sync CPU-spill/Eager or bounded (up to four requests) background overlap/prepared Graphs/shared CPU HiCache/NIXL.",
+        NS("parallel"),
+    ] = False
     elastic_pp_initial_partition: A[
         Optional[str],
         "Comma-separated initial layer counts for every resident elastic PP rank.",
@@ -1115,7 +1120,7 @@ class ServerArgs:
     elastic_pp_weight_staging: A[
         str,
         Arg(
-            help="Background immutable weights: cpu_cache uses the canonical RAM checkpoint; cpu_prepacked prepares native load-layout weights in bounded pinned CPU RAM during Graph startup (native Qwen3.5 TP1/EP1 Triton). pinned/legacy export through CPU/Gloo. No candidate GPU weight cache.",
+            help="Background immutable weights: cpu_cache uses the canonical RAM checkpoint; cpu_prepacked prepares bounded pinned CPU weights during Graph startup (Qwen3.5 TP1/EP1: native BF16 Triton packs on CPU; FP8 Marlin caches processed runtime tensors during the private startup walk). pinned/legacy export through CPU/Gloo. No candidate GPU weight cache.",
             choices=["cpu_cache", "cpu_prepacked", "pinned", "legacy"],
         ),
         NS("parallel"),
@@ -1175,6 +1180,13 @@ class ServerArgs:
         ),
         NS("parallel"),
     ] = "native"
+    elastic_pp_hicache_shared_host: A[
+        bool,
+        Arg(
+            help="Keep node-local page-first HiCache backing shared across PP layouts; requires kernel I/O, native KV, TP1/EP1 and prepared Graphs."
+        ),
+        NS("parallel"),
+    ] = False
     elastic_pp_transition_strategy: A[
         str,
         Arg(
@@ -6925,9 +6937,7 @@ class ServerArgs:
                     "KDA, as the linear-attn decode backend; got "
                     f"--linear-attn-decode-backend={decode!r}."
                 )
-            from sglang.srt.arg_groups.overrides import (
-                mamba_extra_buffer_of,
-            )
+            from sglang.srt.arg_groups.overrides import mamba_extra_buffer_of
 
             if mamba_extra_buffer_of(resolved_view(self)):
                 raise ValueError(
@@ -7940,9 +7950,7 @@ class ServerArgs:
                 raise ValueError("--pp-layer-partition requires --pp-stage-tp-sizes")
             return
 
-        from sglang.srt.distributed.heterogeneous_pp import (
-            HeterogeneousPPTopology,
-        )
+        from sglang.srt.distributed.heterogeneous_pp import HeterogeneousPPTopology
 
         topology = HeterogeneousPPTopology.parse(self.pp_stage_tp_sizes)
         # Keep the first runtime deliberately narrow while the dynamic join and
@@ -8048,6 +8056,13 @@ class ServerArgs:
 
         run_post_process_pass(self, _pipeline_parallel_overlap_disable)
 
+        if self.elastic_pp_hicache_shared_host:
+            from sglang.srt.elastic_pp.shared_host_cache import (
+                validate_shared_host_args,
+            )
+
+            validate_shared_host_args(self)
+
         if self.elastic_pp_kv_base_precopy and not (
             self.enable_elastic_pp_kv_patch
             and self.enable_hierarchical_cache
@@ -8138,10 +8153,9 @@ class ServerArgs:
                 "and batch-local PP routing are being validated"
             )
         if self.disaggregation_mode != "null":
-            raise ValueError(
-                "elastic PP currently requires colocated serving; the separate "
-                "prefill/decode PP drain loops are not yet wired to the topology fence"
-            )
+            from sglang.srt.elastic_pp.pd_registration import validate_decode_args
+
+            validate_decode_args(self)
         if self.elastic_pp_kv_backend == "kvcached" and os.getenv(
             "KVCACHED_AUTOPATCH", ""
         ).lower() in {"1", "true", "yes", "on"}:
@@ -10208,9 +10222,7 @@ class ServerArgs:
     def _resolved_attention_backends(self):
         """Mid-resolution (prefill, decode) backends: reads through the pass
         view so declared fields resolve from the declaration stash."""
-        from sglang.srt.arg_groups.overrides import (
-            attention_backends_of,
-        )
+        from sglang.srt.arg_groups.overrides import attention_backends_of
 
         return attention_backends_of(resolved_view(self))
 
@@ -10337,9 +10349,7 @@ class ServerArgs:
         )
         # Check parallel size constraints
         if self.pp_stage_tp_sizes is not None:
-            from sglang.srt.distributed.heterogeneous_pp import (
-                HeterogeneousPPTopology,
-            )
+            from sglang.srt.distributed.heterogeneous_pp import HeterogeneousPPTopology
 
             HeterogeneousPPTopology.parse(self.pp_stage_tp_sizes).placements_for_node(
                 nnodes=self.nnodes, node_rank=self.node_rank
