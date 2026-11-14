@@ -1357,6 +1357,36 @@ class SchedulerPPMixin:
         send_consensus_prealloc_work = []
         send_release_work = []
 
+        def launch_pd_queue_consensus():
+            nonlocal send_consensus_retract_work, consensus_retract_rids
+            nonlocal send_consensus_prealloc_work, consensus_prealloc_rids
+            nonlocal send_release_work, release_rids
+            # reach consensus on last rank and send to PP=0
+            # otherwise, just pass along previous consensus
+            send_consensus_retract_work, consensus_retract_rids = (
+                self._pp_pd_send_consensus_bootstrapped_ids(
+                    rmbs,
+                    next_first_rank_mb_id,
+                    consensus_retract_rids,
+                    retract_rids,
+                )
+            )
+
+            send_consensus_prealloc_work, consensus_prealloc_rids = (
+                self._pp_pd_send_consensus_bootstrapped_ids(
+                    pmbs,
+                    next_first_rank_mb_id,
+                    consensus_prealloc_rids,
+                    prealloc_rids,
+                )
+            )
+
+            send_release_work, release_rids = (
+                self._pp_pd_send_consensus_release_ids(
+                    tmbs, next_first_rank_mb_id, release_rids, transferred_rids
+                )
+            )
+
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -1451,6 +1481,14 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
                 self._pp_commit_comm_work(send_transfer_work)
 
+                if self._pp_topology() is not None:
+                    # Activations bypass dormant stages; PD control still visits
+                    # them. Post control replies before any activation or token
+                    # wait, including a busy/prebuilt slot. Otherwise PP0 waits
+                    # on proxy 0->2, PP1 on output 0->1, and PP2 on consensus
+                    # 1->2. Send buffers remain owned until the normal waits.
+                    launch_pd_queue_consensus()
+
                 # get batch to run and proxy tensors if needed
                 if elastic_pp_draining:
                     batch = None
@@ -1519,31 +1557,8 @@ class SchedulerPPMixin:
                         )
                     )
 
-                # reach consensus on last rank and send to PP=0
-                # otherwise, just pass along previous consensus
-                send_consensus_retract_work, consensus_retract_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        rmbs,
-                        next_first_rank_mb_id,
-                        consensus_retract_rids,
-                        retract_rids,
-                    )
-                )
-
-                send_consensus_prealloc_work, consensus_prealloc_rids = (
-                    self._pp_pd_send_consensus_bootstrapped_ids(
-                        pmbs,
-                        next_first_rank_mb_id,
-                        consensus_prealloc_rids,
-                        prealloc_rids,
-                    )
-                )
-
-                send_release_work, release_rids = (
-                    self._pp_pd_send_consensus_release_ids(
-                        tmbs, next_first_rank_mb_id, release_rids, transferred_rids
-                    )
-                )
+                if self._pp_topology() is None:
+                    launch_pd_queue_consensus()
 
                 if get_disagg().disaggregation_decode_enable_offload_kvcache:
                     self.decode_offload_manager.check_offload_progress()

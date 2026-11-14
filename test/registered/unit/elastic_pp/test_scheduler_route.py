@@ -502,8 +502,9 @@ def test_elastic_loop_sends_activation_before_waiting_for_output(
 
 @pytest.mark.parametrize("rank", [0, 1, 2])
 @pytest.mark.parametrize("elastic", [False, True])
-def test_pd_idle_slot_progresses_consensus_before_waiting_for_elastic_proxy(
-    monkeypatch, rank, elastic
+@pytest.mark.parametrize("busy", [False, True])
+def test_pd_slots_post_queue_consensus_before_waiting_for_elastic_proxy(
+    monkeypatch, rank, elastic, busy
 ):
     from sglang.srt.managers import scheduler_pp_mixin
 
@@ -522,6 +523,7 @@ def test_pd_idle_slot_progresses_consensus_before_waiting_for_elastic_proxy(
     scheduler.last_mbs = [None] * 3
     scheduler.mbs = [None] * 3
     scheduler.mb_metadata = [None] * 3
+    scheduler.last_rank_comm_queue = []
     scheduler.enable_decode_hicache = False
     scheduler.request_receiver = SimpleNamespace(recv_requests=lambda: [])
     scheduler.process_input_requests = lambda reqs: None
@@ -529,15 +531,21 @@ def test_pd_idle_slot_progresses_consensus_before_waiting_for_elastic_proxy(
     scheduler._pp_pd_get_retract_ids = lambda mb_id: []
     scheduler._pp_pd_get_prealloc_ids = lambda: [[], []]
     scheduler._pp_pd_get_decode_transferred_ids = lambda: []
+    current = SimpleNamespace(forward_mode=SimpleNamespace(is_prebuilt=lambda: True)) if busy else None
     scheduler.get_next_disagg_decode_batch_to_run = lambda **kw: SimpleNamespace(
-        running_batch=scheduler.running_batch, batch_to_run=None
+        running_batch=scheduler.running_batch, batch_to_run=current
     )
+    scheduler._pp_launch_or_skip_batch = lambda *args: (None, None)
     scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = (
         lambda *args: (None, None, None)
     )
     scheduler._pp_send_pyobj_to_next_stage = lambda *args, **kw: []
-    scheduler._pp_pd_send_consensus_bootstrapped_ids = lambda *args: (["consensus"], [])
-    scheduler._pp_pd_send_consensus_release_ids = lambda *args: (["consensus"], [])
+    posted = []
+    def send_consensus(*args):
+        posted.append(True)
+        return ["consensus"], []
+    scheduler._pp_pd_send_consensus_bootstrapped_ids = send_consensus
+    scheduler._pp_pd_send_consensus_release_ids = send_consensus
     proxy = [object()]
     scheduler.send_proxy_work = proxy
     calls = []
@@ -545,9 +553,11 @@ def test_pd_idle_slot_progresses_consensus_before_waiting_for_elastic_proxy(
     def commit(work):
         if work is proxy:
             if elastic:
-                assert calls.count("consensus") == 3, (
-                    "activation completion blocks the dormant-stage PD control ring"
+                assert len(posted) == 3, (
+                    "activation completion blocks the dormant-stage PD control ring: "
+                    "its peer needs the intermediate rank's queue consensus first"
                 )
+                if not busy:assert calls.count("consensus") == 3
             calls.append("proxy")
         elif work:
             assert work == ["consensus"]
@@ -566,7 +576,7 @@ def test_pd_idle_slot_progresses_consensus_before_waiting_for_elastic_proxy(
     with pytest.raises(StopAfterMicrostep):
         scheduler.event_loop_pp_disagg_decode()
     expected = ["consensus"] * 3
-    assert calls == (expected + ["proxy"] if elastic else ["proxy"] + expected)
+    assert calls == (expected + ["proxy"] if elastic and not busy else ["proxy"] + expected)
     assert proxy == []
 
 
