@@ -203,8 +203,7 @@ class MarlinCpuWeightReloader:
                 if end is not None:
                     end.record(self.stream)
         finally:
-            if self.stream is not None:
-                self.stream.synchronize()
+            self._wait_for_restore()
         after = self.runner.export_elastic_pp_layer_state(sorted(ids))
         if before != {
             layer: binding_signature(state) for layer, state in after.items()
@@ -231,4 +230,28 @@ class MarlinCpuWeightReloader:
             h2d_stream_seconds=(
                 begin.elapsed_time(end) / 1000 if begin is not None else None
             ),
+        )
+
+    def _wait_for_restore(self):
+        if self.stream is None:
+            return
+        # A blocking CUDA wait on this background thread can contend with the
+        # scheduler's CUDA/NCCL calls on the same device. Keep host-side waits
+        # outside CUDA; readiness still requires the entire copy stream to be
+        # complete, including any work enqueued before a copy raises.
+        started = time.monotonic()
+        polls, longest_query = 0, 0.0
+        while True:
+            queried = time.monotonic()
+            complete = self.stream.query()
+            longest_query = max(longest_query, time.monotonic() - queried)
+            polls += 1
+            if complete:
+                break
+            time.sleep(0.001)
+        self.metrics.update(
+            h2d_wait_kind="stream_query_poll",
+            h2d_wait_polls=polls,
+            h2d_wait_seconds=time.monotonic() - started,
+            h2d_longest_query_seconds=longest_query,
         )

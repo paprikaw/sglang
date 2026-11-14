@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from types import SimpleNamespace as NS
 
 import pytest
@@ -124,3 +125,77 @@ def test_startup_export_is_not_an_available_runtime_fallback():
     runner._elastic_pp_prepared_graphs.building = False
     with pytest.raises(RuntimeError, match="GPU weight export is disabled"):
         cache.capture([1])
+
+
+def polling_fixture(monkeypatch, outcomes):
+    runner, states, ready, cache = fixture()
+    cache.capture([1, 2])
+    runner._elastic_pp_prepared_graphs.building = False
+    queries = []
+    results = iter(outcomes)
+
+    class Stream:
+        def query(self):
+            assert not ready, "incoming layers became executable before copy completion"
+            queries.append(True)
+            result = next(results)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        def synchronize(self):
+            raise AssertionError("runtime restore must not block in a CUDA wait")
+
+    class Event:
+        def __init__(self, **kwargs):
+            pass
+
+        def record(self, stream):
+            assert stream is cache.stream
+
+        def elapsed_time(self, other):
+            return 2.0
+
+    cache.stream = Stream()
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(torch.cuda, "Event", Event)
+    return states, ready, cache, queries
+
+
+def test_polling_restore_never_publishes_before_copy_completion(monkeypatch):
+    states, ready, cache, queries = polling_fixture(monkeypatch, [False, False, True])
+    expected = states[1]["packed"].clone()
+    states[1]["packed"].zero_()
+    cache.reload(generation=1, layer_ids={1, 2})
+    assert torch.equal(states[1]["packed"], expected)
+    assert ready == [dict(generation=1, layer_ids={1, 2})]
+    assert len(queries) == 3
+    assert cache.metrics["h2d_wait_kind"] == "stream_query_poll"
+
+
+def test_polling_failure_never_marks_incoming_layers_ready(monkeypatch):
+    _, ready, cache, queries = polling_fixture(
+        monkeypatch, [False, RuntimeError("copy stream failed")]
+    )
+    with pytest.raises(RuntimeError, match="copy stream failed"):
+        cache.reload(generation=1, layer_ids={1, 2})
+    assert len(queries) == 2
+    assert not ready
+
+
+def test_partial_copy_error_still_drains_enqueued_work_without_publishing(monkeypatch):
+    _, ready, cache, queries = polling_fixture(monkeypatch, [False, True])
+    original = torch.Tensor.copy_
+    copies = []
+
+    def copy(target, *args, **kwargs):
+        copies.append(True)
+        if len(copies) == 2:
+            raise RuntimeError("partial copy failed")
+        return original(target, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", copy)
+    with pytest.raises(RuntimeError, match="partial copy failed"):
+        cache.reload(generation=1, layer_ids={1, 2})
+    assert len(queries) == 2
+    assert not ready

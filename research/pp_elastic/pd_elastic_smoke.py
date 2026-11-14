@@ -200,6 +200,31 @@ def install_hooks():
         from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
         probe.install_diagnostic_fanout(Scheduler, TokenizerControlMixin)
         probe.install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator)
+        original_copy = ElasticPPMigrationCoordinator._precopy_immutable_weights
+
+        def copy_with_progress(coordinator, transition):
+            adapter = coordinator.cache_transition
+            if adapter is None:
+                return original_copy(coordinator, transition)
+            scheduler = adapter.scheduler
+
+            def snapshot():
+                return dict(monotonic=time.monotonic(), wall=time.time(), requests={
+                    req.rid: len(req.output_ids)
+                    for req in scheduler._elastic_pp_live_requests()
+                    if not req.finished()
+                })
+
+            before = snapshot()
+            try:
+                return original_copy(coordinator, transition)
+            finally:
+                record = dict(generation=transition.target.generation,
+                              rank=coordinator.rank, before=before, after=snapshot())
+                coordinator._smoke_weight_copy_progress = getattr(
+                    coordinator, "_smoke_weight_copy_progress", []) + [record]
+
+        ElasticPPMigrationCoordinator._precopy_immutable_weights = copy_with_progress
         if os.environ.get("ELASTIC_PD_PREPARE_DIAGNOSTICS"):
             import prepare_stall_diagnostics
             prepare_stall_diagnostics.install(ElasticPPMigrationCoordinator,
@@ -209,6 +234,9 @@ def install_hooks():
         def state(scheduler, *args, **kwargs):
             import torch
             result = old_state(scheduler, *args, **kwargs)
+            coordinator = getattr(scheduler, "elastic_pp_migration_coordinator", None)
+            result.internal_state["transition_weight_copy_progress"] = getattr(
+                coordinator, "_smoke_weight_copy_progress", [])
             pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
             def bytes_of(values):
                 storages = {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
@@ -439,6 +467,7 @@ def controller(run, root):
         original_stream = replay.stream
         def observed_stream(endpoint, key, payload, timeout=600, **kwargs):
             anchor = dict(wall=time.time(), perf_counter=time.perf_counter())
+            save(run / "active_stream_clock.json", anchor)
             result = original_stream(endpoint, key, payload, timeout, event_sink=events)
             if root.get("diagnostic_prepare"):
                 result["diagnostic_clock_anchor"] = anchor
@@ -484,6 +513,7 @@ def controller(run, root):
                 results["active"] = active.result(timeout=240)
         finally:
             replay.stream = original_stream
+            save(run / "stream_events.partial.json", events)
         results["stream_events"] = events
         completed = state("completed")
         if root.get("optimized_elastic_pp"):

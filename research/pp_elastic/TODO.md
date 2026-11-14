@@ -2,6 +2,8 @@
 
 ## 122B／A100：P/D 下的最小扩缩容（2026-11-14）
 
+- [ ] **消除权重恢复期间的在线等待。** 用户授权继续最小往返；先只将FP8 Marlin后台恢复的CUDA阻塞等待改成完成查询＋主机短睡眠，保持原通信协议、搬运字节、HiCache、offload及就绪条件。130项相关CPU检查通过，覆盖未完成／复制异常时不能发布层；单次P2固定、D PP2→PP3→PP2待核对客户端间隔、同RID在H2D期间的进度、输出／CPU恢复与独立64 GiB复用，不铺开E2E。默认关闭r19栈定时器，失败另存原件。
+
 - [x] **1.68秒间隔已完成分项核查与首轮阻塞定位。** r18第13→14个token相隔1.683秒，早于第16个token后的最终交接；新增rank1实际恢复38.04 GiB权重，H2D为1.673秒。r19同引擎代码的opt-in诊断中，rank1的8次主线程快照都在GPU输出`irecv`，其后台线程等H2D stream；rank0／2在P/D消息等待，心跳最大间隔约20毫秒。仅收窄到空阶段输出通信与权重恢复的耦合，CUDA／NCCL内部同步因果未隔离。r16→r18控制扩／缩8.573／8.061→1.940／1.262秒，旧客户端9.308／8.145秒长间隔与控制边界分开报告。见[迁移开销专题](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/MIGRATION_OVERHEAD_AUDIT.md)及[复算、511个间隔、原件SHA256](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/qwen122b_pd_migration_overhead_audit_20261114/overhead_audit.json)。诊断辅助仅CPU返回／异常清理smoke通过，未扩大引擎执行资格。
 
 - [ ] **继续隔离准备期通信等待，并查明r19缩容退出。** r19扩容成功，控制1.946秒、H2D1.673秒；但缩容准备期rank0异常退出，HTTP RemoteDisconnected，完整诊断往返失败。原件与Guard清理、缓存使用审计及release保留；内核日志无权限，退出根因未知，不并入成功性能数据。后续优先原生CUDA／NCCL时间线或一次单因素路径对照，权重offload及HiCache边界保持；本轮不自动重跑或铺开E2E。
