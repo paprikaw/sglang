@@ -1,5 +1,11 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-14：迁移开销审计与准备期长间隔定位
+
+只新增opt-in CPU栈／心跳诊断，r19源码`54ab8e4b53722dc1c961dc0b1d7c32c08c7f0f0e`、tag `experiment/sglang/122b-pd-pp-overhead-20261114-r19`；`python/sglang`与r18完全相同。辅助函数返回／异常传播和清理的两种CPU smoke通过，未新增完整CPU套件或引擎资格。复算r16／r18成功原件的511个相邻token间隔与分项：新扩容准备期1.683秒，新增rank1的38.04 GiB H2D为1.673秒；最终fence128.9毫秒发生在稍后，不是该长间隔本身。
+
+r19扩容控制1.946秒、fence127.6毫秒，三rank各8个200毫秒栈样本：rank1主线程在GPU输出irecv，后台线程等权重流完成，其他rank等P/D消息；CPU心跳最长约20毫秒。尚未隔离NCCL／CUDA内部因果。随后缩容准备时rank0退出、HTTP RemoteDisconnected；整轮失败，不能用于新的正确性资格、完整往返性能或稳定性结论。Guard后检查科学成功false、缓存审计及清理true，租约已释放。失败根因未定，不自动追加GPU复测。见[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/MIGRATION_OVERHEAD_AUDIT.md)及[可复算数据／SHA256](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/qwen122b_pd_migration_overhead_audit_20261114/overhead_audit.json)。下列r18成功资格保持原范围，不把r19失败隐藏为性能样本。
+
 ## 2026-11-14：122B P/D接入最新共享HiCache／Graph／CPU权重优化
 
 冻结`dccbefa3c9c76ff33e9fdcd8b572a5bb62ee2e2f`，tag `experiment/sglang/122b-pd-pp-optimized-20261114-r18`，Draft PR #13。固定P2、D侧24/0/24→16/16/16→24/0/24、FP8 Marlin TP1 EP1、单请求及交接静止边界；保留HiCache与确定性模式，启用启动Graph库、非驻留CPU权重、共享CPU HiCache及后台NIXL增量KV。512-token同暖输出逐个一致、无retraction／重新Prefill，新P→D请求及实际CPU恢复576 token通过；共享底层未改变、历史CPU载荷复制0、运行期Graph capture0且有replay、非活跃权重物理页0。独立进程分配并写入64 GiB及矩阵计算时原Decode继续。

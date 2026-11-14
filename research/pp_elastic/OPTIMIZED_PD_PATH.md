@@ -11,3 +11,5 @@
 **当前状态。** r18（`dccbefa3c9c7`）GPU最小往返通过：512-token同暖参考、真实CPU恢复及独立64 GiB复用正确；1275项组合CPU、随后74项相关检查及73项保存结果复算通过。扩／缩控制1.940／1.262秒，最终暂停129／103毫秒；准备期仍有1.683秒出token间隔。退役rank权重／KV为0，worker及约1.78 GiB reserved仍驻留。启动预热约28.2秒单列；不是完整E2E、P侧、多请求、容量扩展或整卡归还证明。见[本轮报告](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/OPTIMIZED_PP_VALIDATION.md)。默认入口为`pd_elastic_smoke.py --prepare`；同步参考必须显式使用`--sync-baseline`。旧r16保持不变。
 
 首轮r17在启动期将已加载权重转换为VMM backing时OOM，未开始请求；失败与清理记录保留。旧PyTorch空闲块只在全部层转换后归还，改为逐层归还，避免累计保留第二份权重；同配置r18通过。旧后端释放夹具未初始化P/D钩子的CPU失败也保留。
+
+**后续开销审计。** [专题报告](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/MIGRATION_OVERHEAD_AUDIT.md)区分准备期1.683秒间隔与最终fence。opt-in `--diagnostic-prepare`只用于CPU栈／心跳采样，默认关闭；r19扩容采样显示空阶段rank1仍在GPU输出irecv路径，具体CUDA／NCCL同步未隔离。r19随后缩容准备失败，不能作新的成功往返或无停顿证明，原r18执行资格不扩大。

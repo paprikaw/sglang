@@ -2,7 +2,9 @@
 
 ## 122B／A100：P/D 下的最小扩缩容（2026-11-14）
 
-- [ ] **查验扩容准备期1.68秒出token间隔。** 先复核r16／r18分项和计时口径，再用同一最小往返的opt-in线程栈／时钟采样识别阻塞点；不改变权重驻留、缓存或调度策略，不铺开完整E2E。诊断数据与无采样r18分开保存。
+- [x] **1.68秒间隔已完成分项核查与首轮阻塞定位。** r18第13→14个token相隔1.683秒，早于第16个token后的最终交接；新增rank1实际恢复38.04 GiB权重，H2D为1.673秒。r19同引擎代码的opt-in诊断中，rank1的8次主线程快照都在GPU输出`irecv`，其后台线程等H2D stream；rank0／2在P/D消息等待，心跳最大间隔约20毫秒。仅收窄到空阶段输出通信与权重恢复的耦合，CUDA／NCCL内部同步因果未隔离。r16→r18控制扩／缩8.573／8.061→1.940／1.262秒，旧客户端9.308／8.145秒长间隔与控制边界分开报告。见[迁移开销专题](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/MIGRATION_OVERHEAD_AUDIT.md)及[复算、511个间隔、原件SHA256](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/qwen122b_pd_migration_overhead_audit_20261114/overhead_audit.json)。诊断辅助仅CPU返回／异常清理smoke通过，未扩大引擎执行资格。
+
+- [ ] **继续隔离准备期通信等待，并查明r19缩容退出。** r19扩容成功，控制1.946秒、H2D1.673秒；但缩容准备期rank0异常退出，HTTP RemoteDisconnected，完整诊断往返失败。原件与Guard清理、缓存使用审计及release保留；内核日志无权限，退出根因未知，不并入成功性能数据。后续优先原生CUDA／NCCL时间线或一次单因素路径对照，权重offload及HiCache边界保持；本轮不自动重跑或铺开E2E。
 
 - [x] **最新优化接入D侧P/D最小验证通过。** r18（`dccbefa3c9c7`）保留确定性模式、共享CPU HiCache、后台／NIXL增量KV、Graph启动预热、非驻留FP8 Marlin CPU权重及P/D注册地址交接。同一RID的512-token暖输出逐个一致；新P→D请求、CPU实际恢复576 token及独立进程64 GiB复用通过。扩／缩控制1.940／1.262秒，最终暂停129／103毫秒，准备期仍有1.683秒出token间隔；中间rank层权重／KV为0，worker仍驻留、reserved约1.78 GiB。1275项组合CPU、随后74项相关检查、73项保存结果复算及Guard清理／release通过。FP8 CPU池由启动期处理后的GPU权重导出，与BF16纯CPU packing区别记录。P侧、多请求、在途交接、容量增益及完整E2E仍未验证，本轮不铺开。见[完整结果](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/OPTIMIZED_PP_VALIDATION.md)、[实现范围](OPTIMIZED_PD_PATH.md)及[端到端计划](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/EXPERIMENT_PLAN.md)。
 
