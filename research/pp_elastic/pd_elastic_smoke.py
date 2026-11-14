@@ -57,68 +57,6 @@ def memory_size_json(value):
     return int(value)
 
 
-def install_prefill_trace(runner):
-    """Temporary synchronized layer evidence; not a performance measurement."""
-    import torch
-    layers = [(name, module) for name, module in runner.model.named_modules()
-              if hasattr(module, "mlp") and (hasattr(module, "linear_attn")
-                                            or hasattr(module, "self_attn"))]
-    counter = [0]
-    def tensors(value):
-        if isinstance(value, torch.Tensor):
-            return [dict(shape=list(value.shape), dtype=str(value.dtype),
-                sha256=hashlib.sha256(value.detach().contiguous().view(torch.uint8)
-                    .cpu().numpy().tobytes()).hexdigest())]
-        if isinstance(value, (list, tuple)):
-            return [item for entry in value for item in tensors(entry)]
-        return []
-    def record(name, phase, value):
-        print("ELASTIC_PD_PREFILL_TRACE", json.dumps(dict(rank=runner.ps.pp_rank,
-            call=counter[0], module=name, phase=phase, tensors=tensors(value))), flush=True)
-    for index, (name, layer) in enumerate(layers):
-        def before(module, args, kwargs, name=name, first=index == 0):
-            if first:
-                counter[0] += 1
-            record(name, "in", (args, kwargs.get("hidden_states"),
-                                kwargs.get("residual"), kwargs.get("positions")))
-        def after(module, args, output, name=name):
-            record(name, "out", output)
-        layer.register_forward_pre_hook(before, with_kwargs=True)
-        layer.register_forward_hook(after)
-        if index in (0, 2):
-            for subname in ("linear_attn", "self_attn", "mlp"):
-                sub = getattr(layer, subname, None)
-                if sub is not None:
-                    sub.register_forward_pre_hook(lambda module, args, n=name + "." + subname: record(n, "in", args))
-                    sub.register_forward_hook(lambda module, args, output, n=name + "." + subname: record(n, "out", output))
-
-
-def install_expert_repeat_check(runner, local):
-    """Repeat one real Expert call with its exact input, routes and weights."""
-    import torch
-    for name, module in local:
-        if ".layers.2." not in name:
-            continue
-        original = module.quant_method.apply
-        def checked(layer, dispatch_output, original=original, name=name):
-            first = original(layer, dispatch_output)
-            if dispatch_output.hidden_states.shape[0] == 64:
-                baseline = first.hidden_states.clone()
-                repeated = original(layer, dispatch_output).hidden_states
-                topk = dispatch_output.topk_output
-                inputs = (dispatch_output.hidden_states, topk.topk_ids, topk.topk_weights)
-                hashes = [hashlib.sha256(t.contiguous().view(torch.uint8)
-                    .cpu().numpy().tobytes()).hexdigest() for t in inputs]
-                delta = (baseline.float() - repeated.float()).abs()
-                print("ELASTIC_PD_EXPERT_REPEAT", json.dumps(dict(rank=runner.ps.pp_rank,
-                    module=name, input_sha256=hashes,
-                    equal=torch.equal(baseline, repeated),
-                    different_elements=int(torch.count_nonzero(delta).item()),
-                    max_abs_difference=float(delta.max().item()))), flush=True)
-            return first
-        module.quant_method.apply = checked
-
-
 def prepare(run):
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
@@ -166,6 +104,7 @@ def prepare(run):
                   logical_gpu_counts=[4, 5, 4], resident_worker_gpus=5,
                   reserved_gpus=8, gpu_reuse_probe_gib=64)
     config["deterministic_inference"] = True
+    config["temporary_prefill_diagnostics"] = False
     save(run / "config.json", config)
     spec["tasks"] = [dict(id="qualification", label="Request/cache/reuse acceptance",
         root=str(run / "task"), expected=1, nodes=list(nodes), controller_script=str(Path(__file__).resolve()))]
@@ -229,33 +168,8 @@ def install_hooks():
             raise RuntimeError(f"Incomplete native FP8 coverage: {len(local)} != {count}")
         print("ELASTIC_PD_FP8_COVERAGE", json.dumps(dict(pp_rank=runner.ps.pp_rank,
               layers=len(local), start=runner.model.start_layer, end=runner.model.end_layer)), flush=True)
-        if os.environ["ELASTIC_PD_ROLE"] == "prefill":
-            install_prefill_trace(runner)
-            install_expert_repeat_check(runner, local)
         return result
     ModelRunner.load_model = load
-    if os.environ["ELASTIC_PD_ROLE"] == "prefill":
-        from sglang.srt.mem_cache.unified_cache.components.mamba_component import MambaComponent
-        old_match = MambaComponent.finalize_match_result_in_cache
-
-        def match(component, params, result):
-            # Qualification-only evidence: distinguish a changing cached GDN
-            # checkpoint from variation in execution of an identical checkpoint.
-            source = component.tree_core.get_component_device_value(
-                result.best_match_node, component.component_type
-            )
-            if params.cow_mamba and source is not None and params.req is not None:
-                import torch
-                req_pool = component.cache.req_to_token_pool
-                slots = req_pool.translate_mamba_indices(source.reshape(-1)).long()
-                cached = req_pool.mamba_pool.mamba_cache
-                tensors = [*cached.conv, cached.temporal]
-                digests = [hashlib.sha256(t.index_select(1, slots).contiguous()
-                    .view(torch.uint8).cpu().numpy().tobytes()).hexdigest() for t in tensors]
-                print("ELASTIC_PD_CACHED_GDN", json.dumps(dict(rid=params.req.rid,
-                    prefix_tokens=len(result.device_indices), checkpoint_sha256=digests)), flush=True)
-            return old_match(component, params, result)
-        MambaComponent.finalize_match_result_in_cache = match
     if os.environ["ELASTIC_PD_ROLE"] == "decode":
         import cache_probe
         cache_probe.install()
