@@ -166,3 +166,26 @@ def test_tensor_copier_handles_packed_row_strides_and_releases_page_lease():
     for src, dst in zip(source[0], target[0]):
         assert torch.equal(src[[1, 4]], dst[[1, 4]])
         assert torch.count_nonzero(dst[[0, 2, 3, 5, 6, 7]]) == 0
+
+
+def test_large_fence_scans_once_and_copies_every_incarnation_in_bounded_order():
+    copier = Copier()
+    session = ContinuousKVPatch(generation=1, capacity=1025, copier=copier, max_rows=256)
+    for slot in reversed(range(1025)):
+        publish(session, slot)
+    session.dirty_rows = Mock(wraps=session.dirty_rows)
+    assert session.finish_at_fence(generation=1, max_rounds=5) == dict(rounds=5, rows_copied=1025)
+    assert session.dirty_rows.call_count == 1
+    assert [(row.slot, row.incarnation) for rows, _ in copier.batches for row in rows] == [(i, 1) for i in range(1025)]
+
+
+def test_bounded_partial_finish_can_retry_without_duplicate_copy():
+    copier = Copier()
+    session = ContinuousKVPatch(generation=1, capacity=1025, copier=copier, max_rows=256)
+    for slot in range(1025):
+        publish(session, slot)
+    with pytest.raises(RuntimeError, match="converge"):
+        session.finish_at_fence(generation=1, max_rounds=4)
+    assert session.phase == "fenced" and session.rows_copied == 1024
+    assert session.finish_at_fence(generation=1, max_rounds=1) == dict(rounds=5, rows_copied=1025)
+    assert [(row.slot, row.incarnation) for rows, _ in copier.batches for row in rows] == [(i, 1) for i in range(1025)]

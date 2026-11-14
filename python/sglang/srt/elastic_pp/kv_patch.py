@@ -101,19 +101,22 @@ class ContinuousKVPatch:
             self._check(generation)
             if self._pending is not None:
                 raise KVPatchBusy("only one bounded KV copy round may be in flight")
-            rows = self.dirty_rows()[: self.max_rows]
-            if not rows:
-                return False
-            self._pinned.update(row.slot for row in rows)
-            try:
-                completion = self.copier.submit(rows)
-            except BaseException:
-                # Keep logical pins until abort drains partial GPU submissions.
-                self._phase = "failed"
-                raise
-            self._pending = (rows, completion)
-            self.rounds += 1
-            return True
+            return self._submit_rows(self.dirty_rows()[: self.max_rows])
+
+    def _submit_rows(self, rows):
+        # Called only with the session lock held and no outstanding copy.
+        if not rows:
+            return False
+        self._pinned.update(row.slot for row in rows)
+        try:
+            completion = self.copier.submit(rows)
+        except BaseException:
+            # Keep logical pins until abort drains partial GPU submissions.
+            self._phase = "failed"
+            raise
+        self._pending = (rows, completion)
+        self.rounds += 1
+        return True
 
     def poll(self, *, generation, wait=False):
         with self._lock:
@@ -148,13 +151,15 @@ class ContinuousKVPatch:
             if any(row.ready is None for row in self._live.values()):
                 raise RuntimeError("unpublished KV writes at the migration fence")
             self.poll(generation=generation, wait=True)
-            for _ in range(max_rounds):
-                if not self.dirty_rows():
-                    self._phase = "complete"
-                    return dict(rounds=self.rounds, rows_copied=self.rows_copied)
-                self.submit(generation=generation)
+            # Writers are fenced and the session lock excludes free/reuse.
+            # Snapshot remaining immutable incarnations once; rescanning and
+            # sorting the entire live set per 256-row copy is quadratic.
+            rows = self.dirty_rows()
+            limit = min(len(rows), max_rounds * self.max_rows)
+            for offset in range(0, limit, self.max_rows):
+                self._submit_rows(rows[offset:offset + self.max_rows])
                 self.poll(generation=generation, wait=True)
-            if not self.dirty_rows():
+            if limit == len(rows):
                 self._phase = "complete"
                 return dict(rounds=self.rounds, rows_copied=self.rows_copied)
             raise RuntimeError("KV patch did not converge within final round bound")

@@ -91,6 +91,10 @@ def prepare(run, mechanism, kvcached_capacity=False):
         expected_tasks=4,expected_profile_requests=76,
         baseline_startup='new PP2 process using admitted ready node-local canonical CPU weights',
         max_scale_cycles=1,full_drain=True,profile_duration_s=1200,
+        native_profile_stop=dict(kind='request_count',requests=76,duration_s=None,
+            protocol='process-scoped finite replay, not an official AgentX steady-state score',
+            changed_scenario_fields=['default_benchmark_duration_seconds','min_benchmark_duration_seconds'],
+            note='Wrapper duration argument is retained for CLI compatibility only; native AgentX phase has no duration window.'),
         profile_grace_s=150,client_wall_timeout_s=1530,wall_timeout_s=1560)
     root['kvcached_capacity']=kvcached_capacity
     if kvcached_capacity:
@@ -114,19 +118,34 @@ def prepare(run, mechanism, kvcached_capacity=False):
     shutil.copyfile(HERE/'router.py',run/'harness/reactive_router.py')
     shutil.copyfile(HERE/'stable_placement.py',run/'harness/stable_placement.py')
     shutil.copyfile(HERE/'lifecycle.py',run/'harness/reactive_lifecycle.py')
+    shutil.copyfile(HERE/'finite_profile.py',run/'harness/finite_profile.py')
+    site=run/'harness/sitecustomize.py'
+    site.write_text(site.read_text()+ '\nimport os as _finite_os\n'
+        'if _finite_os.environ.get("AGENTX_FINITE_REQUEST_COUNT"):\n'
+        '    from finite_profile import install as _install_finite\n'
+        '    _install_finite(int(_finite_os.environ["AGENTX_FINITE_REQUEST_COUNT"]))\n')
+    entry=run/'harness/harness_entry.py';text=entry.read_text()
+    marker='from agentx_cli import main'
+    if text.count(marker)!=1:raise RuntimeError('unknown AgentX CLI entry')
+    text=text.replace(marker, 'from finite_profile import install as install_finite_profile\n'
+        f'install_finite_profile({root["expected_profile_requests"]})\n\n'+marker)
+    entry.write_text(text)
     p=run/'harness/sglang_adapter.py'
     s=p.read_text()+ '\nfrom reactive_router import install as install_reactive\ninstall_reactive(Adapter)\n'
     s=s.replace('first_content_s = time.monotonic() - started','first_content_s = time.monotonic() - started\n                            self.reactive.streaming.add(rid)')
     s=s.replace('self.active.pop(rid, None)','self.active.pop(rid, None)\n            self.reactive.streaming.discard(rid)')
     p.write_text(s)
     p=run/'harness/run.py';s=p.read_text()
+    marker='"--benchmark-duration", str(args.duration), "--benchmark-grace-period", str(args.profile_grace),'
+    if s.count(marker)!=1:raise RuntimeError('unknown AgentX duration CLI')
+    s=s.replace(marker, f'"--request-count", "{root["expected_profile_requests"]}",')
     s=s.replace('web.TCPSite(server, "127.0.0.1", 0)','web.TCPSite(server, "0.0.0.0", 0)')
     s=s.replace('port = site._server.sockets[0].getsockname()[1]', 'port = site._server.sockets[0].getsockname()[1]\n        (args.output.parent / "router_ready.json").write_text(json.dumps(dict(host=socket.gethostname().split(".")[0],port=port,unix=__import__("time").time())))')
     marker='        return code\n'
     if s.count(marker)!=1:raise RuntimeError('unknown AgentX harness return boundary')
     s=s.replace(marker,'        from reactive_lifecycle import hold_control_after_workload\n        await hold_control_after_workload(args.output.parent, code)\n'+marker)
     s=s.replace('"stable_placement.py", "mixed_replay.py", "sitecustomize.py")',
-                '"stable_placement.py", "mixed_replay.py", "sitecustomize.py", "reactive_lifecycle.py")')
+                '"stable_placement.py", "mixed_replay.py", "sitecustomize.py", "reactive_lifecycle.py", "finite_profile.py")')
     p.write_text(s)
     ep=dict(mode='pd',require_hicache=True,api_key_file=root['admin_key_file'],
         prefill=[endpoint(servers['p'])],decode=[endpoint(c) for n,c in servers.items() if n.startswith('d')],
@@ -224,6 +243,12 @@ def install_telemetry():
                     capacity=full.serving_capacity, virtual_capacity=full.size,
                     max_live_slot=max(allocator._live_page_ids,default=0),
                     live_tokens=len(allocator._live_page_ids),free_tokens=allocator.available_size())
+        runner=scheduler.tp_worker.model_runner
+        bank=getattr(runner,'_elastic_pp_shared_host_bank',None)
+        if bank is not None:
+            # Descriptor/allocator bookkeeping only: status polling must never
+            # introduce a CUDA synchronization on the online decode stream.
+            result.internal_state['e2e_shared_host']=bank.evidence()
         result.internal_state['e2e_runtime']=dict(running=len(reqs),waiting=len(scheduler.waiting_queue),
             pd_pending=pd_pending,output_tokens={r:len(x.output_ids) for r,x in reqs.items()})
         return result
@@ -287,6 +312,7 @@ def client(run,root):
     cfg=root['node_configs'][socket.gethostname().split('.')[0]]
     env=dict(os.environ,**packet['environment'],HF_HUB_OFFLINE='1',TRANSFORMERS_OFFLINE='1',
         HF_HUB_CACHE=root['tokenizer_cache'],PYTHONPATH=str(run/'harness'),
+        AGENTX_FINITE_REQUEST_COUNT=str(root['expected_profile_requests']),
         AGENTX_MIXED_CONFIG_PATH=str(run/'plan.json'),AIPERF_DATASET_WEKA_PARALLEL_WORKERS='2')
     h.authenticate(run,cfg,env,local=True)
     stop=threading.Event();signal.signal(signal.SIGTERM,lambda *_:stop.set())
@@ -474,6 +500,7 @@ temporary=p.with_suffix('.tmp');temporary.write_text(json.dumps(value)+chr(10));
             internal_overloaded=max(s['waiting'] for s in runtime)>0 and pending==0
             sample=dict(unix=time.time(),monotonic=now,formal=bool(formal_start),route=route,
                 decode_runtime=runtime,decode_metrics_fresh=metrics_fresh,
+                decode_kv_capacity=[s.get('e2e_kv_capacity') for s in state['internal_states']],
                 expanded=expanded,operation_pending=future is not None)
             samples.append(sample)
             with (run/'telemetry.jsonl').open('a') as f:f.write(json.dumps(sample)+'\n')

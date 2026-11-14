@@ -166,7 +166,7 @@
       "KVCACHED_GPU_DIRECT_RDMA_REQUIRED": "1"
     },
     "build": "Apply patch to the pinned clean upstream tree and rebuild the native extension in an isolated checkout; select it explicitly with PYTHONPATH.",
-    "limits": "Capacity-managed Decode integration requires page-size 1, fixed EP/TP, the admitted PP/capacity frontier, and the stream mapping ABI. CPU checks cover control, allocation and wire paths; full-model HiCache, Graph reuse, growth and physical release await the recorded GPU qualification.",
+    "limits": "Capacity-managed Decode requires page-size 1, fixed EP/TP, admitted PP/capacity layouts, stream mapping and per-allocation RDMA ABIs. The e9349b90d08f r5 GPU minimum qualified HiCache, Graph reuse, growth, reclaim and an independent 64 GiB allocation on the retired GPU. Multi-request and matched E2E performance remain unqualified; subsequent runtime changes require their own GPU regression.",
     "native_stream_mapping_abi": 1,
     "patched_commit": "24d39b203a80062bd00dd651b4bbb5b1895c38f0",
     "native_rdma_mapping_abi": 1
