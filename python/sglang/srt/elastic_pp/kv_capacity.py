@@ -74,5 +74,14 @@ def publish_scheduler_capacity(scheduler):
     scheduler.max_total_num_tokens = capacity
     queue = scheduler.disagg_decode_prealloc_queue
     queue.max_total_num_tokens = capacity
+    observer = getattr(scheduler, "pool_stats_observer", None)
+    if observer is not None:
+        from dataclasses import replace
+
+        scheduler.pool_stats_observer = replace(observer, max_total_num_tokens=capacity)
+    checker = getattr(scheduler, "invariant_checker", None)
+    if checker is not None:
+        checker.max_total_num_tokens = capacity
+        checker.pool_stats_observer = scheduler.pool_stats_observer
     # Shapes, Graph bindings and request slot tables retain the virtual maximum.
     # HTTP status exposes the actual admission limit through these live owners.

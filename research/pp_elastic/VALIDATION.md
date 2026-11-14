@@ -2,6 +2,8 @@
 
 ## 2026-11-14：122B P/D 的 KVCacheD 容量接入，GPU 待验收
 
+首轮 GPU r2 在启动的两个布局 Graph 预捕获后，被正常 idle 内存检查拒绝：hybrid SSM 检查仍读分配器虚拟 `size=12288`，而实际可用8192。未关闭检查；将 allocator.size 改为提交容量、另存 virtual_capacity，并在提交时刷新 frozen pool observer 与检查器。新增真实 idle invariant 及统计 owner 更新的 CPU 检查。r2 未服务正式请求、未验证容量扩缩，两个节点的 owned cleanup 已通过。
+
 独立任务分支 `codex/qwen122b-pd-kvcached-capacity-20261114`，依赖 [P/D 接入 PR #14](https://github.com/paprikaw/sglang/pull/14)。沿用其 `2a8f799737` 中撤回未验收调度改序的执行顺序；不采用此前失败的多请求试验作基线。固定 P2，D 的容量前沿为 PP2 8192／PP3 12288 token，Graph 地址按最高容量预留。注册真实 packed K/V 行步长；HiCache、GDN、CPU 权重 offload、准备期权重恢复和 NIXL 保留。
 
 首次相关组合165项CPU通过。扩大检查891项通过、7项异步检查因插件关闭跳过；唯一失败是旧错误文案断言（无 frontier 仍被正确拒绝），随后更新断言并复测相关控制与容量路径。KVCacheD 扩展已在已预约167节点按 A100 架构、MAX_JOBS=1 编译；使用独立流初始化新物理页。源码与完整补丁固定于 `dependencies.lock.json`。这些不代表真实GPU扩缩验收。

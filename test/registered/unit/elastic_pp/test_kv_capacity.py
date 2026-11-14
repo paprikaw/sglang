@@ -52,7 +52,8 @@ def test_grow_preserves_live_ids_and_adds_real_free_slots():
     pool.set_serving_capacity(4)
     assert pool.elastic_pp_live_slots().tolist() == [1, 2, 3]
     assert pool.available_size() == 1
-    assert pool.size == 8  # Graph and request index address space stays stable.
+    assert pool.size == 4
+    assert pool.virtual_capacity == 8  # Tensor/Graph address space stays stable.
 
 
 def test_shrink_refuses_a_live_tail_even_when_live_count_fits():
@@ -105,3 +106,41 @@ def test_native_prefill_copies_into_strided_kvcached_rows_without_overwrite():
     blocks = manager._transfer_data.call_args.args[1]
     assert blocks == [(1004, 10024, 4), (1008, 10032, 4),
                       (2004, 10028, 4), (2008, 10036, 4)]
+
+
+def test_hybrid_idle_accounting_uses_committed_capacity_and_keeps_virtual_bound():
+    from sglang.srt.managers.scheduler_components.invariant_checker import SchedulerInvariantChecker
+    from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+
+    alloc = allocator()
+    checker = NS(is_hybrid_swa=False, is_hybrid_ssm=True,
+                 tree_cache=NS(supports_mamba=lambda: True, full_protected_size=lambda: 0),
+                 pool_stats_observer=NS(session_held_tokens=lambda: 0),
+                 token_to_kv_pool_allocator=alloc,
+                 _check_pool_invariant=SchedulerInvariantChecker._check_pool_invariant)
+    for capacity in (4, 8, 4):
+        alloc.set_serving_capacity(capacity)
+        stats = PoolStats(full_available_size=capacity, full_evictable_size=0, full_num_used=0, full_token_usage=0)
+        leaked, _ = SchedulerInvariantChecker._check_full_pool(checker, stats)
+        assert not leaked
+        assert alloc.virtual_capacity == 8
+
+
+def test_capacity_commit_refreshes_immutable_statistics_owner():
+    from dataclasses import dataclass
+    from sglang.srt.elastic_pp.kv_capacity import publish_scheduler_capacity
+
+    @dataclass(frozen=True)
+    class Stats:
+        max_total_num_tokens: int
+
+    old = Stats(4)
+    runner = NS(token_to_kv_pool=NS(capacity_managed=True, serving_capacity=8))
+    checker = NS(max_total_num_tokens=4, pool_stats_observer=old)
+    scheduler = NS(tp_worker=NS(model_runner=runner), pool_stats_observer=old,
+                   invariant_checker=checker, disagg_decode_prealloc_queue=NS(max_total_num_tokens=4))
+    publish_scheduler_capacity(scheduler)
+    assert old.max_total_num_tokens == 4
+    assert scheduler.pool_stats_observer.max_total_num_tokens == 8
+    assert checker.pool_stats_observer is scheduler.pool_stats_observer
+    assert checker.max_total_num_tokens == scheduler.max_total_num_tokens == 8

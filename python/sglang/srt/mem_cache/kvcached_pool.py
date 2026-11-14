@@ -1010,7 +1010,7 @@ class _KVCacheDSlotTrackingMixin:
                 )
             return self._elastic_pp_slot_tracker.initial_live_slots
         live_slots = self.elastic_pp_live_slots()
-        tracker_size = self.size + self.page_size - 1
+        tracker_size = getattr(self, "virtual_capacity", self.size) + self.page_size - 1
         self._elastic_pp_slot_tracker = ElasticKVSlotTracker(
             generation=generation,
             size=tracker_size,
@@ -1049,6 +1049,7 @@ class KVCacheDTokenToKVPoolAllocator(
         need_sort: bool,
     ) -> None:
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
+        self.virtual_capacity = int(size)
         self.kvcached_allocator = kvcache.kvcached_allocator
         self._initialize_slot_tracking()
         self.clear()
@@ -1068,7 +1069,7 @@ class KVCacheDTokenToKVPoolAllocator(
                                            dtype=torch.int64, device=self.device)
 
     def check_serving_capacity(self, capacity):
-        if not 0 < capacity <= self.size:
+        if not 0 < capacity <= self.virtual_capacity:
             raise ValueError("KV capacity is outside the reserved slot space")
         if not self.is_not_in_free_group or self.free_group:
             raise RuntimeError("KV capacity change requires completed deferred frees")
@@ -1089,6 +1090,9 @@ class KVCacheDTokenToKVPoolAllocator(
                 self.free_pages = torch.cat((self.free_pages, torch.arange(
                     previous + 1, capacity + 1, dtype=torch.int64, device=self.device)))
         self.serving_capacity = int(capacity)
+        # Existing hybrid pool invariants use allocator.size as the committed
+        # ceiling. Only the tensor pool keeps the virtual reservation size.
+        self.size = int(capacity)
 
     def available_size(self):
         if getattr(self, "serving_capacity", None):
