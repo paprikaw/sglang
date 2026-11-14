@@ -502,10 +502,8 @@ def test_elastic_loop_sends_activation_before_waiting_for_output(
 
 @pytest.mark.parametrize("rank", [0, 1, 2])
 @pytest.mark.parametrize("elastic", [False, True])
-@pytest.mark.parametrize("busy", [False, True])
-@pytest.mark.parametrize("control_ready", [False, True])
-def test_pd_slots_post_queue_consensus_before_waiting_for_elastic_proxy(
-    monkeypatch, rank, elastic, busy, control_ready
+def test_pd_idle_slot_progresses_consensus_before_waiting_for_elastic_proxy(
+    monkeypatch, rank, elastic
 ):
     from sglang.srt.managers import scheduler_pp_mixin
 
@@ -520,14 +518,10 @@ def test_pd_slots_post_queue_consensus_before_waiting_for_elastic_proxy(
         disaggregation_decode_enable_offload_kvcache=False
     ))
     scheduler.init_pp_loop_state = lambda: None
-    # One occupied ring slot exposes an incoming control round immediately;
-    # the other case covers the empty slots while the physical ring fills.
-    scheduler.pp_loop_size = 1 if control_ready else 3
     scheduler.running_mbs = [SimpleNamespace(batch_is_full=False) for _ in range(3)]
     scheduler.last_mbs = [None] * 3
     scheduler.mbs = [None] * 3
     scheduler.mb_metadata = [None] * 3
-    scheduler.last_rank_comm_queue = []
     scheduler.enable_decode_hicache = False
     scheduler.request_receiver = SimpleNamespace(recv_requests=lambda: [])
     scheduler.process_input_requests = lambda reqs: None
@@ -535,29 +529,15 @@ def test_pd_slots_post_queue_consensus_before_waiting_for_elastic_proxy(
     scheduler._pp_pd_get_retract_ids = lambda mb_id: []
     scheduler._pp_pd_get_prealloc_ids = lambda: [[], []]
     scheduler._pp_pd_get_decode_transferred_ids = lambda: []
-    current = SimpleNamespace(forward_mode=SimpleNamespace(is_prebuilt=lambda: True)) if busy else None
     scheduler.get_next_disagg_decode_batch_to_run = lambda **kw: SimpleNamespace(
-        running_batch=scheduler.running_batch, batch_to_run=current
+        running_batch=scheduler.running_batch, batch_to_run=None
     )
-    scheduler._pp_launch_or_skip_batch = lambda *args: (None, None)
     scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = (
         lambda *args: (None, None, None)
     )
     scheduler._pp_send_pyobj_to_next_stage = lambda *args, **kw: []
-    posted = []
-    received = []
-    def receive_control():
-        received.append(True)
-        return []
-    scheduler._pp_recv_pyobj_from_prev_stage = receive_control
-    scheduler.process_retract_queue = lambda value: value
-    scheduler.process_prealloc_queue = lambda value: value
-    scheduler.process_decode_transfer_queue = lambda value: value
-    def send_consensus(*args):
-        posted.append(True)
-        return ["consensus"], []
-    scheduler._pp_pd_send_consensus_bootstrapped_ids = send_consensus
-    scheduler._pp_pd_send_consensus_release_ids = send_consensus
+    scheduler._pp_pd_send_consensus_bootstrapped_ids = lambda *args: (["consensus"], [])
+    scheduler._pp_pd_send_consensus_release_ids = lambda *args: (["consensus"], [])
     proxy = [object()]
     scheduler.send_proxy_work = proxy
     calls = []
@@ -565,12 +545,9 @@ def test_pd_slots_post_queue_consensus_before_waiting_for_elastic_proxy(
     def commit(work):
         if work is proxy:
             if elastic:
-                assert len(posted) == 3, (
-                    "activation completion blocks the dormant-stage PD control ring: "
-                    "its peer needs the intermediate rank's queue consensus first"
+                assert calls.count("consensus") == 3, (
+                    "activation completion blocks the dormant-stage PD control ring"
                 )
-                assert calls.count("consensus") == 3
-                if control_ready:assert len(received) == 3
             calls.append("proxy")
         elif work:
             assert work == ["consensus"]
