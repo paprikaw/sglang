@@ -248,7 +248,10 @@ def worker(run,root,sid):
         save(directory/'failure.json',dict(error=repr(error),traceback=traceback.format_exc()))
         raise
     finally:
-        cleanup=h.cleanup(children)
+        # A retiring replica shares the node with the retained Decode instance.
+        # Verify this exact process group and every observed CUDA child here;
+        # the coordinator proves whole-node idle after all servers have stopped.
+        cleanup=h.cleanup(children,require_node_gpu_idle=False)
         lifecycle['engine_cleaned']=time.time();save(directory/'lifecycle.json',lifecycle)
         save(directory/'cleanup.json',cleanup)
         if not cleanup['cleanup_verified']:raise RuntimeError('owned GPU cleanup failed')
@@ -276,7 +279,9 @@ def client(run,root):
             if stop.wait(1):raise InterruptedError('owned replay stopped')
         if proc.returncode:raise RuntimeError('AgentX replay failed')
     finally:
-        save(run/'client_cleanup.json',h.cleanup(children))
+        cleanup=h.cleanup(children,require_node_gpu_idle=False)
+        save(run/'client_cleanup.json',cleanup)
+        if not cleanup['cleanup_verified']:raise RuntimeError('owned CPU replay cleanup failed')
 
 def coordinator(run,root):
     sys.path.insert(0,str(ENGINE/'python'))
@@ -324,6 +329,18 @@ def coordinator(run,root):
     def info(sid):
         cfg=root['servers'][sid]
         return replay.http(cfg['node'],cfg['port'],'/get_server_info',key,None,30)
+    def verify_node_idle(node):
+        path=run/'node_cleanup'/f'{node}.json'
+        code="""import json,subprocess,sys,time
+from pathlib import Path
+p=Path(sys.argv[1]);p.parent.mkdir(parents=True,exist_ok=True)
+result=subprocess.run(['nvidia-smi','--query-compute-apps=pid,gpu_uuid,used_gpu_memory','--format=csv,noheader,nounits'],check=True,text=True,capture_output=True,timeout=15)
+apps=[line.strip() for line in result.stdout.splitlines() if line.strip()]
+value=dict(node=sys.argv[2],unix=time.time(),query_passed=True,gpu_idle=not apps,observed_gpu_processes=apps)
+temporary=p.with_suffix('.tmp');temporary.write_text(json.dumps(value)+chr(10));temporary.replace(p)
+"""
+        subprocess.run(['ssh','-T','-o','BatchMode=yes',node,shlex.join([PYTHON,'-c',code,str(path),node])],check=True,timeout=25)
+        return visible(path,20,shutdown=True)
     def rhttp(path,body=None):
         return replay.http(router['host'],router['port'],path,key,body,10)
     def action(decision):
@@ -483,7 +500,12 @@ def coordinator(run,root):
             try:clean.append(terminate(sid))
             except BaseException as e:errors.append('cleanup '+sid+': '+repr(e))
         for handle in handles:handle.close()
-        good=bool(clean) and all(c.get('cleanup_verified') for c in clean)
+        idle=[]
+        for node in root['node_configs']:
+            try:idle.append(verify_node_idle(node))
+            except BaseException as e:errors.append('node idle '+node+': '+repr(e))
+        nodes_idle=len(idle)==len(root['node_configs']) and all(c['gpu_idle'] for c in idle)
+        good=bool(clean) and all(c.get('cleanup_verified') for c in clean) and nodes_idle
         save(run/'task/cleanup.json',dict(experiment_id=root['id'],task_id='comparison',timestamp=time.time(),
             passed=good,model_processes_exited=good,gpu_idle=good,errors=errors))
 
