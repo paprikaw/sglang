@@ -100,6 +100,40 @@ def test_explicit_narrow_profile():
     validate_decode_args(_args())
 
 
+def _optimized_args():
+    args = _args()
+    args.elastic_pp_transition_strategy = "background"
+    args.elastic_pp_transition_backing = "overlap"
+    args.disable_cuda_graph = False
+    args.elastic_pp_graph_partitions = "24,0,24;16,16,16"
+    args.elastic_pp_prepared_weight_policy = "offload"
+    args.elastic_pp_hicache_shared_host = True
+    args.elastic_pp_weight_staging = "cpu_prepacked"
+    args.enable_elastic_pp_kv_patch = True
+    args.elastic_pp_kv_patch_transport = "nixl"
+    args.elastic_pp_kv_backend = "native"
+    return args
+
+
+def test_explicit_optimized_single_request_profile():
+    validate_decode_args(_optimized_args())
+
+
+@pytest.mark.parametrize("name,value", [
+    ("elastic_pp_hicache_shared_host", False),
+    ("elastic_pp_prepared_weight_policy", "reuse"),
+    ("elastic_pp_graph_partitions", None),
+    ("elastic_pp_weight_staging", "legacy"),
+    ("enable_elastic_pp_kv_patch", False),
+    ("elastic_pp_kv_patch_transport", "cpu"),
+])
+def test_incomplete_optimized_profiles_fail_closed(name, value):
+    args = _optimized_args()
+    setattr(args, name, value)
+    with pytest.raises(ValueError):
+        validate_decode_args(args)
+
+
 @pytest.mark.parametrize("counts", [(4, 2, 2), (3, 3, 2), (3, 3, 3)])
 def test_fence_catches_up_receivers_without_sending_an_extra_cache_round(counts):
     import concurrent.futures

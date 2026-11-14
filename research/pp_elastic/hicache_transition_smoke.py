@@ -425,10 +425,10 @@ def validate_decode_graph_states(
                     reload = metrics.get("weight_staging_metrics", {})
                     if (
                         reload.get("kind")
-                        != (
-                            "prepared_cpu_cache"
+                        not in (
+                            {"prepared_cpu_cache", "startup_processed_fp8_marlin_cpu"}
                             if metrics["weight_staging"] == "cpu_prepacked"
-                            else "canonical_cpu_cache"
+                            else {"canonical_cpu_cache"}
                         )
                         or not reload.get("cache_key")
                         or metrics.get("background_weight_bytes_sent", -1) != 0
@@ -460,8 +460,26 @@ def validate_decode_graph_states(
                             )
                     if rank in incoming and (
                         reload.get("target_weight_bytes", 0) <= 0
-                        or reload.get("checkpoint_bytes", 0) <= 0
-                        or reload.get("checkpoint_tensors", 0) <= 0
+                        or reload.get(
+                            (
+                                "processed_tensor_bytes"
+                                if reload.get("kind")
+                                == "startup_processed_fp8_marlin_cpu"
+                                else "checkpoint_bytes"
+                            ),
+                            0,
+                        )
+                        <= 0
+                        or reload.get(
+                            (
+                                "processed_tensor_count"
+                                if reload.get("kind")
+                                == "startup_processed_fp8_marlin_cpu"
+                                else "checkpoint_tensors"
+                            ),
+                            0,
+                        )
+                        <= 0
                         or not reload.get("cache_key_matches_initial_load")
                         or not reload.get("storage_verified")
                         or not reload.get("layers_loaded")

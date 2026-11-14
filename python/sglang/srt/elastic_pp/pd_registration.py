@@ -13,9 +13,6 @@ def validate_decode_args(args):
         elastic_pp_disagg_decode=True,
         disaggregation_mode="decode",
         disaggregation_transfer_backend="mooncake",
-        elastic_pp_transition_strategy="sync",
-        elastic_pp_transition_backing="cpu_spill",
-        disable_cuda_graph=True,
         enable_hierarchical_cache=True,
         pp_async_batch_depth=0,
         max_running_requests=1,
@@ -26,6 +23,30 @@ def validate_decode_args(args):
         for name, value in required.items()
         if getattr(args, name, None) != value
     ]
+    sync = (
+        args.elastic_pp_transition_strategy == "sync"
+        and args.elastic_pp_transition_backing == "cpu_spill"
+        and args.disable_cuda_graph
+    )
+    optimized = (
+        args.elastic_pp_transition_strategy == "background"
+        and args.elastic_pp_transition_backing == "overlap"
+        and not args.disable_cuda_graph
+        and getattr(args, "elastic_pp_graph_partitions", None)
+        and getattr(args, "elastic_pp_prepared_weight_policy", None) == "offload"
+        and getattr(args, "elastic_pp_hicache_shared_host", False)
+        and getattr(args, "elastic_pp_weight_staging", None) == "cpu_prepacked"
+        and getattr(args, "enable_elastic_pp_kv_patch", False)
+        and getattr(args, "elastic_pp_kv_patch_transport", None) == "nixl"
+        and getattr(args, "elastic_pp_kv_backend", None) == "native"
+    )
+    if not (sync or optimized):
+        mismatches.append(
+            f"elastic_pp_transition_strategy={args.elastic_pp_transition_strategy!r}, "
+            f"elastic_pp_transition_backing={args.elastic_pp_transition_backing!r}, "
+            f"disable_cuda_graph={args.disable_cuda_graph!r}: requires sync/cpu_spill/Eager "
+            "or background/overlap/prepared Graphs/shared HiCache/CPU-prepacked/NIXL"
+        )
     if mismatches:
         raise ValueError("elastic P/D Decode qualification: " + "; ".join(mismatches))
 
@@ -52,17 +73,24 @@ def align_decode_hicache_polls_at_fence(scheduler, group):
     round at the leading rank; only then can ordinary host-I/O drain wait.
     """
     before = scheduler._pp_pd_hicache_polls
-    reports = group.all_gather_object({
-        "polls": before, "microsteps": scheduler._pp_pd_microsteps,
-    })
+    reports = group.all_gather_object(
+        {
+            "polls": before,
+            "microsteps": scheduler._pp_pd_microsteps,
+        }
+    )
     if not reports or any(
         not isinstance(row.get(name), int) or row[name] < 0
-        for row in reports for name in ("polls", "microsteps")
+        for row in reports
+        for name in ("polls", "microsteps")
     ):
         raise RuntimeError("invalid PD HiCache fence poll counts")
     target = max(row["polls"] for row in reports)
-    poll = getattr(scheduler.tree_cache, "check_hicache_events_pp_decode",
-                   scheduler.tree_cache.check_hicache_events)
+    poll = getattr(
+        scheduler.tree_cache,
+        "check_hicache_events_pp_decode",
+        scheduler.tree_cache.check_hicache_events,
+    )
     while scheduler._pp_pd_hicache_polls < target:
         poll()
         scheduler._pp_pd_hicache_polls += 1

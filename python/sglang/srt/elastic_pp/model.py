@@ -55,9 +55,19 @@ class ElasticPPModelMixin:
         from sglang.srt.elastic_pp.weight_backing import EvictableWeightBank
 
         if self.quant_config is not None:
-            raise ValueError(
-                "nonresident prepared weights currently require unquantized layers"
-            )
+            quant_name = self.quant_config.get_name()
+            experts = [
+                m
+                for i in self._resident_elastic_layer_ids()
+                for m in self.layers[i].modules()
+                if hasattr(m, "num_local_experts")
+            ]
+            if quant_name != "fp8" or any(
+                not getattr(m, "_qwen_a100_fp8_marlin_prepared", False) for m in experts
+            ):
+                raise ValueError(
+                    "nonresident quantized weights require processed Qwen FP8 Marlin layers"
+                )
         bank = self._elastic_pp_weight_backing = EvictableWeightBank()
         for layer_id in sorted(self._resident_elastic_layer_ids()):
             bank.prepare(layer_id, self.layers[layer_id])

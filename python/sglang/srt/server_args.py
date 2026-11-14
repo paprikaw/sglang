@@ -1096,7 +1096,7 @@ class ServerArgs:
     ] = False
     elastic_pp_disagg_decode: A[
         bool,
-        "Experimental fenced Decode PP migration; requires quiescent P/D transfers, sync CPU-spill and Eager execution.",
+        "Experimental single-request Decode PP migration with quiescent P/D transfers: sync CPU-spill/Eager or background overlap/prepared Graphs/shared CPU HiCache/NIXL.",
         NS("parallel"),
     ] = False
     elastic_pp_initial_partition: A[
@@ -1120,7 +1120,7 @@ class ServerArgs:
     elastic_pp_weight_staging: A[
         str,
         Arg(
-            help="Background immutable weights: cpu_cache uses the canonical RAM checkpoint; cpu_prepacked prepares native load-layout weights in bounded pinned CPU RAM during Graph startup (native Qwen3.5 TP1/EP1 Triton). pinned/legacy export through CPU/Gloo. No candidate GPU weight cache.",
+            help="Background immutable weights: cpu_cache uses the canonical RAM checkpoint; cpu_prepacked prepares bounded pinned CPU weights during Graph startup (Qwen3.5 TP1/EP1: native BF16 Triton packs on CPU; FP8 Marlin caches processed runtime tensors during the private startup walk). pinned/legacy export through CPU/Gloo. No candidate GPU weight cache.",
             choices=["cpu_cache", "cpu_prepacked", "pinned", "legacy"],
         ),
         NS("parallel"),

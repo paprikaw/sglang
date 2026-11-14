@@ -116,6 +116,7 @@ class ElasticPPMigrationCoordinator:
         ):
             raise ValueError("online KV patch requires background/overlap transition")
         self._source_backing_attempted = False
+        self._registration_suspended = False
         self._source_backing_metrics: dict[str, Any] = {}
         self._layers_precopied = False
         self._background_weight_bytes_sent = 0
@@ -283,6 +284,7 @@ class ElasticPPMigrationCoordinator:
                 self._cpu_weight_reloader.reset_metrics()
             self._observed_cuda_allocated_peak = 0
             self._source_backing_attempted = False
+            self._registration_suspended = False
             self._source_backing_metrics = {}
             self._stage_seconds = {}
             self._stage_intervals = []
@@ -739,9 +741,19 @@ class ElasticPPMigrationCoordinator:
 
     def _precopy_cpu_cached_weights(self, transition):
         from sglang.srt.elastic_pp.cpu_weight_reload import CanonicalCpuWeightReloader
+        from sglang.srt.elastic_pp.marlin_cpu_weight_reload import (
+            MarlinCpuWeightReloader,
+        )
 
         if self._cpu_weight_reloader is None:
-            self._cpu_weight_reloader = CanonicalCpuWeightReloader(
+            args = self.model_runner.server_args
+            reloader = (
+                MarlinCpuWeightReloader
+                if getattr(args, "quantization", None) == "fp8"
+                and getattr(args, "moe_runner_backend", None) == "marlin"
+                else CanonicalCpuWeightReloader
+            )
+            self._cpu_weight_reloader = reloader(
                 model_runner=self.model_runner,
                 stream=self.layer_transport._migration_stream,
             )
@@ -754,6 +766,18 @@ class ElasticPPMigrationCoordinator:
             if edge.dst_rank == self.rank
             for layer_id in range(edge.layer_range.start, edge.layer_range.end)
         }
+        if isinstance(self._cpu_weight_reloader, MarlinCpuWeightReloader):
+            bank = self.model_runner._elastic_pp_prepared_graphs
+            if bank.building:
+                source = transition.source.layer_range(self.rank)
+                self._cpu_weight_reloader.capture(range(source.start, source.end))
+                works = self.layer_transport.start_sends(transition)
+                try:
+                    self.layer_transport.receive(transition)
+                finally:
+                    self.layer_transport.wait(works)
+                self._cpu_weight_reloader.capture(incoming)
+                return
         self._cpu_weight_reloader.reload(
             generation=transition.target.generation, layer_ids=incoming
         )
@@ -973,6 +997,14 @@ class ElasticPPMigrationCoordinator:
             # Keep the source generation intact until all ranks can publish.
             local_error = None
             try:
+                if (
+                    self.backing == "overlap"
+                    and self.before_backing_release is not None
+                ):
+                    self._registration_suspended = True
+                    self._timed(
+                        "fence_registration_suspend", self.before_backing_release
+                    )
                 device = torch.device(getattr(self.model_runner, "device", "cpu"))
                 if device.type == "cuda":
                     # Dedicated transfer streams must observe all serving producers.
@@ -1242,6 +1274,7 @@ class ElasticPPMigrationCoordinator:
                 self._timed("fence_route_publish", commit_topology, transition.target)
                 if self.after_topology_commit is not None:
                     self.after_topology_commit()
+                    self._registration_suspended = False
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
             reports = self._consensus(
@@ -1417,8 +1450,12 @@ class ElasticPPMigrationCoordinator:
                         transition
                     ),
                 )
-            if self.after_backing_restore is not None:
-                attempt("source P/D registration restore", self.after_backing_restore)
+        if (
+            self._source_backing_attempted or self._registration_suspended
+        ) and self.after_backing_restore is not None:
+            attempt("source P/D registration restore", self.after_backing_restore)
+            if not errors:
+                self._registration_suspended = False
         if errors:
             raise RuntimeError("; ".join(errors))
 

@@ -1,6 +1,6 @@
 """One Guard-owned 122B/A100 P2 + D(PP2->PP3->PP2) qualification.
 
-Not an autoscaling benchmark. Admission is quiescent during each synchronous
+Not an autoscaling benchmark. Admission is quiescent during each
 transition. The physical metadata workers stay resident; a separate process
 tests actual reuse of the retired middle GPU, with residual memory reported.
 """
@@ -32,6 +32,7 @@ import process_helpers as h
 GUARD = Path("/home/bxb1/.codex/skills/llm-experiment-guard/scripts")
 PRIOR = Path("/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/runs/p2d2_start_r1")
 PYTHON = "/data/gpfs/projects/punim2715/vllm_workbench/sglang_overlap_compare/venv-dd15fb57-cu12/bin/python"
+NIXL_ROOT = Path("/data/gpfs/projects/punim2715/vllm_workbench/.dependency-runtimes/sglang-nixl-cu12-1.5.2")
 
 
 def save(path, value):
@@ -57,7 +58,7 @@ def memory_size_json(value):
     return int(value)
 
 
-def prepare(run):
+def prepare(run, optimized=True):
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
     dirty = subprocess.check_output(["git", "-C", str(ENGINE), "status", "--porcelain"], text=True)
@@ -87,6 +88,10 @@ def prepare(run):
                    usage_audit_hostname=socket.gethostname().split('.')[0],
                    role=role, layouts=[row], port=29481 + index * 10,
                    dist_port=29482 + index * 10, bootstrap_port=29479)
+        cfg.update(optimized_elastic_pp=optimized and role == "decode",
+                   cuda_graph=optimized and role == "decode", hicache_size_gib=8,
+                   cpu_weight_cache_gib=64 if optimized and role == "decode" else 0,
+                   nixl_root=str(NIXL_ROOT) if optimized and role == "decode" else None)
         nodes[node] = cfg
         node_spec = json.loads((PRIOR / "cache" / f"{node}.json").read_text())
         node_path = run / "cache" / f"{node}.json"
@@ -94,13 +99,14 @@ def prepare(run):
         cache["node_specs"][node] = describe(node_path)
         cache["usage_logs"][node] = [use]
         # Host cache + CPU KV/GDN spill staging share an explicit reservation.
-        cache["hicache_reserve_bytes_per_node"][node] = 32 * 1024**3
+        cache["hicache_reserve_bytes_per_node"][node] = (240 if optimized and role == "decode" else 32) * 1024**3
     for cfg in nodes.values():
         cfg["model_cache"] = cache
     config = dict(id=run.name, python=PYTHON, node_configs=nodes,
                   admin_key_file=str(key), engine_commit=revision,
                   engine_root=str(ENGINE), output_tokens=512,
-                  admission="quiescent P/D transfers during synchronous fences",
+                  admission="quiescent P/D transfers during PP transitions",
+                  optimized_elastic_pp=optimized,
                   logical_gpu_counts=[4, 5, 4], resident_worker_gpus=5,
                   reserved_gpus=8, gpu_reuse_probe_gib=64)
     config["deterministic_inference"] = True
@@ -114,6 +120,14 @@ def prepare(run):
     tracked = subprocess.check_output(["git", "-C", str(ENGINE), "ls-files", "python/sglang", "research/pp_elastic"], text=True).splitlines()
     paths.extend(ENGINE / p for p in tracked if p.endswith((".py", ".json")))
     paths.extend(GUARD.glob("*.py"))
+    if optimized:
+        for pattern in ("nixl/_api.py", "nixl/__init__.py", "nixl_cu12/_api.py",
+                        "nixl_cu12/_bindings*.so", "nixl_cu12.libs/libucp*.so*",
+                        "nixl_cu12.libs/nixl/libplugin_UCX.so"):
+            matched = list(NIXL_ROOT.glob(pattern))
+            if not matched:
+                raise RuntimeError("Missing qualified NIXL dependency: " + pattern)
+            paths.extend(matched)
     bank = Path("/data/gpfs/projects/punim2715/vllm_workbench/sglang-memory-bank/src/sglang_memory_bank")
     paths.extend(bank / name for name in ("__init__.py", "memory_budget.py", "memory_bank.py"))
     spec["frozen_inputs"] = [describe(p) for p in dict.fromkeys(paths)]
@@ -139,6 +153,9 @@ def environment(cfg):
         HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", PYTHONDONTWRITEBYTECODE="1",
         OMP_NUM_THREADS="4", MKL_NUM_THREADS="1", QWEN_A100_FP8_MOE_MARLIN="1",
         QWEN_A100_FP8_MOE_MARLIN_QUALIFICATION="1", ELASTIC_PD_ROLE=cfg["role"])
+    if cfg.get("optimized_elastic_pp"):
+        env["PYTHONPATH"] = cfg["nixl_root"] + os.pathsep + env["PYTHONPATH"]
+        env.update(UCX_PROTO_INFO="y", UCX_LOG_LEVEL="info")
     return env
 
 
@@ -219,7 +236,7 @@ def engine_entry(run, cfg):
         "--mamba-max-states-per-path", "1", "--mem-fraction-static", ".90", "--page-size", "64",
         "--chunked-prefill-size", "512", "--max-prefill-tokens", "1024", "--pp-max-micro-batch-size", "1" if cfg["role"] == "decode" else "4",
         "--pp-async-batch-depth", "0", "--attention-backend", "triton", "--linear-attn-backend", "triton",
-        "--moe-runner-backend", "marlin", "--moe-a2a-backend", "none", "--disable-cuda-graph",
+        "--moe-runner-backend", "marlin", "--moe-a2a-backend", "none",
         "--enable-deterministic-inference",
         "--skip-server-warmup", "--json-model-override-args", '{"language_model_only":true}',
         "--enable-cache-report", "--enable-hierarchical-cache", "--hicache-size", "8",
@@ -229,8 +246,24 @@ def engine_entry(run, cfg):
         "--disaggregation-ib-device", "mlx5_bond_0"]
     if cfg["role"] == "decode":
         argv += ["--enable-elastic-pp", "--elastic-pp-disagg-decode", "--elastic-pp-initial-partition", "24,0,24",
-                 "--elastic-pp-transition-strategy", "sync", "--elastic-pp-transition-backing", "cpu_spill",
                  "--disaggregation-decode-enable-radix-cache", "--disaggregation-decode-extra-slots", "4"]
+    if cfg.get("optimized_elastic_pp"):
+        argv += ["--elastic-pp-transition-strategy", "background", "--elastic-pp-transition-backing", "overlap",
+                 "--elastic-pp-graph-partitions", "24,0,24;16,16,16",
+                 "--elastic-pp-prepared-weight-policy", "offload", "--cuda-graph-bs-decode", "1",
+                 "--elastic-pp-weight-staging", "cpu_prepacked",
+                 "--elastic-pp-cpu-weight-cache-gib", str(cfg["cpu_weight_cache_gib"]),
+                 "--elastic-pp-hicache-fast-copy", "--elastic-pp-hicache-batch-io",
+                 "--elastic-pp-hicache-background", "--elastic-pp-hicache-shared-host",
+                 "--enable-elastic-pp-kv-patch", "--elastic-pp-kv-patch-transport", "nixl",
+                 "--elastic-pp-kv-base-precopy"]
+    else:
+        argv += ["--disable-cuda-graph"]
+        if cfg["role"] == "decode":
+            argv += ["--elastic-pp-transition-strategy", "sync", "--elastic-pp-transition-backing", "cpu_spill"]
+    save(run / "nodes" / cfg["node"] / "effective_launch.json",
+         dict(engine_commit=cfg["engine_commit"], argv=argv,
+              optimized_elastic_pp=cfg.get("optimized_elastic_pp", False)))
     args = prepare_server_args(argv)
     args.enable_multimodal = False
     args.api_key = args.admin_api_key = h.read_key(cfg)
@@ -429,6 +462,9 @@ def controller(run, root):
                             raise TimeoutError("Migration cleanup did not finish")
                         time.sleep(.1)
                     probe.validate_fenced_decode(after, generation, (0, 2) if generation == 1 else (0, 1, 2), root["output_tokens"])
+                    if root.get("optimized_elastic_pp"):
+                        probe.validate_transition_states(after, generation,
+                            (0, 2) if generation == 1 else (0, 1, 2), "overlap", shared_host=True)
                     results["transitions"][-1]["after"] = after
                 (run / "probe.trigger").touch(mode=0o600)
                 wait_file(run / "gpu_reuse_started.json", 90)
@@ -437,6 +473,8 @@ def controller(run, root):
             replay.stream = original_stream
         results["stream_events"] = events
         completed = state("completed")
+        if root.get("optimized_elastic_pp"):
+            probe.validate_decode_graph_states(completed, 2, (0, 1, 2), (0, 2), prepared=True)
         results["continuity"] = [probe.validate_uninterrupted_decode(
             completed, generation, results["active"], sources, targets
         ) for generation, sources, targets in (
@@ -508,12 +546,13 @@ def controller(run, root):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", type=Path, required=True)
+    parser.add_argument("--sync-baseline", action="store_true")
     for option in ("prepare", "worker", "engine", "probe"):
         parser.add_argument("--" + option, action="store_true")
     args = parser.parse_args()
     run = args.run.resolve()
     if args.prepare:
-        return prepare(run)
+        return prepare(run, optimized=not args.sync_baseline)
     root = json.loads((run / "config.json").read_text())
     if args.worker:
         return worker(run, root)
