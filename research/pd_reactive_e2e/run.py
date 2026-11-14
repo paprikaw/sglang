@@ -143,7 +143,7 @@ def prepare(run, mechanism, kvcached_capacity=False):
     s=s.replace('port = site._server.sockets[0].getsockname()[1]', 'port = site._server.sockets[0].getsockname()[1]\n        (args.output.parent / "router_ready.json").write_text(json.dumps(dict(host=socket.gethostname().split(".")[0],port=port,unix=__import__("time").time())))')
     marker='        return code\n'
     if s.count(marker)!=1:raise RuntimeError('unknown AgentX harness return boundary')
-    s=s.replace(marker,'        from reactive_lifecycle import hold_control_after_workload\n        await hold_control_after_workload(args.output.parent, code)\n'+marker)
+    s=s.replace(marker,'        from reactive_lifecycle import hold_control_after_workload\n        await hold_control_after_workload(args.output.parent, code, adapter=adapter)\n'+marker)
     s=s.replace('"stable_placement.py", "mixed_replay.py", "sitecustomize.py")',
                 '"stable_placement.py", "mixed_replay.py", "sitecustomize.py", "reactive_lifecycle.py", "finite_profile.py")')
     p.write_text(s)

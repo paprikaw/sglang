@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace as NS
 
 import aiohttp
 from aiohttp import web
@@ -75,5 +76,46 @@ def test_zero_harness_exit_does_not_qualify_a_partial_replay(tmp_path,change):
     finite_run(tmp_path,**change)
     with pytest.raises(RuntimeError,match='replay incomplete'):
         asyncio.run(m.hold_control_after_workload(tmp_path,0,timeout_s=0))
-    assert not (tmp_path/'replay_workload_done.json').exists()
+    assert json.loads((tmp_path/'replay_workload_done.json').read_text())['exit_code']==1
     assert not json.loads((tmp_path/'replay_completion_audit.json').read_text())['passed']
+
+
+def test_validation_waits_for_buffered_audit_close_without_closing_control(tmp_path):
+    async def check():
+        finite_run(tmp_path)
+        path=tmp_path/'replay/routing.jsonl'
+        rows=path.read_text().splitlines();path.write_text('')
+        queue=asyncio.Queue();written=asyncio.Event()
+        async def writer():
+            # The real adapter also uses a buffered file through aiofiles.
+            with path.open('a',buffering=1024*1024) as output:
+                for row in rows:output.write(row+'\n')
+                written.set()
+                assert await queue.get() is None
+        task=asyncio.create_task(writer());await written.wait()
+        assert path.stat().st_size==0
+        with pytest.raises(RuntimeError,match='incomplete'):
+            m.validate_finite_replay(tmp_path)
+        adapter=NS(active={},reactive=NS(active={'d0':0},waiting={}),audit_queue=queue,audit_task=task)
+        (tmp_path/'release_router').touch()
+        await m.hold_control_after_workload(tmp_path,0,adapter=adapter)
+        assert adapter.audit_task is None and task.done()
+        assert json.loads((tmp_path/'replay_completion_audit.json').read_text())['passed']
+    asyncio.run(check())
+
+
+def test_audit_flush_waits_for_the_last_http_handler(tmp_path):
+    async def check():
+        queue=asyncio.Queue();closed=asyncio.Event()
+        async def writer():
+            assert await queue.get()=='last row'
+            assert await queue.get() is None
+            closed.set()
+        adapter=NS(active={'last':1},reactive=NS(active={'d0':1},waiting={}),audit_queue=queue,
+                   audit_task=asyncio.create_task(writer()))
+        flushing=asyncio.create_task(m.flush_routing_audit(adapter))
+        await asyncio.sleep(.01);assert not closed.is_set()
+        queue.put_nowait('last row');adapter.active.clear();adapter.reactive.active['d0']=0
+        await flushing
+        assert closed.is_set()
+    asyncio.run(check())

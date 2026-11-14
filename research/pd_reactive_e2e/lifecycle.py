@@ -33,13 +33,34 @@ def validate_finite_replay(run: Path):
     return result
 
 
-async def hold_control_after_workload(run: Path, exit_code: int, timeout_s=480):
-    if not exit_code and (run/'config.json').exists():
-        validate_finite_replay(run)
-    done = run / 'replay_workload_done.json'
-    temporary = done.with_suffix('.tmp')
-    temporary.write_text(json.dumps(dict(exit_code=exit_code, unix=time.time()))+'\n')
-    temporary.replace(done)
+async def flush_routing_audit(adapter, timeout_s=30):
+    """Close only the audit writer, keeping the HTTP control plane alive."""
+    async with asyncio.timeout(timeout_s):
+        # Native request accounting can finish just before a handler's finally
+        # block queues its audit row. Wait for those handlers before the sentinel.
+        while adapter.active or any(adapter.reactive.active.values()) or adapter.reactive.waiting:
+            await asyncio.sleep(.01)
+        if adapter.audit_task is not None:
+            adapter.audit_queue.put_nowait(None)
+            await asyncio.shield(adapter.audit_task)
+            adapter.audit_task = None  # Native stop must not send a second sentinel.
+
+
+async def hold_control_after_workload(run: Path, exit_code: int, timeout_s=480, *, adapter=None):
+    def publish(code, error=None):
+        done = run / 'replay_workload_done.json'
+        temporary = done.with_suffix('.tmp')
+        temporary.write_text(json.dumps(dict(exit_code=code, unix=time.time(), error=error))+'\n')
+        temporary.replace(done)
+    try:
+        if not exit_code and adapter is not None:
+            await flush_routing_audit(adapter)
+        if not exit_code and (run/'config.json').exists():
+            validate_finite_replay(run)
+    except Exception as error:
+        publish(1,repr(error))
+        raise
+    publish(exit_code)
     if exit_code:
         return
     deadline = time.monotonic()+timeout_s
