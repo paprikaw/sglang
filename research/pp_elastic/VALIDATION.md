@@ -1,5 +1,11 @@
 # EP／PP／P/D 集成基线验证
 
+## 2026-11-14：122B P/D接入最新共享HiCache／Graph／CPU权重优化
+
+冻结`dccbefa3c9c76ff33e9fdcd8b572a5bb62ee2e2f`，tag `experiment/sglang/122b-pd-pp-optimized-20261114-r18`，Draft PR #13。固定P2、D侧24/0/24→16/16/16→24/0/24、FP8 Marlin TP1 EP1、单请求及交接静止边界；保留HiCache与确定性模式，启用启动Graph库、非驻留CPU权重、共享CPU HiCache及后台NIXL增量KV。512-token同暖输出逐个一致、无retraction／重新Prefill，新P→D请求及实际CPU恢复576 token通过；共享底层未改变、历史CPU载荷复制0、运行期Graph capture0且有replay、非活跃权重物理页0。独立进程分配并写入64 GiB及矩阵计算时原Decode继续。
+
+控制调用扩／缩1.940／1.262秒；最终暂停128.9／103.3毫秒，各rank协调器完成最长1.930／1.276秒；每方向一次。准备期仍有1.683秒出token间隔，不能宣称转换成本完全隐藏。启动预热约28.2秒、三rank处理后CPU权重池实际19.02／38.04／19.02 GiB另计。缩回后中间rank层权重映射0、KV0，allocated约1.03 GiB、reserved约1.78 GiB，worker未退出。活跃4→5→4卡，驻留worker5卡，Guard整节点8卡。1275项组合CPU检查、启动VMM逐层回收修复后的74项相关检查、73项保存结果复算及Guard后检查／缓存审计／清理通过；r17启动OOM原失败保留。P侧、多请求、在途交接、容量增益及完整E2E未验证。[结果与原始证据](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/OPTIMIZED_PP_VALIDATION.md)。
+
 ## 2026-11-14：122B A100原生P/D下的最小D侧PP扩缩
 
 冻结 `d8c614d14e6c7844df780a8f513e16f3afad7e1e`，tag `experiment/sglang/122b-pd-pp2-pp3-roundtrip-20261114-r16`，Draft PR #13。完整Qwen3.5-122B-A10B-FP8／A100 Marlin W8A16，EP1、Eager、HiCache每rank 8 GiB、确定性模式、同步CPU spill；P固定PP2，D为24/0/24→16/16/16→24/0/24。最终移除逐层同步和Expert复算钩子后，静态重复、同一请求跨两次转换的512-token完整暖输出、新P→D交接和CPU恢复后32-token输出均与相应暖参考逐个一致，无retraction／重新Prefill。两个活跃D rank实际从CPU恢复576 token。182项相关CPU检查与28项保存结果复算通过；不扩大为冷暖生成等价、真实任务质量或长期稳定性。

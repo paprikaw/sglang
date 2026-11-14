@@ -8,6 +8,6 @@
 
 **验收要求。** 同暖前缀的完整输出逐token一致，同一RID跨两次转换且无重试／重新Prefill；转换后新的P→D请求及真实CPU恢复正确。核对共享底层身份不变、历史CPU载荷不复制、运行时Graph不捕获且有实际replay、非活跃候选权重物理页为0。缩回后独立进程实际分配／写入64 GiB并计算，报告仍驻留的worker、Graph／KV及剩余显存。分别报告控制面完整时间、最终暂停及准备期推理间隔，每方向一次，不作为重复均值。
 
-**当前状态。** 实现及1275项组合CPU检查通过（零失败、44条warning），GPU组合尚未验收。旧后端释放夹具未初始化P/D钩子的失败已修正并保留首轮记录。默认入口为`pd_elastic_smoke.py --prepare`；同步参考必须显式使用`--sync-baseline`。结果以新的冻结源码和独立run目录保存，旧r16保持不变。
+**当前状态。** r18（`dccbefa3c9c7`）GPU最小往返通过：512-token同暖参考、真实CPU恢复及独立64 GiB复用正确；1275项组合CPU、随后74项相关检查及73项保存结果复算通过。扩／缩控制1.940／1.262秒，最终暂停129／103毫秒；准备期仍有1.683秒出token间隔。退役rank权重／KV为0，worker及约1.78 GiB reserved仍驻留。启动预热约28.2秒单列；不是完整E2E、P侧、多请求、容量扩展或整卡归还证明。见[本轮报告](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/OPTIMIZED_PP_VALIDATION.md)。默认入口为`pd_elastic_smoke.py --prepare`；同步参考必须显式使用`--sync-baseline`。旧r16保持不变。
 
-首轮r17在启动期将已加载权重转换为VMM backing时OOM，未开始请求；失败与清理记录保留。已定位旧PyTorch空闲块只在全部层转换后归还，新增逐层归还，避免转换期间累计保留第二份权重。后续验证继续沿用相同单请求配置。
+首轮r17在启动期将已加载权重转换为VMM backing时OOM，未开始请求；失败与清理记录保留。旧PyTorch空闲块只在全部层转换后归还，改为逐层归还，避免累计保留第二份权重；同配置r18通过。旧后端释放夹具未初始化P/D钩子的CPU失败也保留。
