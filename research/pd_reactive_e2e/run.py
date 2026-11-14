@@ -136,7 +136,8 @@ def engine(run, root, sid):
     original=server_args.prepare_server_args
     def arguments(argv):
         values={'--context-length':str(root['context_length']),'--max-total-tokens':str(root['max_total_tokens']),
-            '--max-running-requests':'4','--max-mamba-cache-size':'48','--hicache-size':'32'}
+            '--max-running-requests':'4','--max-mamba-cache-size':'48','--hicache-size':'32',
+            '--chunked-prefill-size':'4096','--max-prefill-tokens':'8192'}
         flags=[]
         remove={'--enable-elastic-pp','--elastic-pp-disagg-decode','--disable-cuda-graph'} if sid.startswith('d') and not cfg['optimized_elastic_pp'] else set()
         pairs={'--elastic-pp-initial-partition','--elastic-pp-transition-strategy','--elastic-pp-transition-backing'} if remove else set()
@@ -153,7 +154,10 @@ def engine(run, root, sid):
         if remove:
             flags.extend(['--cuda-graph-bs-decode','1'])
         save(run/'servers'/sid/'effective_launch.json',dict(argv=flags,source=root['engine_commit']))
-        return original(flags)
+        args=original(flags)
+        from launch_checks import validate_prefill_alignment
+        validate_prefill_alignment(args)
+        return args
     server_args.prepare_server_args=arguments
     q.engine_entry(run,cfg)
 
@@ -270,10 +274,10 @@ def coordinator(run,root):
         save(run/'task/progress.json',dict(experiment_id=root['id'],task_id='comparison',timestamp=time.time(),
             stage=stage,controller_pid=os.getpid(),controller_start_ticks=ident['start_ticks'],process_start_ticks=ident['start_ticks'],
             valid_points=int(stage == "complete"),expected=1))
-    def visible(path,seconds=1200):
+    def visible(path,seconds=1200,shutdown=False):
         deadline=time.monotonic()+seconds
         while not path.exists():
-            health()
+            if not shutdown:health()
             if time.monotonic()>deadline:raise TimeoutError(str(path))
             stop.wait(.5)
         subprocess.run([PYTHON,str(GUARD/'artifact_visibility.py'),str(path),'--timeout-s','20',
@@ -291,7 +295,7 @@ def coordinator(run,root):
         proc.stdin.close()
         try:proc.wait(timeout=85)
         except subprocess.TimeoutExpired:proc.terminate();proc.wait(timeout=10)
-        return visible(run/'servers'/sid/'cleanup.json',10)
+        return visible(run/'servers'/sid/'cleanup.json',20,shutdown=True)
     def info(sid):
         cfg=root['servers'][sid]
         return replay.http(cfg['node'],cfg['port'],'/get_server_info',key,None,10)
@@ -355,7 +359,7 @@ def coordinator(run,root):
         save(run/'state.initial.json',initial)
         p,d=[dict(host=root['servers'][n]['node'],port=root['servers'][n]['port'],ep=1,
             bootstrap_port=root['servers'][n]['bootstrap_port']) for n in ['p','d0']]
-        tokens=[1000+i%123 for i in range(256)]
+        tokens=[1000+i%123 for i in range(4608)]
         smoke=[replay.request_one(p,d,key,tokens,8,0,True) for _ in range(2)]
         if smoke[0]['output_ids']!=smoke[1]['output_ids']:raise AssertionError('static P/D warm output mismatch')
         save(run/'start_smoke.json',dict(passed=True,responses=smoke))

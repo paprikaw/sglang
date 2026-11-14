@@ -56,3 +56,11 @@ def test_cache_affinity_distinguishes_cloned_sessions_but_survives_turn_changes(
     b=NS(conversation_id='same-source-conversation',x_correlation_id='clone-b',turn_index=1)
     first=placement.placement_key(a);a.turn_index=7
     assert first==placement.placement_key(a) and first!=placement.placement_key(b)
+
+
+def test_deterministic_prefill_chunk_must_be_large_enough_to_admit_long_requests():
+    spec=importlib.util.spec_from_file_location('launch_checks',Path(__file__).with_name('launch_checks.py'))
+    checks=importlib.util.module_from_spec(spec);spec.loader.exec_module(checks)
+    args=NS(enable_deterministic_inference=True,attention_backend='triton',chunked_prefill_size=512)
+    with pytest.raises(ValueError,match='4096'):checks.validate_prefill_alignment(args)
+    args.chunked_prefill_size=4096;checks.validate_prefill_alignment(args)
