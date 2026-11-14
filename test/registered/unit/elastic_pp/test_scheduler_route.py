@@ -503,8 +503,9 @@ def test_elastic_loop_sends_activation_before_waiting_for_output(
 @pytest.mark.parametrize("rank", [0, 1, 2])
 @pytest.mark.parametrize("elastic", [False, True])
 @pytest.mark.parametrize("busy", [False, True])
+@pytest.mark.parametrize("control_ready", [False, True])
 def test_pd_slots_post_queue_consensus_before_waiting_for_elastic_proxy(
-    monkeypatch, rank, elastic, busy
+    monkeypatch, rank, elastic, busy, control_ready
 ):
     from sglang.srt.managers import scheduler_pp_mixin
 
@@ -519,6 +520,9 @@ def test_pd_slots_post_queue_consensus_before_waiting_for_elastic_proxy(
         disaggregation_decode_enable_offload_kvcache=False
     ))
     scheduler.init_pp_loop_state = lambda: None
+    # One occupied ring slot exposes an incoming control round immediately;
+    # the other case covers the empty slots while the physical ring fills.
+    scheduler.pp_loop_size = 1 if control_ready else 3
     scheduler.running_mbs = [SimpleNamespace(batch_is_full=False) for _ in range(3)]
     scheduler.last_mbs = [None] * 3
     scheduler.mbs = [None] * 3
@@ -541,6 +545,14 @@ def test_pd_slots_post_queue_consensus_before_waiting_for_elastic_proxy(
     )
     scheduler._pp_send_pyobj_to_next_stage = lambda *args, **kw: []
     posted = []
+    received = []
+    def receive_control():
+        received.append(True)
+        return []
+    scheduler._pp_recv_pyobj_from_prev_stage = receive_control
+    scheduler.process_retract_queue = lambda value: value
+    scheduler.process_prealloc_queue = lambda value: value
+    scheduler.process_decode_transfer_queue = lambda value: value
     def send_consensus(*args):
         posted.append(True)
         return ["consensus"], []
@@ -557,7 +569,8 @@ def test_pd_slots_post_queue_consensus_before_waiting_for_elastic_proxy(
                     "activation completion blocks the dormant-stage PD control ring: "
                     "its peer needs the intermediate rank's queue consensus first"
                 )
-                if not busy:assert calls.count("consensus") == 3
+                assert calls.count("consensus") == 3
+                if control_ready:assert len(received) == 3
             calls.append("proxy")
         elif work:
             assert work == ["consensus"]
@@ -576,7 +589,7 @@ def test_pd_slots_post_queue_consensus_before_waiting_for_elastic_proxy(
     with pytest.raises(StopAfterMicrostep):
         scheduler.event_loop_pp_disagg_decode()
     expected = ["consensus"] * 3
-    assert calls == (expected + ["proxy"] if elastic and not busy else ["proxy"] + expected)
+    assert calls == (expected + ["proxy"] if elastic else ["proxy"] + expected)
     assert proxy == []
 
 

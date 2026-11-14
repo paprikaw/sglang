@@ -1387,6 +1387,22 @@ class SchedulerPPMixin:
                 )
             )
 
+        def receive_pd_queue_consensus():
+            # Only receive RID messages here. Applying queue changes remains
+            # after the model/output work, preserving its allocation lifetime.
+            received = []
+            for ring, work in (
+                (rmbs, send_consensus_retract_work),
+                (pmbs, send_consensus_prealloc_work),
+                (tmbs, send_release_work),
+            ):
+                received.append(
+                    self._pp_recv_pyobj_from_prev_stage()
+                    if ring[next_mb_id] is not None else None
+                )
+                self._pp_commit_comm_work(work)
+            return received
+
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
@@ -1481,13 +1497,14 @@ class SchedulerPPMixin:
                 tmbs[mb_id] = transferred_rids
                 self._pp_commit_comm_work(send_transfer_work)
 
+                early_pd_consensus = None
                 if self._pp_topology() is not None:
-                    # Activations bypass dormant stages; PD control still visits
-                    # them. Post control replies before any activation or token
-                    # wait, including a busy/prebuilt slot. Otherwise PP0 waits
-                    # on proxy 0->2, PP1 on output 0->1, and PP2 on consensus
-                    # 1->2. Send buffers remain owned until the normal waits.
+                    # Finish the CPU control ring before activation/output
+                    # waits: a dormant rank separates the two routes. Posting
+                    # sends alone is insufficient if the physical last stage
+                    # still waits for the first stage's receive completion.
                     launch_pd_queue_consensus()
+                    early_pd_consensus = receive_pd_queue_consensus()
 
                 # get batch to run and proxy tensors if needed
                 if elastic_pp_draining:
@@ -1564,25 +1581,37 @@ class SchedulerPPMixin:
                     self.decode_offload_manager.check_offload_progress()
 
                 if rmbs[next_mb_id] is not None:
-                    next_consensus_retract_rids = self._pp_recv_pyobj_from_prev_stage()
+                    next_consensus_retract_rids = (
+                        early_pd_consensus[0] if early_pd_consensus is not None
+                        else self._pp_recv_pyobj_from_prev_stage()
+                    )
                     next_consensus_retract_rids = self.process_retract_queue(
                         next_consensus_retract_rids
                     )
-                self._pp_commit_comm_work(send_consensus_retract_work)
+                if early_pd_consensus is None:
+                    self._pp_commit_comm_work(send_consensus_retract_work)
 
                 if pmbs[next_mb_id] is not None:
-                    next_consensus_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
+                    next_consensus_prealloc_rids = (
+                        early_pd_consensus[1] if early_pd_consensus is not None
+                        else self._pp_recv_pyobj_from_prev_stage()
+                    )
                     next_consensus_prealloc_rids = self.process_prealloc_queue(
                         next_consensus_prealloc_rids
                     )
-                self._pp_commit_comm_work(send_consensus_prealloc_work)
+                if early_pd_consensus is None:
+                    self._pp_commit_comm_work(send_consensus_prealloc_work)
 
                 if tmbs[next_mb_id] is not None:
-                    next_release_rids = self._pp_recv_pyobj_from_prev_stage()
+                    next_release_rids = (
+                        early_pd_consensus[2] if early_pd_consensus is not None
+                        else self._pp_recv_pyobj_from_prev_stage()
+                    )
                     next_release_rids = self.process_decode_transfer_queue(
                         next_release_rids
                     )
-                self._pp_commit_comm_work(send_release_work)
+                if early_pd_consensus is None:
+                    self._pp_commit_comm_work(send_release_work)
 
                 if defer_proxy_completion:
                     self._pp_commit_comm_work(self.send_proxy_work)

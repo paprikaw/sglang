@@ -432,7 +432,11 @@ def coordinator(run,root):
                 if time.time()-completed_at>75 and future is None:
                     raise RuntimeError('normal reactive down did not become safe after drain')
             stop.wait(1)
-        save(run/'state.final.json',last_state)
+        post_smoke=replay.request_one(p,d,key,tokens,8,0,True)
+        if post_smoke['output_ids']!=smoke[0]['output_ids']:
+            raise AssertionError('post-scaling P/D warm output mismatch')
+        save(run/'post_smoke.json',dict(passed=True,response=post_smoke))
+        save(run/'state.final.json',info('d0'))
         save(run/'completed.json',dict(passed=True,formal_start=formal_start,replay_done=completed_at,
             comparison_finished=time.time(),mechanism=root['mechanism'],actions=len(actions),
             scaling_exercised=any(a['decision']['direction']=='up' and a['success'] for a in actions),
