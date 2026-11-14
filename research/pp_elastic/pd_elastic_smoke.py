@@ -57,6 +57,41 @@ def memory_size_json(value):
     return int(value)
 
 
+def install_prefill_trace(runner):
+    """Temporary synchronized layer evidence; not a performance measurement."""
+    import torch
+    layers = [(name, module) for name, module in runner.model.named_modules()
+              if hasattr(module, "mlp") and (hasattr(module, "linear_attn")
+                                            or hasattr(module, "self_attn"))]
+    counter = [0]
+    def tensors(value):
+        if isinstance(value, torch.Tensor):
+            return [dict(shape=list(value.shape), dtype=str(value.dtype),
+                sha256=hashlib.sha256(value.detach().contiguous().view(torch.uint8)
+                    .cpu().numpy().tobytes()).hexdigest())]
+        if isinstance(value, (list, tuple)):
+            return [item for entry in value for item in tensors(entry)]
+        return []
+    def record(name, phase, value):
+        print("ELASTIC_PD_PREFILL_TRACE", json.dumps(dict(rank=runner.ps.pp_rank,
+            call=counter[0], module=name, phase=phase, tensors=tensors(value))), flush=True)
+    for index, (name, layer) in enumerate(layers):
+        def before(module, args, kwargs, name=name, first=index == 0):
+            if first:
+                counter[0] += 1
+            record(name, "in", (args, kwargs.get("positions")))
+        def after(module, args, output, name=name):
+            record(name, "out", output)
+        layer.register_forward_pre_hook(before, with_kwargs=True)
+        layer.register_forward_hook(after)
+        if index == 0:
+            for subname in ("linear_attn", "self_attn", "mlp"):
+                sub = getattr(layer, subname, None)
+                if sub is not None:
+                    sub.register_forward_pre_hook(lambda module, args, n=name + "." + subname: record(n, "in", args))
+                    sub.register_forward_hook(lambda module, args, output, n=name + "." + subname: record(n, "out", output))
+
+
 def prepare(run):
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
@@ -167,6 +202,8 @@ def install_hooks():
             raise RuntimeError(f"Incomplete native FP8 coverage: {len(local)} != {count}")
         print("ELASTIC_PD_FP8_COVERAGE", json.dumps(dict(pp_rank=runner.ps.pp_rank,
               layers=len(local), start=runner.model.start_layer, end=runner.model.end_layer)), flush=True)
+        if os.environ["ELASTIC_PD_ROLE"] == "prefill":
+            install_prefill_trace(runner)
         return result
     ModelRunner.load_model = load
     if os.environ["ELASTIC_PD_ROLE"] == "prefill":
