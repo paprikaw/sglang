@@ -86,6 +86,14 @@ def exercise(run, root, replay, p, d, key, info, health, save):
                 )
             )
         result["references"] = references
+        repeats = [
+            replay.request_one(p, d, key, tokens, 512, j, True, request_timeout_s=120)
+            for j, tokens in enumerate(prompts)
+        ]
+        result["serial_repeats"] = repeats
+        result["serial_repeat_matches"] = [
+            a["output_ids"] == b["output_ids"] for a, b in zip(references, repeats)
+        ]
         initial = observe()
         policy = ReactivePDPolicy("inplace", Parameters(**root["policy"]))
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -157,9 +165,16 @@ def exercise(run, root, replay, p, d, key, info, health, save):
         )
         if result["max_running_after_grow"] < 2:
             raise AssertionError("expanded KV did not execute two concurrent requests")
-        if not all(result["outputs_match"]):
-            raise AssertionError(
-                "concurrent warm outputs differ from static references"
+        # Preserve the strict check, but collect the static target-layout
+        # control and shrink/restore evidence before deciding qualification.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            result["static_pp3_concurrent"] = list(
+                executor.map(
+                    lambda item: replay.request_one(
+                        p, d, key, item[1], 512, item[0], True, request_timeout_s=120
+                    ),
+                    enumerate(prompts),
+                )
             )
         mapped = lambda state: sum(
             r["e2e_kv_capacity"]["physical"]["mapped_memory_bytes"]
@@ -242,6 +257,10 @@ def exercise(run, root, replay, p, d, key, info, health, save):
                     process.terminate()
                     process.wait(timeout=10)
         result["gpu_reuse"] = json.loads((run / "gpu_reuse_started.json").read_text())
+        if not all(result["serial_repeat_matches"]) or not all(result["outputs_match"]):
+            raise AssertionError(
+                "long-output static/concurrent equivalence failed; diagnostic controls preserved"
+            )
         result["passed"] = True
         save(
             run / "completed.json",
