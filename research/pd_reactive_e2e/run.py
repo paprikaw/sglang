@@ -112,6 +112,11 @@ def prepare(run, mechanism, kvcached_capacity=False):
     import shutil
     (run/'data').mkdir()
     shutil.copyfile(PRIOR/'data/traces.jsonl',run/'data/traces.jsonl')
+    # Each arm starts with fresh KV banks. Keep native tree/recycle isolation,
+    # but freeze the marker namespace across arms so tokenized inputs match.
+    root['paired_cache_namespace']=hashlib.sha256(b'pd-finite-paired-cache-v1\0'
+        +(run/'plan.json').read_bytes()+b'\0'+(run/'data/traces.jsonl').read_bytes()).hexdigest()
+    save(run/'config.json',root)
     (run/'harness').mkdir()
     for source in (PRIOR/'harness').glob('*.py'):
         shutil.copyfile(source,run/'harness'/source.name)
@@ -119,16 +124,22 @@ def prepare(run, mechanism, kvcached_capacity=False):
     shutil.copyfile(HERE/'stable_placement.py',run/'harness/stable_placement.py')
     shutil.copyfile(HERE/'lifecycle.py',run/'harness/reactive_lifecycle.py')
     shutil.copyfile(HERE/'finite_profile.py',run/'harness/finite_profile.py')
+    shutil.copyfile(HERE/'paired_cache_bust.py',run/'harness/paired_cache_bust.py')
     site=run/'harness/sitecustomize.py'
     site.write_text(site.read_text()+ '\nimport os as _finite_os\n'
         'if _finite_os.environ.get("AGENTX_FINITE_REQUEST_COUNT"):\n'
         '    from finite_profile import install as _install_finite\n'
-        '    _install_finite(int(_finite_os.environ["AGENTX_FINITE_REQUEST_COUNT"]))\n')
+        '    _install_finite(int(_finite_os.environ["AGENTX_FINITE_REQUEST_COUNT"]))\n'
+        'if _finite_os.environ.get("AGENTX_PAIRED_CACHE_NAMESPACE"):\n'
+        '    from paired_cache_bust import install as _install_paired_cache\n'
+        '    _install_paired_cache(_finite_os.environ["AGENTX_PAIRED_CACHE_NAMESPACE"])\n')
     entry=run/'harness/harness_entry.py';text=entry.read_text()
     marker='from agentx_cli import main'
     if text.count(marker)!=1:raise RuntimeError('unknown AgentX CLI entry')
     text=text.replace(marker, 'from finite_profile import install as install_finite_profile\n'
-        f'install_finite_profile({root["expected_profile_requests"]})\n\n'+marker)
+        f'install_finite_profile({root["expected_profile_requests"]})\n'
+        'from paired_cache_bust import install as install_paired_cache\n'
+        f'install_paired_cache({root["paired_cache_namespace"]!r})\n\n'+marker)
     entry.write_text(text)
     p=run/'harness/sglang_adapter.py'
     s=p.read_text()+ '\nfrom reactive_router import install as install_reactive\ninstall_reactive(Adapter)\n'
@@ -145,7 +156,7 @@ def prepare(run, mechanism, kvcached_capacity=False):
     if s.count(marker)!=1:raise RuntimeError('unknown AgentX harness return boundary')
     s=s.replace(marker,'        from reactive_lifecycle import hold_control_after_workload\n        await hold_control_after_workload(args.output.parent, code, adapter=adapter)\n'+marker)
     s=s.replace('"stable_placement.py", "mixed_replay.py", "sitecustomize.py")',
-                '"stable_placement.py", "mixed_replay.py", "sitecustomize.py", "reactive_lifecycle.py", "finite_profile.py")')
+                '"stable_placement.py", "mixed_replay.py", "sitecustomize.py", "reactive_lifecycle.py", "finite_profile.py", "paired_cache_bust.py")')
     p.write_text(s)
     ep=dict(mode='pd',require_hicache=True,api_key_file=root['admin_key_file'],
         prefill=[endpoint(servers['p'])],decode=[endpoint(c) for n,c in servers.items() if n.startswith('d')],
@@ -313,6 +324,7 @@ def client(run,root):
     env=dict(os.environ,**packet['environment'],HF_HUB_OFFLINE='1',TRANSFORMERS_OFFLINE='1',
         HF_HUB_CACHE=root['tokenizer_cache'],PYTHONPATH=str(run/'harness'),
         AGENTX_FINITE_REQUEST_COUNT=str(root['expected_profile_requests']),
+        AGENTX_PAIRED_CACHE_NAMESPACE=root['paired_cache_namespace'],
         AGENTX_MIXED_CONFIG_PATH=str(run/'plan.json'),AIPERF_DATASET_WEKA_PARALLEL_WORKERS='2')
     h.authenticate(run,cfg,env,local=True)
     stop=threading.Event();signal.signal(signal.SIGTERM,lambda *_:stop.set())

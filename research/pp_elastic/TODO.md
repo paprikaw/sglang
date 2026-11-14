@@ -1,4 +1,4 @@
-- [ ] **KVCacheD 短AgentX／BurstGPT配对验收。** 最小r6容量／缓存／输出／独立64 GiB复用通过。free回调修正的133项CPU检查通过；r4正式76请求／四任务树全部成功，扩容4.317秒、最终fence最长1.729秒，但缓冲审计未关闭便被读取，提前退出，未缩回。候选先排空审计再验证，保持HTTP控制至缩容后；25项相关CPU及实际Adapter的78条刷盘smoke通过。保留所有失败，不与未运行的旧副本准备目录混配。每实例一个活跃Decode限制仍在，完整配对尚待完成。
+- [ ] **KVCacheD 短AgentX／BurstGPT配对验收。** 最小r6容量／缓存／输出／独立64 GiB复用通过。r5两组各76请求、四任务树、扩缩往返、缩后输出和Guard清理／release全部通过；现有原地配置没有E2E或worker GPU时间收益。严格配对发现原生benchmark ID引起前缀分词变化，总输入差17 token；下一候选固定marker命名空间，保留原生树／recycle／warmup ledger，7项实际AgentX CPU检查通过。0.12%CPU取整差、GPU映射差、单Decode活跃请求、一轮伸缩和冷副本启动边界保留；新严格输入配对待完成，不放宽检查。
 
 # PP 原地伸缩＋HiCache：实现与实验清单
 
