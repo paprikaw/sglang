@@ -376,8 +376,21 @@ def controller(run, root):
         tokens = [1000 + (i * 31) % 20000 for i in range(512)]
         results["warmup"] = replay.request_one(p, d, key, tokens, 1, 0, True)
         prompt = tokens + [20000 + i for i in range(64)]
+        # D can cache a longer prefix after its first completed Decode than P
+        # cached during the original Prefill. Warm that boundary before taking
+        # the reference, so a cache-path difference is not blamed on migration.
+        results["full_prefix_warmup"] = replay.request_one(p, d, key, prompt, 64, 0, True)
         results["reference"] = replay.request_one(p, d, key, prompt, root["output_tokens"], 0, True)
+        results["static_repeat"] = replay.request_one(p, d, key, prompt, 64, 0, True)
+        results["static_repeat_match"] = (
+            results["static_repeat"]["output_ids"] == results["reference"]["output_ids"][:64]
+        )
         save(run / "results.partial.json", results)
+        for name in ("reference", "static_repeat"):
+            if results[name]["meta_info"].get("cached_tokens") != len(prompt):
+                raise AssertionError("Warm reference must use the complete D prefix: " + name)
+        if not results["static_repeat_match"]:
+            raise AssertionError("Unchanged-layout warm repetitions differ before migration")
         events = []
         original_stream = replay.stream
         def observed_stream(endpoint, key, payload, timeout=600, **kwargs):
@@ -426,6 +439,13 @@ def controller(run, root):
         ) for generation, sources, targets in (
             (1, (0, 2), (0, 1, 2)), (2, (0, 1, 2), (0, 2))) ]
         results["exact_output_match"] = results["reference"]["output_ids"] == results["active"]["output_ids"]
+        results["warm_start_match"] = all(
+            results["reference"][role].get("cached_tokens")
+            == results["active"][role].get("cached_tokens")
+            for role in ("prefill_meta", "meta_info")
+        )
+        if not results["warm_start_match"]:
+            raise AssertionError("Reference and transition request used different warm prefixes")
         if not results["exact_output_match"] or not results["active"]["output_ids"]:
             raise AssertionError("Transition output IDs differ from unchanged-layout warm reference")
         wait_file(run / "gpu_reuse_done.json", 60)
