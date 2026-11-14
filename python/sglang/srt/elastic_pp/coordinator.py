@@ -101,6 +101,11 @@ class ElasticPPMigrationCoordinator:
         if self.backing == "cpu_spill" and self.strategy not in {"sync", "batched"}:
             raise ValueError("CPU-spill backing requires sync or batched transition")
         self.cache_transition = cache_transition
+        # P/D transports pin registered CUDA addresses independently of the
+        # allocator.  Hooks run only on the scheduler thread at the fence.
+        self.before_backing_release = None
+        self.after_backing_restore = None
+        self.after_topology_commit = None
         self.enable_kv_patch = (
             bool(getattr(args, "enable_elastic_pp_kv_patch", False))
             if enable_kv_patch is None
@@ -111,6 +116,7 @@ class ElasticPPMigrationCoordinator:
         ):
             raise ValueError("online KV patch requires background/overlap transition")
         self._source_backing_attempted = False
+        self._registration_suspended = False
         self._source_backing_metrics: dict[str, Any] = {}
         self._layers_precopied = False
         self._background_weight_bytes_sent = 0
@@ -278,6 +284,7 @@ class ElasticPPMigrationCoordinator:
                 self._cpu_weight_reloader.reset_metrics()
             self._observed_cuda_allocated_peak = 0
             self._source_backing_attempted = False
+            self._registration_suspended = False
             self._source_backing_metrics = {}
             self._stage_seconds = {}
             self._stage_intervals = []
@@ -293,13 +300,13 @@ class ElasticPPMigrationCoordinator:
                 # This caller is the scheduler; allocator snapshots must never
                 # be taken from the preparation worker.
                 self.kv_transport.begin_live_patch(transition)
-                if (
-                    getattr(
-                        getattr(self.model_runner, "server_args", None),
-                        "elastic_pp_kv_base_precopy",
-                        False,
-                    )
-                    and getattr(self.cache_transition, "precopy", None) is not None
+                if getattr(
+                    getattr(self.model_runner, "server_args", None),
+                    "elastic_pp_kv_base_precopy",
+                    False,
+                ) and (
+                    getattr(self.cache_transition, "precopy", None) is not None
+                    or getattr(self.cache_transition, "initial_base_ready", False)
                 ):
                     # Successful capture proved HiCache writers quiescent. A
                     # later forward event covers earlier inference writes; new
@@ -581,6 +588,9 @@ class ElasticPPMigrationCoordinator:
             self._weights_reused = True
             self._layers_precopied = True
         self._kv_prepared = True
+        prepare_capacity = getattr(self.model_runner, "prepare_elastic_pp_kv_capacity", None)
+        if prepare_capacity is not None:
+            self._timed("prepare_kv_capacity", prepare_capacity, transition)
         self._timed("prepare_kv", self.kv_transport.prepare_transition, transition)
         if self._source_backing_attempted:
             self._source_backing_metrics["target_restore"] = (
@@ -623,6 +633,8 @@ class ElasticPPMigrationCoordinator:
         before = sample() if device.type == "cuda" else None
         # Partial release failures also require source reconstruction.
         self._source_backing_attempted = True
+        if self.before_backing_release is not None:
+            self.before_backing_release()
         invalidate = getattr(
             self.model_runner, "invalidate_elastic_pp_attention_state_views", None
         )
@@ -732,9 +744,19 @@ class ElasticPPMigrationCoordinator:
 
     def _precopy_cpu_cached_weights(self, transition):
         from sglang.srt.elastic_pp.cpu_weight_reload import CanonicalCpuWeightReloader
+        from sglang.srt.elastic_pp.marlin_cpu_weight_reload import (
+            MarlinCpuWeightReloader,
+        )
 
         if self._cpu_weight_reloader is None:
-            self._cpu_weight_reloader = CanonicalCpuWeightReloader(
+            args = self.model_runner.server_args
+            reloader = (
+                MarlinCpuWeightReloader
+                if getattr(args, "quantization", None) == "fp8"
+                and getattr(args, "moe_runner_backend", None) == "marlin"
+                else CanonicalCpuWeightReloader
+            )
+            self._cpu_weight_reloader = reloader(
                 model_runner=self.model_runner,
                 stream=self.layer_transport._migration_stream,
             )
@@ -747,6 +769,18 @@ class ElasticPPMigrationCoordinator:
             if edge.dst_rank == self.rank
             for layer_id in range(edge.layer_range.start, edge.layer_range.end)
         }
+        if isinstance(self._cpu_weight_reloader, MarlinCpuWeightReloader):
+            bank = self.model_runner._elastic_pp_prepared_graphs
+            if bank.building:
+                source = transition.source.layer_range(self.rank)
+                self._cpu_weight_reloader.capture(range(source.start, source.end))
+                works = self.layer_transport.start_sends(transition)
+                try:
+                    self.layer_transport.receive(transition)
+                finally:
+                    self.layer_transport.wait(works)
+                self._cpu_weight_reloader.capture(incoming)
+                return
         self._cpu_weight_reloader.reload(
             generation=transition.target.generation, layer_ids=incoming
         )
@@ -966,6 +1000,17 @@ class ElasticPPMigrationCoordinator:
             # Keep the source generation intact until all ranks can publish.
             local_error = None
             try:
+                validate_capacity = getattr(self.model_runner, "validate_elastic_pp_kv_capacity_at_fence", None)
+                if validate_capacity is not None:
+                    validate_capacity(transition)
+                if (
+                    self.backing == "overlap"
+                    and self.before_backing_release is not None
+                ):
+                    self._registration_suspended = True
+                    self._timed(
+                        "fence_registration_suspend", self.before_backing_release
+                    )
                 device = torch.device(getattr(self.model_runner, "device", "cpu"))
                 if device.type == "cuda":
                     # Dedicated transfer streams must observe all serving producers.
@@ -1233,6 +1278,9 @@ class ElasticPPMigrationCoordinator:
                 # From this point onward the local source generation cannot be
                 # restored, even if route publication or peer commit fails.
                 self._timed("fence_route_publish", commit_topology, transition.target)
+                if self.after_topology_commit is not None:
+                    self.after_topology_commit()
+                    self._registration_suspended = False
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
             reports = self._consensus(
@@ -1263,6 +1311,18 @@ class ElasticPPMigrationCoordinator:
                 "decode_graph", success=local_error is None, error=local_error
             )
             self._raise_peer_failures("Decode Graph rebuild", reports)
+
+            # New-serving work has not resumed. Reclaim retired VMM ranges here;
+            # the background cleanup must not device-fence a later NCCL receive.
+            local_error = None
+            try:
+                reclaim = getattr(self.model_runner, "reclaim_elastic_pp_kv_capacity_at_fence", None)
+                if reclaim is not None:
+                    self._timed("fence_capacity_reclaim", reclaim)
+            except BaseException as exc:
+                local_error = f"{type(exc).__name__}: {exc}"
+            reports = self._consensus("capacity_reclaim", success=local_error is None, error=local_error)
+            self._raise_peer_failures("KV capacity reclaim", reports)
 
             with self._condition:
                 self.current_topology = transition.target
@@ -1335,6 +1395,10 @@ class ElasticPPMigrationCoordinator:
                 if release_snapshot is not None:
                     release_snapshot(transition)
                 if cuda_cleanup:
+                    if transition.target.layer_range(self.rank).empty:
+                        # Return freed layer/KV allocator blocks to the driver;
+                        # residual resident control/context memory is separate.
+                        torch.cuda.empty_cache()
                     logger.info(
                         "Elastic PP generation=%d rank=%d cleanup CUDA allocated "
                         "%.3f -> %.3f GiB",
@@ -1404,6 +1468,12 @@ class ElasticPPMigrationCoordinator:
                         transition
                     ),
                 )
+        if (
+            self._source_backing_attempted or self._registration_suspended
+        ) and self.after_backing_restore is not None:
+            attempt("source P/D registration restore", self.after_backing_restore)
+            if not errors:
+                self._registration_suspended = False
         if errors:
             raise RuntimeError("; ".join(errors))
 

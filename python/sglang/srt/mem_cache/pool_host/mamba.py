@@ -60,7 +60,10 @@ class MambaPoolHost(HostKVCache):
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        from sglang.srt.elastic_pp.shared_host_cache import shared_pool_allocator
+
+        shared_allocator = shared_pool_allocator("mamba", device_pool)
+        self.allocator = shared_allocator or get_allocator_from_storage(allocator_type)
         self.num_mamba_layers = device_pool.num_mamba_layers
 
         self.conv_state_shapes = [
@@ -76,14 +79,16 @@ class MambaPoolHost(HostKVCache):
         self.dtype = self.conv_dtype
         self.size_per_token = self.get_size_per_token()
 
-        if host_size > 0:
+        if shared_allocator is not None:
+            self.size = shared_allocator.size
+        elif host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
 
-        self.page_num = self.size // self.page_size + 1
+        self.page_num = self.size // self.page_size + (shared_allocator is None)
         self.size = self.page_num * self.page_size
 
         if self.size <= device_pool.size:
@@ -97,7 +102,7 @@ class MambaPoolHost(HostKVCache):
 
         requested_bytes = self.size * self.size_per_token
         available_bytes = host_memory_budget_bytes()
-        if requested_bytes > available_bytes:
+        if shared_allocator is None and requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
                 f"{requested_bytes / 1e9:.2f} GB but only have "
@@ -347,7 +352,7 @@ class MambaPoolHost(HostKVCache):
                 dst_indices=dst_indices,
                 layer_id=layer_id,
                 item_size=item_size,
-                src_layout_dim=item_size * num_layers,
+                src_layout_dim=src.stride(0) * src.element_size(),
             )
         elif io_backend == "direct":
             transfer_kv_per_layer_direct_pf_lf(
@@ -389,7 +394,7 @@ class MambaPoolHost(HostKVCache):
                 src_indices=src_indices,
                 dst_indices=dst_indices,
                 item_size=item_size,
-                dst_layout_dim=item_size * num_layers,
+                dst_layout_dim=dst.stride(0) * dst.element_size(),
                 num_layers=num_layers,
             )
         elif io_backend == "direct":

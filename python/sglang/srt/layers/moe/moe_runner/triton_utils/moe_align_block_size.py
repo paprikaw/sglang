@@ -29,6 +29,46 @@ if _is_cuda:
 _CUDA_SMALL_BATCH_MAX_BUCKETS = 64
 
 
+def moe_align_block_size_deterministic(
+    topk_ids: torch.Tensor, block_size: int, num_experts: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stable expert grouping, including the -1 EP mask bucket.
+
+    Atomic token insertion can permute rows within an expert between calls.
+    Marlin's split-K grouping can then change floating-point accumulation. This
+    opt-in path orders each expert's rows by their original flattened route ID.
+    All output shapes depend only on input shape, expert count and block size.
+    """
+    count = topk_ids.numel()
+    capacity = (
+        count * block_size
+        if count < num_experts + 1
+        else count + (num_experts + 1) * (block_size - 1)
+    )
+    device = topk_ids.device
+    sorted_ids = torch.full((capacity,), count, dtype=torch.int32, device=device)
+    buckets = topk_ids.reshape(-1).to(torch.int64) + 1
+    counts = torch.zeros(num_experts + 1, dtype=torch.int64, device=device)
+    counts.scatter_add_(0, buckets, torch.ones_like(buckets))
+    padded_counts = ((counts + block_size - 1) // block_size) * block_size
+    padded_ends = padded_counts.cumsum(0)
+    starts = counts.cumsum(0) - counts
+    padded_starts = padded_ends - padded_counts
+    rows = torch.arange(count, device=device, dtype=torch.int64)
+    order = torch.argsort(buckets * (count + 1) + rows)
+    ordered_buckets = buckets[order]
+    destinations = padded_starts[ordered_buckets] + rows - starts[ordered_buckets]
+    sorted_ids.scatter_(0, destinations, order.to(torch.int32))
+    block_starts = torch.arange(
+        triton.cdiv(capacity, block_size), device=device, dtype=torch.int64
+    ) * block_size
+    expert_ids = (torch.bucketize(block_starts, padded_ends, right=True) - 1).to(
+        torch.int32
+    )
+    expert_ids.masked_fill_(block_starts >= padded_ends[-1], -1)
+    return sorted_ids, expert_ids, padded_ends[-1:].to(torch.int32)
+
+
 def moe_align_block_size(
     topk_ids: torch.Tensor,
     block_size: int,

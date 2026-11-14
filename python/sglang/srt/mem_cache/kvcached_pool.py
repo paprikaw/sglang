@@ -98,6 +98,7 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
     is_kvcached_elastic_pool = True
     physical_layer_partitioned = False
     _group_id = 0
+    capacity_managed = False
 
     def __init__(
         self,
@@ -467,6 +468,98 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
             raise RuntimeError("KVCacheD pool already has a logical SGLang allocator")
         self._logical_allocator = allocator
 
+    def _capacity_offsets(self, target, capacity):
+        manager = self.kvcached_allocator
+        pages = math.ceil((int(capacity) + 1) / int(manager.blocks_per_physical_page))
+        span = self._layer_group_total_span()
+        step = int(manager.physical_group_page_size)
+        return {g * span + p * step for g in self._active_layer_groups(target)
+                for p in range(pages)}
+
+    def _back_capacity(self, target, capacity):
+        from kvcached import vmm_ops
+        from kvcached.tp_ipc_util import map_worker_offsets_for_migration
+
+        if getattr(vmm_ops, "elastic_pp_stream_mapping_abi_version", None) != 1:
+            raise RuntimeError("KV capacity requires stream-fenced KVCacheD native ABI v1")
+        if (getattr(vmm_ops, "elastic_pp_rdma_mapping_abi_version", None) != 1
+                or os.getenv("KVCACHED_GPU_DIRECT_RDMA_REQUIRED") != "1"):
+            raise RuntimeError("P/D KV capacity requires RDMA-capable KVCacheD pages and native ABI v1")
+        if not map_worker_offsets_for_migration(
+            sorted(self._capacity_offsets(target, capacity)),
+            group_id=self._group_id, stream_fenced=True,
+        ):
+            raise RuntimeError("KVCacheD serving-capacity physical mapping failed")
+
+    def configure_serving_capacity(self, capacity):
+        if not self.physical_layer_partitioned or self.page_size != 1:
+            raise ValueError("KV capacity requires ownership-aware page-size-one backing")
+        if int(self.kvcached_allocator.layer_group_granularity) != 1:
+            raise ValueError("P/D KV capacity currently requires one attention layer per group")
+        capacity = int(capacity)
+        if not 0 < capacity <= self.size:
+            raise ValueError("KV serving capacity is outside the virtual reservation")
+        self._back_capacity(LayerRange(self.start_layer, self.end_layer), capacity)
+        self.capacity_managed = True
+        self.serving_capacity = capacity
+        self._pending_serving_capacity = None
+        self._logical_allocator.set_serving_capacity(capacity, initialize=True)
+
+    def prepare_serving_capacity(self, target, capacity, generation):
+        if not self.capacity_managed:
+            return
+        if not 0 < capacity <= self.size:
+            raise ValueError("KV capacity is outside the virtual reservation")
+        # A preparation thread must not inspect mutable serving slot sets.
+        # Retain the source ceiling until the drained commit validates shrink.
+        self._back_capacity(target, max(capacity, self.serving_capacity))
+        self._pending_serving_capacity = (int(generation), int(capacity))
+
+    def commit_elastic_pp_kv_layers(self, *, generation):
+        if self.capacity_managed:
+            pending = self._pending_serving_capacity
+            if pending is None or pending[0] != generation:
+                raise RuntimeError("KV capacity has no matching prepared generation")
+            self._logical_allocator.check_serving_capacity(pending[1])
+        target = super().commit_elastic_pp_kv_layers(generation=generation)
+        if self.capacity_managed:
+            self._logical_allocator.set_serving_capacity(pending[1])
+            self.serving_capacity = pending[1]
+            self._pending_serving_capacity = None
+        return target
+
+    def reclaim_capacity_at_fence(self):
+        if not self.capacity_managed:
+            return
+        from kvcached.tp_ipc_util import (
+            snapshot_worker_mapped_offsets,
+            unmap_worker_offsets_for_capacity,
+        )
+        desired = self._capacity_offsets(
+            LayerRange(self.start_layer, self.end_layer), self.serving_capacity
+        )
+        retired = set(snapshot_worker_mapped_offsets(self._group_id)) - desired
+        if not unmap_worker_offsets_for_capacity(sorted(retired), group_id=self._group_id):
+            raise RuntimeError("KVCacheD capacity reclamation failed")
+
+    def get_contiguous_buf_infos(self):
+        if not self.capacity_managed:
+            return super().get_contiguous_buf_infos()
+        tensors = self.k_buffer + self.v_buffer
+        rows = self.serving_capacity + 1
+        return ([t.data_ptr() for t in tensors],
+                [(rows - 1) * t.stride(0) * t.element_size()
+                 + t[0].numel() * t.element_size() for t in tensors],
+                [t[0].numel() * t.element_size() for t in tensors])
+
+    def pd_registration_regions(self):
+        """Register each mapped physical allocation without overlapping K/V."""
+        manager = self.kvcached_allocator
+        step = int(manager.physical_group_page_size)
+        pages = math.ceil((self.serving_capacity + 1) / manager.blocks_per_physical_page)
+        return [(k.data_ptr() + page * step, step)
+                for k in self.k_buffer for page in range(pages)]
+
     def _physical_page_ids_for_slots(self, slot_ids: torch.Tensor) -> set[int]:
         if not self.physical_layer_partitioned:
             return set()
@@ -633,6 +726,10 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
         range through ``_filter_worker_offsets``.
         """
 
+        if self.capacity_managed:
+            if self._pending_serving_capacity is None or self._pending_serving_capacity[0] != generation:
+                raise RuntimeError("capacity must be prepared before the KV fence")
+            return
         if not self.physical_layer_partitioned:
             return
         with self._elastic_pp_lock:
@@ -761,7 +858,12 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
             pending_ids = set(self._elastic_pp_pending_kv)
             # Validate the epoch before touching physical pages. Keep the base
             # transaction intact until unmapping succeeds, for safe retries.
-            self._unmap_layer_groups(pending_ids)
+            if not self.capacity_managed:
+                self._unmap_layer_groups(pending_ids)
+            # New pages remain harmless, unpublished backing after a prepare
+            # abort. Reclaim at the next drained fence or process exit; never
+            # device-synchronize from the background while serving NCCL waits.
+            self._pending_serving_capacity = None
             return super().abort_elastic_pp_kv_layers(generation=generation)
 
     def cleanup_elastic_pp_kv_layers(
@@ -782,7 +884,7 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
     def get_kv_size_bytes(self):
         # Report the configured serving budget, not KVCacheD's much larger
         # virtual-address reservation.
-        rows = self.size + self.page_size
+        rows = getattr(self, "serving_capacity", self.size) + self.page_size
         k_bytes = (
             self.layer_num * rows * self.head_num * self.head_dim * self.dtype.itemsize
         )
@@ -826,6 +928,9 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
                 "active_start_layer": self.start_layer,
                 "active_end_layer": self.end_layer,
                 "physical_layer_partitioned": self.physical_layer_partitioned,
+                "capacity_managed": self.capacity_managed,
+                "serving_capacity": getattr(self, "serving_capacity", self.size),
+                "virtual_capacity": self.size,
             }
         )
         return result
@@ -868,6 +973,8 @@ class _KVCacheDSlotTrackingMixin:
         ).reshape(-1)
         if self._elastic_pp_slot_tracker is not None:
             self._elastic_pp_slot_tracker.record_alloc(slots)
+        if self._elastic_pp_live_patch is not None:
+            self._elastic_pp_live_patch.allocated(slots)
         return slots
 
     def _record_freed_pages(self, page_ids: Iterable[int]) -> list[int]:
@@ -907,7 +1014,7 @@ class _KVCacheDSlotTrackingMixin:
                 )
             return self._elastic_pp_slot_tracker.initial_live_slots
         live_slots = self.elastic_pp_live_slots()
-        tracker_size = self.size + self.page_size - 1
+        tracker_size = getattr(self, "virtual_capacity", self.size) + self.page_size - 1
         self._elastic_pp_slot_tracker = ElasticKVSlotTracker(
             generation=generation,
             size=tracker_size,
@@ -946,6 +1053,7 @@ class KVCacheDTokenToKVPoolAllocator(
         need_sort: bool,
     ) -> None:
         super().__init__(size, 1, dtype, device, kvcache, need_sort)
+        self.virtual_capacity = int(size)
         self.kvcached_allocator = kvcache.kvcached_allocator
         self._initialize_slot_tracking()
         self.clear()
@@ -953,17 +1061,60 @@ class KVCacheDTokenToKVPoolAllocator(
 
     def clear(self) -> None:
         self._check_clear_allowed()
-        self.kvcached_allocator.clear()
+        if not getattr(self, "serving_capacity", None):
+            self.kvcached_allocator.clear()
         self._live_page_ids.clear()
         self.free_pages = torch.empty(0, dtype=torch.int64, device=self.device)
         self.release_pages = torch.empty(0, dtype=torch.int64, device=self.device)
         self.is_not_in_free_group = True
         self.free_group = []
+        if getattr(self, "serving_capacity", None):
+            self.free_pages = torch.arange(1, self.serving_capacity + 1,
+                                           dtype=torch.int64, device=self.device)
+
+    def check_serving_capacity(self, capacity):
+        if not 0 < capacity <= self.virtual_capacity:
+            raise ValueError("KV capacity is outside the reserved slot space")
+        if not self.is_not_in_free_group or self.free_group:
+            raise RuntimeError("KV capacity change requires completed deferred frees")
+        if self._live_page_ids and max(self._live_page_ids) > capacity:
+            raise RuntimeError("KV shrink must drain or evict live/cache slots above the target capacity")
+
+    def set_serving_capacity(self, capacity, initialize=False):
+        self.check_serving_capacity(capacity)
+        previous = getattr(self, "serving_capacity", self.size)
+        if initialize:
+            if self._live_page_ids:
+                raise RuntimeError("initial capacity must precede request admission")
+            self.free_pages = torch.arange(1, capacity + 1, dtype=torch.int64, device=self.device)
+        else:
+            self.merge_and_sort_free()
+            self.free_pages = self.free_pages[self.free_pages <= capacity]
+            if capacity > previous:
+                self.free_pages = torch.cat((self.free_pages, torch.arange(
+                    previous + 1, capacity + 1, dtype=torch.int64, device=self.device)))
+        self.serving_capacity = int(capacity)
+        # Existing hybrid pool invariants use allocator.size as the committed
+        # ceiling. Only the tensor pool keeps the virtual reservation size.
+        self.size = int(capacity)
 
     def available_size(self):
+        if getattr(self, "serving_capacity", None):
+            return len(self.free_pages) + len(self.release_pages)
         return int(self.kvcached_allocator.available_size())
 
+    @property
+    def size_full(self):
+        return getattr(self, "serving_capacity", self.size)
+
     def alloc(self, need_size: int):
+        if getattr(self, "serving_capacity", None):
+            if need_size < 0 or need_size > self.available_size():
+                return None
+            self.merge_and_sort_free()
+            pages = self.free_pages[:need_size]
+            self.free_pages = self.free_pages[need_size:]
+            return self._record_allocated_pages(self._as_int_list(pages))
         page_ids = self.kvcached_allocator.alloc(int(need_size))
         if page_ids is None:
             return None
@@ -975,8 +1126,14 @@ class KVCacheDTokenToKVPoolAllocator(
         if not self.is_not_in_free_group:
             self.free_group.append(self._copy_for_free_group(free_index))
             return
+        if self._elastic_pp_live_patch is not None:
+            # Drain any in-flight copy before making the source row reusable.
+            self._elastic_pp_live_patch.freeing(free_index)
         page_ids = self._record_freed_pages(self._as_int_list(free_index))
-        self.kvcached_allocator.free(page_ids)
+        if getattr(self, "serving_capacity", None):
+            self.release_pages = torch.cat((self.release_pages, free_index))
+        else:
+            self.kvcached_allocator.free(page_ids)
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)

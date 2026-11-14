@@ -555,10 +555,16 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.hisparse_coordinator = coordinator
 
     def get_worker_info(self):
+        # Tokenizer/request index tables retain the reserved upper bound. The
+        # Decode preallocator separately enforces the current serving ceiling.
+        from sglang.srt.elastic_pp.kv_capacity import full_pool
+
+        full = full_pool(self.model_runner)
+        request_capacity = (full.size if getattr(full, "capacity_managed", False)
+                            else self.model_runner.effective_max_total_num_tokens)
         max_req_len = min(
             self.model_config.context_len - 1,
-            self.model_runner.effective_max_total_num_tokens * self.ps.attn_dcp_size
-            - 1,
+            request_capacity * self.ps.attn_dcp_size - 1,
         )
         return (
             self.model_runner.max_total_num_tokens,

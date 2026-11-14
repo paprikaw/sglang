@@ -622,7 +622,7 @@ def owned_group(identity):
     return records
 
 
-def gpu_cleanup_evidence(identities):
+def gpu_cleanup_evidence(identities, *, require_node_gpu_idle=True, known_member_pids=()):
     output = subprocess.run(['nvidia-smi', '--query-compute-apps=pid,gpu_uuid,used_gpu_memory',
         '--format=csv,noheader,nounits'], text=True, capture_output=True, timeout=15, check=True).stdout
     apps = []
@@ -632,19 +632,25 @@ def gpu_cleanup_evidence(identities):
             apps.append(dict(pid=int(fields[0]), gpu_uuid=fields[1], used_gpu_memory_mib=fields[2]))
     remaining = [row for identity in identities for row in owned_group(identity)
                  if row['state'] != 'Z']
-    own_ids = {row['pid'] for row in remaining} | {row['pid'] for row in identities}
+    own_ids = ({row['pid'] for row in remaining} | {row['pid'] for row in identities}
+               | set(known_member_pids))
+    owned_apps = [row for row in apps if row['pid'] in own_ids]
     return dict(timestamp=time.time(), process_groups_exited=not remaining,
-        owned_gpu_processes=[row for row in apps if row['pid'] in own_ids],
+        owned_gpu_processes=owned_apps,
         observed_gpu_processes=apps, node_gpu_idle_observed=not apps,
-        cleanup_verified=not remaining and not apps,
-        scope='leased full node; foreign processes are observed, never signalled')
+        cleanup_verified=not remaining and not (apps if require_node_gpu_idle else owned_apps),
+        require_node_gpu_idle=require_node_gpu_idle,
+        scope=('leased full node; foreign processes are observed, never signalled'
+               if require_node_gpu_idle else
+               'owned groups and CUDA contexts only; whole-node idle is checked after all serving workers stop'))
 
 
-def cleanup(children):
+def cleanup(children, *, require_node_gpu_idle=True):
     """Bound owned-group shutdown and reaping; always obtain fresh GPU evidence."""
     identities = [child['identity'] for child in children]
     started = time.monotonic()
     errors, blocked, reaped = set(), set(), set()
+    known_members = {identity['pid'] for identity in identities}
 
     def group(identity):
         pid = identity['pid']
@@ -656,7 +662,9 @@ def cleanup(children):
                 ('uid', os.getuid()), ('start_ticks', identity['start_ticks']),
                 ('pgid', identity['pgid']), ('session', identity['pgid']))):
                 raise RuntimeError('Refusing a reused or foreign process identity')
-            return owned_group(identity)
+            rows = owned_group(identity)
+            known_members.update(row['pid'] for row in rows)
+            return rows
         except Exception as error:
             blocked.add(pid)
             errors.add(f'identity:{pid}:{type(error).__name__}')
@@ -721,7 +729,8 @@ def cleanup(children):
     while True:
         query_error = None
         try:
-            evidence = gpu_cleanup_evidence(identities)
+            evidence = gpu_cleanup_evidence(identities, require_node_gpu_idle=require_node_gpu_idle,
+                                            known_member_pids=known_members)
             observations.append(dict(timestamp=time.time(), query_passed=True,
                 cleanup_verified=evidence['cleanup_verified']))
         except Exception as error:

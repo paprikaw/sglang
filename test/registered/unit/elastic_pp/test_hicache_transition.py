@@ -278,6 +278,34 @@ def test_publish_rebinds_batches_policy_and_sessions():
     )
 
 
+def test_publish_updates_pd_queues_before_retired_cache_controller_is_destroyed():
+    from sglang.srt.disaggregation.decode_hicache_mixin import DecodeHiCacheTransferMixin
+    from sglang.srt.elastic_pp.hicache_transition import publish_scheduler_cache
+
+    counter = NS(producer_index=0, num_counters=3)
+    polled = []
+    old = NS(cache_controller=NS(layer_done_counter=counter),
+             is_load_back_event_done=lambda _: True)
+    new = NS(cache_controller=NS(layer_done_counter=counter),
+             is_load_back_event_done=lambda index: polled.append(index) or True)
+    metadata_queue, socket = [], object()
+    prealloc = NS(tree_cache=old, queue=metadata_queue, socket=socket)
+    transfer = DecodeHiCacheTransferMixin()
+    transfer.tree_cache, transfer.queue = old, []
+    scheduler = NS(tree_cache=old, disagg_decode_prealloc_queue=prealloc,
+                   disagg_decode_transfer_queue=transfer)
+    publish_scheduler_cache(scheduler, new, NS(canary_manager=None))
+    old.cache_controller = None
+    # Invoke the real native Decode restore poll which failed on GPU after
+    # commit, even with no pending restore requests.
+    transfer._process_hicache_local_restores(transfer.queue)
+    assert polled == [1]
+    assert prealloc.tree_cache is transfer.tree_cache is new
+    assert scheduler.disagg_decode_prealloc_queue is prealloc
+    assert scheduler.disagg_decode_transfer_queue is transfer
+    assert prealloc.queue is metadata_queue and prealloc.socket is socket
+
+
 def test_allocator_shrink_clips_only_free_high_capacity():
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.elastic_pp.hicache_transition import clone_host_allocator

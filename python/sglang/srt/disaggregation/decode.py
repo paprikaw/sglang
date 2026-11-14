@@ -490,7 +490,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             swa_len + swa_reserved,
         )
 
-    def _init_kv_manager(self) -> CommonKVManager:
+    def _build_kv_args(self):
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
@@ -540,6 +540,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        full_pool = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
+        if getattr(full_pool, "capacity_managed", False):
+            kv_args.kv_registration_regions = full_pool.pd_registration_regions()
+            kv_args.kv_row_strides = [int(t.stride(0)) * t.element_size()
+                                      for t in full_pool.k_buffer + full_pool.v_buffer]
         kv_args.kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
             if self.draft_token_to_kv_pool is None
@@ -564,6 +569,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
+        return kv_args
+
+    def _init_kv_manager(self) -> CommonKVManager:
+        kv_args = self._build_kv_args()
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,

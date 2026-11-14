@@ -205,6 +205,38 @@ def _coordinator(group=None, *, fence_step_provider=None, fence_lead_steps=0):
     return coordinator, transition, runner, kv_transport
 
 
+def test_overlap_registration_changes_only_at_fence_and_refreshes_after_commit():
+    coordinator, transition, runner, _ = _coordinator()
+    calls = []
+    coordinator.before_backing_release = lambda: calls.append(
+        ("suspend", runner.committed)
+    )
+    coordinator.after_topology_commit = lambda: calls.append(
+        ("refresh", runner.committed)
+    )
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    assert not calls
+    coordinator.finalize_at_fence(lambda _: None)
+    assert calls == [("suspend", False), ("refresh", True)]
+    assert not coordinator._registration_suspended
+    coordinator.start_cleanup()
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.DONE, timeout=2)
+
+
+def test_overlap_registration_is_restored_when_target_cannot_commit():
+    coordinator, transition, runner, _ = _coordinator(_Group(fail_stage="fence_copy"))
+    calls = []
+    coordinator.before_backing_release = lambda: calls.append("suspend")
+    coordinator.after_backing_restore = lambda: calls.append("restore")
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    with pytest.raises(RuntimeError):
+        coordinator.finalize_at_fence(lambda _: None)
+    assert calls == ["suspend", "restore"]
+    assert not runner.committed and coordinator.snapshot().source_usable
+
+
 @pytest.mark.parametrize("policy", ["reuse", "recopy", "offload"])
 def test_prepared_weight_policy_skips_only_verified_resident_weights(policy):
     coordinator, transition, runner, _ = _coordinator()

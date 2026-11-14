@@ -71,6 +71,20 @@ def test_prepared_graph_config_projects_and_rejects_unknown_target():
         bank.check_topology(PPTopology.from_layer_counts((14, 12, 14)))
 
 
+def test_static_kvcached_replica_can_prepare_a_single_layout():
+    cfg = args(pp_size=2, elastic_pp_initial_partition="20,20",
+               elastic_pp_graph_partitions="20,20", elastic_pp_kv_backend="kvcached",
+               elastic_pp_kv_capacities="8192", max_total_tokens=8192,
+               disaggregation_mode="decode", elastic_pp_disagg_decode=True,
+               enable_hierarchical_cache=True, pp_max_micro_batch_size=1,
+               max_running_requests=1, elastic_pp_transition_strategy="background",
+               elastic_pp_prepared_weight_policy="offload", elastic_pp_hicache_shared_host=True,
+               elastic_pp_weight_staging="cpu_prepacked", enable_elastic_pp_kv_patch=True,
+               elastic_pp_kv_patch_transport="nixl", page_size=1)
+    cfg._handle_pipeline_parallelism()
+    assert cfg._resolved().elastic_pp_graph_partitions == "20,20"
+
+
 @pytest.mark.parametrize(
     "weight_source", ["legacy", "pinned", "cpu_cache", "cpu_prepacked"]
 )

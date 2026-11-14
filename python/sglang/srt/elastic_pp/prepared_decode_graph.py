@@ -29,7 +29,9 @@ _BACKEND_FIELDS = (
 
 
 def validate_graph_partitions(args, initial):
-    partitions = parse_elastic_pp_partitions(args.elastic_pp_graph_partitions)
+    partitions = parse_elastic_pp_partitions(
+        args.elastic_pp_graph_partitions, allow_single=True
+    )
     if getattr(args, "elastic_pp_hicache_allocator", "mmap") == "pytorch" and (
         not args.enable_hierarchical_cache or args.hicache_storage_backend is not None
     ):
@@ -39,7 +41,8 @@ def validate_graph_partitions(args, initial):
     if args.disable_cuda_graph:
         raise ValueError("prepared Decode Graph requires CUDA Graph enabled")
     if (
-        args.elastic_pp_kv_backend != "native"
+        (args.elastic_pp_kv_backend != "native"
+         and not getattr(args, "elastic_pp_kv_capacities", None))
         or args.elastic_pp_transition_backing != "overlap"
     ):
         raise ValueError("prepared Decode Graph requires native/overlap backing")
@@ -399,9 +402,7 @@ def prewarm_scheduler_graph_bank(scheduler):
     bank = getattr(mr, "_elastic_pp_prepared_graphs", None)
     if bank is None:
         return
-    from sglang.srt.elastic_pp.coordinator import (
-        ElasticPPMigrationCoordinator,
-    )
+    from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
     from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationPhase as Phase
     from sglang.srt.elastic_pp.decode_graph import ElasticPPDecodeGraphState
     from sglang.srt.elastic_pp.topology import DynamicPPTransition
@@ -413,6 +414,12 @@ def prewarm_scheduler_graph_bank(scheduler):
     ):
         raise RuntimeError("prepared Graph warmup requires startup with no requests")
     original = scheduler._pp_topology()
+    registration = None
+    if getattr(mr.server_args, "elastic_pp_disagg_decode", False):
+        from sglang.srt.elastic_pp.pd_registration import DecodeRegistrationTransaction
+
+        registration = DecodeRegistrationTransaction(scheduler)
+        registration.suspend()
     initial = tuple(r.size for r in original.layer_ranges)
     started = time.monotonic()
     before = torch.cuda.memory_allocated()
@@ -471,5 +478,10 @@ def prewarm_scheduler_graph_bank(scheduler):
     else:
         bank.select(mr, entry)
         bank.runtime_selections = 0
+    from sglang.srt.elastic_pp.shared_host_cache import initialize_scheduler_shared_host
+
+    initialize_scheduler_shared_host(scheduler)
+    if registration is not None:
+        registration.refresh()
     scheduler.init_elastic_pp_migration_coordinator()
     logger.info("ELASTIC_PP_PREPARED_GRAPHS %s", bank.metrics())
