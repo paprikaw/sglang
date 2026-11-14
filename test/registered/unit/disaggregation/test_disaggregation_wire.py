@@ -46,6 +46,51 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestDisaggregationWire(unittest.TestCase):
+    def _partial_mamba_manager(self, dst_ids, dst_lens):
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.pp_size = 2
+        manager.attn_tp_size = 1
+        manager.kv_args = SimpleNamespace(
+            state_types=[StateType.MAMBA], state_data_ptrs=[[100, 200, 300, 400]],
+            state_item_lens=[[8, 8, 16, 16]], state_dim_per_tensor=[[]],
+            state_layer_ids=[[0, 1, 0, 1]],
+        )
+        peer = SimpleNamespace(
+            dst_pp_size=3, dst_attn_tp_size=1,
+            dst_state_data_ptrs=[[10000 * (i + 1) for i in range(len(dst_lens))]],
+            dst_state_item_lens=[dst_lens], dst_state_dim_per_tensor=[[]],
+            dst_state_layer_ids=[dst_ids],
+        )
+        manager.decode_kv_args_table = {"session": peer}
+        manager._transfer_data = Mock(return_value=0)
+        request = SimpleNamespace(mooncake_session_id="session", dst_state_indices=[[5]])
+        return manager, peer, request
+
+    def test_partial_mamba_transfer_checks_matching_global_layers(self):
+        manager, peer, request = self._partial_mamba_manager([1, 2, 1, 2], [8, 8, 16, 16])
+        self.assertEqual(manager.maybe_send_extra(request, [[3]], None, peer), 0)
+        manager._transfer_data.assert_called_once_with(
+            "session", [(224, 10040, 8), (448, 30080, 16)]
+        )
+
+    def test_dormant_mamba_receiver_requires_no_state_bytes(self):
+        manager, peer, request = self._partial_mamba_manager([], [])
+        self.assertEqual(manager.maybe_send_extra(request, [[3]], None, peer), 0)
+        manager._transfer_data.assert_called_once_with("session", [])
+
+    def test_partial_mamba_transfer_still_rejects_wrong_tensor_size(self):
+        manager, peer, request = self._partial_mamba_manager([1, 2, 1, 2], [9, 8, 16, 16])
+        with self.assertRaisesRegex(RuntimeError, "Mamba state layouts differ"):
+            manager.maybe_send_extra(request, [[3]], None, peer)
+        manager._transfer_data.assert_not_called()
+
+    def test_partial_mamba_transfer_rejects_missing_byte_metadata(self):
+        manager, peer, request = self._partial_mamba_manager([1, 2, 1, 2], [8, 8, 16, 16])
+        peer.dst_state_item_lens[0].pop()
+        with self.assertRaisesRegex(RuntimeError, "metadata is incomplete"):
+            manager.maybe_send_extra(request, [[3]], None, peer)
+        manager._transfer_data.assert_not_called()
+
     def test_mooncake_registration_staging_fields(self):
         msg = [
             b"room",

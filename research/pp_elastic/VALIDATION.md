@@ -1,4 +1,38 @@
+# 2026-11-14：122B P/D 权重恢复与在线 Decode 重叠
+
+r23冻结`5856c9ea8528a13decdc3393f8e782dcdfcba3d1`／tag `experiment/sglang/122b-pd-pp-eager-modules-20261114-r23`，固定P2、D PP2→PP3→PP2，HiCache／Graph／真实CPU权重offload保留。D启动预加载CUDA模块和数据，驱动确认三个rank均EAGER；与r20的`python/sglang`完全相同。新增rank1恢复38.04 GiB／1.671秒，同一RID输出12→101；准备期最大间隔34.0 ms，整轮最大177.8 ms，之前r20为1684.2 ms。扩／缩控制1.917／1.279秒、fence124.0／103.0 ms，客户端跨fence177.8／127.0 ms。每方向一次；未单独计量预加载冷启动／显存增量。
+
+512-token同暖参考逐个一致、无重算／retraction，新P→D、CPU恢复576 token、Graph运行时capture=0及原Decode继续时独立64 GiB复用通过。退役rank物理层权重／KV为0，仍allocated1.03／reserved1.78 GiB，worker未退出。Guard后检查、CPU缓存审计、owned cleanup及release通过，未运行完整E2E。
+
+130项相关CPU检查覆盖r20恢复完成前不得发布、查询错误及中途copy失败后排空；r20至r23引擎代码相同，不重复跑未变套件。r21／r22仅增加opt-in原生采样，CPU精确PID ptrace smoke和外部定时在父进程持GIL时采样通过；GPU两个诊断往返亦通过，但采样耗时不作性能重复。r22栈显示NIXL的首次gather卡在cudaLaunchKernel驱动路径、权重线程query等runtime mutex；r23只前移模块／数据加载后长停顿消失，支持首次加载同步解释，未逐一拆分内部驱动调用。r19原退出根因仍未定。五轮成功原件的512-token序号、511个间隔、两个fence、HiCache／Graph、目标权重／KV归零和数据哈希已复算。[简洁报告及图](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/WEIGHT_DECODE_OVERLAP.md) · [原值及SHA256](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/qwen122b_pd_weight_decode_overlap_20261114/overlap_evidence.json)。P侧、多请求、在途交接、固定容量外的扩展、完整E2E及整卡退出资格保持未验证。
+
 # EP／PP／P/D 集成基线验证
+
+## 2026-11-14：迁移开销审计与准备期长间隔定位
+
+只新增opt-in CPU栈／心跳诊断，r19源码`54ab8e4b53722dc1c961dc0b1d7c32c08c7f0f0e`、tag `experiment/sglang/122b-pd-pp-overhead-20261114-r19`；`python/sglang`与r18完全相同。辅助函数返回／异常传播和清理的两种CPU smoke通过，未新增完整CPU套件或引擎资格。复算r16／r18成功原件的511个相邻token间隔与分项：新扩容准备期1.683秒，新增rank1的38.04 GiB H2D为1.673秒；最终fence128.9毫秒发生在稍后，不是该长间隔本身。
+
+r19扩容控制1.946秒、fence127.6毫秒，三rank各8个200毫秒栈样本：rank1主线程在GPU输出irecv，后台线程等权重流完成，其他rank等P/D消息；CPU心跳最长约20毫秒。尚未隔离NCCL／CUDA内部因果。随后缩容准备时rank0退出、HTTP RemoteDisconnected；整轮失败，不能用于新的正确性资格、完整往返性能或稳定性结论。Guard后检查科学成功false、缓存审计及清理true，租约已释放。失败根因未定，不自动追加GPU复测。见[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/MIGRATION_OVERHEAD_AUDIT.md)及[可复算数据／SHA256](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/qwen122b_pd_migration_overhead_audit_20261114/overhead_audit.json)。下列r18成功资格保持原范围，不把r19失败隐藏为性能样本。
+
+## 2026-11-14：122B P/D接入最新共享HiCache／Graph／CPU权重优化
+
+冻结`dccbefa3c9c76ff33e9fdcd8b572a5bb62ee2e2f`，tag `experiment/sglang/122b-pd-pp-optimized-20261114-r18`，Draft PR #13。固定P2、D侧24/0/24→16/16/16→24/0/24、FP8 Marlin TP1 EP1、单请求及交接静止边界；保留HiCache与确定性模式，启用启动Graph库、非驻留CPU权重、共享CPU HiCache及后台NIXL增量KV。512-token同暖输出逐个一致、无retraction／重新Prefill，新P→D请求及实际CPU恢复576 token通过；共享底层未改变、历史CPU载荷复制0、运行期Graph capture0且有replay、非活跃权重物理页0。独立进程分配并写入64 GiB及矩阵计算时原Decode继续。
+
+控制调用扩／缩1.940／1.262秒；最终暂停128.9／103.3毫秒，各rank协调器完成最长1.930／1.276秒；每方向一次。准备期仍有1.683秒出token间隔，不能宣称转换成本完全隐藏。启动预热约28.2秒、三rank处理后CPU权重池实际19.02／38.04／19.02 GiB另计。缩回后中间rank层权重映射0、KV0，allocated约1.03 GiB、reserved约1.78 GiB，worker未退出。活跃4→5→4卡，驻留worker5卡，Guard整节点8卡。1275项组合CPU检查、启动VMM逐层回收修复后的74项相关检查、73项保存结果复算及Guard后检查／缓存审计／清理通过；r17启动OOM原失败保留。P侧、多请求、在途交接、容量增益及完整E2E未验证。[结果与原始证据](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/OPTIMIZED_PP_VALIDATION.md)。
+
+## 2026-11-14：122B A100原生P/D下的最小D侧PP扩缩
+
+冻结 `d8c614d14e6c7844df780a8f513e16f3afad7e1e`，tag `experiment/sglang/122b-pd-pp2-pp3-roundtrip-20261114-r16`，Draft PR #13。完整Qwen3.5-122B-A10B-FP8／A100 Marlin W8A16，EP1、Eager、HiCache每rank 8 GiB、确定性模式、同步CPU spill；P固定PP2，D为24/0/24→16/16/16→24/0/24。最终移除逐层同步和Expert复算钩子后，静态重复、同一请求跨两次转换的512-token完整暖输出、新P→D交接和CPU恢复后32-token输出均与相应暖参考逐个一致，无retraction／重新Prefill。两个活跃D rank实际从CPU恢复576 token。182项相关CPU检查与28项保存结果复算通过；不扩大为冷暖生成等价、真实任务质量或长期稳定性。
+
+缩回后独立进程在GPU1分配／写入64 GiB、矩阵乘并保持5秒，原Decode同期继续；中间rank的KV为0，allocated约1.51 GiB、reserved约2.98 GiB，控制worker与边界张量仍驻留，因此是实际显存复用资格，不是完整worker退出。扩／缩控制8.573／8.061秒，fence约8.306／7.747秒，各一次；不作为重复均值或性能收益。固定P2加上D的活跃计算卡数4→5→4，物理worker5卡，Guard整节点8卡。4183项冻结输入、缓存使用审计、owned清理及Guard postcheck通过，租约正常释放。P伸缩、在途P→D、多请求、Graph、可用KV容量增加及E2E尚未验证。r1–r14原失败与带诊断的r15成功原样保留。[精简报告与证据](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/qwen122b_pd_elastic_roundtrip_20261114/summary.md)。
+
+## 2026-11-13：共享CPU HiCache，有限同源对照通过
+
+PR #10已以`8570a9153a76`合入项目。新任务[PR #11](https://github.com/paprikaw/sglang/pull/11)的冻结源码`d9a5731c1222f7b77d3a9c497da005ffd08fc94f`／tag `experiment/sglang/pp-hicache-shared-host-20261113-r2`通过1206项完整CPU检查，零失败／错误／跳过，监督139.131秒，源码未变。Black通过；两处既有import的isort欠账在基点也存在，不宣称全仓CI通过。
+
+同A100节点、35B BF16／B1、HiCache、NIXL、CPU预打包权重、候选权重offload、启动Graph，只改变共享CPU开关，各一次PP2→PP3→PP2。私有→共享扩／缩最终暂停105.2／88.5→43.8／39.0 ms、完整转换1.342／0.879→1.007／0.610秒；客户端跨fence间隔129.6／102.0→70.6／52.4 ms，准备期最大间隔74.1／96.2→26.5／58.0 ms。共享模式各rank历史CPU快照／发送／复制均0，物理region身份贯穿往返一致；每方向2048输出与各自同进程暖参考及配对模式逐token一致，真实CPU前缀loadback、在线KV、Graph replay和runtime capture=0通过。非活跃GPU权重页为0，缩回中间GPU释放20.37890625 GiB权重显存。共享／私有142／138项冻结输入匹配，监督含清理242.341／189.582秒，owned清理、节点GPU空闲观测及正常release通过。每模式一次，不作重复均值或整体吞吐结论。
+
+首版`e8cea6e148b1`的A100启动被额外L3 Gloo建组阻塞，没有请求或性能结果，254.904秒内清理及release通过。修正版L2-only视图不建这类组，空阶段采用共享容量；失败及此前两项CPU替身接口失败均保留。当前限定单节点TP1／EP1 native page_first/kernel L2，CPU容量固定；独立review、更多模型／并发、跨节点、冷暖生成等价及整卡归还未扩展。见[专题报告](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/sglang_pp_hicache_shared_host_20261113/summary.md)及[接入说明](SHARED_HOST_CACHE.md)。任务PR仍Draft，总PR #12尚未包括该变更。
 
 ## 2026-11-13：CPU批量HiCache及旧GPU KV基础复制
 

@@ -1337,7 +1337,7 @@ def _skip_qwen35_pp_weight(model, layer_id):
 class Qwen3_5ForCausalLM(ElasticPPModelMixin, nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
-    elastic_pp_quantization_methods = (None, "moe_wna16")
+    elastic_pp_quantization_methods = (None, "moe_wna16", "fp8")
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -1422,8 +1422,8 @@ class Qwen3_5ForCausalLM(ElasticPPModelMixin, nn.Module):
         if self._elastic_pp_enabled and quant_config is not None:
             if quant_config.get_name() not in self.elastic_pp_quantization_methods:
                 raise NotImplementedError(
-                    "Qwen3.5 elastic PP supports BF16/FP16 and moe_wna16; "
-                    "launch GPTQ Int4 weights with --quantization moe_wna16"
+                    "Qwen3.5 elastic PP supports BF16/FP16, moe_wna16 and "
+                    "post-load FP8 runtime-state transfer"
                 )
 
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None

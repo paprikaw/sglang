@@ -121,6 +121,7 @@ def fused_experts_none_to_marlin(
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+    from sglang.srt.runtime_context import get_exec
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -205,6 +206,7 @@ def fused_experts_none_to_marlin(
         gemm1_alpha=runner_config.gemm1_alpha,
         activation=runner_config.activation,
         is_gated=runner_config.is_gated,
+        deterministic=get_exec().deterministic.enable_deterministic_inference,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(

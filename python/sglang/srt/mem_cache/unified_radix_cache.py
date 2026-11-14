@@ -513,6 +513,10 @@ class UnifiedRadixCache(BasePrefixCache):
         reconstruction needs backend-specific recovery; refusing that case is
         safer than leaving stale host pointers behind.
         """
+        if getattr(self, "_elastic_pp_shared_host_bank", None) is not None:
+            raise RuntimeError(
+                "shared PP host backing requires coordinated node-wide suspension"
+            )
         if self._hicache_host_suspended:
             return
         if self.cache_controller is None or self.host_pool_group is None:
@@ -546,7 +550,10 @@ class UnifiedRadixCache(BasePrefixCache):
             _COMPONENT_HOST_ATTR,
         )
 
-        for component_type, (cache_attr, component_attr) in _COMPONENT_HOST_ATTR.items():
+        for component_type, (
+            cache_attr,
+            component_attr,
+        ) in _COMPONENT_HOST_ATTR.items():
             if component_type in self.components:
                 setattr(self, cache_attr, None)
                 setattr(self.components[component_type], component_attr, None)
