@@ -58,7 +58,7 @@ def memory_size_json(value):
     return int(value)
 
 
-def prepare(run, optimized=True, diagnostic_prepare=False):
+def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False):
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
     dirty = subprocess.check_output(["git", "-C", str(ENGINE), "status", "--porcelain"], text=True)
@@ -91,6 +91,7 @@ def prepare(run, optimized=True, diagnostic_prepare=False):
         cfg.update(optimized_elastic_pp=optimized and role == "decode",
                    cuda_graph=optimized and role == "decode", hicache_size_gib=8,
                    prepare_diagnostic_dir=str(run / "diagnostics") if diagnostic_prepare and role == "decode" else None,
+                   native_prepare_dir=str(run / "native_stacks") if native_prepare and role == "decode" else None,
                    cpu_weight_cache_gib=64 if optimized and role == "decode" else 0,
                    nixl_root=str(NIXL_ROOT) if optimized and role == "decode" else None)
         nodes[node] = cfg
@@ -109,6 +110,7 @@ def prepare(run, optimized=True, diagnostic_prepare=False):
                   admission="quiescent P/D transfers during PP transitions",
                   optimized_elastic_pp=optimized,
                   diagnostic_prepare=diagnostic_prepare,
+                  native_prepare=native_prepare,
                   logical_gpu_counts=[4, 5, 4], resident_worker_gpus=5,
                   reserved_gpus=8, gpu_reuse_probe_gib=64)
     config["deterministic_inference"] = True
@@ -160,6 +162,8 @@ def environment(cfg):
         env.update(UCX_PROTO_INFO="y", UCX_LOG_LEVEL="info")
     if cfg.get("prepare_diagnostic_dir"):
         env["ELASTIC_PD_PREPARE_DIAGNOSTICS"] = cfg["prepare_diagnostic_dir"]
+    if cfg.get("native_prepare_dir"):
+        env["ELASTIC_PD_NATIVE_STACKS"] = cfg["native_prepare_dir"]
     return env
 
 
@@ -229,6 +233,10 @@ def install_hooks():
             import prepare_stall_diagnostics
             prepare_stall_diagnostics.install(ElasticPPMigrationCoordinator,
                 os.environ["ELASTIC_PD_PREPARE_DIAGNOSTICS"])
+        if os.environ.get("ELASTIC_PD_NATIVE_STACKS"):
+            import prepare_native_stacks
+            prepare_native_stacks.install(ElasticPPMigrationCoordinator,
+                os.environ["ELASTIC_PD_NATIVE_STACKS"])
         old_state = Scheduler.get_internal_state
 
         def state(scheduler, *args, **kwargs):
@@ -591,12 +599,14 @@ def main():
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--sync-baseline", action="store_true")
     parser.add_argument("--diagnostic-prepare", action="store_true")
+    parser.add_argument("--native-prepare", action="store_true")
     for option in ("prepare", "worker", "engine", "probe"):
         parser.add_argument("--" + option, action="store_true")
     args = parser.parse_args()
     run = args.run.resolve()
     if args.prepare:
-        return prepare(run, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare)
+        return prepare(run, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare,
+                       native_prepare=args.native_prepare)
     root = json.loads((run / "config.json").read_text())
     if args.worker:
         return worker(run, root)

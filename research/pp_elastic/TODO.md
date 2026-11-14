@@ -2,7 +2,7 @@
 
 ## 122B／A100：P/D 下的最小扩缩容（2026-11-14）
 
-- [ ] **消除权重恢复期间的在线等待。** 用户授权继续最小往返；先只将FP8 Marlin后台恢复的CUDA阻塞等待改成完成查询＋主机短睡眠，保持原通信协议、搬运字节、HiCache、offload及就绪条件。130项相关CPU检查通过，覆盖未完成／复制异常时不能发布层；单次P2固定、D PP2→PP3→PP2待核对客户端间隔、同RID在H2D期间的进度、输出／CPU恢复与独立64 GiB复用，不铺开E2E。默认关闭r19栈定时器，失败另存原件。
+- [ ] **消除权重恢复期间的在线等待。** r20（`45ec3f33c680`）仅将FP8 Marlin后台恢复的CUDA阻塞等待改成完成查询＋主机短睡眠：130项相关CPU、完整512-token往返输出、HiCache恢复、独立64 GiB复用及Guard清理通过，但准备期长间隔仍1.684秒。rank1一次本应快速返回的stream.query竟耗时1.658秒，缩容查询均微秒级；说明单纯改变Python等待方式无效。继续用一次原生C++栈定位底层API阻塞，保持原通信协议、真实权重搬运及HiCache/offload；修正研究入口保存字段遗漏，使复制前后请求进度可见。Nsight在CPU小程序中暴露新进程组／退出语义差异，未用于GPU；改用只授权确切调试子PID的一次py-spy dump，不开启r19栈定时器。不是E2E。
 
 - [x] **1.68秒间隔已完成分项核查与首轮阻塞定位。** r18第13→14个token相隔1.683秒，早于第16个token后的最终交接；新增rank1实际恢复38.04 GiB权重，H2D为1.673秒。r19同引擎代码的opt-in诊断中，rank1的8次主线程快照都在GPU输出`irecv`，其后台线程等H2D stream；rank0／2在P/D消息等待，心跳最大间隔约20毫秒。仅收窄到空阶段输出通信与权重恢复的耦合，CUDA／NCCL内部同步因果未隔离。r16→r18控制扩／缩8.573／8.061→1.940／1.262秒，旧客户端9.308／8.145秒长间隔与控制边界分开报告。见[迁移开销专题](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/MIGRATION_OVERHEAD_AUDIT.md)及[复算、511个间隔、原件SHA256](/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/experiments/qwen122b_pd_migration_overhead_audit_20261114/overhead_audit.json)。诊断辅助仅CPU返回／异常清理smoke通过，未扩大引擎执行资格。
 

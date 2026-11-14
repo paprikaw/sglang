@@ -334,6 +334,7 @@ def state_evidence(info):
         "transition_request_execution_scope",
         "transition_request_execution",
         "transition_active_output_lengths",
+        "transition_weight_copy_progress",
         "agentx_cache_probe",
         "agentx_restores",
         "elastic_pp_state",
