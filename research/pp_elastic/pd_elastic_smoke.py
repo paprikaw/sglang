@@ -58,7 +58,7 @@ def memory_size_json(value):
     return int(value)
 
 
-def prepare(run, optimized=True):
+def prepare(run, optimized=True, diagnostic_prepare=False):
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
     dirty = subprocess.check_output(["git", "-C", str(ENGINE), "status", "--porcelain"], text=True)
@@ -90,6 +90,7 @@ def prepare(run, optimized=True):
                    dist_port=29482 + index * 10, bootstrap_port=29479)
         cfg.update(optimized_elastic_pp=optimized and role == "decode",
                    cuda_graph=optimized and role == "decode", hicache_size_gib=8,
+                   prepare_diagnostic_dir=str(run / "diagnostics") if diagnostic_prepare and role == "decode" else None,
                    cpu_weight_cache_gib=64 if optimized and role == "decode" else 0,
                    nixl_root=str(NIXL_ROOT) if optimized and role == "decode" else None)
         nodes[node] = cfg
@@ -107,6 +108,7 @@ def prepare(run, optimized=True):
                   engine_root=str(ENGINE), output_tokens=512,
                   admission="quiescent P/D transfers during PP transitions",
                   optimized_elastic_pp=optimized,
+                  diagnostic_prepare=diagnostic_prepare,
                   logical_gpu_counts=[4, 5, 4], resident_worker_gpus=5,
                   reserved_gpus=8, gpu_reuse_probe_gib=64)
     config["deterministic_inference"] = True
@@ -156,6 +158,8 @@ def environment(cfg):
     if cfg.get("optimized_elastic_pp"):
         env["PYTHONPATH"] = cfg["nixl_root"] + os.pathsep + env["PYTHONPATH"]
         env.update(UCX_PROTO_INFO="y", UCX_LOG_LEVEL="info")
+    if cfg.get("prepare_diagnostic_dir"):
+        env["ELASTIC_PD_PREPARE_DIAGNOSTICS"] = cfg["prepare_diagnostic_dir"]
     return env
 
 
@@ -196,6 +200,10 @@ def install_hooks():
         from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
         probe.install_diagnostic_fanout(Scheduler, TokenizerControlMixin)
         probe.install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator)
+        if os.environ.get("ELASTIC_PD_PREPARE_DIAGNOSTICS"):
+            import prepare_stall_diagnostics
+            prepare_stall_diagnostics.install(ElasticPPMigrationCoordinator,
+                os.environ["ELASTIC_PD_PREPARE_DIAGNOSTICS"])
         old_state = Scheduler.get_internal_state
 
         def state(scheduler, *args, **kwargs):
@@ -430,7 +438,12 @@ def controller(run, root):
         events = []
         original_stream = replay.stream
         def observed_stream(endpoint, key, payload, timeout=600, **kwargs):
-            return original_stream(endpoint, key, payload, timeout, event_sink=events)
+            anchor = dict(wall=time.time(), perf_counter=time.perf_counter())
+            result = original_stream(endpoint, key, payload, timeout, event_sink=events)
+            if root.get("diagnostic_prepare"):
+                result["diagnostic_clock_anchor"] = anchor
+                result["diagnostic_stream_started"] = result["started"]
+            return result
         replay.stream = observed_stream
         try:
             with cf.ThreadPoolExecutor(max_workers=1) as executor:
@@ -547,12 +560,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--sync-baseline", action="store_true")
+    parser.add_argument("--diagnostic-prepare", action="store_true")
     for option in ("prepare", "worker", "engine", "probe"):
         parser.add_argument("--" + option, action="store_true")
     args = parser.parse_args()
     run = args.run.resolve()
     if args.prepare:
-        return prepare(run, optimized=not args.sync_baseline)
+        return prepare(run, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare)
     root = json.loads((run / "config.json").read_text())
     if args.worker:
         return worker(run, root)

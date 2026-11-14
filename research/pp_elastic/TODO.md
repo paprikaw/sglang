@@ -2,6 +2,8 @@
 
 ## 122B／A100：P/D 下的最小扩缩容（2026-11-14）
 
+- [ ] **查验扩容准备期1.68秒出token间隔。** 先复核r16／r18分项和计时口径，再用同一最小往返的opt-in线程栈／时钟采样识别阻塞点；不改变权重驻留、缓存或调度策略，不铺开完整E2E。诊断数据与无采样r18分开保存。
+
 - [x] **最新优化接入D侧P/D最小验证通过。** r18（`dccbefa3c9c7`）保留确定性模式、共享CPU HiCache、后台／NIXL增量KV、Graph启动预热、非驻留FP8 Marlin CPU权重及P/D注册地址交接。同一RID的512-token暖输出逐个一致；新P→D请求、CPU实际恢复576 token及独立进程64 GiB复用通过。扩／缩控制1.940／1.262秒，最终暂停129／103毫秒，准备期仍有1.683秒出token间隔；中间rank层权重／KV为0，worker仍驻留、reserved约1.78 GiB。1275项组合CPU、随后74项相关检查、73项保存结果复算及Guard清理／release通过。FP8 CPU池由启动期处理后的GPU权重导出，与BF16纯CPU packing区别记录。P侧、多请求、在途交接、容量增益及完整E2E仍未验证，本轮不铺开。见[完整结果](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/OPTIMIZED_PP_VALIDATION.md)、[实现范围](OPTIMIZED_PD_PATH.md)及[端到端计划](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/EXPERIMENT_PLAN.md)。
 
   优化路径r17在启动期VMM权重转换OOM，未开始请求；Guard确认进程清理及租约释放。修复为转换前及逐层归还旧PyTorch空闲块，避免额外显存累计，新增受限显存模拟回归；74项相关CPU检查及同配置r18 GPU往返通过。失败证据保留。
