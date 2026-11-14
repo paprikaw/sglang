@@ -76,7 +76,7 @@ def prepare(run, mechanism):
         model_path=old['model_path'],client_node=cfgs[1]['node'],per_instance_admission=4,
         policy=dict(high_wait_s=2,up_hold_s=2,down_hold_s=30,residence_s=15,max_gpus=8),
         slo=dict(ttft_s=15,tpot_s=.150,joint_target=.90),
-        context_length=65536,max_total_tokens=131072,max_running_requests=4,
+        context_length=65536,max_total_tokens=262144,max_running_requests=4,
         baseline_startup='new PP2 process using admitted ready node-local canonical CPU weights',
         max_scale_cycles=1,full_drain=True,wall_timeout_s=1080)
     save(run/'config.json',root)
@@ -154,6 +154,9 @@ def engine(run, root, sid):
         save(run/'servers'/sid/'effective_launch.json',dict(argv=flags,source=root['engine_commit']))
         return original(flags)
     server_args.prepare_server_args=arguments
+    q.engine_entry(run,cfg)
+
+def install_telemetry():
     from sglang.srt.managers.scheduler import Scheduler
     old=Scheduler.get_internal_state
     def state(scheduler,*args,**kw):
@@ -162,14 +165,18 @@ def engine(run, root, sid):
         reqs=live() if live else getattr(getattr(scheduler,'running_batch',None),'reqs',[])
         reqs={r.rid:r for r in reqs if not r.finished()}
         pd_pending=0
-        if cfg['role']=='decode':
+        if os.environ['ELASTIC_PD_ROLE']=='decode':
             from sglang.srt.elastic_pp.pd_registration import pending_pd_work
             pd_pending=pending_pd_work(scheduler)
         result.internal_state['e2e_runtime']=dict(running=len(reqs),waiting=len(scheduler.waiting_queue),
             pd_pending=pd_pending,output_tokens={r:len(x.output_ids) for r,x in reqs.items()})
         return result
     Scheduler.get_internal_state=state
-    q.engine_entry(run,cfg)
+
+
+if os.environ.get("ELASTIC_PD_ROLE"):
+    install_telemetry()
+
 
 def worker(run,root,sid):
     cfg=root['servers'][sid]
@@ -261,7 +268,7 @@ def coordinator(run,root):
         ident=h.process_record(os.getpid())
         save(run/'task/progress.json',dict(experiment_id=root['id'],task_id='comparison',timestamp=time.time(),
             stage=stage,controller_pid=os.getpid(),controller_start_ticks=ident['start_ticks'],process_start_ticks=ident['start_ticks'],
-            valid_points=0,expected=1))
+            valid_points=int(stage == "complete"),expected=1))
     def visible(path,seconds=1200):
         deadline=time.monotonic()+seconds
         while not path.exists():
@@ -341,7 +348,10 @@ def coordinator(run,root):
         progress('loading_P2_D2')
         launch('p');launch('d0')
         visible(run/'servers/p/ready.json');visible(run/'servers/d0/ready.json')
-        save(run/'state.initial.json',dict(prefill=info('p'),decode=info('d0')))
+        initial=dict(prefill=info('p'),decode=info('d0'))
+        if not all('e2e_runtime' in state for state in initial['decode']['internal_states']):
+            raise RuntimeError('spawned GPU workers lack queue telemetry')
+        save(run/'state.initial.json',initial)
         p,d=[dict(host=root['servers'][n]['node'],port=root['servers'][n]['port'],ep=1,
             bootstrap_port=root['servers'][n]['bootstrap_port']) for n in ['p','d0']]
         tokens=[1000+i%123 for i in range(256)]
