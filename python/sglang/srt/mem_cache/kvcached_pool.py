@@ -482,6 +482,9 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
 
         if getattr(vmm_ops, "elastic_pp_stream_mapping_abi_version", None) != 1:
             raise RuntimeError("KV capacity requires stream-fenced KVCacheD native ABI v1")
+        if (getattr(vmm_ops, "elastic_pp_rdma_mapping_abi_version", None) != 1
+                or os.getenv("KVCACHED_GPU_DIRECT_RDMA_REQUIRED") != "1"):
+            raise RuntimeError("P/D KV capacity requires RDMA-capable KVCacheD pages and native ABI v1")
         if not map_worker_offsets_for_migration(
             sorted(self._capacity_offsets(target, capacity)),
             group_id=self._group_id, stream_fenced=True,

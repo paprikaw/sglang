@@ -106,7 +106,7 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
             cfg["launch_env"].update(KVCACHED_LAYER_STACKING="true",
                 KVCACHED_PAGE_PREALLOC_ENABLED="false", KVCACHED_CONTIGUOUS_LAYOUT="true",
                 KVCACHED_PHYSICAL_BLOCK_SIZE_MB="2", KVCACHED_MIN_RESERVED_PAGES="0",
-                KVCACHED_MAX_RESERVED_PAGES="0")
+                KVCACHED_MAX_RESERVED_PAGES="0", KVCACHED_GPU_DIRECT_RDMA_REQUIRED="1")
         if optimized and role == "decode" and not lazy_cuda_modules:
             # First-use NIXL gather kernels on the dormant rank must not load
             # CUDA modules while the real CPU weight restore is in flight.
@@ -170,7 +170,8 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
         spec["sources"].append(dict(role="kv_backing", worktree=str(KVCACHED_ROOT),
                                     commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=KVCACHED_ROOT, text=True).strip()))
         save(run / "kvcached_dependency.json", dict(tree=tree, native=describe(binaries[0]),
-             build_node="spartan-gpgpu167", native_stream_mapping_abi=1))
+             build_node="spartan-gpgpu167", native_stream_mapping_abi=1,
+             native_rdma_mapping_abi=1))
     bank = Path("/data/gpfs/projects/punim2715/vllm_workbench/sglang-memory-bank/src/sglang_memory_bank")
     paths.extend(bank / name for name in ("__init__.py", "memory_budget.py", "memory_bank.py"))
     spec["frozen_inputs"] = [describe(p) for p in dict.fromkeys(paths)]

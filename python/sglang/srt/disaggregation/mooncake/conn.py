@@ -402,7 +402,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         regions = self._registerable_regions()
         if regions:
             ptrs, lens = zip(*regions)
-            self.engine.batch_register(list(ptrs), list(lens))
+            status = self.engine.batch_register(list(ptrs), list(lens))
+            if getattr(self.kv_args, "kv_registration_regions", None) is not None and status != 0:
+                raise RuntimeError(f"P/D KVCacheD RDMA registration failed: {status}")
 
     def deregister_buffer_to_engine(self):
         regions = self._registerable_regions()

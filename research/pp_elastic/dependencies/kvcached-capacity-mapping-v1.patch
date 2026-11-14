@@ -241,10 +241,31 @@ index ff52cca..5eb41ee 100644
    bool async_sched_;
    bool contiguous_layout_;
 diff --git a/csrc/page.cpp b/csrc/page.cpp
-index 55d51de..a7cddce 100644
+index 55d51de..8aed71f 100644
 --- a/csrc/page.cpp
 +++ b/csrc/page.cpp
-@@ -25,7 +25,18 @@ GPUPage::GPUPage(page_id_t page_id, int dev_idx, size_t page_size)
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include <cuda_runtime.h>
++#include <cstdlib>
++#include <cstring>
+ 
+ #include "constants.hpp"
+ #include "cuda_utils.hpp"
+@@ -22,10 +24,30 @@ GPUPage::GPUPage(page_id_t page_id, int dev_idx, size_t page_size)
+               .id = dev_,
+           },
+   };
++  const char *rdma = std::getenv("KVCACHED_GPU_DIRECT_RDMA_REQUIRED");
++  if (rdma != nullptr && std::strcmp(rdma, "1") == 0) {
++    int supported = 0;
++    CHECK_DRV(cuDeviceGetAttribute(
++        &supported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
++        dev_));
++    ASSERT(supported != 0, "This device cannot register CUDA VMM pages for GPUDirect RDMA");
++    prop.allocFlags.gpuDirectRDMACapable = 1;
++  }
    CHECK_DRV(cuMemCreate(&handle_, page_size_, &prop, 0));
  }
  
@@ -521,7 +542,7 @@ index 1e3fbc8..372ff31 100644
 \ No newline at end of file
 +} // namespace kvcached
 diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
-index b59925d..e10bd44 100644
+index b59925d..e2c8b53 100644
 --- a/csrc/torch_bindings.cpp
 +++ b/csrc/torch_bindings.cpp
 @@ -30,12 +30,18 @@ void shutdown_kvcached() {
@@ -617,7 +638,7 @@ index b59925d..e10bd44 100644
  
    m.def("init_kvcached", &kvcached::init_kvcached, "Initialize kvcached",
          py::arg("dev_str"), py::arg("page_size") = 0,
-@@ -188,11 +205,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+@@ -188,11 +205,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
    m.def("create_kv_tensors", &kvcached::create_kv_tensors, "create_kv_tensors",
          py::arg("size"), py::arg("dtype_size"), py::arg("dev_str"),
          py::arg("num_layers"), py::arg("num_kv_buffers") = 2,
@@ -631,10 +652,11 @@ index b59925d..e10bd44 100644
    m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors",
          py::arg("offsets"), py::arg("group_id") = 0);
 +  m.attr("elastic_pp_stream_mapping_abi_version") = 1;
++  m.attr("elastic_pp_rdma_mapping_abi_version") = 1;
    m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
          "unmap_from_kv_tensors", py::arg("offsets"), py::arg("group_id") = 0);
  
-@@ -205,7 +226,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+@@ -205,7 +227,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
             py::arg("async_sched") = false, py::arg("contiguous_layout") = true,
             py::arg("enable_page_prealloc") = true,
             py::arg("num_kv_buffers") = 2, py::arg("group_id") = 0,
@@ -645,7 +667,7 @@ index b59925d..e10bd44 100644
        .def("start_prealloc_thread",
             &kvcached::page_allocator_start_prealloc_thread)
        .def("stop_prealloc_thread",
-@@ -245,6 +268,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+@@ -245,6 +269,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
        .def_readonly("page_id", &kvcached::InternalPage::page_id)
        .def_readonly("page_size", &kvcached::InternalPage::page_size)
        .def("init", &kvcached::InternalPage::init)

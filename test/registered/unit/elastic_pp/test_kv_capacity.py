@@ -144,3 +144,41 @@ def test_capacity_commit_refreshes_immutable_statistics_owner():
     assert scheduler.pool_stats_observer.max_total_num_tokens == 8
     assert checker.pool_stats_observer is scheduler.pool_stats_observer
     assert checker.max_total_num_tokens == scheduler.max_total_num_tokens == 8
+
+
+@pytest.mark.parametrize("abi,enabled", [(None, "1"), (1, "0"), (1, "1")])
+def test_capacity_backing_requires_rdma_native_and_allocation_flag(monkeypatch, abi, enabled):
+    import sys
+    from unittest.mock import Mock
+    from sglang.srt.mem_cache.kvcached_pool import KVCacheDMHATokenToKVPool
+
+    native = NS(elastic_pp_stream_mapping_abi_version=1,
+                elastic_pp_rdma_mapping_abi_version=abi)
+    mapper = Mock(return_value=True)
+    monkeypatch.setitem(sys.modules, "kvcached", NS(vmm_ops=native))
+    monkeypatch.setitem(sys.modules, "kvcached.tp_ipc_util",
+                        NS(map_worker_offsets_for_migration=mapper))
+    monkeypatch.setenv("KVCACHED_GPU_DIRECT_RDMA_REQUIRED", enabled)
+    pool = NS(_capacity_offsets=lambda target, cap: {2, 4}, _group_id=0)
+    if abi != 1 or enabled != "1":
+        with pytest.raises(RuntimeError, match="RDMA-capable"):
+            KVCacheDMHATokenToKVPool._back_capacity(pool, None, 8)
+        mapper.assert_not_called()
+    else:
+        KVCacheDMHATokenToKVPool._back_capacity(pool, None, 8)
+        mapper.assert_called_once_with([2, 4], group_id=0, stream_fenced=True)
+
+
+@pytest.mark.parametrize("status", [0, -1])
+def test_pd_registration_must_succeed_before_serving(status):
+    from unittest.mock import Mock
+    from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
+
+    manager = NS(kv_args=NS(kv_registration_regions=[(100, 200)]),
+                 _registerable_regions=lambda: [(100, 200)],
+                 engine=NS(batch_register=Mock(return_value=status)))
+    if status:
+        with pytest.raises(RuntimeError, match="RDMA registration failed"):
+            MooncakeKVManager.register_buffer_to_engine(manager)
+    else:
+        MooncakeKVManager.register_buffer_to_engine(manager)
