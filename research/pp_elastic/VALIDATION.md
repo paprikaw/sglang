@@ -1,3 +1,13 @@
+# 2026-11-15：容量与严格输入有限流的有界验收完成
+
+冻结`67d60fa4f615b35d28a4a4eaa5ec96cfe29a13bc`／tag `experiment/sglang/pd-kvcached-e2e-20261115-r6`，原地与副本各76／76请求、四任务树、扩缩往返、缩后暖输出、Guard后检查／缓存审计／owned cleanup／正常release通过。逐请求身份及token数、协议、策略和引擎哈希一致；两边输入3071334、输出12964 token，Prefill总缓存命中96.131%。实际spawn bootstrap也通过，前一节7项原生AgentX CPU证据复用；未改引擎代码，不重复累计133项／25项未变CPU检查。
+
+原地容量65536→98304→65536、最高分配槽位98213（包括缓存持有行），CPU HiCache底层身份跨往返一致；中间rank层权重0，worker／Graph仍reserved3.25 GiB。扩／缩控制4.176／2.397秒，fence最长1.705／0.977秒。最小容量r5／r6的独立64 GiB复用和各方向512-token精确参考资格保持，端到端未另做独立显存探针。
+
+受限观察没有收益：原地／副本平均请求E2E35.839／25.149秒、TTFT28.935／20.716秒、TPOT42.817／26.272 ms；从正式开始到缩后检查的worker GPU秒4472.009／3776.780，含启动和待命。准入等待24.564／11.439秒，路由槽位覆盖整个P→D请求，当前原地一条在途链、副本两条。TTFT≤15秒且TPOT≤150 ms的联合达标11／76和29／76，两边都未达到90%。单次有界观察，不宣称一般机制优劣或显著性。
+
+workflow_pair_passed=true；fully_qualified_pair=false，因为峰值CPU缓存实际119.31／119.46 GiB有0.12%取整差。GPU映射也不同，不能完全归因于卡数步长；warm恢复队列先于45／46秒冷任务触发扩容。单D活跃请求、一轮伸缩、D侧page1及固定TP／EP边界不扩大。PR #15保持Draft，未验收多请求PP、P侧容量伸缩、整worker退出、故障注入或论文级重复性能。[报告／原件／SHA256](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/KVCACHED_CAPACITY.md)。
+
 # 2026-11-15：两组完整往返通过，配对输入前缀仍需固定
 
 冻结`9a31341ad95a`的原地／副本r5分别完成76／76正式请求、四任务树、一轮扩缩、缩后暖输出、owned cleanup与Guard postcheck／正常release。原地容量65536→98304→65536，最高槽位98206（含缓存持有行），CPU HiCache底层身份跨往返一致；长KV扩／缩控制4.198／2.409秒、最终fence最长2.038／0.968秒。副本启动106.168秒。原地平均请求E2E35.858秒、副本25.714秒，原地worker GPU秒4473.250、副本3829.768，仅为诊断观察值，未证明提速或省GPU时间。

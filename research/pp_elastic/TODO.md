@@ -1,4 +1,4 @@
-- [ ] **KVCacheD 短AgentX／BurstGPT配对验收。** 最小r6容量／缓存／输出／独立64 GiB复用通过。r5两组各76请求、四任务树、扩缩往返、缩后输出和Guard清理／release全部通过；现有原地配置没有E2E或worker GPU时间收益。严格配对发现原生benchmark ID引起前缀分词变化，总输入差17 token；下一候选固定marker命名空间，保留原生树／recycle／warmup ledger，7项实际AgentX CPU检查通过。0.12%CPU取整差、GPU映射差、单Decode活跃请求、一轮伸缩和冷副本启动边界保留；新严格输入配对待完成，不放宽检查。
+- [x] **KVCacheD容量与有界有限流验收完成。** 最小r5／r6容量／缓存／各方向512输出／独立64 GiB复用通过；最新E2E r6冻结67d60fa4f615，两组各76请求、四树、扩缩往返、缩后输出及Guard清理／release通过，逐请求输入／输出与引擎／协议配对一致。原地容量65536→98304→65536、最高槽位98213；控制4.176／2.397秒、fence最长1.705／0.977秒，退役层权重0、worker仍reserved3.25 GiB。原地／副本平均E2E35.84／25.15秒、worker GPU秒4472／3777，没有性能收益。CPU取整差0.12%、GPU映射差、单D一条P→D链、一轮伸缩、冷副本启动边界保留；不授予多请求或一般性能资格。[报告](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/KVCACHED_CAPACITY.md)。
 
 # PP 原地伸缩＋HiCache：实现与实验清单
 
@@ -6,7 +6,9 @@
 
 - [x] 独立任务 PR #15 的 r5 最小往返通过：固定 P2，D 容量8192→12288→8192；9216-token输入用到槽位10240，物理KV240→336→240 MiB，中间rank KV与权重归零，独立64 GiB复用成功。HiCache CPU恢复576 token；扩、缩各一个512-token持续请求与同暖参考逐token一致。控制1.951／1.073秒，各一次；worker仍reserved1.72 GiB。r2—r4失败及RDMA逐分配注册定位保留，Guard清理与release通过。
 
-- [ ] 将容量路径接入短 AgentX＋BurstGPT 配对，保留单活跃Decode资格限制、最新Graph／offload／NIXL／HiCache、同一reactive策略与相同到达。对比原地D2↔D3与新增／退出D2副本；固定P2。先作有界流程与成本验证，不将其当作多请求吞吐或最优伸缩结论。
+- [x] 容量路径已接入短AgentX＋BurstGPT：固定P2、D2↔D3与新增／退出D2副本，两边全部76请求及严格输入配对通过，负结果按页首记录。真实CPU权重offload、Graph、HiCache与NIXL保留；不是多请求吞吐或最优伸缩结论。
+
+- [ ] **后续性能资格。** 先打通PP的多请求与在途交接，解除整条P→D链只准入一个请求的限制，再做同等有效并发和受控GPU映射的对照；CPU物理字节预算、多个reactive周期、故障恢复及整worker退出分别验证。当前不通过提高KV上限来假设这些问题已解决。
 
 ## 短 AgentX＋BurstGPT reactive E2E 对照（2026-11-14）
 
