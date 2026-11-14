@@ -96,6 +96,7 @@ def prepare(run, mechanism):
     for source in (PRIOR/'harness').glob('*.py'):
         shutil.copyfile(source,run/'harness'/source.name)
     shutil.copyfile(HERE/'router.py',run/'harness/reactive_router.py')
+    shutil.copyfile(HERE/'stable_placement.py',run/'harness/stable_placement.py')
     p=run/'harness/sglang_adapter.py'
     s=p.read_text()+ '\nfrom reactive_router import install as install_reactive\ninstall_reactive(Adapter)\n'
     s=s.replace('first_content_s = time.monotonic() - started','first_content_s = time.monotonic() - started\n                            self.reactive.streaming.add(rid)')

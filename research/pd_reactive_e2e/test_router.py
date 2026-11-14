@@ -47,3 +47,12 @@ def test_router_wait_is_in_latency_but_not_in_decode_tpot():
     assert row['elapsed_s']==13 and row['first_content_s']==5
     assert row['elapsed_s']-row['first_content_s']==8 and row['started_unix_ns']==100
     p.context.reset(token)
+
+
+def test_cache_affinity_distinguishes_cloned_sessions_but_survives_turn_changes():
+    spec=importlib.util.spec_from_file_location('session_placement',Path(__file__).with_name('stable_placement.py'))
+    placement=importlib.util.module_from_spec(spec);spec.loader.exec_module(placement)
+    a=NS(conversation_id='same-source-conversation',x_correlation_id='clone-a',turn_index=1)
+    b=NS(conversation_id='same-source-conversation',x_correlation_id='clone-b',turn_index=1)
+    first=placement.placement_key(a);a.turn_index=7
+    assert first==placement.placement_key(a) and first!=placement.placement_key(b)
