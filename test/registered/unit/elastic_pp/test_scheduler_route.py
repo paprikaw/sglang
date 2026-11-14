@@ -121,6 +121,26 @@ class _FakeSender:
         self.outputs.append((output, recv_req))
 
 
+def test_concurrent_pd_dormant_proxy_keeps_physical_hops():
+    topology=PPTopology.from_layer_counts([2,0,2],generation=0)
+    schedulers=[_FakeScheduler(i,3) for i in range(3)]
+    for s in schedulers:
+        s.server_args=SimpleNamespace(elastic_pp_disagg_decode=True,max_running_requests=4)
+        s._pp_install_topology(topology)
+    schedulers[0]._pp_send_dict_to_next_stage({"hidden_states":torch.ones(2,3)},msg_type="proxy")
+    assert schedulers[0].pp_group.sent[-1]["dst"]==1
+    middle=schedulers[1]
+    middle.pp_group.received.append({"__msg_type__":"proxy","__pp_generation__":0,
+                                    "hidden_states":torch.ones(2,3)})
+    proxy=middle._pp_recv_proxy_tensors()
+    assert middle.pp_group.last_recv_kwargs["src"]==0
+    middle._pp_send_dict_to_next_stage(proxy.tensors,msg_type="proxy")
+    assert middle.pp_group.sent[-1]["dst"]==2
+    schedulers[0].server_args.max_running_requests=1
+    schedulers[0]._pp_send_dict_to_next_stage({"hidden_states":torch.ones(1,3)},msg_type="proxy")
+    assert schedulers[0].pp_group.sent[-1]["dst"]==2
+
+
 class _FakeMigrationCoordinator:
     def __init__(
         self,

@@ -207,6 +207,16 @@ def test_bounded_optimized_multi_request_profile(count):
     validate_decode_args(args)
 
 
+def test_concurrent_optimized_microbatch_four_but_sync_remains_bounded():
+    args=_optimized_args()
+    args.max_running_requests=4
+    args.pp_max_micro_batch_size=4
+    validate_decode_args(args)
+    sync=_args();sync.pp_max_micro_batch_size=4
+    with pytest.raises(ValueError,match="pp_max_micro_batch_size"):
+        validate_decode_args(sync)
+
+
 @pytest.mark.parametrize("count", [0, 5, True, None])
 def test_unsupported_optimized_request_count_fails_closed(count):
     args = _optimized_args()

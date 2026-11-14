@@ -17,6 +17,7 @@ class Admission:
         self.endpoints = {e.name:e for e in endpoints}
         self.enabled = {next(iter(self.endpoints))}
         self.capacity = capacity
+        self.concurrent_kv = False
         self.active = {name:0 for name in self.endpoints}
         self.streaming = set()
         self.owners = {}
@@ -32,7 +33,10 @@ class Admission:
         if not choices:
             return None
         old = self.owners.get(affinity)
-        chosen = old if old in choices else min(choices, key=lambda n:(self.active[n], n))
+        least=min(choices, key=lambda n:(self.active[n], n))
+        chosen = old if old in choices and (
+            not self.concurrent_kv or self.active[old] <= self.active[least]
+        ) else least
         if old and old != chosen:
             self.moves += 1
         self.owners[affinity] = chosen
@@ -94,6 +98,7 @@ def install(Adapter):
     def init(self, config, **kw):
         old_init(self, config, **kw)
         self.reactive = Admission(self.pools['decode'], config['reactive_admission'])
+        self.reactive.concurrent_kv = bool(config.get('concurrent_kv',False))
         self.audit_queue = AuditQueue(self.reactive)
     async def start(self, app):
         # The second replica is deliberately not a live GPU process before demand.

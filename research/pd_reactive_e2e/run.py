@@ -36,7 +36,7 @@ def endpoint(cfg):
         row.update(bootstrap_host=cfg['node'],bootstrap_port=cfg['bootstrap_port'])
     return row
 
-def prepare(run, mechanism, kvcached_capacity=False):
+def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualification_smoke=False):
     # Reuse the authenticated canonical-cache contracts and qualified r23 profile.
     q.prepare(run, kvcached_capacity=kvcached_capacity)
     root = json.loads((run/'config.json').read_text())
@@ -70,6 +70,9 @@ def prepare(run, mechanism, kvcached_capacity=False):
             cfg['launch_env']['KVCACHED_IPC_NAME']=f'{run.name}-d1'
         cfg['layouts'][0]['usage_logs']=[dict(id=f'{run.name}.d1',path=str(run/'cache/d1.log'),expected_ranks=['PP0 TP0','PP1 TP0'])]
         servers['d1']=cfg
+        if concurrent_kv:
+            servers['d0']['layouts'][0]['gpu_groups']=[[0,2]]
+            servers['d1']['layouts'][0]['gpu_groups']=[[1,3]]
     cache=spec['model_cache']
     cache['usage_logs']={n:[] for n in root['node_configs']}
     for cfg in servers.values():
@@ -99,6 +102,17 @@ def prepare(run, mechanism, kvcached_capacity=False):
     root['kvcached_capacity']=kvcached_capacity
     if kvcached_capacity:
         root.update(max_total_tokens=98304,base_kv_capacity=65536)
+    root['concurrent_kv']=concurrent_kv
+    if concurrent_kv:
+        if not kvcached_capacity:raise ValueError('concurrent pilot requires managed KV capacity')
+        root.update(per_instance_admission=10,max_running_requests=4,pp_micro_batch_size=4,
+            qualification_scope='Concurrent managed KV Decode, at most four active requests per instance; qualification pending.',
+            scale_trigger='native_preallocator_kv_tokens_only')
+    root['qualification_smoke']=qualification_smoke
+    if qualification_smoke:
+        if not concurrent_kv or mechanism!='inplace':raise ValueError('smoke requires concurrent in-place arm')
+        root.update(context_length=16384,max_total_tokens=12288,base_kv_capacity=8192)
+        for cfg in servers.values():cfg['hicache_size_gib']=8
     save(run/'config.json',root)
     plan=json.loads((PRIOR/'plan.json').read_text())
     with Path(plan['source']['burstgpt_path']).open() as f:
@@ -161,6 +175,7 @@ def prepare(run, mechanism, kvcached_capacity=False):
     ep=dict(mode='pd',require_hicache=True,api_key_file=root['admin_key_file'],
         prefill=[endpoint(servers['p'])],decode=[endpoint(c) for n,c in servers.items() if n.startswith('d')],
         request_timeout_s=600,backend_force_close=True,provenance=dict(pilot=True),reactive_admission=root['per_instance_admission'])
+    ep['concurrent_kv']=concurrent_kv
     save(run/'endpoints.json',ep)
     registry=Path('/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/kv_checkpoints/registry.json')
     registry_value=json.loads(registry.read_text())
@@ -191,12 +206,15 @@ def engine(run, root, sid):
             '--max-running-requests':str(root['max_running_requests'] if sid.startswith('d') else 4),
             '--max-mamba-cache-size':'48','--hicache-size':str(cfg['hicache_size_gib']),
             '--chunked-prefill-size':'4096','--max-prefill-tokens':'8192'}
+        if root.get('concurrent_kv') and sid.startswith('d'):
+            values['--pp-max-micro-batch-size']=str(root['pp_micro_batch_size'])
         if root.get('kvcached_capacity'):
             values['--elastic-pp-initial-partition']='24,0,24' if root['mechanism']=='inplace' else '24,24'
             values['--elastic-pp-graph-partitions']='24,0,24;16,16,16' if root['mechanism']=='inplace' else '24,24'
-            values['--elastic-pp-kv-capacities']='65536;98304' if root['mechanism']=='inplace' else '65536'
+            base=root['base_kv_capacity'];grown=root['max_total_tokens']
+            values['--elastic-pp-kv-capacities']=f'{base};{grown}' if root['mechanism']=='inplace' else str(base)
             if sid.startswith('d') and root['mechanism']=='replica':
-                values['--max-total-tokens']='65536'
+                values['--max-total-tokens']=str(base)
         flags=[]
         remove={'--enable-elastic-pp','--elastic-pp-disagg-decode','--disable-cuda-graph'} if sid.startswith('d') and not cfg['optimized_elastic_pp'] else set()
         pairs={'--elastic-pp-initial-partition','--elastic-pp-transition-strategy','--elastic-pp-transition-backing'} if remove else set()
@@ -210,6 +228,9 @@ def engine(run, root, sid):
             if k in values:
                 flags.extend([k,values[k]]);i+=2;continue
             flags.append(k);i+=1
+        if root.get('concurrent_kv') and sid.startswith('d'):
+            index=flags.index('--cuda-graph-bs-decode')
+            flags[index+1:index+2]=['1','2','4']
         if remove:
             flags.extend(['--cuda-graph-bs-decode','1'])
         save(run/'servers'/sid/'effective_launch.json',dict(argv=flags,source=root['engine_commit']))
@@ -245,6 +266,9 @@ def install_telemetry():
         if os.environ['ELASTIC_PD_ROLE']=='decode':
             from sglang.srt.elastic_pp.pd_registration import pending_pd_work
             pd_pending=pending_pd_work(scheduler)
+            from sglang.srt.elastic_pp.pd_capacity import capacity_wait_snapshot
+            result.internal_state['e2e_kv_wait']=capacity_wait_snapshot(scheduler.disagg_decode_prealloc_queue)
+            result.internal_state['e2e_unallocated_pd']=len(scheduler.disagg_decode_prealloc_queue.queue)
         if os.environ['ELASTIC_PD_ROLE']=='decode':
             pool=scheduler.token_to_kv_pool_allocator.get_kvcache()
             full=getattr(pool,'full_kv_pool',pool)
@@ -253,7 +277,8 @@ def install_telemetry():
                 result.internal_state['e2e_kv_capacity']=dict(
                     capacity=full.serving_capacity, virtual_capacity=full.size,
                     max_live_slot=max(allocator._live_page_ids,default=0),
-                    live_tokens=len(allocator._live_page_ids),free_tokens=allocator.available_size())
+                    live_tokens=len(allocator._live_page_ids),free_tokens=allocator.available_size(),
+                    physical=full.kvcached_physical_stats())
         runner=scheduler.tp_worker.model_runner
         bank=getattr(runner,'_elastic_pp_shared_host_bank',None)
         if bank is not None:
@@ -420,7 +445,9 @@ temporary=p.with_suffix('.tmp');temporary.write_text(json.dumps(value)+chr(10));
                 while True:
                     health()
                     r=rhttp('/reactive/state');state=info('d0')
-                    if r['prefilling']==0 and all(s['e2e_runtime']['pd_pending']==0 for s in state['internal_states']):break
+                    writers_clear=all(s['e2e_runtime']['pd_pending']==0 for s in state['internal_states'])
+                    allow_unallocated=root.get('concurrent_kv') and decision.direction=='up'
+                    if writers_clear and (allow_unallocated or r['prefilling']==0):break
                     if time.monotonic()>deadline:raise TimeoutError('quiescent handoff drain')
                     stop.wait(.25)
                 record['handoff_drained']=time.time();record['before']=state
@@ -470,6 +497,12 @@ temporary=p.with_suffix('.tmp');temporary.write_text(json.dumps(value)+chr(10));
         smoke=[replay.request_one(p,d,key,tokens,8,0,True,request_timeout_s=120) for _ in range(2)]
         if smoke[0]['output_ids']!=smoke[1]['output_ids']:raise AssertionError('static P/D warm output mismatch')
         save(run/'start_smoke.json',dict(passed=True,responses=smoke))
+        if root.get('qualification_smoke'):
+            from concurrent_smoke import exercise
+            progress('concurrent_capacity_qualification')
+            exercise(run,root,replay,p,d,key,info,health,save)
+            progress('complete')
+            return
         cmd=[PYTHON,str(Path(__file__).resolve()),'--client','--run',str(run)]
         log=(run/'client.log').open('wb');handles.append(log)
         client_process=subprocess.Popen(['ssh','-T','-o','BatchMode=yes',root['client_node'],shlex.join(cmd)],
@@ -510,8 +543,12 @@ temporary=p.with_suffix('.tmp');temporary.write_text(json.dumps(value)+chr(10));
             # admitted slots are actually streaming, not waiting on Prefill/RDMA.
             overloaded=(route['waiting']>0 and route['oldest_wait_s']>=2 and route['streaming']>=root['per_instance_admission'])
             internal_overloaded=max(s['waiting'] for s in runtime)>0 and pending==0
+            kv_wait=[s.get('e2e_kv_wait',{}) for s in state['internal_states']]
+            capacity_blocked=any(s.get('blocked',False) for s in kv_wait)
+            capacity_wait=max((s.get('oldest_wait_s',0) for s in kv_wait),default=0)
             sample=dict(unix=time.time(),monotonic=now,formal=bool(formal_start),route=route,
                 decode_runtime=runtime,decode_metrics_fresh=metrics_fresh,
+                native_kv_wait=kv_wait,
                 decode_kv_capacity=[s.get('e2e_kv_capacity') for s in state['internal_states']],
                 expanded=expanded,operation_pending=future is not None)
             samples.append(sample)
@@ -533,7 +570,10 @@ temporary=p.with_suffix('.tmp');temporary.write_text(json.dumps(value)+chr(10));
                     with (run/'capacity_demotions.jsonl').open('a') as f:f.write(json.dumps(demotion)+'\n')
                     # Observe the freed slot set on the next iteration.
             observation=Observation('decode',now,expanded=expanded,compute_queue=route['waiting'],
-                overloaded=overloaded or internal_overloaded,next_layout_improves=True,
+                capacity_blocked=capacity_blocked if root.get('concurrent_kv') else False,
+                capacity_wait_s=capacity_wait if root.get('concurrent_kv') else 0,
+                overloaded=False if root.get('concurrent_kv') else overloaded or internal_overloaded,
+                next_layout_improves=not root.get('concurrent_kv'),
                 target_fits_state=fits_state,target_fits_load=fits,in_flight_handoff=bool(pending or route['prefilling']),
                 metrics_valid=bool(formal_start) and metrics_fresh and cycles<root['max_scale_cycles'])
             decision=policy.observe([observation],now=now,occupied_gpus=4+(1 if root['mechanism']=='inplace' else 2)*int(expanded),
@@ -591,10 +631,14 @@ temporary=p.with_suffix('.tmp');temporary.write_text(json.dumps(value)+chr(10));
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--run',type=Path,required=True)
-    p.add_argument('--kvcached-capacity',action='store_true');p.add_argument('--prepare',action='store_true');p.add_argument('--mechanism',choices=['inplace','replica'])
-    p.add_argument('--worker',action='store_true');p.add_argument('--engine',action='store_true');p.add_argument('--client',action='store_true')
+    p.add_argument('--kvcached-capacity',action='store_true');p.add_argument('--concurrent-kv',action='store_true');p.add_argument('--qualification-smoke',action='store_true');p.add_argument('--prepare',action='store_true');p.add_argument('--mechanism',choices=['inplace','replica'])
+    p.add_argument('--worker',action='store_true');p.add_argument('--engine',action='store_true');p.add_argument('--client',action='store_true');p.add_argument('--reuse-probe',action='store_true')
     p.add_argument('--server',choices=['p','d0','d1']);a=p.parse_args()
-    if a.prepare:prepare(a.run,a.mechanism,a.kvcached_capacity)
+    if a.reuse_probe:
+        packet=json.loads(sys.stdin.readline());os.environ.update(packet['environment'])
+        os.environ['CUDA_VISIBLE_DEVICES']='1'
+        q.reuse_probe(a.run,json.loads((a.run/'config.json').read_text())['node_configs'][socket.gethostname().split('.')[0]])
+    elif a.prepare:prepare(a.run,a.mechanism,a.kvcached_capacity,a.concurrent_kv,a.qualification_smoke)
     else:
         root=json.loads((a.run/'config.json').read_text())
         if a.engine:engine(a.run,root,a.server)

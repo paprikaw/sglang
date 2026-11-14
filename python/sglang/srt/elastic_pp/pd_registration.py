@@ -15,7 +15,6 @@ def validate_decode_args(args):
         disaggregation_transfer_backend="mooncake",
         enable_hierarchical_cache=True,
         pp_async_batch_depth=0,
-        pp_max_micro_batch_size=1,
     )
     mismatches = [
         f"{name}={getattr(args, name, None)!r} (requires {value!r})"
@@ -43,6 +42,9 @@ def validate_decode_args(args):
     count = getattr(args, "max_running_requests", None)
     if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= (4 if optimized else 1):
         mismatches.append(f"max_running_requests={count!r}: requires 1 (sync) or 1..4 (bounded optimized pilot)")
+    micro = getattr(args, "pp_max_micro_batch_size", None)
+    if not isinstance(micro, int) or isinstance(micro, bool) or not 1 <= micro <= (4 if optimized else 1):
+        mismatches.append(f"pp_max_micro_batch_size={micro!r}: requires 1 (sync) or 1..4 (bounded optimized pilot)")
     if not (sync or optimized):
         mismatches.append(
             f"elastic_pp_transition_strategy={args.elastic_pp_transition_strategy!r}, "
@@ -58,9 +60,12 @@ def pending_pd_work(scheduler):
     """Do not confuse running decode requests with outstanding RDMA writers."""
     prealloc = scheduler.disagg_decode_prealloc_queue
     transfer = scheduler.disagg_decode_transfer_queue
+    from sglang.srt.elastic_pp.pd_capacity import unpublished_waiters_are_safe
+
+    unallocated = 0 if unpublished_waiters_are_safe(scheduler) else (
+        len(prealloc.queue) + len(getattr(prealloc, "pending_reqs", ())))
     return (
-        len(prealloc.queue)
-        + len(getattr(prealloc, "pending_reqs", ()))
+        unallocated
         + len(getattr(prealloc, "retracted_queue", ()))
         + len(transfer.queue)
         + int(transfer.has_pending_deferred_releases())
@@ -128,6 +133,13 @@ class DecodeRegistrationTransaction:
         # do not.  Rebuild all KV/GDN/aux registrations from the committed pool.
         manager.kv_args = queue._build_kv_args()
         manager.register_buffer_to_engine()
-        # Deregistration clears cached bootstrap routes; each subsequent room
-        # therefore republishes the current per-layer addresses to every P rank.
+        # These rooms bootstrapped before migration, but have not published any
+        # token destinations. Republish pool addresses before their first send.
+        # Future rooms use the same refreshed connection cache.
+        for entry in [*queue.queue, *getattr(queue, "pending_reqs", ())]:
+            receiver = entry.kv_receiver
+            if hasattr(receiver, "prefill_dp_rank"):
+                receiver._setup_bootstrap_infos()
+                if receiver.conclude_state is not None:
+                    raise RuntimeError("unallocated P/D receiver re-registration failed")
         self.suspended = False

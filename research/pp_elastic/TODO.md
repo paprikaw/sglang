@@ -2,6 +2,8 @@
 
 # PP 原地伸缩＋HiCache：实现与实验清单
 
+- [ ] **2026-11-15：D 多请求与真实 KV 排队触发。** 主 agent 在 `codex/qwen122b-pd-kv-concurrency-20261115` 顺序实施：解除单请求路由限制，验证含空阶段的并发 PP 及扩缩连续性，使用原生 KV 预分配失败触发，保留 HiCache／Graph／CPU预打包权重／offload／NIXL。只有尚未发布地址的未分配请求可跨地址刷新等待，所有真实写入仍排空。先做最小真实并发验证，再用配对 AgentX＋BurstGPT 做一次短对照；未取得硬件证据前不授予资格。
+
 ## 122B／A100：KVCacheD 容量随 PP 扩缩（2026-11-14）
 
 - [x] 独立任务 PR #15 的 r5 最小往返通过：固定 P2，D 容量8192→12288→8192；9216-token输入用到槽位10240，物理KV240→336→240 MiB，中间rank KV与权重归零，独立64 GiB复用成功。HiCache CPU恢复576 token；扩、缩各一个512-token持续请求与同暖参考逐token一致。控制1.951／1.073秒，各一次；worker仍reserved1.72 GiB。r2—r4失败及RDMA逐分配注册定位保留，Guard清理与release通过。

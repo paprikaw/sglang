@@ -15,6 +15,17 @@ def test_admission_preserves_available_affinity_but_uses_idle_new_replica():
     assert p.moves==1
     assert p.select('b') is None
 
+
+def test_concurrent_admission_uses_multiple_slots_and_new_replica():
+    p=m.Admission([NS(name='d0'),NS(name='d1')],10)
+    p.concurrent_kv=True
+    assert p.select('a').name=='d0'
+    assert p.select('b').name=='d0'
+    p.enabled.add('d1')
+    assert p.select('a').name=='d1'
+    assert p.active=={'d0':2,'d1':1}
+    assert p.moves==1
+
 def test_closed_gate_defers_new_handoff_and_measures_wait():
     async def check():
         p=m.Admission([NS(name='d0')],1);p.paused=True

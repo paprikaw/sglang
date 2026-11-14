@@ -320,6 +320,23 @@ class SchedulerPPMixin:
             )
         return True
 
+    def _pp_pd_relays_proxy(self: Scheduler) -> bool:
+        """Keep concurrent Decode's activation and queue rings hop-aligned.
+
+        The native P/D scheduler advances its admission/output rings once per
+        physical stage. Skipping an empty stage only for activations introduces
+        a different dependency cycle when several microbatches are in flight.
+        Empty Decode stages therefore relay activations, without model compute
+        or model weights. Ordinary PP and the qualified single-request path
+        retain their existing routing.
+        """
+        args = getattr(self, "server_args", None)
+        return bool(
+            self._pp_topology() is not None
+            and getattr(args, "elastic_pp_disagg_decode", False)
+            and getattr(args, "max_running_requests", 1) > 1
+        )
+
     @staticmethod
     def _elastic_pp_layer_counts(topology: PPTopology) -> List[int]:
         return [layer_range.size for layer_range in topology.layer_ranges]
@@ -835,7 +852,14 @@ class SchedulerPPMixin:
         mb_metadata[mb_id] = PPBatchMetadata(can_run_cuda_graph=False)
         event = self.device_module.Event()
         event.record(self.device_module.current_stream())
-        return None, event
+        result = None
+        if self._pp_pd_relays_proxy() and not cur_batch.forward_mode.is_prebuilt():
+            if pp_proxy_tensors is None:
+                raise RuntimeError("dormant Decode stage lost its activation relay")
+            result = GenerationBatchResult(
+                pp_hidden_states_proxy_tensors=pp_proxy_tensors
+            )
+        return result, event
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -1601,8 +1625,9 @@ class SchedulerPPMixin:
                     if (
                         cur_batch
                         and not cur_batch.forward_mode.is_prebuilt()
-                        and self._pp_rank_is_active()
-                        and not self._pp_is_last_rank()
+                        and (self._pp_rank_is_active() or self._pp_pd_relays_proxy())
+                        and not (self._pp_is_physical_last_rank() if self._pp_pd_relays_proxy()
+                                 else self._pp_is_last_rank())
                         and not self._pp_pd_early_proxy
                     ):
                         self.device_module.current_stream().wait_event(
@@ -2253,7 +2278,8 @@ class SchedulerPPMixin:
         if topology is not None:
             tensor_dict["__pp_generation__"] = topology.generation
             if msg_type == "proxy" and dst is None:
-                dst = self._pp_next_active_rank()
+                dst = (self.ps.pp_rank + 1 if self._pp_pd_relays_proxy()
+                       else self._pp_next_active_rank())
                 if dst is None:
                     raise RuntimeError("logical last PP rank cannot send proxy tensors")
         if _pp_stage_tp_sizes(self) is not None and self.ps.attn_tp_rank != 0:
@@ -2372,11 +2398,14 @@ class SchedulerPPMixin:
 
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
-        if self._pp_rank_is_active() and not self._pp_is_first_rank():
+        relay = self._pp_pd_relays_proxy()
+        if (relay and not self._pp_is_physical_first_rank()) or (
+            not relay and self._pp_rank_is_active() and not self._pp_is_first_rank()
+        ):
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
-                    src=self._pp_prev_active_rank(),
+                    src=self.ps.pp_rank - 1 if relay else self._pp_prev_active_rank(),
                     all_gather_group=(
                         self.attn_tp_group if self.require_attn_tp_allgather else None
                     ),
