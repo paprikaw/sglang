@@ -20,6 +20,17 @@ def exercise(run, root, replay, p, d, key, info, health, save):
     )
 
     result = dict(passed=False, samples=[], transitions=[])
+    original_stream = replay.stream
+
+    def traced_stream(*args, **kwargs):
+        events = []
+        kwargs["event_sink"] = events
+        response = original_stream(*args, **kwargs)
+        response["token_events"] = events
+        response["token_event_started"] = response["started"]
+        return response
+
+    replay.stream = traced_stream
 
     def observe():
         health()
@@ -76,6 +87,37 @@ def exercise(run, root, replay, p, d, key, info, health, save):
         [1000 + ((i * 31 + j * 937) % 20000) for i in range(4608)] for j in range(2)
     ]
     try:
+        short_prompts = [tokens[:2048] for tokens in prompts]
+        short_references = [
+            replay.request_one(p, d, key, tokens, 128, j, True, request_timeout_s=120)
+            for j, tokens in enumerate(short_prompts)
+        ]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            short_futures = [
+                executor.submit(
+                    replay.request_one,
+                    p,
+                    d,
+                    key,
+                    tokens,
+                    128,
+                    j,
+                    True,
+                    request_timeout_s=120,
+                )
+                for j, tokens in enumerate(short_prompts)
+            ]
+            while not all(f.done() for f in short_futures):
+                observe()
+                time.sleep(0.1)
+            result["static_pp2_concurrent"] = [f.result() for f in short_futures]
+        result["static_pp2_concurrent_matches"] = [
+            a["output_ids"] == b["output_ids"]
+            for a, b in zip(short_references, result["static_pp2_concurrent"])
+        ]
+        result["static_pp2_max_running"] = max(
+            min(s["running"]) for s in result["samples"]
+        )
         # Priming and references preserve HiCache; no flush-between-request path.
         references = []
         for j, tokens in enumerate(prompts):
@@ -273,4 +315,5 @@ def exercise(run, root, replay, p, d, key, info, health, save):
         )
         return result
     finally:
+        replay.stream = original_stream
         save(run / "concurrent_smoke.json", result)
