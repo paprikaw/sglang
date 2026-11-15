@@ -544,6 +544,7 @@ class ElasticPPMigrationCoordinator:
         for name, component in (
             ("kv", self.kv_transport),
             ("host", self.cache_transition),
+            ("pd_registration", getattr(self.model_runner, "_elastic_pp_pd_registration", None)),
         ):
             provider = getattr(component, "metrics", None)
             if provider is not None:
@@ -1297,7 +1298,7 @@ class ElasticPPMigrationCoordinator:
                 # restored, even if route publication or peer commit fails.
                 self._timed("fence_route_publish", commit_topology, transition.target)
                 if self.after_topology_commit is not None:
-                    self.after_topology_commit()
+                    self._timed("fence_registration_refresh", self.after_topology_commit)
                     self._registration_suspended = False
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"

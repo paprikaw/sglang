@@ -767,6 +767,7 @@ class SchedulerPPMixin:
                 )
 
                 registration = DecodeRegistrationTransaction(self)
+                self.tp_worker.model_runner._elastic_pp_pd_registration = registration
                 coordinator.before_backing_release = registration.suspend
                 coordinator.after_backing_restore = registration.refresh
                 coordinator.after_topology_commit = registration.refresh

@@ -197,3 +197,20 @@ def test_pd_regions_do_not_span_separate_vmm_allocations_or_virtual_tail():
     regions = KVCacheDMHATokenToKVPool.pd_registration_regions(pool)
     assert regions == [(1024, 128), (1152, 128), (1280, 128),
                        (2048, 128), (2176, 128), (2304, 128)]
+
+
+def test_prepared_pd_regions_use_target_layers_and_capacity_without_publishing():
+    from sglang.srt.mem_cache.kvcached_pool import KVCacheDMHATokenToKVPool
+
+    buffers = [NS(data_ptr=lambda p=p: p) for p in [1024, 2048, 4096]]
+    pool = NS(capacity_managed=True, serving_capacity=4, k_buffer=buffers[:1],
+              _kvcached_global_k_buffer=buffers,
+              _pending_serving_capacity=(7, 8),
+              _elastic_pp_residency=NS(pending=NS(generation=7, target=NS(start=1, end=3))),
+              kvcached_allocator=NS(physical_group_page_size=128, blocks_per_physical_page=4))
+    rows = KVCacheDMHATokenToKVPool.prepared_pd_registration_regions(pool, 7)
+    assert rows == [(2048, 128), (2176, 128), (2304, 128),
+                    (4096, 128), (4224, 128), (4352, 128)]
+    assert pool.serving_capacity == 4 and pool.k_buffer == buffers[:1]
+    with pytest.raises(RuntimeError, match='no matching prepared'):
+        KVCacheDMHATokenToKVPool.prepared_pd_registration_regions(pool, 8)

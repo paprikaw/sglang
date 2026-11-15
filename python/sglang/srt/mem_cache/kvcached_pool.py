@@ -560,6 +560,21 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
         return [(k.data_ptr() + page * step, step)
                 for k in self.k_buffer for page in range(pages)]
 
+    def prepared_pd_registration_regions(self, generation):
+        """Only already prepared, stable physical pages may be registered early."""
+        pending = self._elastic_pp_residency.pending
+        capacity = self._pending_serving_capacity
+        if (not self.capacity_managed or pending is None
+                or pending.generation != generation or capacity is None
+                or capacity[0] != generation):
+            raise RuntimeError("P/D registration has no matching prepared KV capacity")
+        manager = self.kvcached_allocator
+        step = int(manager.physical_group_page_size)
+        pages = math.ceil((capacity[1] + 1) / manager.blocks_per_physical_page)
+        buffers = self._kvcached_global_k_buffer[pending.target.start:pending.target.end]
+        return [(k.data_ptr() + page * step, step)
+                for k in buffers for page in range(pages)]
+
     def _physical_page_ids_for_slots(self, slot_ids: torch.Tensor) -> set[int]:
         if not self.physical_layer_partitioned:
             return set()

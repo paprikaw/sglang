@@ -1542,11 +1542,15 @@ class ModelRunner:
                 f"KV pool {type(self.token_to_kv_pool).__name__} does not support "
                 "elastic PP residency"
             )
-        return method(
+        result = method(
             target=target,
             generation=generation,
             total_num_layers=self.model_config.num_hidden_layers,
         )
+        registration = getattr(self, "_elastic_pp_pd_registration", None)
+        if registration is not None:
+            registration.prepare_target(generation)
+        return result
 
     def prepare_elastic_pp_kv_capacity(self, transition):
         from sglang.srt.elastic_pp.kv_capacity import full_pool, topology_capacity
@@ -1623,6 +1627,9 @@ class ModelRunner:
     def abort_elastic_pp_kv_layers(
         self, *, generation: int
     ) -> tuple[torch.Tensor, ...]:
+        registration = getattr(self, "_elastic_pp_pd_registration", None)
+        if registration is not None:
+            registration.abort_prepared(generation)
         return self.token_to_kv_pool.abort_elastic_pp_kv_layers(generation=generation)
 
     def cleanup_elastic_pp_kv_layers(
