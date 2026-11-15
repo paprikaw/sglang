@@ -247,6 +247,61 @@ def test_slot_metadata_signature_does_not_scan_payload(monkeypatch):
     assert a != metadata_signature(src)
 
 
+@pytest.mark.parametrize("changed", ["free_slots", "release_slots", "num_release_slots", "slot_used", "mem_state", "host_slots"])
+def test_binary_signature_covers_all_slot_metadata_without_python_lists(monkeypatch, changed):
+    from test_hicache_fast_copy import cache
+
+    src = cache([1, 2])
+    pool = NS(size=8, free_slots=torch.arange(3, 8), release_slots=[torch.tensor([2])],
+              num_release_slots=1, slot_used=torch.zeros(8, dtype=torch.bool),
+              mem_state=torch.zeros(8, dtype=torch.int64))
+    src.host_pool_group = NS(entries=[NS(name="kv", host_pool=pool)])
+    monkeypatch.setattr(torch.Tensor, "tolist", lambda *a: pytest.fail("large Python list"))
+    before = metadata_signature(src)
+    if changed == "free_slots":pool.free_slots[1] = 7
+    elif changed == "release_slots":pool.release_slots[0][0] = 1
+    elif changed == "num_release_slots":pool.num_release_slots += 1
+    elif changed == "slot_used":pool.slot_used[1] = True
+    elif changed == "mem_state":pool.mem_state[1] = 1
+    elif changed == "host_slots":
+        next(iter(src.tree_core.root_node.children.values())).component_data[0].host_value[0] = 2
+    assert metadata_signature(src) != before
+
+
+def test_binary_signature_normalizes_integral_cpu_storage_and_empty_free_list():
+    from test_hicache_fast_copy import cache
+
+    src = cache([1, 2])
+    pool = NS(size=8, free_slots=torch.arange(3, 8), release_slots=[], num_release_slots=0)
+    src.host_pool_group = NS(entries=[NS(name="kv", host_pool=pool)])
+    before = metadata_signature(src)
+    pool.free_slots = pool.free_slots.to(torch.int32)
+    assert metadata_signature(src) == before
+    pool.free_slots = []
+    empty = metadata_signature(src)
+    pool.free_slots = torch.empty(0, dtype=torch.int64)
+    assert metadata_signature(src) == empty
+
+
+def test_metadata_prefix_hash_is_independent_of_unbacked_radix_splits():
+    from test_hicache_fast_copy import cache
+
+    src = cache([1, 2])
+    pool = NS(size=8, free_slots=torch.arange(3, 8), release_slots=[], num_release_slots=0)
+    src.host_pool_group = NS(entries=[NS(name="kv", host_pool=pool)])
+    before = metadata_signature(src)
+    root = src.tree_core.root_node
+    child = next(iter(root.children.values()))
+    middle_key = NS(extra_key=None, cache_salt=None, is_bigram=False, raw_token_ids=lambda: (7,))
+    middle = NS(key=middle_key, parent=root, component_data=[], children={8: child})
+    root.children = {7: middle}
+    child.parent = middle
+    child.key = NS(extra_key=None, cache_salt=None, is_bigram=False, raw_token_ids=lambda: (8,))
+    assert metadata_signature(src) == before
+    child.key.raw_token_ids = lambda: (9,)
+    assert metadata_signature(src) != before
+
+
 def test_shared_mode_rejects_unsupported_configuration():
     args = NS(
         enable_elastic_pp=True,

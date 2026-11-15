@@ -293,14 +293,14 @@ class NixlKVPatchCopier:
         with self.lock:
             retired, self.retired = self.retired, {}
         rows = sorted(retired.items())
-        for start in range(0, len(rows), 256):
+        for start in range(0, len(rows), 1024):
             for peer in self.targets:
                 self.endpoint.rpc(
                     peer,
                     dict(
                         op="forget",
                         generation=self.generation,
-                        rows=rows[start : start + 256],
+                        rows=rows[start : start + 1024],
                     ),
                 )
 

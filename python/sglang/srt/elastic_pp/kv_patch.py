@@ -12,6 +12,7 @@ from __future__ import annotations
 import threading
 from contextlib import nullcontext
 from dataclasses import dataclass
+from itertools import islice
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class ContinuousKVPatch:
         self.max_rows = max_rows
         self._epochs = {}
         self._live = {}
+        self._dirty = {}
         self._acked = {}
         self._pending = None
         self._pinned = set()
@@ -82,8 +84,10 @@ class ContinuousKVPatch:
                     "publish one completed immutable KV write per incarnation"
                 )
             self._live[slot] = KVRowStamp(slot, incarnation, ready)
+            self._dirty[slot] = self._live[slot]
 
     def free(self, slot, incarnation, *, generation):
+        """Drop one incarnation; return whether the target had acknowledged it."""
         with self._lock:
             self._check(generation, mutable=True)
             row = self._live.get(slot)
@@ -92,22 +96,23 @@ class ContinuousKVPatch:
             if slot in self._pinned:
                 raise KVPatchBusy("KV row copy is in flight; defer free/reuse")
             del self._live[slot]
-            self._acked.pop(slot, None)
+            self._dirty.pop(slot, None)
+            return self._acked.pop(slot, None) == incarnation
 
     def dirty_rows(self):
         with self._lock:
-            return tuple(
-                row
-                for slot, row in sorted(self._live.items())
-                if row.ready is not None and self._acked.get(slot) != row.incarnation
-            )
+            return tuple(self._dirty[slot] for slot in sorted(self._dirty))
 
     def submit(self, *, generation):
         with self._lock:
             self._check(generation)
             if self._pending is not None:
                 raise KVPatchBusy("only one bounded KV copy round may be in flight")
-            return self._submit_rows(self.dirty_rows()[: self.max_rows])
+            # Preserve a ready frontier rather than sorting the full live KV
+            # set at every scheduler poll. Completion/free retires each entry.
+            return self._submit_rows(
+                tuple(islice(self._dirty.values(), self.max_rows))
+            )
 
     def _submit_rows(self, rows):
         # Called only with the session lock held and no outstanding copy.
@@ -142,6 +147,7 @@ class ContinuousKVPatch:
                 current = self._live.get(row.slot)
                 if current is not None and current.incarnation == row.incarnation:
                     self._acked[row.slot] = row.incarnation
+                    self._dirty.pop(row.slot, None)
             self.rows_copied += len(rows)
             self._pinned.clear()
             self._pending = None

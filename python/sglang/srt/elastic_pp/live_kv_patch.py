@@ -260,12 +260,16 @@ class LiveKVSnapshot:
                 for slot in slots.detach().cpu().tolist():
                     epoch = self.epochs[slot]
                     try:
-                        self.session.free(slot, epoch, generation=self.generation)
+                        copied = self.session.free(
+                            slot, epoch, generation=self.generation
+                        )
                     except KVPatchBusy:
                         self.free_waits += 1
                         self.session.poll(generation=self.generation, wait=True)
-                        self.session.free(slot, epoch, generation=self.generation)
-                    if hasattr(self.copier, "forget"):
+                        copied = self.session.free(
+                            slot, epoch, generation=self.generation
+                        )
+                    if copied and hasattr(self.copier, "forget"):
                         self.copier.forget(slot, epoch)
                     del self.epochs[slot]
                     self.published.discard(slot)
@@ -299,12 +303,16 @@ class LiveKVSnapshot:
                     if slot in self.published:
                         epoch = self.epochs[slot]
                         try:
-                            self.session.free(slot, epoch, generation=self.generation)
+                            copied = self.session.free(
+                                slot, epoch, generation=self.generation
+                            )
                         except KVPatchBusy:
                             self.free_waits += 1
                             self.session.poll(generation=self.generation, wait=True)
-                            self.session.free(slot, epoch, generation=self.generation)
-                        if hasattr(self.copier, "forget"):
+                            copied = self.session.free(
+                                slot, epoch, generation=self.generation
+                            )
+                        if copied and hasattr(self.copier, "forget"):
                             self.copier.forget(slot, epoch)
                         self.epochs[slot] = self.session.allocate(
                             slot, generation=self.generation

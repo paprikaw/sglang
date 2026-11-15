@@ -42,6 +42,26 @@ def ready():
     return SimpleNamespace(synchronize=lambda: None)
 
 
+def test_retire_only_incarnations_acknowledged_by_target():
+    allocator, source, slots, patch = fixture(size=4, max_rows=1)
+    retired = []
+    patch.copier.forget = lambda slot, epoch: retired.append((slot, epoch))
+    unpublished = allocator.alloc(1)
+    allocator.free(unpublished)
+    assert retired == []
+    patch.progress(slots, ready())
+    # Rewriting a published but never submitted row also needs no invalidation.
+    patch.prepare_writes(slots[1:])
+    assert retired == []
+    # A pinned free must first finish its copy, then retire that incarnation.
+    allocator.free(slots[:1])
+    assert retired == [(int(slots[0]), 1)]
+    again = allocator.alloc(1)
+    allocator.free(again)
+    assert retired == [(int(slots[0]), 1)]
+    patch.abort()
+
+
 def test_real_allocator_online_snapshot_and_fence_include_unpublished_loadback():
     allocator, source, slots, patch = fixture()
     patch.progress(slots[:1], ready())

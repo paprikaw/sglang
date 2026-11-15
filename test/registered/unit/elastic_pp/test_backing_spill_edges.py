@@ -460,6 +460,8 @@ def test_three_rank_hybrid_spill_grow_shrink_preserves_live_kv_and_all_gdn(
         for rank, pool in enumerate(pools)
     ]
     for pool in pools:
+        # All recurrent rows contain meaningful state in this full-pool case.
+        pool.req_to_token_pool.mamba_allocator.alloc(pool.recurrent_slot_count - 1)
         for layer in pool.elastic_pp_kv_layer_ids(
             LayerRange(pool.start_layer, pool.end_layer)
         ):

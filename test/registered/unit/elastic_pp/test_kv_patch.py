@@ -47,6 +47,25 @@ def publish(session, slot):
     return epoch
 
 
+def test_online_round_does_not_enumerate_full_live_set(monkeypatch):
+    copier = Copier()
+    session = ContinuousKVPatch(generation=1, capacity=10000, copier=copier, max_rows=2)
+    for slot in range(1, 1000):
+        session.allocate(slot, generation=1)
+    for slot in (999, 7, 500):
+        session.publish(slot, 1, ready=Ready(), generation=1)
+    monkeypatch.setattr(session, "dirty_rows", lambda: pytest.fail("full-set scan"))
+    assert session.submit(generation=1)
+    assert [r.slot for r in copier.batches[-1][0]] == [999, 7]
+    session.poll(generation=1, wait=True)
+    assert session.submit(generation=1)
+    assert [r.slot for r in copier.batches[-1][0]] == [500]
+    session.poll(generation=1, wait=True)
+    assert not session.submit(generation=1)
+    assert session.unacknowledged_rows == 996
+    session.abort(generation=1)
+
+
 def test_source_can_append_during_copy_and_final_fence_drains_real_deltas():
     copier = Copier()
     session = ContinuousKVPatch(generation=1, capacity=8, copier=copier, max_rows=1)

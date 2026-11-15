@@ -16,8 +16,8 @@ _SLOTS = "__elastic_pp_recurrent_slots__"
 class ElasticPPHybridKVTransport(ElasticPPKVTransport):
     """GDN state is indexed by request slots, never by token KV slots.
 
-    Copy the complete recurrent slot pool in bounded chunks at the drained
-    scheduler fence. This also preserves unused/padding slots and avoids
+    Copy allocated recurrent slots and padding slot zero at the drained
+    scheduler fence. This preserves cached and active request states and avoids
     depending on a stale background request snapshot. Allocator identity is
     checked collectively before any transfer; slot remapping is not supported.
     """
@@ -55,15 +55,21 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
             ),
         }
 
-    def snapshot_at_fence(self, transition):
-        size = super().snapshot_at_fence(transition)
-        free = set(
-            int(i) for i in self.pool.req_to_token_pool.mamba_allocator.free_slots
-        )
-        slots = torch.tensor(
+    def _live_recurrent_slots(self):
+        """Read only at the drained fence; maps are checked before transfer."""
+        free_ids = torch.as_tensor(
+            self.pool.req_to_token_pool.mamba_allocator.free_slots,
+            dtype=torch.int64,
+        ).detach().cpu()
+        free = set(free_ids.tolist())
+        return torch.tensor(
             [i for i in range(self.pool.recurrent_slot_count) if i not in free],
             dtype=torch.int64,
         )
+
+    def snapshot_at_fence(self, transition):
+        size = super().snapshot_at_fence(transition)
+        slots = self._live_recurrent_slots()
         layers = {
             layer
             for edge in self.outbound_transfers(transition)
@@ -133,9 +139,7 @@ class ElasticPPHybridKVTransport(ElasticPPKVTransport):
         # Separate address space from slot_ids (the sparse token-KV rows).
         # Use a blocking host-to-device copy: a CUDA arange on the serving
         # stream could otherwise race index_select on the migration streams.
-        request_slots = torch.arange(
-            self.pool.recurrent_slot_count, dtype=torch.int64
-        ).to(self.pool.device)
+        request_slots = self._live_recurrent_slots().to(self.pool.device)
         chunks = _slot_chunks(request_slots, self.recurrent_chunk_size)
         for transfer in sorted(transition.kv_transfers, key=self._sort_key):
             if self.rank not in (transfer.src_rank, transfer.dst_rank):

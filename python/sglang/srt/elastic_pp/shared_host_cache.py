@@ -393,36 +393,69 @@ def merge_schemas(reports, total_layers):
 
 
 def metadata_signature(cache):
-    """Inspect logical slot metadata only, never read historical KV/GDN bytes."""
-    from sglang.srt.elastic_pp.hicache_transition import host_nodes
+    """Hash exact CPU slot metadata without building large Python lists."""
+    import array
+    import sys
 
-    nodes = sorted(
-        (repr(identity), component, tuple(node.slots.tolist()))
-        for (identity, component), node in host_nodes(cache).items()
-    )
-    allocators = []
+    digest = hashlib.sha256(b"elastic-shared-host-metadata-v2")
+
+    def field(value):
+        data = repr(value).encode()
+        digest.update(len(data).to_bytes(8, "little"))
+        digest.update(data)
+
+    def slots(value):
+        value = torch.as_tensor(value)
+        if value.device.type != "cpu":
+            raise ValueError("host metadata must be CPU resident")
+        if value.numel() and (value.is_floating_point() or value.is_complex()):
+            raise ValueError("slot metadata must be integral")
+        field((tuple(value.shape), value.dtype == torch.bool))
+        value = value.detach().to(dtype=torch.int64).contiguous().reshape(-1).numpy()
+        data = memoryview(value).cast("B")
+        digest.update(len(data).to_bytes(8, "little"))
+        digest.update(data)
+
+    # Extend a token-stream hash once per edge. Re-encoding every complete
+    # ancestor prefix makes long, branching sessions quadratic. Hash state is
+    # independent of radix split boundaries and never reads KV/GDN payloads.
+    nodes = []
+    stack = [(cache.tree_core.root_node, hashlib.sha256(b"host-token-prefix-v1"))]
+    while stack:
+        node, prefix = stack.pop()
+        key = node.key
+        if node.parent is not None:
+            if key.is_bigram:
+                raise NotImplementedError("elastic HiCache bigram trees are unsupported")
+            tokens = array.array("q", key.raw_token_ids())
+            if tokens.itemsize != 8:
+                raise RuntimeError("token hashing requires 64-bit signed integers")
+            if sys.byteorder != "little":
+                tokens.byteswap()
+            prefix = prefix.copy()
+            prefix.update(memoryview(tokens).cast("B"))
+        identity = (repr(key.extra_key), repr(key.cache_salt), prefix.hexdigest())
+        for component, data in enumerate(node.component_data):
+            if data.host_value is not None:
+                nodes.append((identity, component, data.host_value))
+        stack.extend((child, prefix) for child in node.children.values())
+    field(len(nodes))
+    for identity, component, value in sorted(nodes, key=lambda n: (n[0], n[1])):
+        field((repr(identity), component))
+        slots(value)
+    field(len(cache.host_pool_group.entries))
     for entry in cache.host_pool_group.entries:
         pool = entry.host_pool
-        allocators.append(
-            (
-                str(entry.name),
-                pool.size,
-                tuple(torch.as_tensor(pool.free_slots).tolist()),
-                tuple(tuple(torch.as_tensor(x).tolist()) for x in pool.release_slots),
-                pool.num_release_slots,
-                (
-                    tuple(torch.as_tensor(pool.slot_used).tolist())
-                    if hasattr(pool, "slot_used")
-                    else None
-                ),
-                (
-                    tuple(torch.as_tensor(pool.mem_state).tolist())
-                    if hasattr(pool, "mem_state")
-                    else None
-                ),
-            )
-        )
-    return hashlib.sha256(repr((nodes, allocators)).encode()).hexdigest()
+        field((str(entry.name), pool.size, pool.num_release_slots))
+        slots(pool.free_slots)
+        field(len(pool.release_slots))
+        for released in pool.release_slots:
+            slots(released)
+        for name in ("slot_used", "mem_state"):
+            field((name, hasattr(pool, name)))
+            if hasattr(pool, name):
+                slots(getattr(pool, name))
+    return digest.hexdigest()
 
 
 def detach_inherited_host_stack(clone):
