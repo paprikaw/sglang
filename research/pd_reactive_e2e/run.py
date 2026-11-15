@@ -105,7 +105,7 @@ def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualif
     root['concurrent_kv']=concurrent_kv
     if concurrent_kv:
         if not kvcached_capacity:raise ValueError('concurrent pilot requires managed KV capacity')
-        root.update(per_instance_admission=10,max_running_requests=4,pp_micro_batch_size=4,
+        root.update(per_instance_admission=10,max_running_requests=4,pp_micro_batch_size=1,
             qualification_scope='Concurrent managed KV Decode, at most four active requests per instance; qualification pending.',
             scale_trigger='native_preallocator_kv_tokens_only')
     root['qualification_smoke']=qualification_smoke
@@ -230,7 +230,7 @@ def engine(run, root, sid):
             flags.append(k);i+=1
         if root.get('concurrent_kv') and sid.startswith('d'):
             index=flags.index('--cuda-graph-bs-decode')
-            flags[index+1:index+2]=['1','2','4']
+            flags[index+1:index+2]=['1'] if root['pp_micro_batch_size']==1 else ['1','2','4']
         if remove:
             flags.extend(['--cuda-graph-bs-decode','1'])
         save(run/'servers'/sid/'effective_launch.json',dict(argv=flags,source=root['engine_commit']))

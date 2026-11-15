@@ -86,11 +86,35 @@ def exercise(run, root, replay, p, d, key, info, health, save):
     prompts = [
         [1000 + ((i * 31 + j * 937) % 20000) for i in range(4608)] for j in range(2)
     ]
+
+    def stable_reference(tokens, output, lane):
+        history = []
+        for attempt in range(4):
+            response = replay.request_one(
+                p, d, key, tokens, output, lane, True, request_timeout_s=120
+            )
+            history.append(response)
+            if (
+                len(history) > 1
+                and response["output_ids"] == history[-2]["output_ids"]
+                and (
+                    response["prefill_meta"].get("cached_tokens_details")
+                    == history[-2]["prefill_meta"].get("cached_tokens_details")
+                )
+            ):
+                result.setdefault("reference_warmup", []).append(
+                    dict(lane=lane, output=output, responses=history)
+                )
+                return response
+        result.setdefault("reference_warmup", []).append(
+            dict(lane=lane, output=output, responses=history)
+        )
+        raise AssertionError("static cache warmup did not stabilize within four calls")
+
     try:
         short_prompts = [tokens[:2048] for tokens in prompts]
         short_references = [
-            replay.request_one(p, d, key, tokens, 128, j, True, request_timeout_s=120)
-            for j, tokens in enumerate(short_prompts)
+            stable_reference(tokens, 128, j) for j, tokens in enumerate(short_prompts)
         ]
         with ThreadPoolExecutor(max_workers=2) as executor:
             short_futures = [
@@ -122,11 +146,7 @@ def exercise(run, root, replay, p, d, key, info, health, save):
         references = []
         for j, tokens in enumerate(prompts):
             replay.request_one(p, d, key, tokens, 64, j, True, request_timeout_s=120)
-            references.append(
-                replay.request_one(
-                    p, d, key, tokens, 512, j, True, request_timeout_s=120
-                )
-            )
+            references.append(stable_reference(tokens, 512, j))
         result["references"] = references
         repeats = [
             replay.request_one(p, d, key, tokens, 512, j, True, request_timeout_s=120)
@@ -247,6 +267,7 @@ def exercise(run, root, replay, p, d, key, info, health, save):
         restored = replay.request_one(
             p, d, key, prompts[0], 32, 0, True, request_timeout_s=120
         )
+        result["restored_response"] = restored
         result["restore_match"] = (
             restored["output_ids"] == references[0]["output_ids"][:32]
         )
