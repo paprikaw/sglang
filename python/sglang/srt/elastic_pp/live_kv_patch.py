@@ -175,8 +175,8 @@ class LiveKVSnapshot:
     def seed_initial_base(self):
         """Scheduler-only: HiCache writers were quiescent at transition start.
 
-        Do not mark later asynchronous loadback allocations ready. The first
-        forward completion supplies the event for the captured incarnations;
+        Do not mark later asynchronous loadback allocations ready. The caller
+        supplies a scheduler-stream event for these captured incarnations;
         every subsequent rewrite still uses prepare_writes before GPU access.
         """
         with self.lock:
@@ -200,6 +200,40 @@ class LiveKVSnapshot:
                 self.published.add(slot)
                 self.initial_base_rows_published += 1
         self.initial_base = None
+
+    def start_initial_base(self, ready):
+        """Scheduler-only event covering the quiescent base captured at begin.
+
+        This also starts an idle server's cache copy, without manufacturing a
+        forward or publishing later asynchronous loadback allocations.
+        """
+        with self.lock:
+            if not self.initial_base_enabled:
+                raise RuntimeError("initial KV base was not seeded")
+            self._publish_initial_base(ready)
+            self.poll_online()
+
+    @property
+    def unacknowledged_rows(self):
+        with self.lock:
+            if self.error is not None:
+                raise RuntimeError("online KV snapshot failed: " + self.error)
+            return self.session.unacknowledged_rows
+
+    def poll_online(self):
+        """Scheduler-only, nonblocking copy progress, including idle slots."""
+        with self.lock:
+            if not self.active:
+                return
+            try:
+                if self.session.poll(generation=self.generation):
+                    self.online_completed_rows = self.session.rows_copied
+                    if getattr(
+                        self.copier, "ready_to_submit", True
+                    ) and self.session.submit(generation=self.generation):
+                        self.online_submissions += 1
+            except BaseException as exc:
+                self._fail(exc)
 
     def _allocate(self, slots):
         for slot in slots.detach().cpu().tolist():
@@ -287,12 +321,7 @@ class LiveKVSnapshot:
                 self.forward_checkpoints += 1
                 self._publish_initial_base(ready)
                 self._publish(slots, ready)
-                if self.session.poll(generation=self.generation):
-                    self.online_completed_rows = self.session.rows_copied
-                    if getattr(
-                        self.copier, "ready_to_submit", True
-                    ) and self.session.submit(generation=self.generation):
-                        self.online_submissions += 1
+                self.poll_online()
             except BaseException as exc:
                 self._fail(exc)
 

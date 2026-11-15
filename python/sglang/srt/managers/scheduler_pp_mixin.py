@@ -415,6 +415,9 @@ class SchedulerPPMixin:
         coordinator = self.elastic_pp_migration_coordinator
         if coordinator is None:
             return False
+        poll_patch = getattr(coordinator, "poll_live_patch", None)
+        if poll_patch is not None:
+            poll_patch()
         snapshot = coordinator.snapshot()
         if snapshot.phase == ElasticPPMigrationPhase.FAILED:
             self._elastic_pp_draining = False

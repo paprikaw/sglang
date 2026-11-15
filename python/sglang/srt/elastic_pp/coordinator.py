@@ -309,7 +309,7 @@ class ElasticPPMigrationCoordinator:
                     or getattr(self.cache_transition, "initial_base_ready", False)
                 ):
                     # Successful capture proved HiCache writers quiescent. A
-                    # later forward event covers earlier inference writes; new
+                    # current-stream event covers earlier inference writes; new
                     # asynchronous loadback allocations remain unpublished.
                     self.kv_transport.seed_initial_live_base()
             self._thread = Thread(
@@ -322,6 +322,10 @@ class ElasticPPMigrationCoordinator:
     def progress_live_patch(self, batch, ready_event, req_to_token_pool):
         if self.enable_kv_patch:
             self.kv_transport.progress_live_patch(batch, ready_event, req_to_token_pool)
+
+    def poll_live_patch(self):
+        if self.enable_kv_patch and self.phase == ElasticPPMigrationPhase.PREPARING:
+            self.kv_transport.poll_live_patch()
 
     def prepare_live_patch_writes(self, batch):
         if self.enable_kv_patch:
@@ -924,6 +928,20 @@ class ElasticPPMigrationCoordinator:
                     error=local_error,
                 )
                 self._raise_peer_failures("background host copy", reports)
+            if self.enable_kv_patch:
+                wait_base = getattr(self.kv_transport, "wait_initial_live_base", None)
+                if wait_base is not None:
+                    local_error = None
+                    try:
+                        self._timed("online_kv_catchup", wait_base)
+                    except BaseException as exc:
+                        local_error = f"{type(exc).__name__}: {exc}"
+                    reports = self._consensus(
+                        "online_kv_catchup",
+                        success=local_error is None,
+                        error=local_error,
+                    )
+                    self._raise_peer_failures("online KV catchup", reports)
             logger.info(
                 "Elastic PP generation=%d rank=%d allocation consensus complete",
                 generation,

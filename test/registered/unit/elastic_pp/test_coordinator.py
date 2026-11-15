@@ -310,6 +310,45 @@ def test_live_patch_starts_on_scheduler_and_finishes_before_fenced_transfer():
     assert calls[2][0] == "release"
 
 
+@pytest.mark.parametrize("failure", [None, "local", "peer"])
+def test_online_catchup_consensus_precedes_fence_without_blocking_scheduler(failure):
+    group = _Group(fail_stage="online_kv_catchup" if failure == "peer" else None)
+    coordinator, transition, runner, kv = _coordinator(group)
+    coordinator.strategy = "background"
+    coordinator.enable_kv_patch = True
+    kv.begin_live_patch = lambda t: None
+    kv.check_live_patch = lambda: None
+    coordinator._precopy_immutable_weights = lambda t: None
+    entered, release = threading.Event(), threading.Event()
+    polled = []
+    kv.poll_live_patch = lambda: polled.append(threading.current_thread().name)
+
+    def wait_base():
+        entered.set()
+        assert release.wait(1)
+        if failure == "local":
+            raise TimeoutError("base catchup timeout")
+
+    kv.wait_initial_live_base = wait_base
+    coordinator.begin(transition)
+    assert entered.wait(1)
+    assert coordinator.snapshot().phase == ElasticPPMigrationPhase.PREPARING
+    coordinator.poll_live_patch()
+    assert polled == [threading.current_thread().name]
+    assert "arm_fence" not in group.stages
+    release.set()
+    expected = (ElasticPPMigrationPhase.BULK_READY if failure is None
+                else ElasticPPMigrationPhase.FAILED)
+    snapshot = coordinator.wait_for_phase(expected, timeout=2)
+    assert "online_kv_catchup" in group.stages
+    if failure is None:
+        assert group.stages.index("online_kv_catchup") < group.stages.index("arm_fence")
+    else:
+        assert snapshot.source_usable and kv.aborted_staged
+        assert "arm_fence" not in group.stages
+        assert not runner.committed
+
+
 def test_live_patch_prepare_failure_reaches_collective_abort():
     coordinator, transition, runner, kv = _coordinator()
     coordinator.strategy = "background"

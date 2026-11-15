@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import time
 from contextlib import contextmanager
 from typing import Any, Literal
 
@@ -506,9 +507,13 @@ class ElasticPPKVTransport:
                 for layer in layers
             }
             copier = None
+            online_rows = min(256, self.slot_chunk_size)
             if self._nixl_endpoint is not None:
                 from sglang.srt.elastic_pp.nixl_kv_patch import NixlKVPatchCopier
 
+                # The existing staging buffer supplies the byte bound; this
+                # changes transfer granularity without increasing its storage.
+                online_rows = min(1024, self.slot_chunk_size)
                 targets = {}
                 for edge in self.outbound_transfers(transition):
                     targets.setdefault(edge.dst_rank, set()).update(
@@ -519,13 +524,13 @@ class ElasticPPKVTransport:
                     endpoint=self._nixl_endpoint,
                     generation=transition.target.generation,
                     targets=targets,
-                    max_rows=min(256, self.slot_chunk_size),
+                    max_rows=online_rows,
                 )
             self._live_patch = LiveKVSnapshot(
                 generation=transition.target.generation,
                 allocator=self.allocator,
                 source=source,
-                max_rows=min(256, self.slot_chunk_size),
+                max_rows=online_rows,
                 admit_host_bytes=_require_cpu_space,
                 copier=copier,
             )
@@ -536,6 +541,32 @@ class ElasticPPKVTransport:
     def seed_initial_live_base(self):
         if self._live_patch is not None:
             self._live_patch.seed_initial_base()
+            ready = self._record_ready_event(
+                torch.cuda.current_stream(self._runner_device)
+                if self._runner_device.type == "cuda"
+                else None
+            )
+            self._live_patch.start_initial_base(ready)
+
+    def poll_live_patch(self):
+        if self._live_patch is not None:
+            self._live_patch.poll_online()
+
+    def wait_initial_live_base(self, *, timeout=30.0):
+        """Preparation-thread wait on counters, never on allocator/GPU state.
+
+        The scheduler keeps serving and advancing bounded copies. Only the
+        final small delta, not the whole cached prefix, should reach the fence.
+        """
+        patch = self._live_patch
+        if patch is None or not patch.initial_base_enabled:
+            return
+        deadline = time.monotonic() + timeout
+        while patch.unacknowledged_rows > patch.session.max_rows:
+            self.check_live_patch()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("online KV base did not catch up before fence")
+            time.sleep(0.002)
 
     def check_live_patch(self):
         error = self._live_patch_error

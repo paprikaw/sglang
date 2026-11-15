@@ -47,6 +47,12 @@ class ContinuousKVPatch:
         with self._lock:
             return self._phase
 
+    @property
+    def unacknowledged_rows(self):
+        """Include unpublished/new incarnations; do not inspect GPU state."""
+        with self._lock:
+            return len(self._live) - len(self._acked)
+
     def _check(self, generation, *, mutable=False):
         if generation != self.generation:
             raise ValueError("KV patch generation mismatch")

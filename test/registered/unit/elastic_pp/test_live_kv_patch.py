@@ -103,6 +103,69 @@ def test_abort_drains_pending_copy_and_preserves_serving_allocator():
     assert allocator.available_size() == allocator.size
 
 
+def test_idle_base_catches_up_online_without_publishing_later_loadback():
+    allocator, source, slots, patch = fixture(size=128, max_rows=4)
+    allocator.alloc(62)
+    patch.seed_initial_base()
+    patch.start_initial_base(ready())
+    later = allocator.alloc(1)
+    # Polling an idle pipeline must progress the base without a fake forward.
+    for _ in range(18):
+        patch.poll_online()
+    assert patch.forward_checkpoints == 0
+    assert patch.online_completed_rows == 64
+    assert patch.unacknowledged_rows == 1
+    assert later.item() not in patch.published
+    patch.finish_at_fence(allocator.elastic_pp_live_slots(), ready())
+    assert patch.metrics()['fence']['rows_copied_at_fence'] == 1
+
+
+def test_preparation_wait_reads_counters_while_scheduler_advances_base():
+    import threading
+
+    allocator, source, slots, patch = fixture(size=128, max_rows=4)
+    allocator.alloc(62)
+    patch.seed_initial_base()
+    patch.start_initial_base(ready())
+    transport = ElasticPPKVTransport.__new__(ElasticPPKVTransport)
+    transport._live_patch = patch
+    transport._live_patch_error = None
+    errors = []
+    done = threading.Event()
+
+    def wait():
+        try:
+            transport.wait_initial_live_base(timeout=1)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=wait)
+    worker.start()
+    assert not done.wait(.005)
+    for _ in range(18):
+        patch.poll_online()
+    worker.join(1)
+    assert done.is_set() and not errors
+    patch.finish_at_fence(allocator.elastic_pp_live_slots(), ready())
+    assert patch.metrics()['fence']['rows_copied_at_fence'] == 0
+
+
+def test_online_base_timeout_leaves_source_unfenced():
+    allocator, source, slots, patch = fixture(size=32, max_rows=2)
+    allocator.alloc(10)
+    patch.seed_initial_base()
+    patch.start_initial_base(ready())
+    transport = ElasticPPKVTransport.__new__(ElasticPPKVTransport)
+    transport._live_patch = patch
+    transport._live_patch_error = None
+    with pytest.raises(TimeoutError, match='catch up'):
+        transport.wait_initial_live_base(timeout=0)
+    assert patch.active and patch.session.phase == 'copying'
+    patch.abort()
+
+
 def test_copy_failure_aborts_only_patch_and_rejects_transition(monkeypatch):
     allocator, source, slots, patch = fixture()
 

@@ -61,6 +61,25 @@ def test_source_can_append_during_copy_and_final_fence_drains_real_deltas():
     assert session.dirty_rows() == ()
 
 
+def test_unacknowledged_count_includes_unpublished_rows_and_reused_incarnations():
+    copier = Copier()
+    session = ContinuousKVPatch(generation=1, capacity=8, copier=copier)
+    first = publish(session, 1)
+    second = session.allocate(2, generation=1)
+    assert session.unacknowledged_rows == 2
+    session.submit(generation=1)
+    session.poll(generation=1, wait=True)
+    assert session.unacknowledged_rows == 1
+    session.free(1, first, generation=1)
+    assert session.unacknowledged_rows == 1
+    publish(session, 1)
+    assert session.unacknowledged_rows == 2
+    session.free(2, second, generation=1)
+    assert session.unacknowledged_rows == 1
+    session.finish_at_fence(generation=1)
+    assert session.unacknowledged_rows == 0
+
+
 def test_free_is_blocked_until_copy_completes_and_reuse_requires_another_copy():
     copier = Copier()
     session = ContinuousKVPatch(generation=1, capacity=8, copier=copier)
