@@ -139,6 +139,7 @@ def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualif
     shutil.copyfile(HERE/'lifecycle.py',run/'harness/reactive_lifecycle.py')
     shutil.copyfile(HERE/'finite_profile.py',run/'harness/finite_profile.py')
     shutil.copyfile(HERE/'paired_cache_bust.py',run/'harness/paired_cache_bust.py')
+    shutil.copyfile(HERE/'stream_timing.py',run/'harness/stream_timing.py')
     site=run/'harness/sitecustomize.py'
     site.write_text(site.read_text()+ '\nimport os as _finite_os\n'
         'if _finite_os.environ.get("AGENTX_FINITE_REQUEST_COUNT"):\n'
@@ -159,7 +160,8 @@ def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualif
     s=p.read_text()+ '\nfrom reactive_router import install as install_reactive\ninstall_reactive(Adapter)\n'
     s=s.replace('first_content_s = time.monotonic() - started','first_content_s = time.monotonic() - started\n                            self.reactive.streaming.add(rid)')
     s=s.replace('self.active.pop(rid, None)','self.active.pop(rid, None)\n            self.reactive.streaming.discard(rid)')
-    p.write_text(s)
+    from stream_timing import instrument_adapter
+    p.write_text(instrument_adapter(s))
     p=run/'harness/run.py';s=p.read_text()
     marker='"--benchmark-duration", str(args.duration), "--benchmark-grace-period", str(args.profile_grace),'
     if s.count(marker)!=1:raise RuntimeError('unknown AgentX duration CLI')
@@ -170,7 +172,7 @@ def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualif
     if s.count(marker)!=1:raise RuntimeError('unknown AgentX harness return boundary')
     s=s.replace(marker,'        from reactive_lifecycle import hold_control_after_workload\n        await hold_control_after_workload(args.output.parent, code, adapter=adapter)\n'+marker)
     s=s.replace('"stable_placement.py", "mixed_replay.py", "sitecustomize.py")',
-                '"stable_placement.py", "mixed_replay.py", "sitecustomize.py", "reactive_lifecycle.py", "finite_profile.py", "paired_cache_bust.py")')
+                '"stable_placement.py", "mixed_replay.py", "sitecustomize.py", "reactive_lifecycle.py", "finite_profile.py", "paired_cache_bust.py", "stream_timing.py")')
     p.write_text(s)
     ep=dict(mode='pd',require_hicache=True,api_key_file=root['admin_key_file'],
         prefill=[endpoint(servers['p'])],decode=[endpoint(c) for n,c in servers.items() if n.startswith('d')],

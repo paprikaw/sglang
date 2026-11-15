@@ -2619,6 +2619,13 @@ class SchedulerDisaggregationDecodeMixin:
         curr_batch_size = running_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
+        if self.ps.pp_size > 1:
+            # This is one PP slot, not the whole instance. Keep new P/D
+            # requests queued for another slot when this microbatch is full.
+            # Native prebuilt merging must honor the same cap as Prefill.
+            microbatch_cap = get_parallel().pp_max_micro_batch_size
+            if microbatch_cap is not None:
+                batch_size = min(batch_size, microbatch_cap)
 
         num_not_used_batch = batch_size - curr_batch_size
 
