@@ -1,3 +1,7 @@
+# 2026-11-15：并发容量触发与一组完整有限流对照
+
+冻结 `e00f2688b01f427efd33689a53a6648c7ff825f2`，185项相关CPU通过；最小r5验证两条512-token迁移输出一致、CPU HiCache恢复、物理KV往返及独立64 GiB复用。短AgentX＋BurstGPT两组各76请求、扩缩、缩后输出和Guard后检查／归属清理通过。原地／实例级平均E2E25.61／27.21秒、TPOT53.96／31.21 ms、服务区间worker GPU秒3289.86／4104.00。只授予文档写明的有限资格：PP微批1、运行上限4、固定P2、单周期；两组未达90% SLO，CPU预算不严格相同，新的PP3请求生成差异未隔离。不能把流程成功作为一般正确性／性能成功。[完整记录](../pd_reactive_e2e/VALIDATION_CONCURRENT_KV_20261115.md)。
+
 # 2026-11-15：容量与严格输入有限流的有界验收完成
 
 冻结`67d60fa4f615b35d28a4a4eaa5ec96cfe29a13bc`／tag `experiment/sglang/pd-kvcached-e2e-20261115-r6`，原地与副本各76／76请求、四任务树、扩缩往返、缩后暖输出、Guard后检查／缓存审计／owned cleanup／正常release通过。逐请求身份及token数、协议、策略和引擎哈希一致；两边输入3071334、输出12964 token，Prefill总缓存命中96.131%。实际spawn bootstrap也通过，前一节7项原生AgentX CPU证据复用；未改引擎代码，不重复累计133项／25项未变CPU检查。

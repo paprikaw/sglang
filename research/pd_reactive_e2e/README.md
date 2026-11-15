@@ -1,3 +1,9 @@
+# 2026-11-15：并发 KV 容量触发路径
+
+新增 `--concurrent-kv`：整条P→D链的单请求限制解除，KV预留覆盖在途PP微批，扩容使用原生KV分配不足造成的持续等待。硬件验证使用每微批1请求、运行上限4；HiCache／Graph／CPU预打包offload／NIXL保留。`--qualification-smoke` 先执行有界最小验证，`--reuse-probe` 检查独立显存复用。两组短对照完成，结果与未解决的生成一致性、预算及SLO边界见[本轮验收](VALIDATION_CONCURRENT_KV_20261115.md)。
+
+以下保留旧单请求试跑说明，其限制与负结果不代表新路径：
+
 # 122B／A100：短 reactive 端到端试跑
 
 固定 P=PP2，只比较 D 原地 PP2→PP3 与增加完整 PP2。两者使用相同 AgentX 会话、工具等待、暖会话和 BurstGPT 新任务到达，以及同一队列阈值、持续时间和缩容规则。CUDA Graph、CPU HiCache、真实权重 offload 和 CUDA 模块预加载沿用 r23。每个 Decode 实例仍只允许一个活跃请求；客户端可保留多个排队任务，不能当作多请求吞吐资格。
