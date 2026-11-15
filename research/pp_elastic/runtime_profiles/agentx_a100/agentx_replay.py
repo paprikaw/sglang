@@ -34,14 +34,23 @@ def stream(endpoint, key, payload, timeout=600, *, event_sink=None):
         data=json.dumps(payload).encode(),
         headers={'Authorization': 'Bearer ' + key, 'Content-Type': 'application/json'})
     first = last = final = None
+    data_events = ignored_lines = 0
+    done = False
+    status = content_type = content_encoding = None
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = response.status
+            content_type = response.headers.get('Content-Type', '')
+            content_encoding = response.headers.get('Content-Encoding', '')
             for line in response:
                 if not line.startswith(b'data: '):
+                    ignored_lines += 1
                     continue
                 if line[6:].strip() == b'[DONE]':
+                    done = True
                     break
                 value = json.loads(line[6:])
+                data_events += 1
                 meta = value.get('meta_info', {})
                 if 'error' in value:
                     raise RuntimeError(str(value['error']))
@@ -59,7 +68,16 @@ def stream(endpoint, key, payload, timeout=600, *, event_sink=None):
     except urllib.error.HTTPError as error:
         raise RuntimeError(f'HTTP {error.code}: {error.read().decode()[:500]}') from None
     if first is None or final is None:
-        raise RuntimeError('Incomplete response stream')
+        last_meta = final.get('meta_info', {}) if final is not None else {}
+        finish = last_meta.get('finish_reason')
+        finish_type = finish.get('type') if isinstance(finish, dict) else None
+        raise RuntimeError(
+            f'Incomplete response stream: HTTP={status}, content_type={content_type!r}, '
+            f'content_encoding={content_encoding!r}, '
+            f'data_events={data_events}, ignored_lines={ignored_lines}, done={done}, '
+            f'completion_tokens={last_meta.get("completion_tokens")}, '
+            f'finish_type={finish_type!r}'
+        )
     meta = final['meta_info']
     count = meta['completion_tokens']
     if count != payload['sampling_params']['max_new_tokens']:
@@ -92,7 +110,22 @@ def request_one(prefill, decode, key, tokens, output, lane, return_logprob=False
     start = time.perf_counter()
     with cf.ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(http, prefill['host'], prefill['port'], '/generate', key, pre, request_timeout_s)
-        result = stream(decode, key, payload, timeout=request_timeout_s)
+        try:
+            result = stream(decode, key, payload, timeout=request_timeout_s)
+        except Exception as decode_error:
+            # A failed Decode stream must not hide the concurrent Prefill error.
+            # Report only status/error information, never the request or tokens.
+            try:
+                pre_result = future.result()
+            except Exception as pre_error:
+                pre_status = f'{type(pre_error).__name__}: {str(pre_error)[:300]}'
+            else:
+                pre_meta = pre_result.get('meta_info', {})
+                pre_status = f'completed, completion_tokens={pre_meta.get("completion_tokens")}'
+                if 'error' in pre_result:
+                    pre_status = f'error: {str(pre_result["error"])[:300]}'
+            message = f'P/D request failed: Decode={decode_error}; Prefill={pre_status}'
+            raise RuntimeError(message.replace(key, '[REDACTED]') if key else message) from decode_error
         pre_result = future.result()
     if 'error' in pre_result:
         raise RuntimeError(str(pre_result['error']))
