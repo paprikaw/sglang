@@ -2,17 +2,41 @@
 
 from __future__ import annotations
 
+import array
 import hashlib
 import math
 import threading
 import time
 from contextlib import nullcontext
 
+import numpy as np
 import torch
 
 
 def _signature(versions):
-    return hashlib.sha256(repr(sorted(versions.items())).encode()).hexdigest()
+    """Canonical complete coverage, without formatting every row as text.
+
+    Callers own a frozen epoch snapshot or hold the receiver lock. Fixed-width
+    little-endian slot and incarnation vectors preserve every bit, including
+    high incarnations, and are independent of arrival/insertion order.
+    """
+    try:
+        slots = array.array("Q", versions)
+        epochs = array.array("Q", versions.values())
+    except (TypeError, OverflowError) as exc:
+        raise ValueError("NIXL coverage requires unsigned 64-bit integer rows") from exc
+    if slots.itemsize != 8:
+        raise RuntimeError("NIXL coverage hashing requires 64-bit words")
+    slots = np.frombuffer(slots, dtype=np.uint64)
+    epochs = np.frombuffer(epochs, dtype=np.uint64)
+    order = np.argsort(slots)
+    slots = slots[order].astype("<u8", copy=False)
+    epochs = epochs[order].astype("<u8", copy=False)
+    digest = hashlib.sha256(b"elastic-live-kv-coverage-v2")
+    digest.update(len(versions).to_bytes(8, "little"))
+    digest.update(memoryview(slots).cast("B"))
+    digest.update(memoryview(epochs).cast("B"))
+    return digest.hexdigest()
 
 
 def _positive(value, name, *, zero=False):
@@ -378,6 +402,9 @@ class NixlKVPatchCopier:
             self._flush_retired()
             self.fence_metrics["retired_seconds"] = time.monotonic() - started
             self.fence_metrics["peer_seal_seconds"] = {}
+            started = time.monotonic()
+            signature = _signature(versions)
+            self.fence_metrics["signature_seconds"] = time.monotonic() - started
             for peer in self.targets:
                 started = time.monotonic()
                 self.endpoint.rpc(
@@ -386,7 +413,7 @@ class NixlKVPatchCopier:
                         op="seal",
                         generation=self.generation,
                         count=len(versions),
-                        signature=_signature(versions),
+                        signature=signature,
                     ),
                 )
                 self.fence_metrics["peer_seal_seconds"][peer] = (
