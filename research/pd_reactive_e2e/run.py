@@ -37,8 +37,8 @@ def endpoint(cfg):
     return row
 
 def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualification_smoke=False,
-            decode_graph_batches=None, verify_migrated_state=False):
-    if verify_migrated_state and not (qualification_smoke and concurrent_kv and mechanism=='inplace'):
+            decode_graph_batches=None, verify_migrated_state=False, probe_marlin_batching=False):
+    if (verify_migrated_state or probe_marlin_batching) and not (qualification_smoke and concurrent_kv and mechanism=='inplace'):
         raise ValueError('State byte audit is a minimum diagnostic, not a performance run')
     if decode_graph_batches is not None:
         if (not concurrent_kv or not decode_graph_batches
@@ -72,6 +72,8 @@ def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualif
         cfg['launch_env']['ELASTIC_PD_STATIC_DECODE']=str(int(sid.startswith('d') and mechanism=='replica'))
         if verify_migrated_state and sid.startswith('d'):
             cfg['launch_env']['SGLANG_ELASTIC_PP_VERIFY_STATE']='1'
+        if probe_marlin_batching and sid.startswith('d'):
+            cfg['launch_env']['ELASTIC_PD_MARLIN_BATCH_PROBE_DIR']=str(run/'kernel_probe')
         servers[sid]=cfg
     if mechanism=='replica':
         cfg=copy.deepcopy(servers['d0']); cfg.update(server_id='d1',port=29701 if kvcached_capacity else 29501,dist_port=29702 if kvcached_capacity else 29502)
@@ -121,6 +123,7 @@ def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualif
             scale_trigger='native_preallocator_kv_tokens_only')
     root['qualification_smoke']=qualification_smoke
     root['verify_migrated_state']=verify_migrated_state
+    root['probe_marlin_batching']=probe_marlin_batching
     if qualification_smoke:
         if not concurrent_kv or mechanism!='inplace':raise ValueError('smoke requires concurrent in-place arm')
         root.update(context_length=16384,max_total_tokens=12288,base_kv_capacity=8192)
@@ -651,13 +654,14 @@ if __name__=='__main__':
     p.add_argument('--kvcached-capacity',action='store_true');p.add_argument('--concurrent-kv',action='store_true');p.add_argument('--qualification-smoke',action='store_true');p.add_argument('--prepare',action='store_true');p.add_argument('--mechanism',choices=['inplace','replica'])
     p.add_argument('--decode-graph-batches',type=int,nargs='+')
     p.add_argument('--verify-migrated-state',action='store_true')
+    p.add_argument('--probe-marlin-batching',action='store_true')
     p.add_argument('--worker',action='store_true');p.add_argument('--engine',action='store_true');p.add_argument('--client',action='store_true');p.add_argument('--reuse-probe',action='store_true')
     p.add_argument('--server',choices=['p','d0','d1']);a=p.parse_args()
     if a.reuse_probe:
         packet=json.loads(sys.stdin.readline());os.environ.update(packet['environment'])
         os.environ['CUDA_VISIBLE_DEVICES']='1'
         q.reuse_probe(a.run,json.loads((a.run/'config.json').read_text())['node_configs'][socket.gethostname().split('.')[0]])
-    elif a.prepare:prepare(a.run,a.mechanism,a.kvcached_capacity,a.concurrent_kv,a.qualification_smoke,a.decode_graph_batches,a.verify_migrated_state)
+    elif a.prepare:prepare(a.run,a.mechanism,a.kvcached_capacity,a.concurrent_kv,a.qualification_smoke,a.decode_graph_batches,a.verify_migrated_state,a.probe_marlin_batching)
     else:
         root=json.loads((a.run/'config.json').read_text())
         if a.engine:engine(a.run,root,a.server)
