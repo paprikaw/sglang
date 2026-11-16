@@ -223,6 +223,29 @@ def test_project_pending_hybrid_does_not_publish(hybrid_pool_factory):
     pool.abort_elastic_pp_kv_layers(generation=1)
 
 
+def test_projected_host_counter_registration_cannot_replace_serving_counter(
+    hybrid_pool_factory,
+):
+    from sglang.srt.elastic_pp.hicache_transition import project_target_device_pool
+    from sglang.srt.elastic_pp.topology import LayerRange
+
+    pool = hybrid_pool_factory(start_layer=0, end_layer=2)
+    source_counter, full_counter, private_counter = object(), object(), object()
+    pool.layer_transfer_counter = source_counter
+    pool.full_kv_pool.layer_transfer_counter = full_counter
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(0, 4), generation=1, total_num_layers=4
+    )
+    view, req = project_target_device_pool(pool, target=LayerRange(0, 4), generation=1)
+    view.register_layer_transfer_counter(private_counter)
+    assert pool.layer_transfer_counter is source_counter
+    assert pool.full_kv_pool.layer_transfer_counter is full_counter
+    assert view.layer_transfer_counter is private_counter
+    assert view.full_kv_pool.layer_transfer_counter is None
+    assert req is not pool.req_to_token_pool and req.mamba_pool is not pool.mamba_pool
+    pool.abort_elastic_pp_kv_layers(generation=1)
+
+
 def test_logical_host_allocator_preserves_slot_order_into_physical():
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.elastic_pp.hicache_transition import clone_host_allocator

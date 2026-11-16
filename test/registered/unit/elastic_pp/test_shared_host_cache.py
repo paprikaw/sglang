@@ -730,3 +730,141 @@ def test_dormant_shared_view_uses_bank_capacity_without_a_collective(bank, monke
     assert clone.host_pool_group.get_pool(PoolName.KV).size == 32
     assert clone.host_pool_group.get_pool(PoolName.MAMBA).size == 8
     assert bank.leases == 0
+
+
+def test_private_shared_controller_is_adopted_with_fresh_fence_metadata(monkeypatch):
+    from sglang.srt.elastic_pp import hicache_transition as module
+    from sglang.srt.elastic_pp import shared_host_cache as shared
+
+    adapter, change = _shared_transition_adapter()
+    adapter.overlap_shared_metadata = True
+    adapter.model_runner.token_to_kv_pool = object()
+    live = adapter.scheduler.tree_cache
+    live.ongoing_load_back = {"still serving": object()}
+    prepared = NS(host_pool_group=object(), cache_controller=object())
+    fresh = object()
+    calls = []
+
+    def construct(cache, **kwargs):
+        assert shared._active_bank.get() is adapter.shared_bank
+        calls.append((cache, kwargs))
+        if kwargs.get("allocation_only"):
+            assert cache is live and kwargs["reuse_shared"]
+            kwargs["metrics"].update(
+                host_target_init_seconds=0.01, host_target_metadata_seconds=0.002
+            )
+            return prepared
+        assert cache is fresh and kwargs["prepared"] is prepared
+        assert kwargs["reuse_shared"]
+        return NS(tree_core="fresh fence tree")
+
+    monkeypatch.setattr(module, "prepare_target_host_cache", construct)
+    adapter.prepare_shared_target(change)
+    assert adapter.scheduler.tree_cache is live and adapter.target_cache is None
+    assert live.ongoing_load_back and adapter._prepared_shared_generation == 1
+    with pytest.raises(RuntimeError, match="still owned"):
+        adapter.prepare_shared_target(change)
+    # A request completes and the canonical metadata changes after preparation.
+    # Only this fresh adapter cache, never the prepared template, is published.
+    adapter.adapter = NS(cache=fresh)
+    adapter._shared_verified_generation = 1
+    adapter.apply_staged(change)
+    assert len(calls) == 2 and adapter.target_cache.tree_core == "fresh fence tree"
+    assert adapter.prepared_host is None and adapter._prepared_shared_generation is None
+    assert adapter.scheduler.tree_cache is live
+    assert adapter._background_metrics["host_shared_prepared_init_seconds"] == 0.01
+
+
+@pytest.mark.parametrize("fault", ["generation", "unverified"])
+def test_prepared_shared_controller_cannot_bypass_fence_validation(monkeypatch, fault):
+    from sglang.srt.elastic_pp import hicache_transition as module
+
+    adapter, change = _shared_transition_adapter()
+    adapter.prepared_host = NS()
+    adapter._prepared_shared_generation = 1 if fault == "unverified" else 2
+    adapter._shared_verified_generation = None if fault == "unverified" else 1
+    monkeypatch.setattr(
+        module,
+        "prepare_target_host_cache",
+        lambda *a, **k: pytest.fail("adopted stale metadata"),
+    )
+    with pytest.raises(RuntimeError, match="validated slot|generation mismatch"):
+        adapter.apply_staged(change)
+    assert adapter.prepared_host is not None
+
+
+def test_private_shared_controller_abort_retires_only_prepared_views(monkeypatch):
+    from sglang.srt.elastic_pp import hicache_transition as module
+
+    adapter, change = _shared_transition_adapter()
+    live = adapter.scheduler.tree_cache
+    prepared = NS(host_pool_group=object())
+    adapter.prepared_host, adapter._prepared_shared_generation = prepared, 1
+    retired = []
+
+    def discard(cache):
+        assert cache is prepared and cache is not live
+        retired.append(cache)
+        cache.host_pool_group = None
+
+    monkeypatch.setattr(module, "discard_host_cache", discard)
+    adapter.abort(change)
+    adapter.abort(change)
+    assert retired == [prepared] and live.host_pool_group is not None
+    assert adapter.prepared_host is None and adapter._prepared_shared_generation is None
+
+
+def test_private_shared_controller_is_opt_in_and_constructor_failure_is_safe(
+    monkeypatch,
+):
+    from sglang.srt.elastic_pp import hicache_transition as module
+
+    adapter, change = _shared_transition_adapter()
+    live = adapter.scheduler.tree_cache
+    adapter.model_runner.token_to_kv_pool = object()
+    calls = []
+
+    def fail(cache, **kwargs):
+        calls.append(cache)
+        raise MemoryError("private view construction failed")
+
+    monkeypatch.setattr(module, "prepare_target_host_cache", fail)
+    adapter.prepare_shared_target(change)
+    assert not calls and adapter.prepared_host is None
+    adapter.overlap_shared_metadata = True
+    with pytest.raises(MemoryError, match="private view construction failed"):
+        adapter.prepare_shared_target(change)
+    adapter.abort(change)
+    assert calls == [live] and adapter.scheduler.tree_cache is live
+    assert adapter.prepared_host is None and adapter._prepared_shared_generation is None
+
+
+def test_shared_prepared_eviction_callbacks_use_new_cache_and_allocator():
+    from sglang.srt.elastic_pp.hicache_transition import rebind_shared_host_callbacks
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+    calls = []
+    entry = NS(name=PoolName.MAMBA)
+    cache = NS(
+        host_pool_group=NS(entries=[NS(name=PoolName.KV), entry]),
+        evict_host=lambda n, ct: calls.append(("host", n, ct)),
+        evict=lambda params: calls.append(("device", params.mamba_num)),
+    )
+    allocator = NS(
+        alloc=lambda n: calls.append(("alloc", n)),
+        free=lambda slots: calls.append(("free", slots)),
+    )
+    rebind_shared_host_callbacks(
+        cache, NS(req_to_token_pool=NS(mamba_allocator=allocator))
+    )
+    entry.host_evict_fn(3)
+    entry.device_evict_fn(5)
+    entry.device_alloc_fn(2)
+    entry.device_free_fn([4])
+    assert calls == [
+        ("host", 3, ComponentType.MAMBA),
+        ("device", 5),
+        ("alloc", 2),
+        ("free", [4]),
+    ]

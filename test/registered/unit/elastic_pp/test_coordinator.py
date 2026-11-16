@@ -570,6 +570,38 @@ def test_live_patch_prepare_failure_reaches_collective_abort():
     assert not runner.committed
 
 
+@pytest.mark.parametrize("fail", [False, True])
+def test_private_host_preparation_follows_device_allocation_before_weight_copy(fail):
+    coordinator, transition, runner, kv = _coordinator()
+    coordinator.strategy = "background"
+    events = []
+    kv.prepare_transition = lambda change: events.append("device")
+
+    def prepare_host(change):
+        assert events == ["device"] and not runner.committed
+        assert threading.current_thread() is not threading.main_thread()
+        events.append("host")
+        if fail:
+            raise MemoryError("private controller allocation refused")
+
+    coordinator.cache_transition = SimpleNamespace(
+        prepare_shared_target=prepare_host,
+        abort=lambda change: events.append("abort"),
+    )
+    coordinator._precopy_immutable_weights = lambda change: events.append("weights")
+    coordinator.begin(transition)
+    phase = (
+        ElasticPPMigrationPhase.FAILED if fail else ElasticPPMigrationPhase.BULK_READY
+    )
+    snapshot = coordinator.wait_for_phase(phase, timeout=2)
+    assert snapshot.source_usable and not runner.committed
+    assert "prepare_allocations" in coordinator.group.stages
+    assert events == (
+        ["device", "host", "abort"] if fail else ["device", "host", "weights"]
+    )
+    assert "prepare_shared_host" in coordinator.transition_metrics()["stage_seconds"]
+
+
 @pytest.mark.parametrize(
     "device, expected_gpu", [("cpu", None), ("cuda", 3), ("cuda:2", 2)]
 )

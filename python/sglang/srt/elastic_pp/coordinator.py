@@ -603,6 +603,11 @@ class ElasticPPMigrationCoordinator:
         if prepare_capacity is not None:
             self._timed("prepare_kv_capacity", prepare_capacity, transition)
         self._timed("prepare_kv", self.kv_transport.prepare_transition, transition)
+        prepare_host = getattr(self.cache_transition, "prepare_shared_target", None)
+        if self.strategy == "background" and prepare_host is not None:
+            # Private target views use only already-prepared device mappings.
+            # Live tree/allocator metadata is still captured at the final fence.
+            self._timed("prepare_shared_host", prepare_host, transition)
         if self._source_backing_attempted:
             self._source_backing_metrics["target_restore"] = (
                 self.kv_transport.restore_target_from_snapshot(transition)

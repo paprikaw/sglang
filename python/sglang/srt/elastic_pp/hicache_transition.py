@@ -731,6 +731,20 @@ def adopt_prepared_host_stack(clone, prepared, *, allocator, params):
             setattr(prepared.components[ct], component_attr, None)
 
 
+def rebind_shared_host_callbacks(cache, params):
+    """Prepared Mamba eviction closures must use the fresh fence metadata."""
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+    for entry in cache.host_pool_group.entries:
+        if entry.name == PoolName.MAMBA:
+            entry.host_evict_fn = lambda n: cache.evict_host(n, ComponentType.MAMBA)
+            entry.device_evict_fn = lambda n: cache.evict(EvictParams(mamba_num=n))
+            entry.device_alloc_fn = params.req_to_token_pool.mamba_allocator.alloc
+            entry.device_free_fn = params.req_to_token_pool.mamba_allocator.free
+
+
 def _prepare_target_host_cache(
     cache,
     *,
@@ -790,6 +804,8 @@ def _prepare_target_host_cache(
             adopt_prepared_host_stack(
                 clone, prepared, allocator=allocator, params=params
             )
+            if reuse_shared:
+                rebind_shared_host_callbacks(clone, params)
         elif target.size == 0:
             build_dormant_host_stack(
                 clone, source=cache, projected=projected, params=params
@@ -1128,6 +1144,7 @@ class SchedulerHiCacheTransition:
             )
         self.precopy = None
         self.prepared_host = None
+        self._prepared_shared_generation = None
         self._background_metrics = {}
         if self.shared_host:
             # The shared path never snapshots or precopies historical CPU data.
@@ -1175,6 +1192,42 @@ class SchedulerHiCacheTransition:
             self._background_metrics["host_background_fallback"] = (
                 type(exc).__name__ + ": " + str(exc)
             )
+
+    def prepare_shared_target(self, transition):
+        """Construct only private shared-bank views while source serving continues.
+
+        This uses pool geometry and fixed collaborators, never template state
+        as the handoff snapshot. Projected device pools own their counter
+        attributes; the final fence supplies fresh tree/allocator/request
+        metadata before adopting this empty stack.
+        """
+        if not self.overlap_shared_metadata:
+            return
+        if self.prepared_host is not None:
+            raise RuntimeError("previous prepared shared host generation still owned")
+        from sglang.srt.elastic_pp.shared_host_cache import use_shared_host_bank
+        from sglang.srt.mem_cache.pool_host.base import hicache_capacity_group
+
+        metrics = self._background_metrics
+        started = time.monotonic()
+        with use_shared_host_bank(self.shared_bank), hicache_capacity_group(self.group):
+            self.prepared_host = prepare_target_host_cache(
+                self.scheduler.tree_cache,
+                device_pool=self.model_runner.token_to_kv_pool,
+                target=transition.target.layer_range(self.rank),
+                generation=transition.target.generation,
+                metrics=metrics,
+                allocation_only=True,
+                reuse_shared=True,
+            )
+        self._prepared_shared_generation = transition.target.generation
+        metrics["host_shared_prepared_init_seconds"] = metrics.pop(
+            "host_target_init_seconds"
+        )
+        metrics["host_shared_prepared_metadata_seconds"] = metrics.pop(
+            "host_target_metadata_seconds"
+        )
+        metrics["host_shared_prepared_seconds"] = time.monotonic() - started
 
     def allocate_background(self, transition, *, enabled):
         if not enabled:
@@ -1258,6 +1311,7 @@ class SchedulerHiCacheTransition:
         ):
             discard_host_cache(self.prepared_host)
         self.prepared_host = None
+        self._prepared_shared_generation = None
 
     def release_source_device_aliases(self, transition):
         """Fence-only: retire projected owners and invalidate raw GDN addresses."""
@@ -1540,6 +1594,10 @@ class SchedulerHiCacheTransition:
                 raise RuntimeError(
                     "shared CPU layer views require validated slot metadata"
                 )
+            if self.prepared_host is not None and (
+                self._prepared_shared_generation != transition.target.generation
+            ):
+                raise RuntimeError("prepared shared host generation mismatch")
             with use_shared_host_bank(self.shared_bank):
                 self.target_cache = prepare_target_host_cache(
                     self.adapter.cache,
@@ -1548,7 +1606,10 @@ class SchedulerHiCacheTransition:
                     generation=transition.target.generation,
                     metrics=self._phase_metrics,
                     reuse_shared=True,
+                    prepared=self.prepared_host,
                 )
+            self.prepared_host = None
+            self._prepared_shared_generation = None
             return
         self.target_cache = prepare_target_host_cache(
             self.adapter.cache,
