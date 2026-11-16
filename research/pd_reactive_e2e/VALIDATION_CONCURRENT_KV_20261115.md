@@ -122,3 +122,7 @@ R13定向CPU回归83项通过，覆盖重复冷输出拒绝、GPU／CPU缓存来
 **R18：初始快照行登记与发布的批处理候选。** R17 source rank初始约84ms未分项时间对应scheduler-owned快照／base准备候选。本次增加两段协调器计时及patch内allocate／publish-base计时，将已知行集合的重复锁／generation检查合并为一次，仍先检查整个批次，保留每行incarnation与ready stamp、复制pin和free／reuse保护。初始base仍只来自原先quiescent快照，晚到异步loadback不被提前标记ready。未改MR交接、缓存预算、工作量或权重offload。
 
 150项CPU检查通过，包括逐行与批量stamp等价、无效批次不部分发布、已pin行禁止free、复用需新incarnation、高64位及generation／phase约束，以及既有真实tensor／allocator／伪NIXL与coordinator检查。独立CPU对比基于R17的98aa3b1c4d版本，每点7样本，36,265行总71.057→51.462ms、58,300行119.557→92.613ms、98,304行210.601→177.003ms；大点publish单段未更快，不夸大为所有段优化。仅CPU记账小测，无GPU和端到端性能资格。脚本及原始JSON在持续实验目录analysis。下一步沿用严格最小验证与同一76请求有限流。
+
+**R18有界GPU及关闭探针的端到端已完成。** 源124b9a404d52cbed05c74a958afbbaaffbc859f9／不可移动tag experiment/sglang/pd-kv-performance-20261116-r18。四组精确输出／匹配缓存、六组提交KV／GDN字节审计、CPU HiCache恢复、物理KV240→336→240MiB及独立64GiB复用通过；Guard后检查／归属清理及release通过。该最小轮含审计，不作性能。
+
+同一76请求／四任务，输入3071334、输出12964，完整工作量签名匹配R17。关闭探针后平均TPOT19.230ms、请求E2E15.717秒、TTFT12.492秒，SLO59／76（77.63%），Prefill GPU＋CPU命中96.13%。最终扩／缩129.673／191.994ms，完整操作2.341／1.575秒，控制调用2.161／1.150秒。扩容最大SSE内容间隔176.781ms靠近最终交接，初始准备处155.111ms；缩容无在途间隔样本。Guard退出0、清理／release通过。源rank0／2的初始快照／base及线程启动63.862／62.612ms，对应36,257行，R17约84ms。暂停下降，但整轮TPOT／E2E未优于R17；几十毫秒目标与同源副本仍待完成。连续原值在既有实验目录analysis/kvcached_perf_e2e_r18.json、kvcached_perf_e2e_streams_r18.json及initial_kv_setup_e2e_r18.json。

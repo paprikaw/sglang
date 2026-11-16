@@ -183,4 +183,4 @@
 
 - [ ] **下一项：拆清准备开始的同步停顿和shared-host元数据开销。** R17源rank在host capture后至后台prepare首段有约84ms未分项时间，较长SSE间隔发生在控制开始后，另有最终fence间隔。先计时begin_live_patch与initial-base准备，定位主线程阻塞来源；分开metadata hash与Gloo等待，再判断安全重叠／更低成本实现。不减少完整状态校验、工作量、HiCache或权重offload；新代码继续先CPU、严格GPU最小、再同一短端到端。
 
-- [ ] **2026-11-16 R18：初始KV批量登记／发布与准备分项。** 对调度线程捕获的行集合，在同一session锁内完整校验后批量更新；保留逐行stamp、64位incarnation、ready事件、pin、free／reuse与最终完整覆盖检查。非法批次不得部分更新，后续异步loadback不进入初始ready集合。新增begin_live_kv_snapshot／seed_initial_kv_base及allocate／publish-base计时。150项相关CPU通过，含批量／逐行一致、错误批次原子拒绝、pin／复用、高位代次及generation／phase边界。独立CPU微测36,265行登记＋发布71.057→51.462ms；不是GPU或端到端收益。严格GPU最小及同一短端到端待验。
+- [x] **2026-11-16 R18：初始KV批量登记／发布与准备分项的有界验收。** 源124b9a404d52／tag experiment/sglang/pd-kv-performance-20261116-r18，150项CPU通过；四组严格输出／缓存、六组KV／GDN内容、CPU恢复、物理KV往返及独立64GiB复用均通过。关闭探针的同一76请求完成，TPOT19.230ms、E2E15.717秒、TTFT12.492秒，SLO59／76，最终扩／缩129.673／191.994ms，扩容最大SSE内容间隔176.781ms，Guard清理／release通过。初始36,257行登记／base准备两源rank约63.862／62.612ms（R17约84ms）。保留完整incarnation、ready、pin及free／reuse；整轮延迟未优于R17，几十毫秒、同源副本及一般性能资格仍未达。证据见持续CONCURRENT_KV报告和对应analysis，不以审计最小轮计时作性能。
