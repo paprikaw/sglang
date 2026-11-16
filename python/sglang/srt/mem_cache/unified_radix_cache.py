@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.pp_control_work import BackgroundSendWork
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -227,7 +228,8 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.work_list: list[torch.distributed.Work] = []
+        self.work_list: list[torch.distributed.Work | BackgroundSendWork] = []
+        self._pp_background_send_waits = False
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -300,8 +302,12 @@ class UnifiedRadixCache(BasePrefixCache):
         retain unfinished sends without waiting ahead of its consensus ring.
         Scheduler thread only.
         """
+        if not blocking:
+            self._pp_background_send_waits = True
         pending = []
         for work in self.work_list:
+            if not blocking:
+                work = BackgroundSendWork.wrap(work)
             if blocking or work.is_completed():
                 work.wait()
             else:
@@ -342,6 +348,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 group=self.pp_group,
                 tag=tag,
             )
+            if getattr(self, "_pp_background_send_waits", False):
+                send_work = BackgroundSendWork.wrap(send_work, keepalive=copy_of_data)
             self.work_list.append(send_work)
 
     def reset(self) -> None:

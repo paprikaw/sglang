@@ -1597,6 +1597,8 @@ def drain_host_io_at_fence(cache, group, timeout_s=15.0):
         host_io_status_seconds=0.0,
         host_io_submit_seconds=0.0,
         host_io_event_seconds=0.0,
+        host_io_async_work_before=len(getattr(cache, "work_list", ())),
+        host_io_async_work_after=0,
     )
     controller = cache.cache_controller
 
@@ -1626,6 +1628,7 @@ def drain_host_io_at_fence(cache, group, timeout_s=15.0):
         started = time.monotonic()
         cache._drain_async_work()
         metrics["host_io_async_wait_seconds"] += time.monotonic() - started
+        metrics["host_io_async_work_after"] = len(getattr(cache, "work_list", ()))
         pending = bool(pending_io())
         expired = time.monotonic() >= deadline
         started = time.monotonic()
