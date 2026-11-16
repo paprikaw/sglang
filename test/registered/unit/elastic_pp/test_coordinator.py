@@ -205,6 +205,55 @@ def _coordinator(group=None, *, fence_step_provider=None, fence_lead_steps=0):
     return coordinator, transition, runner, kv_transport
 
 
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_content_audit_happens_after_graph_selection_and_fails_closed(mismatch):
+    coordinator, transition, runner, kv = _coordinator()
+    events = []
+    def capture(change, slots):
+        assert not runner.committed
+        assert slots.tolist() == [1, 3, 5]
+        events.append("capture")
+        return {"rank": 0, "generation": change.source.generation}
+    def verify(change, snapshots):
+        assert runner.committed
+        assert events == ["capture", "graph"]
+        assert len(snapshots) == 2
+        events.append("verify")
+        if mismatch:
+            raise RuntimeError("injected committed state content differs")
+    kv.capture_fenced_contents, kv.verify_fenced_contents = capture, verify
+    runner.rebuild_elastic_pp_decode_graph = lambda **kwargs: events.append("graph")
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    if mismatch:
+        with pytest.raises(RuntimeError, match="content differs"):
+            coordinator.finalize_at_fence(lambda _: None)
+        assert not coordinator.snapshot().source_usable
+        assert coordinator.phase == ElasticPPMigrationPhase.FAILED
+    else:
+        coordinator.finalize_at_fence(lambda _: None)
+        assert coordinator.phase == ElasticPPMigrationPhase.COMMITTED
+    assert events == ["capture", "graph", "verify"]
+
+
+def test_content_audit_requires_opt_in_on_every_rank_before_copying():
+    class SkewGroup(_Group):
+        def all_gather_object(self, report):
+            reports = super().all_gather_object(report)
+            if report["stage"] == "fence_slots":
+                reports[1]["details"] = ("no audit",)
+            return reports
+    coordinator, transition, runner, kv = _coordinator(SkewGroup())
+    kv.capture_fenced_contents = lambda change, slots: {"rank": 0}
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    with pytest.raises(RuntimeError, match="not enabled on every"):
+        coordinator.finalize_at_fence(lambda _: None)
+    assert not runner.committed
+    assert not kv.phases
+    assert coordinator.snapshot().source_usable
+
+
 def test_overlap_registration_changes_only_at_fence_and_refreshes_after_commit():
     coordinator, transition, runner, _ = _coordinator()
     calls = []

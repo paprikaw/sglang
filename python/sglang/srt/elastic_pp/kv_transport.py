@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import time
 from contextlib import contextmanager
 from typing import Any, Literal
@@ -193,6 +194,11 @@ class ElasticPPKVTransport:
         self.pool = model_runner.token_to_kv_pool
         self.allocator = allocator
         self.rank = int(rank)
+        self._content_audit = None
+        if os.environ.get("SGLANG_ELASTIC_PP_VERIFY_STATE") == "1":
+            from sglang.srt.elastic_pp.state_content_audit import FencedStateContentAudit
+
+            self._content_audit = FencedStateContentAudit(self.pool, self.rank)
         self.slot_chunk_size = int(slot_chunk_size)
         self._live_patch = None
         self._live_patch_error = None
@@ -259,6 +265,7 @@ class ElasticPPKVTransport:
         fed a private startup generation. Never use it with requests in flight.
         """
         endpoint, receiver = self._nixl_endpoint, self._nixl_receiver
+        content_audit = self._content_audit
         if self._live_patch is not None or (
             receiver is not None and receiver.generation is not None
         ):
@@ -266,10 +273,14 @@ class ElasticPPKVTransport:
                 "startup transport cannot suspend a live NIXL generation"
             )
         self._nixl_endpoint = self._nixl_receiver = None
+        # No real request state exists in this private pre-readiness walk.
+        # Only audit the later runtime fences, including retained live layers.
+        self._content_audit = None
         try:
             yield
         finally:
             self._nixl_endpoint, self._nixl_receiver = endpoint, receiver
+            self._content_audit = content_audit
 
     @contextmanager
     def _stream_context(self, stream):
@@ -448,6 +459,11 @@ class ElasticPPKVTransport:
     def metrics(self):
         patch = self._live_patch
         return {
+            "state_content_audit": (
+                dict(self._content_audit.stats)
+                if self._content_audit is not None
+                else {"enabled": False}
+            ),
             "backing_spill": self.backing_spill_metrics(),
             "live_kv_patch": (
                 patch.metrics() if patch is not None else self._last_live_patch_metrics
@@ -779,6 +795,16 @@ class ElasticPPKVTransport:
 
         del transition
         return self.allocator.elastic_pp_live_slots()
+
+    def capture_fenced_contents(self, transition, slot_ids):
+        if self._content_audit is not None:
+            return self._content_audit.capture(transition, slot_ids)
+        return None
+
+    def verify_fenced_contents(self, transition, snapshots):
+        if self._content_audit is None:
+            raise RuntimeError("state content audit was not enabled on every PP rank")
+        self._content_audit.verify(transition, snapshots)
 
     def send_phase(
         self,

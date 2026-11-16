@@ -1095,6 +1095,20 @@ class ElasticPPMigrationCoordinator:
                         "kv": slot_signature,
                         "recurrent": state_signature(),
                     }
+                capture_contents = getattr(
+                    self.kv_transport, "capture_fenced_contents", None
+                )
+                if capture_contents is not None:
+                    contents = self._timed(
+                        "fence_state_content_capture",
+                        capture_contents,
+                        transition,
+                        fence_slots,
+                    )
+                    if contents is not None:
+                        if not isinstance(slot_signature, dict):
+                            slot_signature = {"kv": slot_signature}
+                        slot_signature["content_snapshot"] = contents
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
             reports = self._consensus(
@@ -1104,6 +1118,19 @@ class ElasticPPMigrationCoordinator:
                 details=slot_signature,
             )
             self._raise_peer_failures("fence slots", reports)
+            content_snapshots = [
+                peer.get("details", {}).get("content_snapshot")
+                if isinstance(peer.get("details"), dict)
+                else None
+                for peer in reports
+            ]
+            if any(snapshot is not None for snapshot in content_snapshots):
+                if any(snapshot is None for snapshot in content_snapshots):
+                    raise RuntimeError(
+                        "state content audit was not enabled on every PP rank"
+                    )
+            else:
+                content_snapshots = None
             if isinstance(slot_signature, dict) and "recurrent" in slot_signature:
                 # All ranks retain scheduler state, including inactive ranks.
                 # A recurrent slot is meaningful only if every owner agrees on
@@ -1323,6 +1350,13 @@ class ElasticPPMigrationCoordinator:
                         rebuild,
                         generation=transition.target.generation,
                         active=not transition.target.layer_range(self.rank).empty,
+                    )
+                if content_snapshots is not None:
+                    self._timed(
+                        "fence_state_content_verify",
+                        self.kv_transport.verify_fenced_contents,
+                        transition,
+                        content_snapshots,
                     )
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"

@@ -50,3 +50,19 @@ def test_pd_merged_batch_frontier_has_graph_coverage(monkeypatch, tmp_path,
     assert all(any(c >= batch for c in captures)
                for batch in range(1, actual_limit + 1))
     assert actual_limit == 4
+
+
+@pytest.mark.parametrize('qualification,concurrent,mechanism', [
+    (False, True, 'inplace'), (True, False, 'inplace'), (True, True, 'replica')])
+def test_byte_audit_cannot_enter_a_performance_or_unsupported_run(
+        tmp_path, qualification, concurrent, mechanism):
+    source = Path(__file__).with_name('run.py')
+    tree = ast.parse(source.read_text())
+    function = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                    and n.name == 'prepare')
+    namespace = {}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(source), 'exec'),
+         namespace)
+    with pytest.raises(ValueError, match='minimum diagnostic'):
+        namespace['prepare'](tmp_path, mechanism, True, concurrent, qualification,
+                             verify_migrated_state=True)
