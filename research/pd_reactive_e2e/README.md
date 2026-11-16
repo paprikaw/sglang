@@ -1,6 +1,6 @@
 # 2026-11-15：并发 KV 容量触发路径
 
-新增 `--concurrent-kv`：整条P→D链的单请求限制解除，KV预留覆盖在途PP微批，扩容使用原生KV分配不足造成的持续等待。硬件验证使用每微批1请求、运行上限4；HiCache／Graph／CPU预打包offload／NIXL保留。`--qualification-smoke` 先执行有界最小验证，`--reuse-probe` 检查独立显存复用。两组短对照完成，结果与未解决的生成一致性、预算及SLO边界见[本轮验收](VALIDATION_CONCURRENT_KV_20261115.md)。
+新增 `--concurrent-kv`：整条P→D链的单请求限制解除，KV预留覆盖在途PP微批，扩容使用原生KV分配不足造成的持续等待。当前运行／微批上限均为4，捕获B1/B2/B4 Graph；实际批次由原生P/D合批决定。HiCache／CPU预打包offload／NIXL保留。`--qualification-smoke` 验证匹配暖缓存下的串行、静态PP2／PP3与迁移输出，`--reuse-probe` 检查独立显存复用。R13有界最小轮通过；76请求原地端到端平均TPOT31.975 ms、最终扩／缩暂停239／315 ms。同源新版双实例尚未补测，通用生成／多周期与达标资源收益不作声明，见[本轮验收](VALIDATION_CONCURRENT_KV_20261115.md)。
 
 以下保留旧单请求试跑说明，其限制与负结果不代表新路径：
 
