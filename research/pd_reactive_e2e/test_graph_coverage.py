@@ -9,8 +9,9 @@ import pytest
 
 @pytest.mark.parametrize('microbatch_cap', [1, 4])
 @pytest.mark.parametrize('mechanism', ['inplace', 'replica'])
+@pytest.mark.parametrize('capture_sizes', [[1, 2, 4], [4]])
 def test_pd_merged_batch_frontier_has_graph_coverage(monkeypatch, tmp_path,
-                                                   microbatch_cap, mechanism):
+                                                   microbatch_cap, mechanism, capture_sizes):
     import sglang.srt.server_args as server_args
 
     source = Path(__file__).with_name('run.py')
@@ -34,6 +35,7 @@ def test_pd_merged_batch_frontier_has_graph_coverage(monkeypatch, tmp_path,
                 concurrent_kv=True, mechanism=mechanism, kvcached_capacity=False,
                 context_length=65536, max_total_tokens=98304,
                 max_running_requests=4, pp_micro_batch_size=microbatch_cap,
+                decode_graph_batch_sizes=capture_sizes,
                 engine_commit='test')
     namespace['engine'](tmp_path, root, 'd0')
     flags = results[0]
@@ -41,10 +43,10 @@ def test_pd_merged_batch_frontier_has_graph_coverage(monkeypatch, tmp_path,
     captures = []
     while i < len(flags) and not flags[i].startswith('--'):
         captures.append(int(flags[i])); i += 1
-    # Native P/D may merge two requests even with the legacy nominal cap=1.
+    # Keep capture coverage valid for either declared PP microbatch cap.
     # Default graph padding must support every actual batch through the limit.
     actual_limit = int(flags[flags.index('--max-running-requests') + 1])
-    assert 1 in captures
+    assert captures == capture_sizes
     assert all(any(c >= batch for c in captures)
                for batch in range(1, actual_limit + 1))
-    assert 2 in captures
+    assert actual_limit == 4

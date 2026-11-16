@@ -36,7 +36,13 @@ def endpoint(cfg):
         row.update(bootstrap_host=cfg['node'],bootstrap_port=cfg['bootstrap_port'])
     return row
 
-def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualification_smoke=False):
+def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualification_smoke=False,
+            decode_graph_batches=None):
+    if decode_graph_batches is not None:
+        if (not concurrent_kv or not decode_graph_batches
+                or any(b not in (1, 2, 4) for b in decode_graph_batches)
+                or 4 not in decode_graph_batches):
+            raise ValueError('Decode graphs must cover concurrent batches 1..4')
     # Reuse the authenticated canonical-cache contracts and qualified r23 profile.
     q.prepare(run, kvcached_capacity=kvcached_capacity)
     root = json.loads((run/'config.json').read_text())
@@ -106,6 +112,7 @@ def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualif
     if concurrent_kv:
         if not kvcached_capacity:raise ValueError('concurrent pilot requires managed KV capacity')
         root.update(per_instance_admission=10,max_running_requests=4,pp_micro_batch_size=4,
+            decode_graph_batch_sizes=sorted(set(decode_graph_batches or [1,2,4])),
             qualification_scope='Concurrent managed KV Decode, at most four active requests per instance; qualification pending.',
             scale_trigger='native_preallocator_kv_tokens_only')
     root['qualification_smoke']=qualification_smoke
@@ -232,10 +239,10 @@ def engine(run, root, sid):
             flags.append(k);i+=1
         if root.get('concurrent_kv') and sid.startswith('d'):
             index=flags.index('--cuda-graph-bs-decode')
-            # Native P/D merges prebuilt requests into an existing microbatch
-            # using max_running_requests, not pp_max_micro_batch_size. Cover
-            # that actual frontier even for an older cap=1 configuration.
-            flags[index+1:index+2]=['1','2','4']
+            # All captures cover the full four-request frontier via padding.
+            # A single B4 graph can diagnose batch-shape-dependent arithmetic
+            # without reducing admitted requests or the actual batch limit.
+            flags[index+1:index+2]=[str(b) for b in root.get('decode_graph_batch_sizes',[1,2,4])]
         if remove:
             flags.extend(['--cuda-graph-bs-decode','1'])
         save(run/'servers'/sid/'effective_launch.json',dict(argv=flags,source=root['engine_commit']))
@@ -637,13 +644,14 @@ temporary=p.with_suffix('.tmp');temporary.write_text(json.dumps(value)+chr(10));
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--run',type=Path,required=True)
     p.add_argument('--kvcached-capacity',action='store_true');p.add_argument('--concurrent-kv',action='store_true');p.add_argument('--qualification-smoke',action='store_true');p.add_argument('--prepare',action='store_true');p.add_argument('--mechanism',choices=['inplace','replica'])
+    p.add_argument('--decode-graph-batches',type=int,nargs='+')
     p.add_argument('--worker',action='store_true');p.add_argument('--engine',action='store_true');p.add_argument('--client',action='store_true');p.add_argument('--reuse-probe',action='store_true')
     p.add_argument('--server',choices=['p','d0','d1']);a=p.parse_args()
     if a.reuse_probe:
         packet=json.loads(sys.stdin.readline());os.environ.update(packet['environment'])
         os.environ['CUDA_VISIBLE_DEVICES']='1'
         q.reuse_probe(a.run,json.loads((a.run/'config.json').read_text())['node_configs'][socket.gethostname().split('.')[0]])
-    elif a.prepare:prepare(a.run,a.mechanism,a.kvcached_capacity,a.concurrent_kv,a.qualification_smoke)
+    elif a.prepare:prepare(a.run,a.mechanism,a.kvcached_capacity,a.concurrent_kv,a.qualification_smoke,a.decode_graph_batches)
     else:
         root=json.loads((a.run/'config.json').read_text())
         if a.engine:engine(a.run,root,a.server)
