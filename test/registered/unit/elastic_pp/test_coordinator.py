@@ -286,6 +286,161 @@ def test_overlap_registration_is_restored_when_target_cannot_commit():
     assert not runner.committed and coordinator.snapshot().source_usable
 
 
+def test_registration_retirement_overlaps_host_snapshot_but_joins_before_copy():
+    coordinator, transition, runner, kv = _coordinator()
+    entered, released, finished = (threading.Event() for _ in range(3))
+    events = []
+
+    def suspend():
+        events.append(("suspend", threading.current_thread().name))
+        entered.set()
+        assert released.wait(2)
+        assert not runner.committed
+        finished.set()
+
+    def prepare(change):
+        assert entered.wait(2)
+        assert not finished.is_set()
+        events.append(("host", threading.current_thread().name))
+        released.set()
+
+    def exchange(change):
+        assert finished.is_set()
+        events.append(("copy", threading.current_thread().name))
+
+    coordinator.overlap_registration_suspend = True
+    coordinator.before_backing_release = suspend
+    coordinator.after_topology_commit = lambda: events.append(("refresh", ""))
+    coordinator.cache_transition = SimpleNamespace(
+        prepare_transition=prepare,
+        exchange_at_fence=exchange,
+        apply_staged=lambda _: None,
+        commit=lambda _: None,
+    )
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    assert not entered.is_set()
+    coordinator.finalize_at_fence(lambda _: None)
+    assert runner.committed and kv.phases
+    assert events[0][0] == "suspend" and events[0][1] != "MainThread"
+    assert events[1:] == [
+        ("host", "MainThread"),
+        ("copy", "MainThread"),
+        ("refresh", ""),
+    ]
+    assert (
+        "fence_registration_join" in coordinator.transition_metrics()["stage_seconds"]
+    )
+
+
+@pytest.mark.parametrize("retirement_fails", [False, True])
+def test_host_failure_joins_registration_worker_before_rollback(retirement_fails):
+    coordinator, transition, runner, kv = _coordinator()
+    entered, released, host_failed, finished, rolled_back = (
+        threading.Event() for _ in range(5)
+    )
+    failures = []
+
+    def suspend():
+        entered.set()
+        assert released.wait(2)
+        finished.set()
+        if retirement_fails:
+            raise RuntimeError("native registration retirement failed")
+
+    def prepare(change):
+        assert entered.wait(2)
+        host_failed.set()
+        raise RuntimeError("host snapshot failed")
+
+    def abort(change):
+        assert finished.is_set()
+        rolled_back.set()
+
+    def finalize():
+        try:
+            coordinator.finalize_at_fence(lambda _: None)
+        except BaseException as exc:
+            failures.append(str(exc))
+
+    coordinator.overlap_registration_suspend = True
+    coordinator.before_backing_release = suspend
+    coordinator.after_backing_restore = lambda: None
+    coordinator.cache_transition = SimpleNamespace(
+        prepare_transition=prepare, abort=abort
+    )
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    caller = threading.Thread(target=finalize)
+    caller.start()
+    try:
+        assert host_failed.wait(2)
+        assert not rolled_back.wait(0.05)
+        assert not runner.aborted_kv and not runner.aborted_layers
+        assert caller.is_alive()
+    finally:
+        released.set()
+        caller.join(timeout=2)
+    assert not caller.is_alive() and finished.is_set() and rolled_back.is_set()
+    assert not runner.committed and not kv.phases
+    assert len(failures) == 1 and "host snapshot failed" in failures[0]
+    assert ("native registration retirement failed" in failures[0]) is retirement_fails
+
+
+def test_registration_worker_failure_prevents_publication():
+    coordinator, transition, runner, kv = _coordinator()
+    entered, released = (threading.Event() for _ in range(2))
+
+    def suspend():
+        entered.set()
+        assert released.wait(2)
+        raise RuntimeError("native registration retirement failed")
+
+    def prepare(change):
+        assert entered.wait(2)
+        released.set()
+
+    coordinator.overlap_registration_suspend = True
+    coordinator.before_backing_release = suspend
+    coordinator.after_backing_restore = lambda: None
+    coordinator.cache_transition = SimpleNamespace(
+        prepare_transition=prepare, abort=lambda _: None
+    )
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    with pytest.raises(RuntimeError, match="native registration retirement failed"):
+        coordinator.finalize_at_fence(lambda _: None)
+    assert not runner.committed and not kv.phases
+    assert coordinator.snapshot().source_usable
+
+
+def test_registration_thread_start_failure_does_not_start_host_snapshot(monkeypatch):
+    import sglang.srt.elastic_pp.coordinator as module
+
+    coordinator, transition, runner, _ = _coordinator()
+    events = []
+    coordinator.overlap_registration_suspend = True
+    coordinator.before_backing_release = lambda: events.append("suspend")
+    coordinator.after_backing_restore = lambda: events.append("restore")
+    coordinator.cache_transition = SimpleNamespace(
+        prepare_transition=lambda _: events.append("host"),
+        abort=lambda _: events.append("abort"),
+    )
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+
+    def cannot_start(**kwargs):
+        return SimpleNamespace(
+            start=lambda: (_ for _ in ()).throw(RuntimeError("no thread"))
+        )
+
+    monkeypatch.setattr(module, "Thread", cannot_start)
+    with pytest.raises(RuntimeError, match="no thread"):
+        coordinator.finalize_at_fence(lambda _: None)
+    assert events == ["abort", "restore"]
+    assert not runner.committed and coordinator.snapshot().source_usable
+
+
 @pytest.mark.parametrize("policy", ["reuse", "recopy", "offload"])
 def test_prepared_weight_policy_skips_only_verified_resident_weights(policy):
     coordinator, transition, runner, _ = _coordinator()

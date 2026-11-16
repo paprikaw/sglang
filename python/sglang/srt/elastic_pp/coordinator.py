@@ -102,8 +102,10 @@ class ElasticPPMigrationCoordinator:
             raise ValueError("CPU-spill backing requires sync or batched transition")
         self.cache_transition = cache_transition
         # P/D transports pin registered CUDA addresses independently of the
-        # allocator.  Hooks run only on the scheduler thread at the fence.
+        # allocator. Only the qualified overlap path may retire registrations
+        # on a CPU worker, joined before any backing or topology can change.
         self.before_backing_release = None
+        self.overlap_registration_suspend = False
         self.after_backing_restore = None
         self.after_topology_commit = None
         self.enable_kv_patch = (
@@ -1018,8 +1020,12 @@ class ElasticPPMigrationCoordinator:
             # Host I/O and live allocator reads occur only at the drained fence.
             # Keep the source generation intact until all ranks can publish.
             local_error = None
+            registration_thread = None
+            registration_errors = []
             try:
-                validate_capacity = getattr(self.model_runner, "validate_elastic_pp_kv_capacity_at_fence", None)
+                validate_capacity = getattr(
+                    self.model_runner, "validate_elastic_pp_kv_capacity_at_fence", None
+                )
                 if validate_capacity is not None:
                     validate_capacity(transition)
                 if (
@@ -1027,9 +1033,34 @@ class ElasticPPMigrationCoordinator:
                     and self.before_backing_release is not None
                 ):
                     self._registration_suspended = True
-                    self._timed(
-                        "fence_registration_suspend", self.before_backing_release
-                    )
+                    if self.overlap_registration_suspend:
+
+                        def retire_registration():
+                            try:
+                                self._set_worker_device()
+                                self._timed(
+                                    "fence_registration_suspend",
+                                    self.before_backing_release,
+                                )
+                            except BaseException as exc:
+                                registration_errors.append(
+                                    f"{type(exc).__name__}: {exc}"
+                                )
+
+                        worker = Thread(
+                            target=retire_registration,
+                            name=(
+                                "elastic-pp-pd-unregister-"
+                                f"g{transition.target.generation}-r{self.rank}"
+                            ),
+                            daemon=True,
+                        )
+                        worker.start()
+                        registration_thread = worker
+                    else:
+                        self._timed(
+                            "fence_registration_suspend", self.before_backing_release
+                        )
                 device = torch.device(getattr(self.model_runner, "device", "cpu"))
                 if device.type == "cuda":
                     # Dedicated transfer streams must observe all serving producers.
@@ -1053,6 +1084,20 @@ class ElasticPPMigrationCoordinator:
                     # Snapshot completion and peak admission precede allocation.
             except BaseException as exc:
                 local_error = f"{type(exc).__name__}: {exc}"
+            finally:
+                if registration_thread is not None:
+                    # Host metadata and the independently registered NIXL
+                    # patch may finish while Mooncake retires drained MRs.
+                    # Both source and prepared pages stay mapped until this
+                    # join, including when either operation raises. Rollback
+                    # must never unmap memory still owned by the CPU worker.
+                    self._timed("fence_registration_join", registration_thread.join)
+                    if registration_errors:
+                        local_error = " | ".join(
+                            error
+                            for error in [local_error, *registration_errors]
+                            if error is not None
+                        )
             reports = self._consensus(
                 "fence_snapshot", success=local_error is None, error=local_error
             )
