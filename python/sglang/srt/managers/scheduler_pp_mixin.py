@@ -789,6 +789,7 @@ class SchedulerPPMixin:
                     model_runner=self.tp_worker.model_runner,
                     group=coordinator.group,
                     rank=self.ps.pp_rank,
+                    overlap_shared_metadata=coordinator.overlap_registration_suspend,
                 )
             coordinator.begin(transition)
         except BaseException as exc:

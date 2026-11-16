@@ -12,6 +12,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
+from threading import Thread
 
 import torch
 
@@ -948,7 +949,9 @@ def rebind_cache_device_pools(cache, device_pool, *, refresh_recurrent_pointers=
 class SchedulerHiCacheTransition:
     """Coordinator-facing transaction; source remains owned through publish."""
 
-    def __init__(self, *, scheduler, model_runner, group, rank):
+    def __init__(
+        self, *, scheduler, model_runner, group, rank, overlap_shared_metadata=False
+    ):
         self.scheduler, self.model_runner = scheduler, model_runner
         self.group, self.rank = group, rank
         self.adapter = None
@@ -968,6 +971,12 @@ class SchedulerHiCacheTransition:
         self.shared_bank = getattr(model_runner, "_elastic_pp_shared_host_bank", None)
         if self.shared_host and self.shared_bank is None:
             raise RuntimeError("shared CPU backing must be installed at startup")
+        self.overlap_shared_metadata = bool(
+            overlap_shared_metadata and self.shared_host
+        )
+        self._metadata_hash_thread = None
+        self._metadata_hash_report = None
+        self._metadata_hash_generation = None
         self.initial_base_ready = False
         self._shared_verified_generation = None
         self.fast_copy = bool(
@@ -1195,6 +1204,10 @@ class SchedulerHiCacheTransition:
         self._phase_metrics["host_io_drain_seconds"] = time.monotonic() - started
         started = time.monotonic()
         self._source_cache = cache
+        if self.overlap_shared_metadata and self.rank in transition.source.active_ranks:
+            # I/O is drained and the scheduler is fenced. The source CPU tree
+            # and allocator stay read-only until this task has been joined.
+            self._start_metadata_hash(cache, transition)
         canonical = transition.source.first_rank
         dormant = [
             r
@@ -1285,20 +1298,84 @@ class SchedulerHiCacheTransition:
         self.adapter.snapshot_at_fence(transition)
         self._phase_metrics["host_snapshot_gather_seconds"] = time.monotonic() - started
 
+    def _inspect_shared_metadata(self, cache, transition, *, background=False):
+        from sglang.srt.elastic_pp.shared_host_cache import metadata_signature
+
+        started = time.monotonic()
+        self._phase_metrics["host_metadata_hash_started_monotonic"] = started
+        self._phase_metrics["host_metadata_hash_background"] = background
+        try:
+            signature = (
+                metadata_signature(cache)
+                if self.rank in transition.source.active_ranks
+                else None
+            )
+            return dict(rank=self.rank, signature=signature, error=None)
+        except BaseException as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self._phase_metrics["host_metadata_hash_error"] = error
+            return dict(rank=self.rank, signature=None, error=error)
+        finally:
+            finished = time.monotonic()
+            self._phase_metrics["host_metadata_hash_finished_monotonic"] = finished
+            self._phase_metrics["host_metadata_hash_seconds"] = finished - started
+
+    def _start_metadata_hash(self, cache, transition):
+        if self._metadata_hash_thread is not None:
+            raise RuntimeError("previous shared CPU metadata inspection is unjoined")
+        self._metadata_hash_report = None
+        self._metadata_hash_generation = transition.target.generation
+
+        def inspect():
+            self._metadata_hash_report = self._inspect_shared_metadata(
+                cache, transition, background=True
+            )
+
+        worker = Thread(
+            target=inspect,
+            name=(
+                f"elastic-pp-host-metadata-g{transition.target.generation}-r{self.rank}"
+            ),
+            daemon=True,
+        )
+        # Assign only after start succeeds; abort must never join an unstarted
+        # thread. The callback only reads source CPU metadata, never CUDA state.
+        worker.start()
+        self._metadata_hash_thread = worker
+
+    def _join_metadata_hash(self):
+        worker = self._metadata_hash_thread
+        if worker is not None:
+            started = time.monotonic()
+            worker.join()
+            finished = time.monotonic()
+            self._phase_metrics["host_metadata_hash_join_seconds"] = finished - started
+            self._phase_metrics["host_metadata_hash_joined_monotonic"] = finished
+            self._metadata_hash_thread = None
+
     def exchange_at_fence(self, transition):
         if self.shared_host:
-            from sglang.srt.elastic_pp.shared_host_cache import metadata_signature
-
+            if self._metadata_hash_thread is not None:
+                self._join_metadata_hash()
+                report = self._metadata_hash_report
+                if (
+                    self._metadata_hash_generation != transition.target.generation
+                    or report is None
+                ):
+                    report = dict(
+                        rank=self.rank,
+                        signature=None,
+                        error="shared CPU metadata generation mismatch",
+                    )
+            else:
+                report = self._inspect_shared_metadata(self._source_cache, transition)
+            started = time.monotonic()
             try:
-                signature = (
-                    metadata_signature(self._source_cache)
-                    if self.rank in transition.source.active_ranks
-                    else None
+                reports = self.group.all_gather_object(report)
+            finally:
+                self._phase_metrics["host_metadata_consensus_seconds"] = (
+                    time.monotonic() - started
                 )
-                report = dict(rank=self.rank, signature=signature, error=None)
-            except Exception as exc:
-                report = dict(rank=self.rank, signature=None, error=str(exc))
-            reports = self.group.all_gather_object(report)
             if len(reports) != transition.source.max_pp_size or any(
                 x["error"] for x in reports
             ):
@@ -1403,6 +1480,9 @@ class SchedulerHiCacheTransition:
         self._reset_precopy()
 
     def abort(self, transition):
+        # An error in canonical metadata or a peer must not let rollback or
+        # target destruction overtake this read of the live source CPU pools.
+        self._join_metadata_hash()
         if self.adapter is not None:
             self.adapter.abort(transition)
         if self.target_cache is not None:

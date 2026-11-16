@@ -1,5 +1,6 @@
 import copy
 import multiprocessing
+from threading import Event, Thread
 from types import SimpleNamespace as NS
 
 import pytest
@@ -394,6 +395,213 @@ def test_shared_handoff_requires_complete_equal_source_metadata(fault):
     else:
         adapter.exchange_at_fence(transition)
         assert adapter._shared_verified_generation == 1
+
+
+def _metadata_overlap_adapter(monkeypatch):
+    from sglang.srt.elastic_pp import hicache_transition as module
+
+    adapter, transition = _shared_transition_adapter()
+    adapter.rank = 2  # Active noncanonical rank avoids unrelated wire fixtures.
+    adapter.overlap_shared_metadata = True
+    drained = Event()
+
+    def drain(cache, group):
+        drained.set()
+        return {}
+
+    monkeypatch.setattr(module, "drain_host_io_at_fence", drain)
+    monkeypatch.setattr(
+        module,
+        "HiCacheTransitionAdapter",
+        lambda **kw: NS(
+            prepare_transition=lambda t: None, abort=lambda t: None, metrics={}
+        ),
+    )
+    return module, adapter, transition, drained
+
+
+def test_shared_metadata_hash_overlaps_and_joins_before_slot_validation(monkeypatch):
+    from sglang.srt.elastic_pp import shared_host_cache as shared
+
+    module, adapter, transition, drained = _metadata_overlap_adapter(monkeypatch)
+    signature = metadata_signature(adapter._source_cache)
+    hashing, release, finished, joining, gathered = (Event() for _ in range(5))
+
+    def inspect(cache):
+        assert drained.is_set()
+        hashing.set()
+        assert release.wait(3)
+        finished.set()
+        return signature
+
+    def gather(report):
+        assert finished.is_set()
+        assert report == dict(rank=2, signature=signature, error=None)
+        gathered.set()
+        return [
+            dict(rank=r, signature=signature if r != 1 else None, error=None)
+            for r in range(3)
+        ]
+
+    monkeypatch.setattr(shared, "metadata_signature", inspect)
+    adapter.group = NS(all_gather_object=gather)
+    adapter.prepare_transition(transition)
+    assert hashing.wait(3) and not finished.is_set()
+    native_join = adapter._metadata_hash_thread.join
+
+    def join():
+        joining.set()
+        native_join()
+
+    monkeypatch.setattr(adapter._metadata_hash_thread, "join", join)
+    errors = []
+
+    def exchange():
+        try:
+            adapter.exchange_at_fence(transition)
+        except BaseException as exc:
+            errors.append(exc)
+
+    caller = Thread(target=exchange)
+    caller.start()
+    try:
+        assert joining.wait(3)
+        assert not gathered.is_set() and adapter._shared_verified_generation is None
+    finally:
+        release.set()
+        caller.join(3)
+        adapter._join_metadata_hash()
+    assert not caller.is_alive() and not errors and gathered.is_set()
+    assert adapter._shared_verified_generation == 1
+    assert adapter._metadata_hash_thread is None
+    metrics = adapter.metrics()
+    assert metrics["host_metadata_hash_background"]
+    assert (
+        metrics["host_metadata_hash_finished_monotonic"]
+        <= metrics["host_metadata_hash_joined_monotonic"]
+    )
+
+
+@pytest.mark.parametrize("fault", ["hash", "generation"])
+def test_async_shared_metadata_fault_is_collectively_rejected(monkeypatch, fault):
+    from sglang.srt.elastic_pp import shared_host_cache as shared
+
+    _, adapter, transition, _ = _metadata_overlap_adapter(monkeypatch)
+    signature = metadata_signature(adapter._source_cache)
+
+    def inspect(cache):
+        if fault == "hash":
+            raise ValueError("bad CPU slot metadata")
+        return signature
+
+    reports = []
+
+    def gather(report):
+        reports.append(report)
+        return [
+            dict(rank=0, signature=signature, error=None),
+            dict(rank=1, signature=None, error=None),
+            report,
+        ]
+
+    monkeypatch.setattr(shared, "metadata_signature", inspect)
+    adapter.group = NS(all_gather_object=gather)
+    adapter.prepare_transition(transition)
+    if fault == "generation":
+        adapter._metadata_hash_generation = 99
+    with pytest.raises(RuntimeError, match="metadata inspection failed"):
+        adapter.exchange_at_fence(transition)
+    assert reports[0]["error"] and reports[0]["signature"] is None
+    assert adapter._shared_verified_generation is None
+    assert adapter._metadata_hash_thread is None
+    adapter.abort(transition)
+
+
+def test_shared_metadata_reader_joins_before_abort_or_target_destruction(monkeypatch):
+    from sglang.srt.elastic_pp import shared_host_cache as shared
+
+    module, adapter, transition, drained = _metadata_overlap_adapter(monkeypatch)
+    signature = metadata_signature(adapter._source_cache)
+    hashing, release, finished, joining = (Event() for _ in range(4))
+    target, discarded = object(), []
+
+    def inspect(cache):
+        assert drained.is_set()
+        hashing.set()
+        assert release.wait(3)
+        finished.set()
+        return signature
+
+    def broken_constructor(**kw):
+        assert hashing.wait(3)
+        raise RuntimeError("target metadata constructor failed")
+
+    def discard(cache):
+        assert finished.is_set()
+        discarded.append(cache)
+
+    monkeypatch.setattr(shared, "metadata_signature", inspect)
+    monkeypatch.setattr(module, "HiCacheTransitionAdapter", broken_constructor)
+    monkeypatch.setattr(module, "discard_host_cache", discard)
+    with pytest.raises(RuntimeError, match="constructor failed"):
+        adapter.prepare_transition(transition)
+    adapter.target_cache = target
+    native_join = adapter._metadata_hash_thread.join
+
+    def join():
+        joining.set()
+        native_join()
+
+    monkeypatch.setattr(adapter._metadata_hash_thread, "join", join)
+    errors = []
+
+    def abort():
+        try:
+            adapter.abort(transition)
+        except BaseException as exc:
+            errors.append(exc)
+
+    caller = Thread(target=abort)
+    caller.start()
+    try:
+        assert joining.wait(3)
+        assert not discarded and adapter.target_cache is target
+    finally:
+        release.set()
+        caller.join(3)
+        adapter._join_metadata_hash()
+    assert not caller.is_alive() and not errors
+    assert discarded == [target] and adapter.target_cache is None
+
+
+def test_shared_metadata_inspection_never_starts_before_io_drain(monkeypatch):
+    module, adapter, transition, _ = _metadata_overlap_adapter(monkeypatch)
+
+    def drain(*args):
+        raise RuntimeError("host I/O failed to drain")
+
+    monkeypatch.setattr(module, "drain_host_io_at_fence", drain)
+    with pytest.raises(RuntimeError, match="failed to drain"):
+        adapter.prepare_transition(transition)
+    assert adapter._metadata_hash_thread is None
+    assert adapter._metadata_hash_report is None
+
+
+def test_shared_metadata_thread_start_failure_leaves_abort_safe(monkeypatch):
+    module, adapter, transition, _ = _metadata_overlap_adapter(monkeypatch)
+
+    class BrokenThread:
+        def __init__(self, **kw):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread start rejected")
+
+    monkeypatch.setattr(module, "Thread", BrokenThread)
+    with pytest.raises(RuntimeError, match="thread start rejected"):
+        adapter.prepare_transition(transition)
+    assert adapter._metadata_hash_thread is None
+    adapter.abort(transition)
 
 
 def test_shared_begin_avoids_payload_snapshot_and_does_not_publish_busy_loadback(

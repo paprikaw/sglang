@@ -126,3 +126,7 @@ R13定向CPU回归83项通过，覆盖重复冷输出拒绝、GPU／CPU缓存来
 **R18有界GPU及关闭探针的端到端已完成。** 源124b9a404d52cbed05c74a958afbbaaffbc859f9／不可移动tag experiment/sglang/pd-kv-performance-20261116-r18。四组精确输出／匹配缓存、六组提交KV／GDN字节审计、CPU HiCache恢复、物理KV240→336→240MiB及独立64GiB复用通过；Guard后检查／归属清理及release通过。该最小轮含审计，不作性能。
 
 同一76请求／四任务，输入3071334、输出12964，完整工作量签名匹配R17。关闭探针后平均TPOT19.230ms、请求E2E15.717秒、TTFT12.492秒，SLO59／76（77.63%），Prefill GPU＋CPU命中96.13%。最终扩／缩129.673／191.994ms，完整操作2.341／1.575秒，控制调用2.161／1.150秒。扩容最大SSE内容间隔176.781ms靠近最终交接，初始准备处155.111ms；缩容无在途间隔样本。Guard退出0、清理／release通过。源rank0／2的初始快照／base及线程启动63.862／62.612ms，对应36,257行，R17约84ms。暂停下降，但整轮TPOT／E2E未优于R17；几十毫秒目标与同源副本仍待完成。连续原值在既有实验目录analysis/kvcached_perf_e2e_r18.json、kvcached_perf_e2e_streams_r18.json及initial_kv_setup_e2e_r18.json。
+
+**R19候选：减少CPU记录创建并重叠只读元数据检查。** KVRowStamp使用不可变NamedTuple，不改变完整slot／incarnation、ready事件对象或copy pin/free/reuse协议。独立CPU对比每点七样本，36,265／58,300／98,304行的分配＋发布均值52.149→35.830／96.284→68.005／183.032→131.236ms；仅slots dataclass没有一致改善，原值一并保留。微测不证明GPU或在线暂停改善。
+
+shared-host元数据签名仍覆盖原完整CPU树／slot／allocator字段。只在已限定的P/D Decode容量伸缩路径启用后台检查；先完成HiCache I/O排空，源CPU元数据保持只读。最终元数据交换先join并检查generation和完整rank报告，失败时同样先join再回滚或析构目标缓存；默认路径继续同步。分别保存hash、join和collective秒数，以及实际monotonic开始／完成／join时刻，以便从GPU日志验证重叠与先后关系。213项相关CPU通过，含真实Thread/Event握手的drain-before-start、并发与发布前join、hash和generation失败、目标构造失败后的join-before-destruction，以及线程无法启动的安全回滚。严格GPU往返、关闭探针的76请求和性能目标仍待验。

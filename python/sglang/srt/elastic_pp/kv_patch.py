@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import threading
 from contextlib import nullcontext
-from dataclasses import dataclass
 from itertools import islice
+from typing import NamedTuple
 
 
-@dataclass(frozen=True)
-class KVRowStamp:
+class KVRowStamp(NamedTuple):
     slot: int
     incarnation: int
     ready: object

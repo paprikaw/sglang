@@ -7,6 +7,7 @@ import torch
 from sglang.srt.elastic_pp.kv_patch import (
     ContinuousKVPatch,
     KVPatchBusy,
+    KVRowStamp,
     TensorKVPatchCopier,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -17,6 +18,16 @@ register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 class Ready:
     def synchronize(self):
         pass
+
+
+@pytest.mark.parametrize("field", ["slot", "incarnation", "ready"])
+def test_stamp_keeps_full_version_and_event_immutable(field):
+    event = Ready()
+    row = KVRowStamp(7, (1 << 63) + 5, event)
+    with pytest.raises(AttributeError):
+        setattr(row, field, None)
+    assert row.slot == 7 and row.incarnation == (1 << 63) + 5
+    assert row.ready is event
 
 
 class Pending:
