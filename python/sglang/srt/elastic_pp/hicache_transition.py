@@ -456,12 +456,19 @@ def clone_host_allocator(source, target):
         raise RuntimeError("source host allocator free lists and used slots disagree")
     if used[limit:].any():
         raise RuntimeError("target host pool cannot preserve live high host slots")
-    target.free_slots = free[free < target.logical_size].clone()
-    target.release_slots = [
-        v[v < target.logical_size].clone()
-        for v in releases
-        if (v < target.logical_size).any()
-    ]
+    if target.logical_size >= source.logical_size:
+        # The complete source-capacity validation above still applies. There
+        # is nothing to clip, so avoid boolean indexing followed by a second
+        # copy of the already-private result.
+        target.free_slots = free.clone()
+        target.release_slots = [v.clone() for v in releases if v.numel()]
+    else:
+        target.free_slots = free[free < target.logical_size]
+        target.release_slots = []
+        for value in releases:
+            clipped = value[value < target.logical_size]
+            if clipped.numel():
+                target.release_slots.append(clipped)
     target.num_release_slots = sum(len(v) for v in target.release_slots)
     if hasattr(target, "slot_used"):
         target.slot_used.zero_()
@@ -946,6 +953,112 @@ def rebind_cache_device_pools(cache, device_pool, *, refresh_recurrent_pointers=
     cache.__dict__.pop("_elastic_pp_projected_pool", None)
 
 
+_HOST_ALLOCATOR_FIELDS = (
+    "logical_size",
+    "free_slots",
+    "release_slots",
+    "num_release_slots",
+    "mem_state",
+    "slot_used",
+)
+_HOST_ALLOCATOR_MANIFEST = "__elastic_host_allocator_manifest__"
+_HOST_ALLOCATOR_TENSOR_PREFIX = "__elastic_host_allocator_tensor_"
+
+
+def canonical_host_allocator_wire(cache, generation):
+    """Snapshot drained, fenced allocators into owned native CPU payloads.
+
+    GroupCoordinator only separates top-level tensors from pickled metadata.
+    Keep every allocator tensor at the top level, preserving dtype and order.
+    Copy each tensor once into a contiguous private payload. Source allocator
+    mutation or rollback cannot change an already-issued send's contents.
+    """
+    from numbers import Number
+
+    wire = {}
+
+    def encode(value):
+        if isinstance(value, torch.Tensor):
+            if value.device.type != "cpu":
+                raise ValueError(
+                    "canonical host allocator tensors must be CPU resident"
+                )
+            key = _HOST_ALLOCATOR_TENSOR_PREFIX + str(len(wire))
+            wire[key] = value.detach().clone(memory_format=torch.contiguous_format)
+            return ("tensor", key)
+        if isinstance(value, (list, tuple)):
+            return (
+                "list" if isinstance(value, list) else "tuple",
+                [encode(item) for item in value],
+            )
+        if value is None or isinstance(value, (Number, str)):
+            return ("value", value)
+        raise TypeError("unsupported canonical host allocator metadata leaf")
+
+    pools = []
+    names = set()
+    for entry in cache.host_pool_group.entries:
+        if entry.name in names:
+            raise ValueError("duplicate canonical host allocator name")
+        names.add(entry.name)
+        pools.append(
+            (
+                entry.name,
+                {
+                    name: encode(getattr(entry.host_pool, name))
+                    for name in _HOST_ALLOCATOR_FIELDS
+                    if hasattr(entry.host_pool, name)
+                },
+            )
+        )
+    wire[_HOST_ALLOCATOR_MANIFEST] = dict(version=1, generation=generation, pools=pools)
+    return wire
+
+
+def restore_canonical_host_allocators(wire, generation):
+    """Validate the native tensor envelope before constructing a dormant cache."""
+    manifest = wire.get(_HOST_ALLOCATOR_MANIFEST)
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("version") != 1
+        or manifest.get("generation") != generation
+    ):
+        raise RuntimeError("canonical host allocator wire version/generation mismatch")
+    used = set()
+
+    def decode(record):
+        if not isinstance(record, (tuple, list)) or len(record) != 2:
+            raise RuntimeError("invalid canonical host allocator field")
+        kind, value = record
+        if kind == "tensor":
+            if (
+                not isinstance(value, str)
+                or not value.startswith(_HOST_ALLOCATOR_TENSOR_PREFIX)
+                or value in used
+            ):
+                raise RuntimeError("invalid canonical host allocator tensor")
+            tensor = wire.get(value)
+            if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu":
+                raise RuntimeError("invalid canonical host allocator tensor")
+            used.add(value)
+            return tensor
+        if kind in {"list", "tuple"}:
+            values = [decode(item) for item in value]
+            return values if kind == "list" else tuple(values)
+        if kind == "value":
+            return value
+        raise RuntimeError("unknown canonical host allocator field encoding")
+
+    result = {}
+    for name, fields in manifest["pools"]:
+        if name in result or set(fields) - set(_HOST_ALLOCATOR_FIELDS):
+            raise RuntimeError("invalid canonical host allocator pool")
+        result[name] = {field: decode(value) for field, value in fields.items()}
+    if used != {key for key in wire if key.startswith(_HOST_ALLOCATOR_TENSOR_PREFIX)}:
+        raise RuntimeError("canonical host allocator tensor manifest is incomplete")
+    return result
+
+
 class SchedulerHiCacheTransition:
     """Coordinator-facing transaction; source remains owned through publish."""
 
@@ -1218,39 +1331,55 @@ class SchedulerHiCacheTransition:
         prepare_error = None
         if self.rank == canonical and dormant:
             try:
+                snapshot_started = time.monotonic()
+                tree = snapshot_tree_metadata(cache)
+                self._phase_metrics["host_canonical_tree_snapshot_seconds"] = (
+                    time.monotonic() - snapshot_started
+                )
+                snapshot_started = time.monotonic()
                 metadata = {}
-                for entry in cache.host_pool_group.entries:
-                    pool = entry.host_pool
-                    metadata[entry.name] = {
-                        name: copy.deepcopy(getattr(pool, name))
-                        for name in (
-                            "logical_size",
-                            "free_slots",
-                            "release_slots",
-                            "num_release_slots",
-                            "mem_state",
-                            "slot_used",
-                        )
-                        if hasattr(pool, name)
-                    }
+                if self.overlap_shared_metadata:
+                    allocator_wire = canonical_host_allocator_wire(
+                        cache, transition.target.generation
+                    )
+                else:
+                    for entry in cache.host_pool_group.entries:
+                        pool = entry.host_pool
+                        metadata[entry.name] = {
+                            name: copy.deepcopy(getattr(pool, name))
+                            for name in _HOST_ALLOCATOR_FIELDS
+                            if hasattr(pool, name)
+                        }
+                    allocator_wire = {"allocators": metadata}
+                self._phase_metrics["host_canonical_allocator_pack_seconds"] = (
+                    time.monotonic() - snapshot_started
+                )
                 canonical_wire = {
-                    "tree": snapshot_tree_metadata(cache),
-                    "allocators": metadata,
+                    "tree": tree,
                     "requests": self.scheduler._elastic_pp_request_cache_state(),
+                    **allocator_wire,
                 }
             except Exception as exc:
                 prepare_error = exc
                 canonical_wire = {"error": f"{type(exc).__name__}: {exc}"}
         for destination in dormant:
             if self.rank == canonical:
+                wire_started = time.monotonic()
                 ElasticPPLayerTransport.wait(
                     self.group.send_tensor_dict(
                         canonical_wire, dst=destination, async_send=True
                     )
                     or ()
                 )
+                self._phase_metrics["host_canonical_send_seconds"] = (
+                    time.monotonic() - wire_started
+                )
             elif self.rank == destination:
+                wire_started = time.monotonic()
                 wire = self.group.recv_tensor_dict(src=canonical)
+                self._phase_metrics["host_canonical_recv_seconds"] = (
+                    time.monotonic() - wire_started
+                )
                 if "error" in wire:
                     prepare_error = RuntimeError(
                         "canonical HiCache snapshot failed: " + wire["error"]
@@ -1266,12 +1395,18 @@ class SchedulerHiCacheTransition:
                     )
                     continue
                 self._request_state = records
+                metadata = (
+                    restore_canonical_host_allocators(
+                        wire, transition.target.generation
+                    )
+                    if self.overlap_shared_metadata
+                    else wire["allocators"]
+                )
                 shadow = clone_cache_runtime_metadata(cache)
                 shadow.tree_core = restore_tree_metadata(wire["tree"], shadow)
                 shadow.session_refs.tree_core = shadow.tree_core
                 shadow._elastic_host_allocator_metadata = {
-                    name: SimpleNamespace(**data)
-                    for name, data in wire["allocators"].items()
+                    name: SimpleNamespace(**data) for name, data in metadata.items()
                 }
                 cache = shadow
         if prepare_error is not None:
@@ -1533,9 +1668,11 @@ def snapshot_tree_metadata(cache):
         for data in node.component_data:
             for value in vars(data).values():
                 if isinstance(value, torch.Tensor):
-                    memo[id(value)] = value.detach().cpu().clone()
+                    if id(value) not in memo:
+                        memo[id(value)] = value.detach().to(device="cpu", copy=True)
     empty = tree._empty_match_result.device_indices
-    memo[id(empty)] = empty.detach().cpu().clone()
+    if id(empty) not in memo:
+        memo[id(empty)] = empty.detach().to(device="cpu", copy=True)
     cloned = copy.deepcopy(tree, memo)
     cloned.device = "cpu"
     return pickle.dumps(cloned, protocol=5)

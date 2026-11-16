@@ -590,3 +590,145 @@ def test_canonical_snapshot_failure_is_delivered_to_dormant_peer(monkeypatch):
         source.prepare_transition(tx)
     with pytest.raises(RuntimeError, match="canonical HiCache snapshot failed"):
         target.prepare_transition(tx)
+
+
+def _canonical_allocator_cache():
+    # Deliberately noncontiguous free slots and an empty release batch.
+    pool = NS(
+        logical_size=8,
+        free_slots=torch.tensor([6, 99, 2, 99, 5, 99, 1, 99])[::2],
+        release_slots=[
+            torch.tensor([4]),
+            torch.empty(0, dtype=torch.int64),
+            torch.tensor([7]),
+        ],
+        num_release_slots=2,
+        slot_used=torch.tensor([True, False, False, True, False, False, False, False]),
+        mem_state=torch.arange(8, dtype=torch.uint8),
+    )
+    return NS(host_pool_group=NS(entries=[NS(name="kv", host_pool=pool)]))
+
+
+def test_canonical_allocator_native_wire_is_private_and_bypasses_tensor_pickle():
+    import pickle
+
+    from sglang.srt.distributed.parallel_state import _split_tensor_dict
+    from sglang.srt.elastic_pp.hicache_transition import (
+        canonical_host_allocator_wire,
+        restore_canonical_host_allocators,
+    )
+
+    source = _canonical_allocator_cache()
+    pool = source.host_pool_group.entries[0].host_pool
+    wire = canonical_host_allocator_wire(source, 9)
+    metadata, tensors = _split_tensor_dict(wire)
+    assert len(tensors) == 6
+    assert all(t.device.type == "cpu" and t.is_contiguous() for t in tensors)
+
+    def contains_tensor(value):
+        if isinstance(value, torch.Tensor):
+            return True
+        if isinstance(value, dict):
+            return any(contains_tensor(v) for v in value.values())
+        if isinstance(value, (tuple, list)):
+            return any(contains_tensor(v) for v in value)
+        return False
+
+    # The real GroupCoordinator splitter leaves nested tensors in metadata.
+    # This verifies that its actual pickle lane carries descriptors only.
+    assert not contains_tensor(pickle.loads(pickle.dumps(metadata)))
+    expected = restore_canonical_host_allocators(wire, 9)["kv"]
+    assert expected["free_slots"].tolist() == [6, 2, 5, 1]
+    assert [v.tolist() for v in expected["release_slots"]] == [[4], [], [7]]
+    assert expected["slot_used"].dtype == torch.bool
+    assert expected["mem_state"].dtype == torch.uint8
+    for name in ["free_slots", "slot_used", "mem_state"]:
+        assert (
+            expected[name].untyped_storage().data_ptr()
+            != getattr(pool, name).untyped_storage().data_ptr()
+        )
+    pool.free_slots.zero_()
+    pool.release_slots[0].zero_()
+    assert expected["free_slots"].tolist() == [6, 2, 5, 1]
+    assert expected["release_slots"][0].tolist() == [4]
+    expected["mem_state"].zero_()
+    assert pool.mem_state.tolist() == list(range(8))
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "version",
+        "generation",
+        "missing",
+        "extra",
+        "repeated",
+        "pool",
+        "encoding",
+        "not_tensor",
+    ],
+)
+def test_canonical_allocator_native_wire_rejects_incomplete_or_wrong_generation(fault):
+    from sglang.srt.elastic_pp.hicache_transition import (
+        _HOST_ALLOCATOR_MANIFEST,
+        _HOST_ALLOCATOR_TENSOR_PREFIX,
+        canonical_host_allocator_wire,
+        restore_canonical_host_allocators,
+    )
+
+    wire = canonical_host_allocator_wire(_canonical_allocator_cache(), 9)
+    manifest = wire[_HOST_ALLOCATOR_MANIFEST]
+    fields = manifest["pools"][0][1]
+    if fault in {"version", "generation"}:
+        manifest[fault] += 1
+    elif fault == "missing":
+        del wire[fields["free_slots"][1]]
+    elif fault == "extra":
+        wire[_HOST_ALLOCATOR_TENSOR_PREFIX + "999"] = torch.tensor([99])
+    elif fault == "repeated":
+        fields["slot_used"] = fields["free_slots"]
+    elif fault == "pool":
+        manifest["pools"].append(manifest["pools"][0])
+    elif fault == "encoding":
+        fields["mem_state"] = ("unknown", None)
+    else:
+        wire[fields["free_slots"][1]] = [6, 2, 5, 1]
+    with pytest.raises(RuntimeError, match="canonical host allocator"):
+        restore_canonical_host_allocators(wire, 9)
+
+
+@pytest.mark.parametrize("target_capacity", [4, 8, 10])
+def test_allocator_resize_preserves_full_state_and_private_free_release_buffers(
+    target_capacity,
+):
+    from sglang.srt.elastic_pp.hicache_transition import clone_host_allocator
+
+    source = _canonical_allocator_cache().host_pool_group.entries[0].host_pool
+    target = NS(
+        logical_size=target_capacity,
+        slot_used=torch.zeros(target_capacity, dtype=torch.bool),
+        mem_state=torch.zeros(target_capacity, dtype=torch.uint8),
+    )
+    clone_host_allocator(source, target)
+    assert (
+        target.free_slots.tolist()
+        == {4: [2, 1], 8: [6, 2, 5, 1], 10: [6, 2, 5, 1, 8, 9]}[target_capacity]
+    )
+    assert [v.tolist() for v in target.release_slots] == (
+        [] if target_capacity == 4 else [[4], [7]]
+    )
+    assert target.num_release_slots == (0 if target_capacity == 4 else 2)
+    assert (
+        target.slot_used[: min(8, target_capacity)].tolist()
+        == source.slot_used[:target_capacity].tolist()
+    )
+    target.free_slots.zero_()
+    for released in target.release_slots:
+        released.zero_()
+    target.mem_state.zero_()
+    assert source.free_slots.tolist() == [6, 2, 5, 1]
+    assert [v.tolist() for v in source.release_slots] == [[4], [], [7]]
+    assert source.mem_state.tolist() == list(range(8))
+    source.slot_used[0] = False
+    with pytest.raises(RuntimeError, match="free lists and used slots disagree"):
+        clone_host_allocator(source, target)

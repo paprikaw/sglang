@@ -130,3 +130,9 @@ R13定向CPU回归83项通过，覆盖重复冷输出拒绝、GPU／CPU缓存来
 **R19候选：减少CPU记录创建并重叠只读元数据检查。** KVRowStamp使用不可变NamedTuple，不改变完整slot／incarnation、ready事件对象或copy pin/free/reuse协议。独立CPU对比每点七样本，36,265／58,300／98,304行的分配＋发布均值52.149→35.830／96.284→68.005／183.032→131.236ms；仅slots dataclass没有一致改善，原值一并保留。微测不证明GPU或在线暂停改善。
 
 shared-host元数据签名仍覆盖原完整CPU树／slot／allocator字段。只在已限定的P/D Decode容量伸缩路径启用后台检查；先完成HiCache I/O排空，源CPU元数据保持只读。最终元数据交换先join并检查generation和完整rank报告，失败时同样先join再回滚或析构目标缓存；默认路径继续同步。分别保存hash、join和collective秒数，以及实际monotonic开始／完成／join时刻，以便从GPU日志验证重叠与先后关系。213项相关CPU通过，含真实Thread/Event握手的drain-before-start、并发与发布前join、hash和generation失败、目标构造失败后的join-before-destruction，以及线程无法启动的安全回滚。严格GPU往返、关闭探针的76请求和性能目标仍待验。
+
+**R19有界验证及端到端完成。** 源b964a72129b904c3f5f38e8684a82f77b16539cf／不可移动tag experiment/sglang/pd-kv-performance-20261116-r19。严格最小四组输出／四组匹配缓存、六组提交KV／GDN审计、CPU HiCache恢复、物理KV240→336→240MiB与独立64GiB复用均通过；五个后台元数据读取先join再应用／发布。相同76请求／四任务、输入3071334／输出12964，工作量签名匹配R18。关闭探针后TPOT19.461ms、请求E2E15.729秒、TTFT12.468秒，SLO60／76，Prefill GPU＋CPU命中96.13%；最终扩／缩117.280／166.373ms，控制2.113／1.126秒，完整操作2.566／1.551秒。扩容最大SSE内容间隔163.827ms，准备开始处123.485ms；缩容无在途样本。Guard后检查／归属清理／release通过。初始源rank准备48.320／47.325ms，R18约63ms；整轮延迟未改善，不宣称显著收益，几十毫秒及同源副本仍待完成。
+
+**R20候选：分配器Tensor直接传输与减少重复CPU复制。** canonical元数据原为嵌套字典，GroupCoordinator只拆顶层Tensor，实际仍将分配器数组序列化进pickle。候选仅在既有shared-host重叠路径，把完整字段编码为version／generation清单及独立连续CPU Tensor；每个数组仍有私有快照，源变化／回滚不能改写已发送内容。接收拒绝缺失、额外、重复、错误generation或未知字段编码，随后沿用原请求进度、元数据签名及发布门槛。分配器保留完整used/free与高地址live检查，等容／扩容直接克隆有序列表，缩容使用已私有的筛选结果；树索引从GPU到CPU不再追加一次CPU clone。新增canonical树快照、分配器pack和发送／接收计时，GPU及端到端仍待验。
+
+R20相关CPU两组不重复文件共437项通过（225＋212），源码／测试编译及diff检查通过。真实两进程Gloo使用生产GroupCoordinator方法和完整wait，逐字段验证dtype／shape／值／空release；262144槽位、每模式预热一次后七样本，完整发送均值2.757→1.138ms，pickle元数据2361015→696字节。仅CPU传输证据，不证明在线暂停改善；首个独立脚本导入路径错误保留于原日志，修正后检查通过。GPU严格最小及同一有限流待验。
