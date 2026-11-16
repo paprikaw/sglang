@@ -179,4 +179,6 @@
 
 - [x] **2026-11-16 R16：完整KV覆盖的二进制摘要，有界验收。** 源4156e46674ab，86项CPU、四组严格输出／缓存、双向KV／GDN内容、CPU恢复与独立64GiB复用通过。同一76请求端到端TPOT19.147ms、请求E2E15.291秒，扩／缩150.270／182.926ms，扩容最大SSE内容间隔210.876ms，Guard清理release通过。摘要仍覆盖全部64位slot／incarnation；发送端实测约1.85ms。目标未达到，同源副本待补。
 
-- [ ] **2026-11-16 R17：在已排空fence内重叠注册注销与缓存收尾。** 仅P/D Decode的background／overlap／KVCacheD路径启用CPU注销线程；HiCache元数据与独立NIXL patch同时收尾，原源／目标页保留至join完成，异常也先join再回滚。提交、注册地址刷新、Graph和物理回收仍在主线程且位于join之后。147项定向CPU检查通过，覆盖重叠、正常提交、host失败／双失败、线程启动失败和回滚前join；GPU严格最小轮及端到端尚待验证。
+- [x] **2026-11-16 R17：排空fence内注销与缓存收尾重叠，有界验收。** 源a482a617dba0，147项CPU、四组严格输出／匹配缓存、六组KV／GDN内容、CPU恢复、物理KV往返与独立64GiB复用通过；注销线程的实际重叠及join-before-copy／commit已核验。相同76请求端到端TPOT18.732ms、E2E15.576秒，最终扩／缩142.650／191.520ms，最大扩容SSE内容间隔197.103ms，Guard清理release通过。对R16仅小幅缩短单轮扩容fence，不宣称总体更快；几十毫秒目标未达到。
+
+- [ ] **下一项：拆清准备开始的同步停顿和shared-host元数据开销。** R17源rank在host capture后至后台prepare首段有约84ms未分项时间，较长SSE间隔发生在控制开始后，另有最终fence间隔。先计时begin_live_patch与initial-base准备，定位主线程阻塞来源；分开metadata hash与Gloo等待，再判断安全重叠／更低成本实现。不减少完整状态校验、工作量、HiCache或权重offload；新代码继续先CPU、严格GPU最小、再同一短端到端。

@@ -110,3 +110,10 @@ R13定向CPU回归83项通过，覆盖重复冷输出拒绝、GPU／CPU缓存来
 **R16有界最小及短端到端完成。** 源4156e46674ab，86项CPU检查；四组输出与四组匹配Prefill缓存、双向三rank KV／GDN审计、CPU恢复、物理KV240→336→240MiB及独立64GiB复用通过。关闭探针后同一76请求／四任务完成，输入3071334、输出12964，与R15完整工作量签名一致。TPOT19.147ms、E2E15.291秒、TTFT12.077秒，64／76达标；最终扩／缩150.270／182.926ms、最大扩容SSE内容间隔210.876ms，完整操作2.691／1.564秒。Guard清理及release通过。暂停仍非几十毫秒；双实例同源对照尚未补测。
 
 **R17：注销与缓存收尾重叠候选。** 只在已经排空的KVCacheD最终fence内，将Mooncake注册注销交给绑定正确CUDA设备的CPU线程；HiCache与独立NIXL收尾留在主线程。所有映射保留至注销线程join完成；主路径异常也先join，保留主路径和注销的双错误，之后才允许共识、状态复制、提交或回滚。其余路径默认同步，不改变P/D准入、工作量、Graph、CPU预算或权重offload。147项相关CPU检查通过，覆盖正常重叠、失败及回滚前join和原有注册／shared-host不变量。开源Mooncake v0.3.13绑定的batchUnregisterMemory释放GIL；这不是安装wheel实际重叠的证据，须由GPU时段记录检验。GPU最小资格尚未完成，不作性能结论。
+
+
+**R17有界GPU最小及关闭探针的端到端已完成。** 实验冻结a482a617dba0f94d8a719fdc54593d22384bbfb5／tag experiment/sglang/pd-kv-performance-20261116-r17。147项CPU；最小四组输出、四组匹配Prefill缓存、六组KV／GDN内容审计、CPU HiCache恢复、物理KV240→336→240MiB及独立64GiB复用均通过。各方向三rank的注销在复制／提交前已join，源rank有真实原生注销／host或patch重叠。Guard清理及release通过；含审计的最小轮计时不作性能。
+
+同一76请求／四任务、3071334输入与12964输出token，工作量签名匹配R16。关闭探针后TPOT18.732ms、E2E15.576秒、TTFT12.443秒，SLO60／76；扩／缩fence142.650／191.520ms，完整操作2.437／1.579秒，最大扩容SSE内容间隔197.103ms。缩容无在途输出间隔样本。Guard后检查、归属清理及release通过。R16对应fence150.270／182.926ms、TPOT19.147ms、E2E15.291秒、SLO64／76；单轮不能声明R17总体更优，几十毫秒目标未达，同源副本尚未补测。
+
+时段进一步显示：grow源rank0／2注销与收尾重叠23.321／46.955ms；源rank2注销本身52.509ms。host capture结束至后台prepare首个计时段还存在约83.97／83.79ms未分项时间，主线程begin_live_patch／initial-base是候选，不能直接归因为H2D或GPU通信。最大SSE间隔出现在准备开始时，另一次187.815ms靠近最终交接，需要分别诊断。连续原值及重叠时段见既有CONCURRENT_KV_20261115报告下analysis，未扩大为多周期或一般性能资格。
