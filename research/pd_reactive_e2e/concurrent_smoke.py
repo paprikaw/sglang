@@ -10,12 +10,49 @@ from dataclasses import asdict
 from pathlib import Path
 
 
+def prefill_cache_signature(response):
+    meta = response["prefill_meta"]
+    details = meta.get("cached_tokens_details") or {}
+    values = (
+        meta["prompt_tokens"],
+        meta.get("cached_tokens", 0),
+        details.get("device", 0),
+        details.get("host", 0),
+    )
+    if any(type(value) is not int or value < 0 for value in values):
+        raise ValueError("invalid Prefill cache counters")
+    prompt, cached, device, host = values
+    if cached > prompt or device + host != cached:
+        raise ValueError("inconsistent Prefill cache counters")
+    return values
+
+
+def warm_reference_ready(previous, response):
+    signature = prefill_cache_signature(response)
+    return (
+        signature[1] > 0
+        and signature == prefill_cache_signature(previous)
+        and response["output_ids"] == previous["output_ids"]
+    )
+
+
+def matching_prefill_caches(references, responses):
+    return [
+        prefill_cache_signature(a) == prefill_cache_signature(b)
+        for a, b in zip(references, responses)
+    ]
+
+
 def require_generation_checks(result):
     for name in (
         "serial_repeat_matches",
         "outputs_match",
         "static_pp2_concurrent_matches",
         "static_pp3_concurrent_matches",
+        "static_pp2_prefill_cache_matches",
+        "serial_prefill_cache_matches",
+        "migrating_prefill_cache_matches",
+        "static_pp3_prefill_cache_matches",
     ):
         values = result.get(name)
         if (
@@ -110,14 +147,7 @@ def exercise(run, root, replay, p, d, key, info, health, save):
                 p, d, key, tokens, output, lane, True, request_timeout_s=120
             )
             history.append(response)
-            if (
-                len(history) > 1
-                and response["output_ids"] == history[-2]["output_ids"]
-                and (
-                    response["prefill_meta"].get("cached_tokens_details")
-                    == history[-2]["prefill_meta"].get("cached_tokens_details")
-                )
-            ):
+            if len(history) > 1 and warm_reference_ready(history[-2], response):
                 result.setdefault("reference_warmup", []).append(
                     dict(lane=lane, output=output, responses=history)
                 )
@@ -155,6 +185,9 @@ def exercise(run, root, replay, p, d, key, info, health, save):
             a["output_ids"] == b["output_ids"]
             for a, b in zip(short_references, result["static_pp2_concurrent"])
         ]
+        result["static_pp2_prefill_cache_matches"] = matching_prefill_caches(
+            short_references, result["static_pp2_concurrent"]
+        )
         result["static_pp2_max_running"] = max(
             min(s["running"]) for s in result["samples"]
         )
@@ -172,6 +205,9 @@ def exercise(run, root, replay, p, d, key, info, health, save):
         result["serial_repeat_matches"] = [
             a["output_ids"] == b["output_ids"] for a, b in zip(references, repeats)
         ]
+        result["serial_prefill_cache_matches"] = matching_prefill_caches(
+            references, repeats
+        )
         initial = observe()
         policy = ReactivePDPolicy("inplace", Parameters(**root["policy"]))
         with ThreadPoolExecutor(max_workers=2) as executor:
@@ -233,6 +269,9 @@ def exercise(run, root, replay, p, d, key, info, health, save):
             a["output_ids"] == b["output_ids"]
             for a, b in zip(references, result["responses"])
         ]
+        result["migrating_prefill_cache_matches"] = matching_prefill_caches(
+            references, result["responses"]
+        )
         result["max_running_after_grow"] = max(
             (
                 min(s["running"])
@@ -258,6 +297,9 @@ def exercise(run, root, replay, p, d, key, info, health, save):
             a["output_ids"] == b["output_ids"]
             for a, b in zip(references, result["static_pp3_concurrent"])
         ]
+        result["static_pp3_prefill_cache_matches"] = matching_prefill_caches(
+            references, result["static_pp3_concurrent"]
+        )
         mapped = lambda state: sum(
             r["e2e_kv_capacity"]["physical"]["mapped_memory_bytes"]
             for r in state["internal_states"]

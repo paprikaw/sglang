@@ -8,6 +8,10 @@ CHECKS = (
     "outputs_match",
     "static_pp2_concurrent_matches",
     "static_pp3_concurrent_matches",
+    "static_pp2_prefill_cache_matches",
+    "serial_prefill_cache_matches",
+    "migrating_prefill_cache_matches",
+    "static_pp3_prefill_cache_matches",
 )
 
 
