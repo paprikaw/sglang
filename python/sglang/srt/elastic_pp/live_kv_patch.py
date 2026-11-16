@@ -169,7 +169,9 @@ class LiveKVSnapshot:
         )
         self.epochs = {}
         self.published = set()
+        started = time.monotonic()
         self._allocate(allocator.elastic_pp_live_slots())
+        self.startup_metrics = dict(allocate_seconds=time.monotonic() - started)
         allocator.attach_elastic_pp_live_patch(self)
 
     def seed_initial_base(self):
@@ -188,17 +190,18 @@ class LiveKVSnapshot:
     def _publish_initial_base(self, ready):
         if self.initial_base is None:
             return
-        for slot, incarnation in self.initial_base.items():
-            if (
-                slot
-                and self.epochs.get(slot) == incarnation
-                and slot not in self.published
-            ):
-                self.session.publish(
-                    slot, incarnation, ready=ready, generation=self.generation
-                )
-                self.published.add(slot)
-                self.initial_base_rows_published += 1
+        started = time.monotonic()
+        versions = [
+            (slot, incarnation)
+            for slot, incarnation in self.initial_base.items()
+            if slot
+            and self.epochs.get(slot) == incarnation
+            and slot not in self.published
+        ]
+        self.session.publish_many(versions, ready=ready, generation=self.generation)
+        self.published.update(slot for slot, _ in versions)
+        self.initial_base_rows_published += len(versions)
+        self.startup_metrics["publish_base_seconds"] = time.monotonic() - started
         self.initial_base = None
 
     def start_initial_base(self, ready):
@@ -236,8 +239,11 @@ class LiveKVSnapshot:
                 self._fail(exc)
 
     def _allocate(self, slots):
-        for slot in slots.detach().cpu().tolist():
-            self.epochs[slot] = self.session.allocate(slot, generation=self.generation)
+        self.epochs.update(
+            self.session.allocate_many(
+                slots.detach().cpu().tolist(), generation=self.generation
+            )
+        )
 
     def _fail(self, exc):
         self.error = f"{type(exc).__name__}: {exc}"
@@ -402,6 +408,7 @@ class LiveKVSnapshot:
                 forward_checkpoints=self.forward_checkpoints,
                 initial_base_enabled=self.initial_base_enabled,
                 initial_base_rows_published=self.initial_base_rows_published,
+                startup=dict(self.startup_metrics),
                 online_submissions=self.online_submissions,
                 online_completed_rows=self.online_completed_rows,
                 total_rounds=self.session.rounds,

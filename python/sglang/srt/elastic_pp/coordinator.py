@@ -301,7 +301,9 @@ class ElasticPPMigrationCoordinator:
             if self.enable_kv_patch:
                 # This caller is the scheduler; allocator snapshots must never
                 # be taken from the preparation worker.
-                self.kv_transport.begin_live_patch(transition)
+                self._timed(
+                    "begin_live_kv_snapshot", self.kv_transport.begin_live_patch, transition
+                )
                 if getattr(
                     getattr(self.model_runner, "server_args", None),
                     "elastic_pp_kv_base_precopy",
@@ -313,7 +315,9 @@ class ElasticPPMigrationCoordinator:
                     # Successful capture proved HiCache writers quiescent. A
                     # current-stream event covers earlier inference writes; new
                     # asynchronous loadback allocations remain unpublished.
-                    self.kv_transport.seed_initial_live_base()
+                    self._timed(
+                        "seed_initial_kv_base", self.kv_transport.seed_initial_live_base
+                    )
             self._thread = Thread(
                 target=self._prepare_worker,
                 name=f"elastic-pp-prepare-g{transition.target.generation}-r{self.rank}",

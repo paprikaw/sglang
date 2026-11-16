@@ -47,6 +47,82 @@ def publish(session, slot):
     return epoch
 
 
+def test_bulk_snapshot_matches_scalar_stamps_and_preserves_copy_pins():
+    scalar = ContinuousKVPatch(generation=1, capacity=16, copier=Copier(), max_rows=2)
+    batch = ContinuousKVPatch(generation=1, capacity=16, copier=Copier(), max_rows=2)
+    slots, event = [8, 2, 11], Ready()
+    expected = {slot: scalar.allocate(slot, generation=1) for slot in slots}
+    assert batch.allocate_many(iter(slots), generation=1) == expected
+    for slot, epoch in expected.items():
+        scalar.publish(slot, epoch, ready=event, generation=1)
+    batch.publish_many(iter(expected.items()), ready=event, generation=1)
+    assert batch.dirty_rows() == scalar.dirty_rows()
+    assert batch.unacknowledged_rows == 3
+    assert batch.submit(generation=1)
+    with pytest.raises(KVPatchBusy):
+        batch.free(8, expected[8], generation=1)
+    batch.poll(generation=1, wait=True)
+    assert batch.free(8, expected[8], generation=1)
+    assert batch.allocate_many([8], generation=1) == {8: 2}
+    with pytest.raises(ValueError, match="stale"):
+        batch.publish_many([(8, 1)], ready=event, generation=1)
+    batch.publish_many([(8, 2)], ready=event, generation=1)
+    batch.finish_at_fence(generation=1)
+    assert batch.unacknowledged_rows == 0
+
+
+@pytest.mark.parametrize("slots", [[2, 2], [2, 8], [2, -1], [2, 1]])
+def test_bulk_allocation_rejects_entire_invalid_batch_without_mutation(slots):
+    session = ContinuousKVPatch(generation=1, capacity=8, copier=Copier())
+    session.allocate(1, generation=1)
+    with pytest.raises(ValueError):
+        session.allocate_many(slots, generation=1)
+    assert set(session._live) == {1}
+    assert session.allocate(2, generation=1) == 1
+
+
+@pytest.mark.parametrize(
+    "invalid", ["duplicate", "stale", "missing", "not_ready", "republish"]
+)
+def test_bulk_publish_checks_every_row_before_publishing_any(invalid):
+    session = ContinuousKVPatch(generation=1, capacity=8, copier=Copier())
+    session.allocate_many([1, 2, 3], generation=1)
+    event = Ready()
+    rows = [(1, 1), (2, 1)]
+    if invalid == "duplicate":
+        rows.append((1, 1))
+    elif invalid == "stale":
+        rows.append((3, 99))
+    elif invalid == "missing":
+        rows.append((7, 1))
+    elif invalid == "not_ready":
+        event = None
+    else:
+        session.publish(3, 1, ready=event, generation=1)
+        rows.append((3, 1))
+    with pytest.raises(ValueError):
+        session.publish_many(rows, ready=event, generation=1)
+    assert session._live[1].ready is None and session._live[2].ready is None
+    assert all(row.slot == 3 for row in session.dirty_rows())
+
+
+def test_bulk_snapshot_preserves_high_incarnations_and_generation_fences():
+    session = ContinuousKVPatch(generation=1, capacity=8, copier=Copier())
+    session._epochs[3] = 1 << 63
+    epochs = session.allocate_many([3], generation=1)
+    assert epochs == {3: (1 << 63) + 1}
+    with pytest.raises(ValueError, match="generation"):
+        session.allocate_many([4], generation=2)
+    with pytest.raises(ValueError, match="generation"):
+        session.publish_many(epochs.items(), ready=Ready(), generation=2)
+    session.publish_many(epochs.items(), ready=Ready(), generation=1)
+    session.finish_at_fence(generation=1)
+    with pytest.raises(RuntimeError, match="complete"):
+        session.allocate_many([], generation=1)
+    with pytest.raises(RuntimeError, match="complete"):
+        session.publish_many([], ready=Ready(), generation=1)
+
+
 def test_online_round_does_not_enumerate_full_live_set(monkeypatch):
     copier = Copier()
     session = ContinuousKVPatch(generation=1, capacity=10000, copier=copier, max_rows=2)

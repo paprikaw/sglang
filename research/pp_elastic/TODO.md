@@ -182,3 +182,5 @@
 - [x] **2026-11-16 R17：排空fence内注销与缓存收尾重叠，有界验收。** 源a482a617dba0，147项CPU、四组严格输出／匹配缓存、六组KV／GDN内容、CPU恢复、物理KV往返与独立64GiB复用通过；注销线程的实际重叠及join-before-copy／commit已核验。相同76请求端到端TPOT18.732ms、E2E15.576秒，最终扩／缩142.650／191.520ms，最大扩容SSE内容间隔197.103ms，Guard清理release通过。对R16仅小幅缩短单轮扩容fence，不宣称总体更快；几十毫秒目标未达到。
 
 - [ ] **下一项：拆清准备开始的同步停顿和shared-host元数据开销。** R17源rank在host capture后至后台prepare首段有约84ms未分项时间，较长SSE间隔发生在控制开始后，另有最终fence间隔。先计时begin_live_patch与initial-base准备，定位主线程阻塞来源；分开metadata hash与Gloo等待，再判断安全重叠／更低成本实现。不减少完整状态校验、工作量、HiCache或权重offload；新代码继续先CPU、严格GPU最小、再同一短端到端。
+
+- [ ] **2026-11-16 R18：初始KV批量登记／发布与准备分项。** 对调度线程捕获的行集合，在同一session锁内完整校验后批量更新；保留逐行stamp、64位incarnation、ready事件、pin、free／reuse与最终完整覆盖检查。非法批次不得部分更新，后续异步loadback不进入初始ready集合。新增begin_live_kv_snapshot／seed_initial_kv_base及allocate／publish-base计时。150项相关CPU通过，含批量／逐行一致、错误批次原子拒绝、pin／复用、高位代次及generation／phase边界。独立CPU微测36,265行登记＋发布71.057→51.462ms；不是GPU或端到端收益。严格GPU最小及同一短端到端待验。

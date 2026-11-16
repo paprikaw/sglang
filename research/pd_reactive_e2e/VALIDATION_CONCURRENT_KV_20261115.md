@@ -117,3 +117,8 @@ R13定向CPU回归83项通过，覆盖重复冷输出拒绝、GPU／CPU缓存来
 同一76请求／四任务、3071334输入与12964输出token，工作量签名匹配R16。关闭探针后TPOT18.732ms、E2E15.576秒、TTFT12.443秒，SLO60／76；扩／缩fence142.650／191.520ms，完整操作2.437／1.579秒，最大扩容SSE内容间隔197.103ms。缩容无在途输出间隔样本。Guard后检查、归属清理及release通过。R16对应fence150.270／182.926ms、TPOT19.147ms、E2E15.291秒、SLO64／76；单轮不能声明R17总体更优，几十毫秒目标未达，同源副本尚未补测。
 
 时段进一步显示：grow源rank0／2注销与收尾重叠23.321／46.955ms；源rank2注销本身52.509ms。host capture结束至后台prepare首个计时段还存在约83.97／83.79ms未分项时间，主线程begin_live_patch／initial-base是候选，不能直接归因为H2D或GPU通信。最大SSE间隔出现在准备开始时，另一次187.815ms靠近最终交接，需要分别诊断。连续原值及重叠时段见既有CONCURRENT_KV_20261115报告下analysis，未扩大为多周期或一般性能资格。
+
+
+**R18：初始快照行登记与发布的批处理候选。** R17 source rank初始约84ms未分项时间对应scheduler-owned快照／base准备候选。本次增加两段协调器计时及patch内allocate／publish-base计时，将已知行集合的重复锁／generation检查合并为一次，仍先检查整个批次，保留每行incarnation与ready stamp、复制pin和free／reuse保护。初始base仍只来自原先quiescent快照，晚到异步loadback不被提前标记ready。未改MR交接、缓存预算、工作量或权重offload。
+
+150项CPU检查通过，包括逐行与批量stamp等价、无效批次不部分发布、已pin行禁止free、复用需新incarnation、高64位及generation／phase约束，以及既有真实tensor／allocator／伪NIXL与coordinator检查。独立CPU对比基于R17的98aa3b1c4d版本，每点7样本，36,265行总71.057→51.462ms、58,300行119.557→92.613ms、98,304行210.601→177.003ms；大点publish单段未更快，不夸大为所有段优化。仅CPU记账小测，无GPU和端到端性能资格。脚本及原始JSON在持续实验目录analysis。下一步沿用严格最小验证与同一76请求有限流。

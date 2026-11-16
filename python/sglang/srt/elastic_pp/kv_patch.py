@@ -73,6 +73,27 @@ class ContinuousKVPatch:
             self._live[slot] = KVRowStamp(slot, epoch, None)
             return epoch
 
+    def allocate_many(self, slots, *, generation):
+        """Register a scheduler-owned snapshot under one checked lock.
+
+        Validate the complete batch before changing any incarnation. Later
+        free/reuse and copying still use the same per-row stamps and pins.
+        """
+        slots = tuple(slots)
+        with self._lock:
+            self._check(generation, mutable=True)
+            if len(set(slots)) != len(slots) or any(
+                not 0 <= slot < self.capacity or slot in self._live for slot in slots
+            ):
+                raise ValueError("KV patch slot is outside capacity or already live")
+            epochs = {slot: self._epochs.get(slot, 0) + 1 for slot in slots}
+            rows = {
+                slot: KVRowStamp(slot, epoch, None) for slot, epoch in epochs.items()
+            }
+            self._epochs.update(epochs)
+            self._live.update(rows)
+            return epochs
+
     def publish(self, slot, incarnation, *, ready, generation):
         with self._lock:
             self._check(generation, mutable=True)
@@ -85,6 +106,25 @@ class ContinuousKVPatch:
                 )
             self._live[slot] = KVRowStamp(slot, incarnation, ready)
             self._dirty[slot] = self._live[slot]
+
+    def publish_many(self, versions, *, ready, generation):
+        """Publish one common ready event without a lock/check per row."""
+        with self._lock:
+            self._check(generation, mutable=True)
+            rows, seen = {}, set()
+            for slot, incarnation in versions:
+                row = self._live.get(slot)
+                if row is None or row.incarnation != incarnation:
+                    raise ValueError("stale KV row incarnation")
+                if ready is None or row.ready is not None or slot in seen:
+                    raise ValueError(
+                        "publish one completed immutable KV write per incarnation"
+                    )
+                seen.add(slot)
+                rows[slot] = KVRowStamp(slot, incarnation, ready)
+            # A malformed later entry must not publish an earlier valid row.
+            self._live.update(rows)
+            self._dirty.update(rows)
 
     def free(self, slot, incarnation, *, generation):
         """Drop one incarnation; return whether the target had acknowledged it."""
