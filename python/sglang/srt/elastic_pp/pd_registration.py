@@ -139,17 +139,39 @@ class DecodeRegistrationTransaction:
             != "background"
         ):
             return
-        pool = getattr(runner.token_to_kv_pool, "full_kv_pool", runner.token_to_kv_pool)
+        device_pool = runner.token_to_kv_pool
+        pool = getattr(device_pool, "full_kv_pool", device_pool)
         if not getattr(pool, "capacity_managed", False):
             return
         if self.prepared_regions is not None:
             raise RuntimeError("previous P/D region preparation still owned")
-        from sglang.srt.elastic_pp.pd_registered_regions import PreparedDecodeRegions
+        from sglang.srt.elastic_pp.pd_registered_regions import (
+            PreparedDecodeRegions,
+            regions,
+        )
 
         manager = self.scheduler.disagg_decode_prealloc_queue.kv_manager
         target = pool.prepared_pd_registration_regions(generation)
+        # Metadata buffers belong to the persistent P/D queue, not to a PP
+        # layer generation. Keep their registrations throughout the handoff.
+        args = manager.kv_args
+        auxiliary = regions(
+            zip(
+                getattr(args, "aux_data_ptrs", ()) or (),
+                getattr(args, "aux_data_lens", ()) or (),
+                strict=True,
+            )
+        )
+        prepare_state = getattr(
+            device_pool, "prepared_pd_state_registration_regions", None
+        )
+        if prepare_state is not None:
+            auxiliary.update(regions(prepare_state(generation)))
         lease = PreparedDecodeRegions(
-            manager.engine, manager._registerable_regions(), target
+            manager.engine,
+            manager._registerable_regions(),
+            target,
+            target_aux=auxiliary,
         )
         self.prepared_regions, self.prepared_generation = lease, generation
         lease.prepare()

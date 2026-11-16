@@ -62,6 +62,76 @@ def test_prepare_abort_leaves_original_registrations_untouched():
     assert engine.calls[-1] == ("deregister", {400})
 
 
+def test_prepared_state_and_persistent_metadata_avoid_fence_reregistration():
+    engine = Engine()
+    auxiliary = {(200, 10), (500, 10)}
+    complete_target = TARGET_KV | auxiliary
+    lease = PreparedDecodeRegions(engine, SOURCE, TARGET_KV, target_aux=auxiliary)
+    lease.prepare()
+    assert engine.live == SOURCE | complete_target
+    lease.suspend()
+    assert engine.live == complete_target
+    lease.commit(complete_target)
+    assert engine.calls == [
+        ("register", {(400, 10), (500, 10)}),
+        ("deregister", {300}),
+    ]
+    assert lease.metrics["target_kv_regions"] == 2
+    assert lease.metrics["target_aux_regions"] == 2
+    assert lease.metrics["refresh_regions"] == 0
+
+
+def test_abort_cleans_attempted_gdn_and_kv_before_backing_can_be_unmapped():
+    engine = Engine()
+    engine.register_status = -1
+    lease = PreparedDecodeRegions(engine, SOURCE, TARGET_KV, target_aux={(500, 10)})
+    with pytest.raises(RuntimeError, match="registration failed"):
+        lease.prepare()
+    lease.abort()
+    assert engine.live == SOURCE
+    assert engine.calls[-1] == ("deregister", {400, 500})
+
+
+def test_committed_gdn_cannot_drift_from_prepared_address():
+    engine = Engine()
+    lease = PreparedDecodeRegions(engine, SOURCE, TARGET_KV, target_aux={(500, 10)})
+    lease.prepare()
+    lease.suspend()
+    with pytest.raises(RuntimeError, match="differ from prepared"):
+        lease.commit(TARGET_KV | {(600, 10)})
+    assert not any(call == ("register", {(600, 10)}) for call in engine.calls)
+
+
+def test_pending_hybrid_state_regions_leave_live_state_and_layer_map_untouched(
+    hybrid_pool_factory,
+):
+    from sglang.srt.elastic_pp.topology import LayerRange
+
+    pool = hybrid_pool_factory(start_layer=0, end_layer=2)
+    pool.mamba_pool.conv_slice_axis = 0
+    old = pool.mamba_pool.mamba_cache
+    old_map = dict(pool.req_to_token_pool.mamba_map)
+    with pytest.raises(RuntimeError, match="no hybrid KV preparation"):
+        pool.prepared_pd_state_registration_regions(1)
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(1, 4), generation=1, total_num_layers=4
+    )
+    pending = pool._pending_state
+    expected = tuple(
+        (tensor[i].data_ptr(), tensor[i].nbytes)
+        for tensor in (*pending.conv, pending.temporal)
+        for i in range(len(pool._pending_mamba_ids))
+    )
+    assert pool.prepared_pd_state_registration_regions(1) == expected
+    assert pool.mamba_pool.mamba_cache is old
+    assert pool.req_to_token_pool.mamba_map == old_map
+    with pytest.raises(RuntimeError, match="no hybrid KV preparation"):
+        pool.prepared_pd_state_registration_regions(2)
+    pool.abort_elastic_pp_kv_layers(generation=1)
+    with pytest.raises(RuntimeError, match="no hybrid KV preparation"):
+        pool.prepared_pd_state_registration_regions(1)
+
+
 def test_fenced_abort_restores_source_only_after_prepared_backing_abort():
     engine = Engine()
     lease = PreparedDecodeRegions(engine, SOURCE, TARGET_KV)
@@ -188,6 +258,28 @@ def test_transaction_abort_before_fence_is_idempotent_and_checks_generation():
         transaction.abort_prepared(2)
     transaction.abort_prepared(1)
     transaction.abort_prepared(1)
+    assert engine.live == SOURCE
+
+
+def test_transaction_prepares_gdn_and_preserves_persistent_queue_metadata():
+    sched, engine, manager, _ = scheduler()
+    args = NS(aux_data_ptrs=[200], aux_data_lens=[10])
+    manager.kv_args = args
+    manager._registerable_regions = lambda: SOURCE
+    full = sched.tp_worker.model_runner.token_to_kv_pool
+    sched.tp_worker.model_runner.token_to_kv_pool = NS(
+        full_kv_pool=full,
+        prepared_pd_state_registration_regions=lambda generation: {(500, 10)},
+    )
+    transaction = DecodeRegistrationTransaction(sched)
+    transaction.prepare_target(1)
+    assert manager.kv_args is args and manager.connection_pool
+    assert transaction.prepared_regions.target_prepared == TARGET | {(200, 10)}
+    assert engine.live == SOURCE | TARGET
+    transaction.suspend()
+    assert engine.live == TARGET | {(200, 10)}
+    transaction.abort_prepared(1)
+    transaction.refresh()
     assert engine.live == SOURCE
 
 

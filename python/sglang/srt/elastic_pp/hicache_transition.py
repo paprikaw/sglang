@@ -1191,7 +1191,7 @@ class SchedulerHiCacheTransition:
         cache = self.scheduler.tree_cache
         self._phase_metrics = dict(self._background_metrics)
         started = time.monotonic()
-        drain_host_io_at_fence(cache, self.group)
+        self._phase_metrics.update(drain_host_io_at_fence(cache, self.group))
         self._phase_metrics["host_io_drain_seconds"] = time.monotonic() - started
         started = time.monotonic()
         self._source_cache = cache
@@ -1580,44 +1580,81 @@ def build_dormant_host_stack(clone, *, source, projected, params):
 
 
 def drain_host_io_at_fence(cache, group, timeout_s=15.0):
-    """All resident ranks poll in the same order, even locally idle ranks."""
-    import time
+    """Retire existing cache work without creating idle PP readiness packets.
+
+    The scheduler has drained and aligned its pre-fence PP event rounds before
+    entering here. Retire those sends first, then make a group-wide decision:
+    an idle local rank must still poll when a peer has I/O. Only a globally
+    idle group may skip another event round. The CPU migration group is
+    separate from the old cache's PP control communicator.
+    """
 
     deadline = time.monotonic() + timeout_s
+    metrics = dict(
+        host_io_status_rounds=0,
+        host_io_event_rounds=0,
+        host_io_async_wait_seconds=0.0,
+        host_io_status_seconds=0.0,
+        host_io_submit_seconds=0.0,
+        host_io_event_seconds=0.0,
+    )
+    controller = cache.cache_controller
+
+    def pending_io():
+        return any(
+            getattr(owner, name, None)
+            for owner, names in (
+                (
+                    cache,
+                    (
+                        "ongoing_backup",
+                        "ongoing_load_back",
+                        "ongoing_prefetch",
+                        "ongoing_write_through",
+                        "work_list",
+                    ),
+                ),
+                (
+                    controller,
+                    ("load_queue", "write_queue", "ack_load_queue", "ack_write_queue"),
+                ),
+            )
+            for name in names
+        )
+
     while True:
-        controller = cache.cache_controller
+        started = time.monotonic()
+        cache._drain_async_work()
+        metrics["host_io_async_wait_seconds"] += time.monotonic() - started
+        pending = bool(pending_io())
+        expired = time.monotonic() >= deadline
+        started = time.monotonic()
+        if hasattr(group, "all_reduce_cpu"):
+            # SUM implements group-wide OR for both nonnegative flags, without
+            # object serialization and its second size/payload collective.
+            status = torch.tensor([pending, expired], dtype=torch.int64, device="cpu")
+            group.all_reduce_cpu(status)
+            pending, expired = (bool(v) for v in status.tolist())
+        else:
+            statuses = group.all_gather_object({"pending": pending, "expired": expired})
+            pending = any(s["pending"] for s in statuses)
+            expired = any(s["expired"] for s in statuses)
+        metrics["host_io_status_seconds"] += time.monotonic() - started
+        metrics["host_io_status_rounds"] += 1
+        if not pending:
+            return metrics
+        if expired:
+            raise RuntimeError("timed out retiring HiCache I/O at elastic PP fence")
+        started = time.monotonic()
         if controller.load_queue:
             controller.start_loading()
         if controller.write_queue:
             controller.start_writing()
+        metrics["host_io_submit_seconds"] += time.monotonic() - started
+        started = time.monotonic()
         cache.check_hicache_events()
-        cache._drain_async_work()
-        pending = any(
-            getattr(cache, name, None)
-            for name in (
-                "ongoing_backup",
-                "ongoing_load_back",
-                "ongoing_prefetch",
-                "ongoing_write_through",
-                "work_list",
-            )
-        )
-        pending = pending or any(
-            getattr(controller, name, None)
-            for name in (
-                "load_queue",
-                "write_queue",
-                "ack_load_queue",
-                "ack_write_queue",
-            )
-        )
-        statuses = group.all_gather_object(
-            {"pending": bool(pending), "expired": time.monotonic() >= deadline}
-        )
-        if not any(s["pending"] for s in statuses):
-            return
-        if any(s["expired"] for s in statuses):
-            raise RuntimeError("timed out retiring HiCache I/O at elastic PP fence")
+        metrics["host_io_event_seconds"] += time.monotonic() - started
+        metrics["host_io_event_rounds"] += 1
 
 
 def publish_scheduler_cache(scheduler, clone, model_runner):

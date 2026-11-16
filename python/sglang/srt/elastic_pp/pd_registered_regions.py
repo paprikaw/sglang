@@ -24,10 +24,11 @@ def regions(values):
 
 
 class PreparedDecodeRegions:
-    def __init__(self, engine, source, target_kv):
+    def __init__(self, engine, source, target_kv, *, target_aux=()):
         self.engine = engine
         self.source, self.target_kv = regions(source), regions(target_kv)
-        target = sorted(self.target_kv)
+        self.target_prepared = self.target_kv | regions(target_aux)
+        target = sorted(self.target_prepared)
         if any(p + n > q for (p, n), (q, _) in zip(target, target[1:])) or any(
             p < q + m and q < p + n and (p, n) != (q, m)
             for p, n in target
@@ -42,6 +43,9 @@ class PreparedDecodeRegions:
             target_kv_regions=len(self.target_kv),
             source_bytes=sum(n for _, n in self.source),
             target_kv_bytes=sum(n for _, n in self.target_kv),
+            target_prepared_regions=len(self.target_prepared),
+            target_prepared_bytes=sum(n for _, n in self.target_prepared),
+            target_aux_regions=len(self.target_prepared - self.target_kv),
         )
 
     def _register(self, values, phase):
@@ -71,7 +75,7 @@ class PreparedDecodeRegions:
         if self.phase != "new":
             raise RuntimeError("P/D region preparation already attempted")
         # Record attempts before entering the engine: failures may be partial.
-        self.attempted_added = self.target_kv - self.source
+        self.attempted_added = self.target_prepared - self.source
         self.phase = "preparing"
         self._register(self.attempted_added, "prepare")
         self.registered.update(self.attempted_added)
@@ -80,7 +84,7 @@ class PreparedDecodeRegions:
     def suspend(self):
         if self.phase != "prepared":
             raise RuntimeError("P/D regions have no complete preparation")
-        retired = self.source - self.target_kv
+        retired = self.source - self.target_prepared
         self.phase = "suspending"
         self._deregister(retired, "suspend")
         self.registered.difference_update(retired)
@@ -90,7 +94,7 @@ class PreparedDecodeRegions:
         if self.phase != "suspended":
             raise RuntimeError("P/D region commit requires suspended writers")
         target = regions(target)
-        if not self.target_kv <= target or not self.registered <= target:
+        if not self.target_prepared <= target or not self.registered <= target:
             raise RuntimeError("committed P/D addresses differ from prepared regions")
         self.phase = "committing"
         self._register(target - self.registered, "refresh")

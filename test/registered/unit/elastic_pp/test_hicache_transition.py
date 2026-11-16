@@ -279,21 +279,30 @@ def test_publish_rebinds_batches_policy_and_sessions():
 
 
 def test_publish_updates_pd_queues_before_retired_cache_controller_is_destroyed():
-    from sglang.srt.disaggregation.decode_hicache_mixin import DecodeHiCacheTransferMixin
+    from sglang.srt.disaggregation.decode_hicache_mixin import (
+        DecodeHiCacheTransferMixin,
+    )
     from sglang.srt.elastic_pp.hicache_transition import publish_scheduler_cache
 
     counter = NS(producer_index=0, num_counters=3)
     polled = []
-    old = NS(cache_controller=NS(layer_done_counter=counter),
-             is_load_back_event_done=lambda _: True)
-    new = NS(cache_controller=NS(layer_done_counter=counter),
-             is_load_back_event_done=lambda index: polled.append(index) or True)
+    old = NS(
+        cache_controller=NS(layer_done_counter=counter),
+        is_load_back_event_done=lambda _: True,
+    )
+    new = NS(
+        cache_controller=NS(layer_done_counter=counter),
+        is_load_back_event_done=lambda index: polled.append(index) or True,
+    )
     metadata_queue, socket = [], object()
     prealloc = NS(tree_cache=old, queue=metadata_queue, socket=socket)
     transfer = DecodeHiCacheTransferMixin()
     transfer.tree_cache, transfer.queue = old, []
-    scheduler = NS(tree_cache=old, disagg_decode_prealloc_queue=prealloc,
-                   disagg_decode_transfer_queue=transfer)
+    scheduler = NS(
+        tree_cache=old,
+        disagg_decode_prealloc_queue=prealloc,
+        disagg_decode_transfer_queue=transfer,
+    )
     publish_scheduler_cache(scheduler, new, NS(canary_manager=None))
     old.cache_controller = None
     # Invoke the real native Decode restore poll which failed on GPU after
@@ -453,9 +462,97 @@ def test_fence_host_drain_keeps_idle_rank_in_all_rounds():
             return [local, {"pending": self.rounds == 1, "expired": False}]
 
     group = Group()
-    drain_host_io_at_fence(cache, group)
+    metrics = drain_host_io_at_fence(cache, group)
     assert group.rounds == 2
-    assert calls == ["check", "retire", "check", "retire"]
+    assert calls == ["retire", "check", "retire"]
+    assert metrics["host_io_event_rounds"] == 1
+
+
+def test_idle_fence_retires_existing_sends_without_creating_another_round():
+    from sglang.srt.elastic_pp.hicache_transition import drain_host_io_at_fence
+
+    cache = NS(
+        cache_controller=NS(load_queue=[], write_queue=[]),
+        work_list=[object()],
+        check_hicache_events=lambda: pytest.fail("idle fence created a PP packet"),
+    )
+    cache._drain_async_work = cache.work_list.clear
+    flags = []
+
+    def reduce(status):
+        assert status.device.type == "cpu" and status.dtype == torch.int64
+        flags.append(status.tolist())
+
+    metrics = drain_host_io_at_fence(cache, NS(all_reduce_cpu=reduce))
+    assert not cache.work_list
+    assert flags == [[0, 0]]
+    assert metrics["host_io_status_rounds"] == 1
+    assert metrics["host_io_event_rounds"] == 0
+
+
+def test_tensor_fence_keeps_idle_rank_polling_for_remote_io():
+    from sglang.srt.elastic_pp.hicache_transition import drain_host_io_at_fence
+
+    events = []
+    cache = NS(
+        cache_controller=NS(load_queue=[], write_queue=[]),
+        check_hicache_events=lambda: events.append("poll"),
+        _drain_async_work=lambda: events.append("retire"),
+    )
+    rounds = []
+
+    def reduce(status):
+        rounds.append(status.tolist())
+        if len(rounds) == 1:
+            status[0] += 1  # Another rank owns an unfinished transfer.
+
+    metrics = drain_host_io_at_fence(cache, NS(all_reduce_cpu=reduce))
+    assert rounds == [[0, 0], [0, 0]]
+    assert events == ["retire", "poll", "retire"]
+    assert metrics["host_io_event_rounds"] == 1
+
+
+def test_fence_submits_and_retires_both_queued_io_directions():
+    from sglang.srt.elastic_pp.hicache_transition import drain_host_io_at_fence
+
+    events = []
+    cc = NS(load_queue=[1], write_queue=[2], ack_load_queue=[], ack_write_queue=[])
+    cache = NS(cache_controller=cc, _drain_async_work=lambda: None)
+
+    def submit(direction):
+        events.append(direction)
+        getattr(cc, direction + "_queue").clear()
+        getattr(cc, "ack_" + direction + "_queue").append(object())
+
+    def poll():
+        assert cc.ack_load_queue and cc.ack_write_queue
+        events.append("finish")
+        cc.ack_load_queue.clear()
+        cc.ack_write_queue.clear()
+
+    cc.start_loading = lambda: submit("load")
+    cc.start_writing = lambda: submit("write")
+    cache.check_hicache_events = poll
+    metrics = drain_host_io_at_fence(cache, NS(all_reduce_cpu=lambda status: None))
+    assert events == ["load", "write", "finish"]
+    assert metrics["host_io_status_rounds"] == 2
+    assert metrics["host_io_event_rounds"] == 1
+
+
+def test_fence_does_not_ignore_a_remote_timeout():
+    from sglang.srt.elastic_pp.hicache_transition import drain_host_io_at_fence
+
+    cache = NS(
+        cache_controller=NS(load_queue=[], write_queue=[]),
+        _drain_async_work=lambda: None,
+        check_hicache_events=lambda: pytest.fail("poll after timeout"),
+    )
+
+    def reduce(status):
+        status += 1  # A peer has both pending I/O and an expired deadline.
+
+    with pytest.raises(RuntimeError, match="timed out retiring HiCache"):
+        drain_host_io_at_fence(cache, NS(all_reduce_cpu=reduce))
 
 
 def test_canonical_snapshot_failure_is_delivered_to_dormant_peer(monkeypatch):
