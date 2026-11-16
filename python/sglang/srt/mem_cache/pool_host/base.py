@@ -160,19 +160,24 @@ class HostKVCache(abc.ABC):
         self.layout = layout
         self.pin_memory = pin_memory
         self.device = device
-        self.allocator = get_allocator_from_storage(allocator_type)
+        from sglang.srt.elastic_pp.shared_host_cache import shared_pool_allocator
+
+        shared_allocator = shared_pool_allocator("full", device_pool)
+        self.allocator = shared_allocator or get_allocator_from_storage(allocator_type)
         self.can_use_write_back_jit = False
 
         self.dtype = device_pool.store_dtype
         self.size_per_token = self.get_size_per_token()
-        if host_size > 0:
+        if shared_allocator is not None:
+            self.size = shared_allocator.size
+        elif host_size > 0:
             self.size = sync_fixed_hicache_size(
                 int(host_size * 1e9 // self.size_per_token), host_size
             )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
         # Align up the host memory pool size to the page size
-        self.page_num = self.size // self.page_size + 1
+        self.page_num = self.size // self.page_size + (shared_allocator is None)
         self.size = self.page_num * self.page_size
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
@@ -190,7 +195,7 @@ class HostKVCache(abc.ABC):
         # Verify there is enough available host memory.
         requested_bytes = self.size * self.size_per_token
         available_bytes = host_memory_budget_bytes()
-        if requested_bytes > available_bytes:
+        if shared_allocator is None and requested_bytes > available_bytes:
             raise ValueError(
                 f"Not enough host memory available. Requesting "
                 f"{requested_bytes / 1e9:.2f} GB but only have "
@@ -255,6 +260,8 @@ class HostKVCache(abc.ABC):
                 ):
                     setattr(self, name, [])
             self.kv_buffer = None
+            if getattr(self.allocator, "shared_host_backing", False):
+                self.allocator.release()
             return
         if buffers is not None and self.pin_memory and (_is_cuda or _is_hip):
             if not isinstance(buffers, (list, tuple)):

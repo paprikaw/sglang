@@ -223,6 +223,29 @@ def test_project_pending_hybrid_does_not_publish(hybrid_pool_factory):
     pool.abort_elastic_pp_kv_layers(generation=1)
 
 
+def test_projected_host_counter_registration_cannot_replace_serving_counter(
+    hybrid_pool_factory,
+):
+    from sglang.srt.elastic_pp.hicache_transition import project_target_device_pool
+    from sglang.srt.elastic_pp.topology import LayerRange
+
+    pool = hybrid_pool_factory(start_layer=0, end_layer=2)
+    source_counter, full_counter, private_counter = object(), object(), object()
+    pool.layer_transfer_counter = source_counter
+    pool.full_kv_pool.layer_transfer_counter = full_counter
+    pool.prepare_elastic_pp_kv_layers(
+        target=LayerRange(0, 4), generation=1, total_num_layers=4
+    )
+    view, req = project_target_device_pool(pool, target=LayerRange(0, 4), generation=1)
+    view.register_layer_transfer_counter(private_counter)
+    assert pool.layer_transfer_counter is source_counter
+    assert pool.full_kv_pool.layer_transfer_counter is full_counter
+    assert view.layer_transfer_counter is private_counter
+    assert view.full_kv_pool.layer_transfer_counter is None
+    assert req is not pool.req_to_token_pool and req.mamba_pool is not pool.mamba_pool
+    pool.abort_elastic_pp_kv_layers(generation=1)
+
+
 def test_logical_host_allocator_preserves_slot_order_into_physical():
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.elastic_pp.hicache_transition import clone_host_allocator
@@ -276,6 +299,43 @@ def test_publish_rebinds_batches_policy_and_sessions():
     assert all(
         holder.tree_cache is new for holder in (scheduler, batch, policy, session)
     )
+
+
+def test_publish_updates_pd_queues_before_retired_cache_controller_is_destroyed():
+    from sglang.srt.disaggregation.decode_hicache_mixin import (
+        DecodeHiCacheTransferMixin,
+    )
+    from sglang.srt.elastic_pp.hicache_transition import publish_scheduler_cache
+
+    counter = NS(producer_index=0, num_counters=3)
+    polled = []
+    old = NS(
+        cache_controller=NS(layer_done_counter=counter),
+        is_load_back_event_done=lambda _: True,
+    )
+    new = NS(
+        cache_controller=NS(layer_done_counter=counter),
+        is_load_back_event_done=lambda index: polled.append(index) or True,
+    )
+    metadata_queue, socket = [], object()
+    prealloc = NS(tree_cache=old, queue=metadata_queue, socket=socket)
+    transfer = DecodeHiCacheTransferMixin()
+    transfer.tree_cache, transfer.queue = old, []
+    scheduler = NS(
+        tree_cache=old,
+        disagg_decode_prealloc_queue=prealloc,
+        disagg_decode_transfer_queue=transfer,
+    )
+    publish_scheduler_cache(scheduler, new, NS(canary_manager=None))
+    old.cache_controller = None
+    # Invoke the real native Decode restore poll which failed on GPU after
+    # commit, even with no pending restore requests.
+    transfer._process_hicache_local_restores(transfer.queue)
+    assert polled == [1]
+    assert prealloc.tree_cache is transfer.tree_cache is new
+    assert scheduler.disagg_decode_prealloc_queue is prealloc
+    assert scheduler.disagg_decode_transfer_queue is transfer
+    assert prealloc.queue is metadata_queue and prealloc.socket is socket
 
 
 def test_allocator_shrink_clips_only_free_high_capacity():
@@ -425,9 +485,97 @@ def test_fence_host_drain_keeps_idle_rank_in_all_rounds():
             return [local, {"pending": self.rounds == 1, "expired": False}]
 
     group = Group()
-    drain_host_io_at_fence(cache, group)
+    metrics = drain_host_io_at_fence(cache, group)
     assert group.rounds == 2
-    assert calls == ["check", "retire", "check", "retire"]
+    assert calls == ["retire", "check", "retire"]
+    assert metrics["host_io_event_rounds"] == 1
+
+
+def test_idle_fence_retires_existing_sends_without_creating_another_round():
+    from sglang.srt.elastic_pp.hicache_transition import drain_host_io_at_fence
+
+    cache = NS(
+        cache_controller=NS(load_queue=[], write_queue=[]),
+        work_list=[object()],
+        check_hicache_events=lambda: pytest.fail("idle fence created a PP packet"),
+    )
+    cache._drain_async_work = cache.work_list.clear
+    flags = []
+
+    def reduce(status):
+        assert status.device.type == "cpu" and status.dtype == torch.int64
+        flags.append(status.tolist())
+
+    metrics = drain_host_io_at_fence(cache, NS(all_reduce_cpu=reduce))
+    assert not cache.work_list
+    assert flags == [[0, 0]]
+    assert metrics["host_io_status_rounds"] == 1
+    assert metrics["host_io_event_rounds"] == 0
+
+
+def test_tensor_fence_keeps_idle_rank_polling_for_remote_io():
+    from sglang.srt.elastic_pp.hicache_transition import drain_host_io_at_fence
+
+    events = []
+    cache = NS(
+        cache_controller=NS(load_queue=[], write_queue=[]),
+        check_hicache_events=lambda: events.append("poll"),
+        _drain_async_work=lambda: events.append("retire"),
+    )
+    rounds = []
+
+    def reduce(status):
+        rounds.append(status.tolist())
+        if len(rounds) == 1:
+            status[0] += 1  # Another rank owns an unfinished transfer.
+
+    metrics = drain_host_io_at_fence(cache, NS(all_reduce_cpu=reduce))
+    assert rounds == [[0, 0], [0, 0]]
+    assert events == ["retire", "poll", "retire"]
+    assert metrics["host_io_event_rounds"] == 1
+
+
+def test_fence_submits_and_retires_both_queued_io_directions():
+    from sglang.srt.elastic_pp.hicache_transition import drain_host_io_at_fence
+
+    events = []
+    cc = NS(load_queue=[1], write_queue=[2], ack_load_queue=[], ack_write_queue=[])
+    cache = NS(cache_controller=cc, _drain_async_work=lambda: None)
+
+    def submit(direction):
+        events.append(direction)
+        getattr(cc, direction + "_queue").clear()
+        getattr(cc, "ack_" + direction + "_queue").append(object())
+
+    def poll():
+        assert cc.ack_load_queue and cc.ack_write_queue
+        events.append("finish")
+        cc.ack_load_queue.clear()
+        cc.ack_write_queue.clear()
+
+    cc.start_loading = lambda: submit("load")
+    cc.start_writing = lambda: submit("write")
+    cache.check_hicache_events = poll
+    metrics = drain_host_io_at_fence(cache, NS(all_reduce_cpu=lambda status: None))
+    assert events == ["load", "write", "finish"]
+    assert metrics["host_io_status_rounds"] == 2
+    assert metrics["host_io_event_rounds"] == 1
+
+
+def test_fence_does_not_ignore_a_remote_timeout():
+    from sglang.srt.elastic_pp.hicache_transition import drain_host_io_at_fence
+
+    cache = NS(
+        cache_controller=NS(load_queue=[], write_queue=[]),
+        _drain_async_work=lambda: None,
+        check_hicache_events=lambda: pytest.fail("poll after timeout"),
+    )
+
+    def reduce(status):
+        status += 1  # A peer has both pending I/O and an expired deadline.
+
+    with pytest.raises(RuntimeError, match="timed out retiring HiCache"):
+        drain_host_io_at_fence(cache, NS(all_reduce_cpu=reduce))
 
 
 def test_canonical_snapshot_failure_is_delivered_to_dormant_peer(monkeypatch):
@@ -465,3 +613,145 @@ def test_canonical_snapshot_failure_is_delivered_to_dormant_peer(monkeypatch):
         source.prepare_transition(tx)
     with pytest.raises(RuntimeError, match="canonical HiCache snapshot failed"):
         target.prepare_transition(tx)
+
+
+def _canonical_allocator_cache():
+    # Deliberately noncontiguous free slots and an empty release batch.
+    pool = NS(
+        logical_size=8,
+        free_slots=torch.tensor([6, 99, 2, 99, 5, 99, 1, 99])[::2],
+        release_slots=[
+            torch.tensor([4]),
+            torch.empty(0, dtype=torch.int64),
+            torch.tensor([7]),
+        ],
+        num_release_slots=2,
+        slot_used=torch.tensor([True, False, False, True, False, False, False, False]),
+        mem_state=torch.arange(8, dtype=torch.uint8),
+    )
+    return NS(host_pool_group=NS(entries=[NS(name="kv", host_pool=pool)]))
+
+
+def test_canonical_allocator_native_wire_is_private_and_bypasses_tensor_pickle():
+    import pickle
+
+    from sglang.srt.distributed.parallel_state import _split_tensor_dict
+    from sglang.srt.elastic_pp.hicache_transition import (
+        canonical_host_allocator_wire,
+        restore_canonical_host_allocators,
+    )
+
+    source = _canonical_allocator_cache()
+    pool = source.host_pool_group.entries[0].host_pool
+    wire = canonical_host_allocator_wire(source, 9)
+    metadata, tensors = _split_tensor_dict(wire)
+    assert len(tensors) == 6
+    assert all(t.device.type == "cpu" and t.is_contiguous() for t in tensors)
+
+    def contains_tensor(value):
+        if isinstance(value, torch.Tensor):
+            return True
+        if isinstance(value, dict):
+            return any(contains_tensor(v) for v in value.values())
+        if isinstance(value, (tuple, list)):
+            return any(contains_tensor(v) for v in value)
+        return False
+
+    # The real GroupCoordinator splitter leaves nested tensors in metadata.
+    # This verifies that its actual pickle lane carries descriptors only.
+    assert not contains_tensor(pickle.loads(pickle.dumps(metadata)))
+    expected = restore_canonical_host_allocators(wire, 9)["kv"]
+    assert expected["free_slots"].tolist() == [6, 2, 5, 1]
+    assert [v.tolist() for v in expected["release_slots"]] == [[4], [], [7]]
+    assert expected["slot_used"].dtype == torch.bool
+    assert expected["mem_state"].dtype == torch.uint8
+    for name in ["free_slots", "slot_used", "mem_state"]:
+        assert (
+            expected[name].untyped_storage().data_ptr()
+            != getattr(pool, name).untyped_storage().data_ptr()
+        )
+    pool.free_slots.zero_()
+    pool.release_slots[0].zero_()
+    assert expected["free_slots"].tolist() == [6, 2, 5, 1]
+    assert expected["release_slots"][0].tolist() == [4]
+    expected["mem_state"].zero_()
+    assert pool.mem_state.tolist() == list(range(8))
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "version",
+        "generation",
+        "missing",
+        "extra",
+        "repeated",
+        "pool",
+        "encoding",
+        "not_tensor",
+    ],
+)
+def test_canonical_allocator_native_wire_rejects_incomplete_or_wrong_generation(fault):
+    from sglang.srt.elastic_pp.hicache_transition import (
+        _HOST_ALLOCATOR_MANIFEST,
+        _HOST_ALLOCATOR_TENSOR_PREFIX,
+        canonical_host_allocator_wire,
+        restore_canonical_host_allocators,
+    )
+
+    wire = canonical_host_allocator_wire(_canonical_allocator_cache(), 9)
+    manifest = wire[_HOST_ALLOCATOR_MANIFEST]
+    fields = manifest["pools"][0][1]
+    if fault in {"version", "generation"}:
+        manifest[fault] += 1
+    elif fault == "missing":
+        del wire[fields["free_slots"][1]]
+    elif fault == "extra":
+        wire[_HOST_ALLOCATOR_TENSOR_PREFIX + "999"] = torch.tensor([99])
+    elif fault == "repeated":
+        fields["slot_used"] = fields["free_slots"]
+    elif fault == "pool":
+        manifest["pools"].append(manifest["pools"][0])
+    elif fault == "encoding":
+        fields["mem_state"] = ("unknown", None)
+    else:
+        wire[fields["free_slots"][1]] = [6, 2, 5, 1]
+    with pytest.raises(RuntimeError, match="canonical host allocator"):
+        restore_canonical_host_allocators(wire, 9)
+
+
+@pytest.mark.parametrize("target_capacity", [4, 8, 10])
+def test_allocator_resize_preserves_full_state_and_private_free_release_buffers(
+    target_capacity,
+):
+    from sglang.srt.elastic_pp.hicache_transition import clone_host_allocator
+
+    source = _canonical_allocator_cache().host_pool_group.entries[0].host_pool
+    target = NS(
+        logical_size=target_capacity,
+        slot_used=torch.zeros(target_capacity, dtype=torch.bool),
+        mem_state=torch.zeros(target_capacity, dtype=torch.uint8),
+    )
+    clone_host_allocator(source, target)
+    assert (
+        target.free_slots.tolist()
+        == {4: [2, 1], 8: [6, 2, 5, 1], 10: [6, 2, 5, 1, 8, 9]}[target_capacity]
+    )
+    assert [v.tolist() for v in target.release_slots] == (
+        [] if target_capacity == 4 else [[4], [7]]
+    )
+    assert target.num_release_slots == (0 if target_capacity == 4 else 2)
+    assert (
+        target.slot_used[: min(8, target_capacity)].tolist()
+        == source.slot_used[:target_capacity].tolist()
+    )
+    target.free_slots.zero_()
+    for released in target.release_slots:
+        released.zero_()
+    target.mem_state.zero_()
+    assert source.free_slots.tolist() == [6, 2, 5, 1]
+    assert [v.tolist() for v in source.release_slots] == [[4], [], [7]]
+    assert source.mem_state.tolist() == list(range(8))
+    source.slot_used[0] = False
+    with pytest.raises(RuntimeError, match="free lists and used slots disagree"):
+        clone_host_allocator(source, target)

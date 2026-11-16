@@ -152,17 +152,24 @@
   "kvcached": {
     "upstream_url": "https://github.com/ovg-project/kvcached.git",
     "upstream_commit": "3cc92bec02fc77b72b86ed6f8d91dc454bbca154",
-    "patch": "dependencies/kvcached-layer-mapping-v1.patch",
-    "patch_sha256": "dbd6d41eaf8c603bc6a807a05b55482007b212a0a3cdbe53e6c59f2a2e8f2d75",
-    "patched_tree": "14c85a5f0701a5a7789683ee57f9cbf873ea4cc7",
+    "patch": "dependencies/kvcached-capacity-mapping-v1.patch",
+    "patch_sha256": "a79206ef0ec3da54565c5bd482397bf4cd0ef52bfa51280f5238fa3c65678305",
+    "patched_tree": "e40e45e9758635e0545a43ab8dbeb2b56448911c",
     "python_layer_mapping_api": 1,
     "native_layer_mapping_abi": 1,
     "required_environment": {
       "KVCACHED_LAYER_STACKING": "true",
-      "KVCACHED_PAGE_PREALLOC_ENABLED": "false"
+      "KVCACHED_PAGE_PREALLOC_ENABLED": "false",
+      "KVCACHED_PHYSICAL_BLOCK_SIZE_MB": "2",
+      "KVCACHED_MIN_RESERVED_PAGES": "0",
+      "KVCACHED_MAX_RESERVED_PAGES": "0",
+      "KVCACHED_GPU_DIRECT_RDMA_REQUIRED": "1"
     },
     "build": "Apply patch to the pinned clean upstream tree and rebuild the native extension in an isolated checkout; select it explicitly with PYTHONPATH.",
-    "limits": "The bounded A100 gpu-r1 primitive check validates mapping/reclamation, retained addresses/values, packed-row copying and two small Graph replays. Full-model Graph reuse, hybrid HiCache on this backend, GDN stable addresses, online patch transport and returning working GPUs remain unqualified. Hybrid HiCache retains its native-backend-only guard."
+    "limits": "Capacity-managed Decode requires page-size 1, fixed EP/TP, admitted PP/capacity layouts, stream mapping and per-allocation RDMA ABIs. The e9349b90d08f r5 GPU minimum qualified HiCache, Graph reuse, growth, reclaim and an independent 64 GiB allocation on the retired GPU. Multi-request and matched E2E performance remain unqualified; subsequent runtime changes require their own GPU regression.",
+    "native_stream_mapping_abi": 1,
+    "patched_commit": "24d39b203a80062bd00dd651b4bbb5b1895c38f0",
+    "native_rdma_mapping_abi": 1
   },
   "nixl": {
     "packages": {

@@ -103,7 +103,9 @@ def paired_overhead(baseline, active, states, generation):
     return measured
 
 
-def validate_transition_states(states, generation, source_ranks, backing):
+def validate_transition_states(
+    states, generation, source_ranks, backing, shared_host=False
+):
     ranks = rank_states(states)
     for state in ranks.values():
         metrics = state.get("transition_metrics", {})
@@ -120,7 +122,25 @@ def validate_transition_states(states, generation, source_ranks, backing):
         .get("host_background_bytes_sent", 0)
         for state in ranks.values()
     )
-    if sent <= 0:
+    if shared_host:
+        identities = []
+        for state in ranks.values():
+            host = state["transition_metrics"].get("host", {})
+            bank = state.get("transition_shared_host", {})
+            if (
+                not host.get("host_shared_reuse")
+                or host.get("host_historical_payload_copied_bytes") != 0
+                or sent != 0
+                or bank.get("logical_bytes", 0) <= 0
+                or not bank.get("regions")
+            ):
+                raise AssertionError(
+                    "shared CPU handoff lacks zero-copy backing evidence"
+                )
+            identities.append(bank["regions"])
+        if any(value != identities[0] for value in identities[1:]):
+            raise AssertionError("CPU workers do not share the same physical backing")
+    elif sent <= 0:
         raise AssertionError("no CPU-only host payload moved during this transition")
     if backing == "cpu_spill":
         for rank in source_ranks:
@@ -310,9 +330,11 @@ def state_evidence(info):
         "transition_rank",
         "transition_fence_records",
         "transition_metrics",
+        "transition_shared_host",
         "transition_request_execution_scope",
         "transition_request_execution",
         "transition_active_output_lengths",
+        "transition_weight_copy_progress",
         "agentx_cache_probe",
         "agentx_restores",
         "elastic_pp_state",
@@ -328,6 +350,7 @@ def state_evidence(info):
         "enable_elastic_pp_kv_patch",
         "elastic_pp_kv_patch_transport",
         "elastic_pp_kv_base_precopy",
+        "elastic_pp_hicache_shared_host",
     )
     return {
         "internal_states": [
@@ -403,10 +426,10 @@ def validate_decode_graph_states(
                     reload = metrics.get("weight_staging_metrics", {})
                     if (
                         reload.get("kind")
-                        != (
-                            "prepared_cpu_cache"
+                        not in (
+                            {"prepared_cpu_cache", "startup_processed_fp8_marlin_cpu"}
                             if metrics["weight_staging"] == "cpu_prepacked"
-                            else "canonical_cpu_cache"
+                            else {"canonical_cpu_cache"}
                         )
                         or not reload.get("cache_key")
                         or metrics.get("background_weight_bytes_sent", -1) != 0
@@ -438,8 +461,26 @@ def validate_decode_graph_states(
                             )
                     if rank in incoming and (
                         reload.get("target_weight_bytes", 0) <= 0
-                        or reload.get("checkpoint_bytes", 0) <= 0
-                        or reload.get("checkpoint_tensors", 0) <= 0
+                        or reload.get(
+                            (
+                                "processed_tensor_bytes"
+                                if reload.get("kind")
+                                == "startup_processed_fp8_marlin_cpu"
+                                else "checkpoint_bytes"
+                            ),
+                            0,
+                        )
+                        <= 0
+                        or reload.get(
+                            (
+                                "processed_tensor_count"
+                                if reload.get("kind")
+                                == "startup_processed_fp8_marlin_cpu"
+                                else "checkpoint_tensors"
+                            ),
+                            0,
+                        )
+                        <= 0
                         or not reload.get("cache_key_matches_initial_load")
                         or not reload.get("storage_verified")
                         or not reload.get("layers_loaded")
@@ -640,6 +681,10 @@ def install_transition_hooks(Scheduler, ElasticPPMigrationCoordinator):
             result.internal_state["transition_metrics"] = (
                 coordinator.transition_metrics()
             )
+        runner = getattr(getattr(self, "tp_worker", None), "model_runner", None)
+        bank = getattr(runner, "_elastic_pp_shared_host_bank", None)
+        if bank is not None:
+            result.internal_state["transition_shared_host"] = bank.evidence()
         result.internal_state["transition_request_execution_scope"] = (
             "active model-launch batches; zero-layer passthrough excluded"
         )
@@ -690,6 +735,11 @@ def engine_entry(cfg, row):
             )
             + (["--elastic-pp-hicache-batch-io"] if cfg.get("hicache_batch_io") else [])
             + (["--elastic-pp-kv-base-precopy"] if cfg.get("kv_base_precopy") else [])
+            + (
+                ["--elastic-pp-hicache-shared-host"]
+                if cfg.get("hicache_shared_host")
+                else []
+            )
             + (
                 (
                     ["--elastic-pp-hicache-background"]
@@ -1178,6 +1228,7 @@ def worker(run, cfg):
                         generation,
                         (0, 2) if generation == 1 else (0, 1, 2),
                         cfg.get("backing", "overlap"),
+                        cfg.get("hicache_shared_host", False),
                     )
                     if cfg.get("cuda_graph"):
                         validate_decode_graph_states(
@@ -1365,6 +1416,7 @@ def prepare(args):
         hicache_background=getattr(args, "hicache_background", False),
         hicache_batch_io=getattr(args, "hicache_batch_io", False),
         kv_base_precopy=getattr(args, "kv_base_precopy", False),
+        hicache_shared_host=getattr(args, "hicache_shared_host", False),
         active_output_tokens=getattr(args, "active_output_tokens", 256),
         context_length=(
             4096 if getattr(args, "active_output_tokens", 256) > 1024 else 2048
@@ -1470,6 +1522,16 @@ def prepare(args):
         base.desc(ENGINE / "python/sglang/srt/elastic_pp/hicache_precopy.py"),
         base.desc(ENGINE / "python/sglang/srt/mem_cache/pool_host/base.py"),
     ]
+    if cfg["hicache_shared_host"]:
+        spec["frozen_inputs"] += [
+            base.desc(ENGINE / path)
+            for path in (
+                "python/sglang/srt/elastic_pp/shared_host_cache.py",
+                "python/sglang/srt/mem_cache/pool_host/mha.py",
+                "python/sglang/srt/mem_cache/pool_host/mamba.py",
+                "python/sglang/srt/mem_cache/unified_radix_cache.py",
+            )
+        ]
     if getattr(args, "supervised_lifecycle", False):
         spec["frozen_inputs"] += [
             base.desc(ROOT / name)
@@ -1631,6 +1693,7 @@ def main():
     parser.add_argument("--hicache-fast-copy", action="store_true")
     parser.add_argument("--hicache-background", action="store_true")
     parser.add_argument("--hicache-batch-io", action="store_true")
+    parser.add_argument("--hicache-shared-host", action="store_true")
     parser.add_argument(
         "--hicache-allocator", choices=["mmap", "pytorch"], default="mmap"
     )
@@ -1650,6 +1713,14 @@ def main():
         parser.error("Decode Graph requires overlap backing")
     if args.prepared_graphs and not args.cuda_graph:
         parser.error("prepared Graphs require --cuda-graph")
+    if args.hicache_shared_host and (
+        not args.prepared_graphs
+        or args.prepared_weight_policy != "offload"
+        or args.backing != "overlap"
+    ):
+        parser.error(
+            "shared CPU HiCache requires prepared Graphs, offload and overlap backing"
+        )
     if args.same_process_warm_reference and (
         not args.prepared_graphs
         or args.cached_reference_evidence

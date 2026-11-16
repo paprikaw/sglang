@@ -1,6 +1,8 @@
 """CPU protocol tests: fake byte transport, real tensors/allocator/patch tracker."""
 
 import ctypes
+import hashlib
+import struct
 import threading
 import time
 from collections import defaultdict
@@ -13,7 +15,11 @@ import torch
 
 from sglang.srt.elastic_pp.kv_patch import KVPatchBusy
 from sglang.srt.elastic_pp.live_kv_patch import LiveKVSnapshot
-from sglang.srt.elastic_pp.nixl_kv_patch import NixlKVPatchCopier, NixlKVReceiver
+from sglang.srt.elastic_pp.nixl_kv_patch import (
+    NixlKVPatchCopier,
+    NixlKVReceiver,
+    _signature,
+)
 from sglang.srt.elastic_pp.nixl_transport import NixlCompletion, NixlMigrationEndpoint
 from sglang.srt.elastic_pp.topology import LayerRange
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
@@ -132,6 +138,49 @@ def endpoints():
 
 def ready():
     return SimpleNamespace(synchronize=lambda: None)
+
+
+def test_coverage_digest_is_canonical_and_preserves_all_64_bits():
+    rows = {2**64 - 1: 2**64 - 1, 0: 1, 7: 2**40 + 3}
+    words = [3, 0, 7, 2**64 - 1, 1, 2**40 + 3, 2**64 - 1]
+    expected = hashlib.sha256(
+        b"elastic-live-kv-coverage-v2" + struct.pack("<7Q", *words)
+    ).hexdigest()
+    assert _signature(rows) == expected
+    assert _signature(dict(reversed(list(rows.items())))) == expected
+    assert _signature({}) != _signature({0: 0})
+    changed = dict(rows)
+    changed[7] += 2**32
+    assert _signature(changed) != expected
+
+
+@pytest.mark.parametrize(
+    "rows", [{-1: 1}, {1: -1}, {2**64: 1}, {1: 2**64}, {1.5: 1}, {1: 1.5}]
+)
+def test_coverage_digest_rejects_values_that_could_be_truncated(rows):
+    with pytest.raises(ValueError, match="unsigned 64-bit integer"):
+        _signature(rows)
+
+
+@pytest.mark.parametrize("changed", [{1: 1, 4: 1}, {1: 1, 2: 2}])
+def test_receiver_rejects_same_count_with_wrong_slot_or_incarnation(endpoints, changed):
+    receiver = NixlKVReceiver(endpoints[1], Pool())
+    receiver.configure(1, {0: (3,)})
+    receiver.ready(1)
+    receiver.versions[0] = {1: 1, 2: 1}
+    with pytest.raises(ValueError, match="coverage"):
+        receiver.receive(
+            0,
+            dict(op="seal", generation=1, count=2, signature=_signature(changed)),
+            torch.empty(0),
+        )
+    assert not receiver.sealed
+    receiver.receive(
+        0,
+        dict(op="seal", generation=1, count=2, signature=_signature({2: 1, 1: 1})),
+        torch.empty(0),
+    )
+    assert receiver.sealed == {0}
 
 
 def setup_patch(endpoints, *, peers=(1,), layers=(3,), max_rows=2):

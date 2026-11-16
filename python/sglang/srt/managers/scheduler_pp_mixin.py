@@ -320,6 +320,23 @@ class SchedulerPPMixin:
             )
         return True
 
+    def _pp_pd_relays_proxy(self: Scheduler) -> bool:
+        """Keep concurrent Decode's activation and queue rings hop-aligned.
+
+        The native P/D scheduler advances its admission/output rings once per
+        physical stage. Skipping an empty stage only for activations introduces
+        a different dependency cycle when several microbatches are in flight.
+        Empty Decode stages therefore relay activations, without model compute
+        or model weights. Ordinary PP and the qualified single-request path
+        retain their existing routing.
+        """
+        args = getattr(self, "server_args", None)
+        return bool(
+            self._pp_topology() is not None
+            and getattr(args, "elastic_pp_disagg_decode", False)
+            and getattr(args, "max_running_requests", 1) > 1
+        )
+
     @staticmethod
     def _elastic_pp_layer_counts(topology: PPTopology) -> List[int]:
         return [layer_range.size for layer_range in topology.layer_ranges]
@@ -398,6 +415,9 @@ class SchedulerPPMixin:
         coordinator = self.elastic_pp_migration_coordinator
         if coordinator is None:
             return False
+        poll_patch = getattr(coordinator, "poll_live_patch", None)
+        if poll_patch is not None:
+            poll_patch()
         snapshot = coordinator.snapshot()
         if snapshot.phase == ElasticPPMigrationPhase.FAILED:
             self._elastic_pp_draining = False
@@ -450,6 +470,8 @@ class SchedulerPPMixin:
         return fence
 
     def _elastic_pp_fence_is_drained(self: Scheduler) -> bool:
+        if not getattr(self, "_elastic_pp_pd_ring_drained", True):
+            return False
         if not self._elastic_pp_request_ring_drained:
             return False
         if any(batch is not None for batch in self.mbs):
@@ -563,6 +585,19 @@ class SchedulerPPMixin:
             self._pp_microstep,
             self.pp_loop_size,
         )
+        if (
+            getattr(getattr(self, "server_args", None), "elastic_pp_disagg_decode", False)
+            and self.enable_decode_hicache
+        ):
+            from sglang.srt.elastic_pp.pd_registration import (
+                align_decode_hicache_polls_at_fence,
+            )
+
+            self._pp_pd_hicache_fence_alignment = align_decode_hicache_polls_at_fence(
+                self, coordinator.group
+            )
+            logger.info("Elastic PD HiCache fence alignment: %s",
+                        self._pp_pd_hicache_fence_alignment)
         try:
             coordinator.finalize_at_fence(self._pp_install_topology)
         except BaseException:
@@ -713,9 +748,34 @@ class SchedulerPPMixin:
             requested_counts,
             generation=target_generation,
         )
+        if getattr(getattr(self, "server_args", None), "elastic_pp_disagg_decode", False) and (
+            target.first_rank != 0 or target.last_rank != self.ps.pp_size - 1
+        ):
+            return make_output(
+                success=False,
+                message="P/D qualification keeps physical input/output endpoints active",
+                target_generation=target_generation,
+                new_counts=requested_counts,
+                phase=coordinator.phase.value,
+            )
         transition = DynamicPPTransition.build(current, target)
         self._elastic_pp_pending_req = recv_req
         try:
+            if getattr(getattr(self, "server_args", None), "elastic_pp_disagg_decode", False):
+                from sglang.srt.elastic_pp.pd_registration import (
+                    DecodeRegistrationTransaction,
+                )
+
+                registration = DecodeRegistrationTransaction(self)
+                self.tp_worker.model_runner._elastic_pp_pd_registration = registration
+                coordinator.before_backing_release = registration.suspend
+                coordinator.overlap_registration_suspend = (
+                    coordinator.strategy == "background"
+                    and coordinator.backing == "overlap"
+                    and bool(self.server_args.elastic_pp_kv_capacities)
+                )
+                coordinator.after_backing_restore = registration.refresh
+                coordinator.after_topology_commit = registration.refresh
             if (
                 getattr(self, "enable_hierarchical_cache", False)
                 and coordinator.cache_transition is None
@@ -729,6 +789,7 @@ class SchedulerPPMixin:
                     model_runner=self.tp_worker.model_runner,
                     group=coordinator.group,
                     rank=self.ps.pp_rank,
+                    overlap_shared_metadata=coordinator.overlap_registration_suspend,
                 )
             coordinator.begin(transition)
         except BaseException as exc:
@@ -801,7 +862,14 @@ class SchedulerPPMixin:
         mb_metadata[mb_id] = PPBatchMetadata(can_run_cuda_graph=False)
         event = self.device_module.Event()
         event.record(self.device_module.current_stream())
-        return None, event
+        result = None
+        if self._pp_pd_relays_proxy() and not cur_batch.forward_mode.is_prebuilt():
+            if pp_proxy_tensors is None:
+                raise RuntimeError("dormant Decode stage lost its activation relay")
+            result = GenerationBatchResult(
+                pp_hidden_states_proxy_tensors=pp_proxy_tensors
+            )
+        return result, event
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
@@ -1338,7 +1406,29 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                recv_reqs = self.request_receiver.recv_requests()
+                elastic_pp_draining = self._elastic_pp_drain_due()
+                request_ring_fence = None
+                if (
+                    self.ps.pp_rank == 0
+                    and elastic_pp_draining
+                    and not self._elastic_pp_request_ring_fence_seen
+                ):
+                    snapshot = self.elastic_pp_migration_coordinator.snapshot()
+                    request_ring_fence = _ElasticPPRequestRingFence(
+                        generation=snapshot.generation,
+                        fence_microstep=snapshot.fence_microstep,
+                    )
+                recv_reqs = (
+                    [] if elastic_pp_draining else self.request_receiver.recv_requests()
+                )
+                received_fence = self._elastic_pp_extract_request_ring_fence(recv_reqs)
+                if received_fence is not None:
+                    request_ring_fence = received_fence
+                    recv_reqs = []
+                    self._elastic_pp_draining = True
+                    elastic_pp_draining = True
+                if request_ring_fence is not None:
+                    self._elastic_pp_request_ring_fence_seen = True
                 self.process_input_requests(recv_reqs)
 
                 # PP uses its own queue consensus instead of process_decode_queue.
@@ -1363,26 +1453,48 @@ class SchedulerPPMixin:
 
                 if not self._pp_is_physical_last_rank():
                     self._pp_commit_comm_work(self.send_req_work)
+                if elastic_pp_draining:
+                    self._elastic_pp_request_ring_drained = (
+                        self._elastic_pp_request_ring_fence_seen
+                        and not self.send_req_work
+                    )
 
                 # reaching consensus through PP ranks
-                retract_rids = self._pp_pd_get_retract_ids(mb_id)
+                # A None marker closes each native P/D queue ring alongside
+                # the request fence. Downstream consumes it once, then retires
+                # the previously launched consensus slots without new rounds.
+                consume_pd_round = not elastic_pp_draining or (
+                    request_ring_fence is not None and self.ps.pp_rank != 0
+                )
+                retract_rids = (
+                    self._pp_pd_get_retract_ids(mb_id) if consume_pd_round else None
+                )
                 rmbs[mb_id] = retract_rids
                 self._pp_commit_comm_work(send_retract_work)
 
-                prealloc_rids = self._pp_pd_get_prealloc_ids()
+                prealloc_rids = (
+                    self._pp_pd_get_prealloc_ids() if consume_pd_round else None
+                )
                 pmbs[mb_id] = prealloc_rids
                 self._pp_commit_comm_work(send_prealloc_work)
 
-                transferred_rids = self._pp_pd_get_decode_transferred_ids()
+                transferred_rids = (
+                    self._pp_pd_get_decode_transferred_ids()
+                    if consume_pd_round else None
+                )
                 tmbs[mb_id] = transferred_rids
                 self._pp_commit_comm_work(send_transfer_work)
 
                 # get batch to run and proxy tensors if needed
-                plan = self.get_next_disagg_decode_batch_to_run(
-                    running_batch=self.running_batch
-                )
-                self.running_batch = plan.running_batch
-                batch = plan.batch_to_run
+                if elastic_pp_draining:
+                    batch = None
+                    server_is_idle = False
+                else:
+                    plan = self.get_next_disagg_decode_batch_to_run(
+                        running_batch=self.running_batch
+                    )
+                    self.running_batch = plan.running_batch
+                    batch = plan.batch_to_run
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -1402,7 +1514,18 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
-                self._pp_commit_comm_work(self.send_proxy_work)
+                # A dormant physical stage delays native PD consensus by one
+                # metadata hop, while activations skip it. On an idle slot,
+                # waiting for the previous activation here can prevent the
+                # last stage from completing its consensus send and reaching
+                # the matching activation receive. Retain the P2PWork owners
+                # until those consensus rounds have progressed. The initial
+                # elastic PD profile admits one request, leaving idle slots.
+                defer_proxy_completion = (
+                    self._pp_topology() is not None and cur_batch is None
+                )
+                if not defer_proxy_completion:
+                    self._pp_commit_comm_work(self.send_proxy_work)
                 self._pp_commit_comm_work(self.send_output_handoff_work)
 
                 if cur_batch:
@@ -1480,6 +1603,9 @@ class SchedulerPPMixin:
                     )
                 self._pp_commit_comm_work(send_release_work)
 
+                if defer_proxy_completion:
+                    self._pp_commit_comm_work(self.send_proxy_work)
+
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     if not self.mbs[next_mb_id].forward_mode.is_prebuilt():
@@ -1490,9 +1616,12 @@ class SchedulerPPMixin:
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
-                if not self._pp_is_physical_last_rank():
+                if not self._pp_is_physical_last_rank() and (
+                    not elastic_pp_draining or request_ring_fence is not None
+                ):
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                        [request_ring_fence] if request_ring_fence is not None else recv_reqs,
+                        async_send=True,
                     )
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
                         retract_rids, async_send=True
@@ -1506,8 +1635,9 @@ class SchedulerPPMixin:
                     if (
                         cur_batch
                         and not cur_batch.forward_mode.is_prebuilt()
-                        and self._pp_rank_is_active()
-                        and not self._pp_is_last_rank()
+                        and (self._pp_rank_is_active() or self._pp_pd_relays_proxy())
+                        and not (self._pp_is_physical_last_rank() if self._pp_pd_relays_proxy()
+                                 else self._pp_is_last_rank())
                         and not self._pp_pd_early_proxy
                     ):
                         self.device_module.current_stream().wait_event(
@@ -1525,6 +1655,22 @@ class SchedulerPPMixin:
                 consensus_prealloc_rids = next_consensus_prealloc_rids
 
                 self.running_batch.batch_is_full = False
+                self._pp_microstep += 1
+                if elastic_pp_draining:
+                    pd_works = (
+                        send_retract_work, send_prealloc_work, send_transfer_work,
+                        send_consensus_retract_work, send_consensus_prealloc_work,
+                        send_release_work,
+                    )
+                    self._elastic_pp_pd_ring_drained = (
+                        not any(pd_works)
+                        and all(value is None for ring in (rmbs, pmbs, tmbs) for value in ring)
+                        and consensus_retract_rids is None
+                        and consensus_prealloc_rids is None
+                        and release_rids is None
+                    )
+                if self._elastic_pp_finalize_if_drained():
+                    break
 
             # When the server is idle, self-check and re-init some states
             queue_size = (
@@ -1609,6 +1755,7 @@ class SchedulerPPMixin:
         self._elastic_pp_draining = False
         self._elastic_pp_request_ring_fence_seen = False
         self._elastic_pp_request_ring_drained = False
+        self._elastic_pp_pd_ring_drained = True
         self._elastic_pp_post_commit_launch_logs_remaining = 0
 
     def profile_and_init_predictor(self: Scheduler):
@@ -2141,7 +2288,8 @@ class SchedulerPPMixin:
         if topology is not None:
             tensor_dict["__pp_generation__"] = topology.generation
             if msg_type == "proxy" and dst is None:
-                dst = self._pp_next_active_rank()
+                dst = (self.ps.pp_rank + 1 if self._pp_pd_relays_proxy()
+                       else self._pp_next_active_rank())
                 if dst is None:
                     raise RuntimeError("logical last PP rank cannot send proxy tensors")
         if _pp_stage_tp_sizes(self) is not None and self.ps.attn_tp_rank != 0:
@@ -2260,11 +2408,14 @@ class SchedulerPPMixin:
 
     def _pp_recv_proxy_tensors(self: Scheduler) -> Optional[PPProxyTensors]:
         pp_proxy_tensors = None
-        if self._pp_rank_is_active() and not self._pp_is_first_rank():
+        relay = self._pp_pd_relays_proxy()
+        if (relay and not self._pp_is_physical_first_rank()) or (
+            not relay and self._pp_rank_is_active() and not self._pp_is_first_rank()
+        ):
             pp_proxy_tensors = PPProxyTensors(
                 self._pp_recv_typed_dict(
                     expected_kind="proxy",
-                    src=self._pp_prev_active_rank(),
+                    src=self.ps.pp_rank - 1 if relay else self._pp_prev_active_rank(),
                     all_gather_group=(
                         self.attn_tp_group if self.require_attn_tp_allgather else None
                     ),
@@ -2969,6 +3120,8 @@ class SchedulerPPMixin:
         else:
             # Other ranks, receive the retracted reqs info from the previous rank and ensure the consensus
             prev_retract_rids = self._pp_recv_pyobj_from_prev_stage()
+            if prev_retract_rids is None:
+                return None
             return list(set(prev_retract_rids) & set(curr_retract_rids))
 
     def _pp_pd_get_prealloc_ids(self: Scheduler):
@@ -2984,6 +3137,8 @@ class SchedulerPPMixin:
         else:
             # Other ranks, receive the preallocated reqs info from the previous rank and ensure the consensus
             prev_prealloc_rids = self._pp_recv_pyobj_from_prev_stage()
+            if prev_prealloc_rids is None:
+                return None
             prev_good_prealloc_rids, prev_bad_prealloc_rids = prev_prealloc_rids
             curr_good_prealloc_rids, curr_bad_prealloc_rids = self.get_rids(
                 self.disagg_decode_prealloc_queue.queue,
@@ -3042,6 +3197,8 @@ class SchedulerPPMixin:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
+            if prev_transferred_rids is None:
+                return None
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_rids(
                 self.disagg_decode_transfer_queue.queue,

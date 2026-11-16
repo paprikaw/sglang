@@ -120,6 +120,9 @@ def test_fenced_runtime_release_drops_views_and_rollback_rebinds_source(
     coordinator = ElasticPPMigrationCoordinator.__new__(ElasticPPMigrationCoordinator)
     coordinator.model_runner = runner
     coordinator.cache_transition = None
+    coordinator.before_backing_release = None
+    coordinator.after_backing_restore = None
+    coordinator.after_topology_commit = None
     coordinator._source_backing_attempted = False
     coordinator._source_backing_metrics = {}
     coordinator.kv_transport = SimpleNamespace(

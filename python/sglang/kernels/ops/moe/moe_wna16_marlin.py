@@ -17,9 +17,9 @@ _MAX_THREAD_N = 256
 
 @cache_once
 def _jit_moe_wna16_marlin_module(
-    dtype: torch.dtype, is_ep: bool, has_bias: bool
+    dtype: torch.dtype, is_ep: bool, has_bias: bool, canonical_k: bool = False
 ) -> Module:
-    args = make_cpp_args(dtype, is_ep, has_bias)
+    args = make_cpp_args(dtype, is_ep, has_bias, canonical_k)
     return load_jit(
         "moe_wna16_marlin",
         *args,
@@ -67,8 +67,11 @@ def moe_wna16_marlin_gemm(
     use_atomic_add: bool = False,
     use_fp32_reduce: bool = False,
     is_zp_float: bool = False,
+    canonical_k: bool = False,
 ) -> torch.Tensor:
     device = a.device
+    if canonical_k and use_atomic_add:
+        raise ValueError("canonical Marlin K stripes forbid atomic output reduction")
 
     # Allocate output if not provided
     if c_or_none is not None:
@@ -136,7 +139,7 @@ def moe_wna16_marlin_gemm(
     b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
     global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
 
-    module = _jit_moe_wna16_marlin_module(a.dtype, is_ep, has_bias)
+    module = _jit_moe_wna16_marlin_module(a.dtype, is_ep, has_bias, canonical_k)
     module.moe_wna16_marlin_gemm(
         a,
         c,

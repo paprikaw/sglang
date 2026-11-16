@@ -169,14 +169,16 @@ class LiveKVSnapshot:
         )
         self.epochs = {}
         self.published = set()
+        started = time.monotonic()
         self._allocate(allocator.elastic_pp_live_slots())
+        self.startup_metrics = dict(allocate_seconds=time.monotonic() - started)
         allocator.attach_elastic_pp_live_patch(self)
 
     def seed_initial_base(self):
         """Scheduler-only: HiCache writers were quiescent at transition start.
 
-        Do not mark later asynchronous loadback allocations ready. The first
-        forward completion supplies the event for the captured incarnations;
+        Do not mark later asynchronous loadback allocations ready. The caller
+        supplies a scheduler-stream event for these captured incarnations;
         every subsequent rewrite still uses prepare_writes before GPU access.
         """
         with self.lock:
@@ -188,22 +190,60 @@ class LiveKVSnapshot:
     def _publish_initial_base(self, ready):
         if self.initial_base is None:
             return
-        for slot, incarnation in self.initial_base.items():
-            if (
-                slot
-                and self.epochs.get(slot) == incarnation
-                and slot not in self.published
-            ):
-                self.session.publish(
-                    slot, incarnation, ready=ready, generation=self.generation
-                )
-                self.published.add(slot)
-                self.initial_base_rows_published += 1
+        started = time.monotonic()
+        versions = [
+            (slot, incarnation)
+            for slot, incarnation in self.initial_base.items()
+            if slot
+            and self.epochs.get(slot) == incarnation
+            and slot not in self.published
+        ]
+        self.session.publish_many(versions, ready=ready, generation=self.generation)
+        self.published.update(slot for slot, _ in versions)
+        self.initial_base_rows_published += len(versions)
+        self.startup_metrics["publish_base_seconds"] = time.monotonic() - started
         self.initial_base = None
 
+    def start_initial_base(self, ready):
+        """Scheduler-only event covering the quiescent base captured at begin.
+
+        This also starts an idle server's cache copy, without manufacturing a
+        forward or publishing later asynchronous loadback allocations.
+        """
+        with self.lock:
+            if not self.initial_base_enabled:
+                raise RuntimeError("initial KV base was not seeded")
+            self._publish_initial_base(ready)
+            self.poll_online()
+
+    @property
+    def unacknowledged_rows(self):
+        with self.lock:
+            if self.error is not None:
+                raise RuntimeError("online KV snapshot failed: " + self.error)
+            return self.session.unacknowledged_rows
+
+    def poll_online(self):
+        """Scheduler-only, nonblocking copy progress, including idle slots."""
+        with self.lock:
+            if not self.active:
+                return
+            try:
+                if self.session.poll(generation=self.generation):
+                    self.online_completed_rows = self.session.rows_copied
+                    if getattr(
+                        self.copier, "ready_to_submit", True
+                    ) and self.session.submit(generation=self.generation):
+                        self.online_submissions += 1
+            except BaseException as exc:
+                self._fail(exc)
+
     def _allocate(self, slots):
-        for slot in slots.detach().cpu().tolist():
-            self.epochs[slot] = self.session.allocate(slot, generation=self.generation)
+        self.epochs.update(
+            self.session.allocate_many(
+                slots.detach().cpu().tolist(), generation=self.generation
+            )
+        )
 
     def _fail(self, exc):
         self.error = f"{type(exc).__name__}: {exc}"
@@ -226,12 +266,16 @@ class LiveKVSnapshot:
                 for slot in slots.detach().cpu().tolist():
                     epoch = self.epochs[slot]
                     try:
-                        self.session.free(slot, epoch, generation=self.generation)
+                        copied = self.session.free(
+                            slot, epoch, generation=self.generation
+                        )
                     except KVPatchBusy:
                         self.free_waits += 1
                         self.session.poll(generation=self.generation, wait=True)
-                        self.session.free(slot, epoch, generation=self.generation)
-                    if hasattr(self.copier, "forget"):
+                        copied = self.session.free(
+                            slot, epoch, generation=self.generation
+                        )
+                    if copied and hasattr(self.copier, "forget"):
                         self.copier.forget(slot, epoch)
                     del self.epochs[slot]
                     self.published.discard(slot)
@@ -265,12 +309,16 @@ class LiveKVSnapshot:
                     if slot in self.published:
                         epoch = self.epochs[slot]
                         try:
-                            self.session.free(slot, epoch, generation=self.generation)
+                            copied = self.session.free(
+                                slot, epoch, generation=self.generation
+                            )
                         except KVPatchBusy:
                             self.free_waits += 1
                             self.session.poll(generation=self.generation, wait=True)
-                            self.session.free(slot, epoch, generation=self.generation)
-                        if hasattr(self.copier, "forget"):
+                            copied = self.session.free(
+                                slot, epoch, generation=self.generation
+                            )
+                        if copied and hasattr(self.copier, "forget"):
                             self.copier.forget(slot, epoch)
                         self.epochs[slot] = self.session.allocate(
                             slot, generation=self.generation
@@ -287,12 +335,7 @@ class LiveKVSnapshot:
                 self.forward_checkpoints += 1
                 self._publish_initial_base(ready)
                 self._publish(slots, ready)
-                if self.session.poll(generation=self.generation):
-                    self.online_completed_rows = self.session.rows_copied
-                    if getattr(
-                        self.copier, "ready_to_submit", True
-                    ) and self.session.submit(generation=self.generation):
-                        self.online_submissions += 1
+                self.poll_online()
             except BaseException as exc:
                 self._fail(exc)
 
@@ -365,6 +408,7 @@ class LiveKVSnapshot:
                 forward_checkpoints=self.forward_checkpoints,
                 initial_base_enabled=self.initial_base_enabled,
                 initial_base_rows_published=self.initial_base_rows_published,
+                startup=dict(self.startup_metrics),
                 online_submissions=self.online_submissions,
                 online_completed_rows=self.online_completed_rows,
                 total_rounds=self.session.rounds,

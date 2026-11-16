@@ -121,6 +121,26 @@ class _FakeSender:
         self.outputs.append((output, recv_req))
 
 
+def test_concurrent_pd_dormant_proxy_keeps_physical_hops():
+    topology=PPTopology.from_layer_counts([2,0,2],generation=0)
+    schedulers=[_FakeScheduler(i,3) for i in range(3)]
+    for s in schedulers:
+        s.server_args=SimpleNamespace(elastic_pp_disagg_decode=True,max_running_requests=4)
+        s._pp_install_topology(topology)
+    schedulers[0]._pp_send_dict_to_next_stage({"hidden_states":torch.ones(2,3)},msg_type="proxy")
+    assert schedulers[0].pp_group.sent[-1]["dst"]==1
+    middle=schedulers[1]
+    middle.pp_group.received.append({"__msg_type__":"proxy","__pp_generation__":0,
+                                    "hidden_states":torch.ones(2,3)})
+    proxy=middle._pp_recv_proxy_tensors()
+    assert middle.pp_group.last_recv_kwargs["src"]==0
+    middle._pp_send_dict_to_next_stage(proxy.tensors,msg_type="proxy")
+    assert middle.pp_group.sent[-1]["dst"]==2
+    schedulers[0].server_args.max_running_requests=1
+    schedulers[0]._pp_send_dict_to_next_stage({"hidden_states":torch.ones(1,3)},msg_type="proxy")
+    assert schedulers[0].pp_group.sent[-1]["dst"]==2
+
+
 class _FakeMigrationCoordinator:
     def __init__(
         self,
@@ -498,6 +518,76 @@ def test_elastic_loop_sends_activation_before_waiting_for_output(
     with pytest.raises(StopAfterMicrostep):
         scheduler.event_loop_pp()
     assert calls == ["launch", "wait-forward", "send-proxy", "receive-output", "retire"]
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2])
+@pytest.mark.parametrize("elastic", [False, True])
+def test_pd_idle_slot_progresses_consensus_before_waiting_for_elastic_proxy(
+    monkeypatch, rank, elastic
+):
+    from sglang.srt.managers import scheduler_pp_mixin
+
+    scheduler = _FakeScheduler(rank=rank, size=3)
+    if elastic:
+        scheduler._pp_install_topology(PPTopology.from_layer_counts([2, 0, 2]))
+    monkeypatch.delenv("SGLANG_PP_PD_EARLY_PROXY", raising=False)
+    monkeypatch.setattr(scheduler_pp_mixin, "get_parallel", lambda: SimpleNamespace(
+        pp_async_batch_depth=0
+    ))
+    monkeypatch.setattr(scheduler_pp_mixin, "get_disagg", lambda: SimpleNamespace(
+        disaggregation_decode_enable_offload_kvcache=False
+    ))
+    scheduler.init_pp_loop_state = lambda: None
+    scheduler.running_mbs = [SimpleNamespace(batch_is_full=False) for _ in range(3)]
+    scheduler.last_mbs = [None] * 3
+    scheduler.mbs = [None] * 3
+    scheduler.mb_metadata = [None] * 3
+    scheduler.enable_decode_hicache = False
+    scheduler.request_receiver = SimpleNamespace(recv_requests=lambda: [])
+    scheduler.process_input_requests = lambda reqs: None
+    scheduler._elastic_pp_drain_due = lambda: False
+    scheduler._pp_pd_get_retract_ids = lambda mb_id: []
+    scheduler._pp_pd_get_prealloc_ids = lambda: [[], []]
+    scheduler._pp_pd_get_decode_transferred_ids = lambda: []
+    scheduler.get_next_disagg_decode_batch_to_run = lambda **kw: SimpleNamespace(
+        running_batch=scheduler.running_batch, batch_to_run=None
+    )
+    scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = (
+        lambda *args: (None, None, None)
+    )
+    scheduler._pp_send_pyobj_to_next_stage = lambda *args, **kw: []
+    scheduler._pp_pd_send_consensus_bootstrapped_ids = lambda *args: (["consensus"], [])
+    scheduler._pp_pd_send_consensus_release_ids = lambda *args: (["consensus"], [])
+    proxy = [object()]
+    scheduler.send_proxy_work = proxy
+    calls = []
+
+    def commit(work):
+        if work is proxy:
+            if elastic:
+                assert calls.count("consensus") == 3, (
+                    "activation completion blocks the dormant-stage PD control ring"
+                )
+            calls.append("proxy")
+        elif work:
+            assert work == ["consensus"]
+            calls.append("consensus")
+        work.clear()
+
+    scheduler._pp_commit_comm_work = commit
+
+    class StopAfterMicrostep(Exception):
+        pass
+
+    def stop():
+        raise StopAfterMicrostep
+
+    scheduler._elastic_pp_finalize_if_drained = stop
+    with pytest.raises(StopAfterMicrostep):
+        scheduler.event_loop_pp_disagg_decode()
+    expected = ["consensus"] * 3
+    assert calls == (expected + ["proxy"] if elastic else ["proxy"] + expected)
+    assert proxy == []
 
 
 def test_common_future_microstep_arms_drain_on_the_exact_boundary():

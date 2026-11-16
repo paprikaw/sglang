@@ -735,6 +735,20 @@ class CommonKVManager(BaseKVManager):
             return [self.pp_rank], 1, 1
         if info.pp_size == 1 and self._supports_pp1_to_pp_decode(info):
             return [0], self.pp_size, 1
+        if (
+            getattr(getattr(self, "server_args", None), "elastic_pp_disagg_decode", False)
+            and getattr(self, "supports_partial_pp_transfer", False)
+        ):
+            if (
+                self.attn_tp_size != 1 or info.attn_tp_size != 1
+                or self.attn_cp_size != 1 or info.attn_cp_size != 1
+                or self.dcp_size != 1
+                or (self.kv_args.kv_data_ptrs and not self.kv_args.kv_layer_ids)
+            ):
+                raise RuntimeError("Elastic PP transfer requires layer-aware Mooncake TP1/CP1")
+            # Every sender/destination pair participates, including empty
+            # stages, but only globally matching KV/GDN layers are copied.
+            return list(range(info.pp_size)), self.pp_size, info.pp_size
         assert self.pp_size == 1, (
             f"Decode pp size ({self.pp_size}) should be equal to prefill pp size ({info.pp_size}) or 1; "
             "PP1 to pipelined decode requires a qualified layer-aware backend",

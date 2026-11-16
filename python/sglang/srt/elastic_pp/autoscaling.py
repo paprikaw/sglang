@@ -16,7 +16,9 @@ from typing import Optional, Sequence, Tuple
 LayerPartition = Tuple[int, ...]
 
 
-def parse_elastic_pp_partitions(raw: str) -> Tuple[LayerPartition, ...]:
+def parse_elastic_pp_partitions(
+    raw: str, *, allow_single: bool = False
+) -> Tuple[LayerPartition, ...]:
     """Parse ``"40,0,0,40;20,20,20,20"`` into ordered partitions."""
 
     if not isinstance(raw, str) or not raw.strip():
@@ -43,7 +45,7 @@ def parse_elastic_pp_partitions(raw: str) -> Tuple[LayerPartition, ...]:
             )
         partitions.append(partition)
 
-    if len(partitions) < 2:
+    if len(partitions) < 2 and not allow_single:
         raise ValueError(
             "elastic PP autoscaling requires at least two ordered partitions"
         )

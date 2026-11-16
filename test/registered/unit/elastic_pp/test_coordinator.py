@@ -205,6 +205,242 @@ def _coordinator(group=None, *, fence_step_provider=None, fence_lead_steps=0):
     return coordinator, transition, runner, kv_transport
 
 
+@pytest.mark.parametrize("mismatch", [False, True])
+def test_content_audit_happens_after_graph_selection_and_fails_closed(mismatch):
+    coordinator, transition, runner, kv = _coordinator()
+    events = []
+    def capture(change, slots):
+        assert not runner.committed
+        assert slots.tolist() == [1, 3, 5]
+        events.append("capture")
+        return {"rank": 0, "generation": change.source.generation}
+    def verify(change, snapshots):
+        assert runner.committed
+        assert events == ["capture", "graph"]
+        assert len(snapshots) == 2
+        events.append("verify")
+        if mismatch:
+            raise RuntimeError("injected committed state content differs")
+    kv.capture_fenced_contents, kv.verify_fenced_contents = capture, verify
+    runner.rebuild_elastic_pp_decode_graph = lambda **kwargs: events.append("graph")
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    if mismatch:
+        with pytest.raises(RuntimeError, match="content differs"):
+            coordinator.finalize_at_fence(lambda _: None)
+        assert not coordinator.snapshot().source_usable
+        assert coordinator.phase == ElasticPPMigrationPhase.FAILED
+    else:
+        coordinator.finalize_at_fence(lambda _: None)
+        assert coordinator.phase == ElasticPPMigrationPhase.COMMITTED
+    assert events == ["capture", "graph", "verify"]
+
+
+def test_content_audit_requires_opt_in_on_every_rank_before_copying():
+    class SkewGroup(_Group):
+        def all_gather_object(self, report):
+            reports = super().all_gather_object(report)
+            if report["stage"] == "fence_slots":
+                reports[1]["details"] = ("no audit",)
+            return reports
+    coordinator, transition, runner, kv = _coordinator(SkewGroup())
+    kv.capture_fenced_contents = lambda change, slots: {"rank": 0}
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    with pytest.raises(RuntimeError, match="not enabled on every"):
+        coordinator.finalize_at_fence(lambda _: None)
+    assert not runner.committed
+    assert not kv.phases
+    assert coordinator.snapshot().source_usable
+
+
+def test_overlap_registration_changes_only_at_fence_and_refreshes_after_commit():
+    coordinator, transition, runner, _ = _coordinator()
+    calls = []
+    coordinator.before_backing_release = lambda: calls.append(
+        ("suspend", runner.committed)
+    )
+    coordinator.after_topology_commit = lambda: calls.append(
+        ("refresh", runner.committed)
+    )
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    assert not calls
+    coordinator.finalize_at_fence(lambda _: None)
+    assert calls == [("suspend", False), ("refresh", True)]
+    assert not coordinator._registration_suspended
+    coordinator.start_cleanup()
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.DONE, timeout=2)
+
+
+def test_overlap_registration_is_restored_when_target_cannot_commit():
+    coordinator, transition, runner, _ = _coordinator(_Group(fail_stage="fence_copy"))
+    calls = []
+    coordinator.before_backing_release = lambda: calls.append("suspend")
+    coordinator.after_backing_restore = lambda: calls.append("restore")
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    with pytest.raises(RuntimeError):
+        coordinator.finalize_at_fence(lambda _: None)
+    assert calls == ["suspend", "restore"]
+    assert not runner.committed and coordinator.snapshot().source_usable
+
+
+def test_registration_retirement_overlaps_host_snapshot_but_joins_before_copy():
+    coordinator, transition, runner, kv = _coordinator()
+    entered, released, finished = (threading.Event() for _ in range(3))
+    events = []
+
+    def suspend():
+        events.append(("suspend", threading.current_thread().name))
+        entered.set()
+        assert released.wait(2)
+        assert not runner.committed
+        finished.set()
+
+    def prepare(change):
+        assert entered.wait(2)
+        assert not finished.is_set()
+        events.append(("host", threading.current_thread().name))
+        released.set()
+
+    def exchange(change):
+        assert finished.is_set()
+        events.append(("copy", threading.current_thread().name))
+
+    coordinator.overlap_registration_suspend = True
+    coordinator.before_backing_release = suspend
+    coordinator.after_topology_commit = lambda: events.append(("refresh", ""))
+    coordinator.cache_transition = SimpleNamespace(
+        prepare_transition=prepare,
+        exchange_at_fence=exchange,
+        apply_staged=lambda _: None,
+        commit=lambda _: None,
+    )
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    assert not entered.is_set()
+    coordinator.finalize_at_fence(lambda _: None)
+    assert runner.committed and kv.phases
+    assert events[0][0] == "suspend" and events[0][1] != "MainThread"
+    assert events[1:] == [
+        ("host", "MainThread"),
+        ("copy", "MainThread"),
+        ("refresh", ""),
+    ]
+    assert (
+        "fence_registration_join" in coordinator.transition_metrics()["stage_seconds"]
+    )
+
+
+@pytest.mark.parametrize("retirement_fails", [False, True])
+def test_host_failure_joins_registration_worker_before_rollback(retirement_fails):
+    coordinator, transition, runner, kv = _coordinator()
+    entered, released, host_failed, finished, rolled_back = (
+        threading.Event() for _ in range(5)
+    )
+    failures = []
+
+    def suspend():
+        entered.set()
+        assert released.wait(2)
+        finished.set()
+        if retirement_fails:
+            raise RuntimeError("native registration retirement failed")
+
+    def prepare(change):
+        assert entered.wait(2)
+        host_failed.set()
+        raise RuntimeError("host snapshot failed")
+
+    def abort(change):
+        assert finished.is_set()
+        rolled_back.set()
+
+    def finalize():
+        try:
+            coordinator.finalize_at_fence(lambda _: None)
+        except BaseException as exc:
+            failures.append(str(exc))
+
+    coordinator.overlap_registration_suspend = True
+    coordinator.before_backing_release = suspend
+    coordinator.after_backing_restore = lambda: None
+    coordinator.cache_transition = SimpleNamespace(
+        prepare_transition=prepare, abort=abort
+    )
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    caller = threading.Thread(target=finalize)
+    caller.start()
+    try:
+        assert host_failed.wait(2)
+        assert not rolled_back.wait(0.05)
+        assert not runner.aborted_kv and not runner.aborted_layers
+        assert caller.is_alive()
+    finally:
+        released.set()
+        caller.join(timeout=2)
+    assert not caller.is_alive() and finished.is_set() and rolled_back.is_set()
+    assert not runner.committed and not kv.phases
+    assert len(failures) == 1 and "host snapshot failed" in failures[0]
+    assert ("native registration retirement failed" in failures[0]) is retirement_fails
+
+
+def test_registration_worker_failure_prevents_publication():
+    coordinator, transition, runner, kv = _coordinator()
+    entered, released = (threading.Event() for _ in range(2))
+
+    def suspend():
+        entered.set()
+        assert released.wait(2)
+        raise RuntimeError("native registration retirement failed")
+
+    def prepare(change):
+        assert entered.wait(2)
+        released.set()
+
+    coordinator.overlap_registration_suspend = True
+    coordinator.before_backing_release = suspend
+    coordinator.after_backing_restore = lambda: None
+    coordinator.cache_transition = SimpleNamespace(
+        prepare_transition=prepare, abort=lambda _: None
+    )
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+    with pytest.raises(RuntimeError, match="native registration retirement failed"):
+        coordinator.finalize_at_fence(lambda _: None)
+    assert not runner.committed and not kv.phases
+    assert coordinator.snapshot().source_usable
+
+
+def test_registration_thread_start_failure_does_not_start_host_snapshot(monkeypatch):
+    import sglang.srt.elastic_pp.coordinator as module
+
+    coordinator, transition, runner, _ = _coordinator()
+    events = []
+    coordinator.overlap_registration_suspend = True
+    coordinator.before_backing_release = lambda: events.append("suspend")
+    coordinator.after_backing_restore = lambda: events.append("restore")
+    coordinator.cache_transition = SimpleNamespace(
+        prepare_transition=lambda _: events.append("host"),
+        abort=lambda _: events.append("abort"),
+    )
+    coordinator.begin(transition)
+    coordinator.wait_for_phase(ElasticPPMigrationPhase.BULK_READY, timeout=2)
+
+    def cannot_start(**kwargs):
+        return SimpleNamespace(
+            start=lambda: (_ for _ in ()).throw(RuntimeError("no thread"))
+        )
+
+    monkeypatch.setattr(module, "Thread", cannot_start)
+    with pytest.raises(RuntimeError, match="no thread"):
+        coordinator.finalize_at_fence(lambda _: None)
+    assert events == ["abort", "restore"]
+    assert not runner.committed and coordinator.snapshot().source_usable
+
+
 @pytest.mark.parametrize("policy", ["reuse", "recopy", "offload"])
 def test_prepared_weight_policy_skips_only_verified_resident_weights(policy):
     coordinator, transition, runner, _ = _coordinator()
@@ -278,6 +514,45 @@ def test_live_patch_starts_on_scheduler_and_finishes_before_fenced_transfer():
     assert calls[2][0] == "release"
 
 
+@pytest.mark.parametrize("failure", [None, "local", "peer"])
+def test_online_catchup_consensus_precedes_fence_without_blocking_scheduler(failure):
+    group = _Group(fail_stage="online_kv_catchup" if failure == "peer" else None)
+    coordinator, transition, runner, kv = _coordinator(group)
+    coordinator.strategy = "background"
+    coordinator.enable_kv_patch = True
+    kv.begin_live_patch = lambda t: None
+    kv.check_live_patch = lambda: None
+    coordinator._precopy_immutable_weights = lambda t: None
+    entered, release = threading.Event(), threading.Event()
+    polled = []
+    kv.poll_live_patch = lambda: polled.append(threading.current_thread().name)
+
+    def wait_base():
+        entered.set()
+        assert release.wait(1)
+        if failure == "local":
+            raise TimeoutError("base catchup timeout")
+
+    kv.wait_initial_live_base = wait_base
+    coordinator.begin(transition)
+    assert entered.wait(1)
+    assert coordinator.snapshot().phase == ElasticPPMigrationPhase.PREPARING
+    coordinator.poll_live_patch()
+    assert polled == [threading.current_thread().name]
+    assert "arm_fence" not in group.stages
+    release.set()
+    expected = (ElasticPPMigrationPhase.BULK_READY if failure is None
+                else ElasticPPMigrationPhase.FAILED)
+    snapshot = coordinator.wait_for_phase(expected, timeout=2)
+    assert "online_kv_catchup" in group.stages
+    if failure is None:
+        assert group.stages.index("online_kv_catchup") < group.stages.index("arm_fence")
+    else:
+        assert snapshot.source_usable and kv.aborted_staged
+        assert "arm_fence" not in group.stages
+        assert not runner.committed
+
+
 def test_live_patch_prepare_failure_reaches_collective_abort():
     coordinator, transition, runner, kv = _coordinator()
     coordinator.strategy = "background"
@@ -293,6 +568,38 @@ def test_live_patch_prepare_failure_reaches_collective_abort():
     assert snapshot.source_usable and kv.aborted_staged
     assert "prepare_allocations" in coordinator.group.stages
     assert not runner.committed
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_private_host_preparation_follows_device_allocation_before_weight_copy(fail):
+    coordinator, transition, runner, kv = _coordinator()
+    coordinator.strategy = "background"
+    events = []
+    kv.prepare_transition = lambda change: events.append("device")
+
+    def prepare_host(change):
+        assert events == ["device"] and not runner.committed
+        assert threading.current_thread() is not threading.main_thread()
+        events.append("host")
+        if fail:
+            raise MemoryError("private controller allocation refused")
+
+    coordinator.cache_transition = SimpleNamespace(
+        prepare_shared_target=prepare_host,
+        abort=lambda change: events.append("abort"),
+    )
+    coordinator._precopy_immutable_weights = lambda change: events.append("weights")
+    coordinator.begin(transition)
+    phase = (
+        ElasticPPMigrationPhase.FAILED if fail else ElasticPPMigrationPhase.BULK_READY
+    )
+    snapshot = coordinator.wait_for_phase(phase, timeout=2)
+    assert snapshot.source_usable and not runner.committed
+    assert "prepare_allocations" in coordinator.group.stages
+    assert events == (
+        ["device", "host", "abort"] if fail else ["device", "host", "weights"]
+    )
+    assert "prepare_shared_host" in coordinator.transition_metrics()["stage_seconds"]
 
 
 @pytest.mark.parametrize(
