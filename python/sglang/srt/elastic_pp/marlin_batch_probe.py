@@ -36,9 +36,14 @@ def probe(kwargs, forward):
         activation_dtype=str(hidden.dtype),
         weight_dtype=str(kwargs["w1"].dtype),
         deterministic=kwargs.get("deterministic", False),
-        input_rms=hidden[:1].float().square().mean().sqrt().item(),
-        reference_rms=reference.float().square().mean().sqrt().item(),
+        input_rms=(hidden[:1].float().square().sum() / hidden[:1].numel())
+        .sqrt()
+        .item(),
+        reference_rms=(reference.float().square().sum() / reference.numel())
+        .sqrt()
+        .item(),
         reference_nonzero_values=reference.count_nonzero().item(),
+        canonical_k=os.environ.get("SGLANG_MARLIN_MOE_CANONICAL_K") == "1",
         single_repeat_equal=torch.equal(reference, repeat),
         cases={},
     )

@@ -615,7 +615,8 @@ void marlin_mm(
     int sms,
     bool use_atomic_add,
     bool use_fp32_reduce,
-    bool is_zp_float) {
+    bool is_zp_float,
+    bool canonical_k) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
 
@@ -831,7 +832,7 @@ void marlin_mm(
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
-      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem);
+      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, canonical_k, max_shared_mem);
   // clang-format on
 }
 
@@ -839,7 +840,7 @@ void marlin_mm(
 
 }  // namespace device::marlin_moe
 
-template <typename scalar_t, bool kIsEP, bool kHasBias>
+template <typename scalar_t, bool kIsEP, bool kHasBias, bool kCanonicalK = false>
 void moe_wna16_marlin_gemm(
     tvm::ffi::TensorView a,
     tvm::ffi::TensorView c,
@@ -878,6 +879,7 @@ void moe_wna16_marlin_gemm(
 
   RuntimeCheck(is_ep == kIsEP, "is_ep does not match the compiled Marlin MoE specialization");
   RuntimeCheck(has_bias == kHasBias, "has_bias does not match the compiled Marlin MoE specialization");
+  RuntimeCheck(!kCanonicalK || !use_atomic_add, "canonical K requires non-atomic output reduction");
 
   ScalarType const b_q_type = ScalarType::from_id(b_q_type_id);
   int pack_factor = 32 / b_q_type.size_bits();
@@ -1114,7 +1116,8 @@ void moe_wna16_marlin_gemm(
       sms,
       use_atomic_add,
       use_fp32_reduce,
-      is_zp_float);
+      is_zp_float,
+      kCanonicalK);
 }
 
 }  // namespace sglang

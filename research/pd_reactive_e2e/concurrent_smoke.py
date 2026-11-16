@@ -10,6 +10,22 @@ from dataclasses import asdict
 from pathlib import Path
 
 
+def require_generation_checks(result):
+    for name in (
+        "serial_repeat_matches",
+        "outputs_match",
+        "static_pp2_concurrent_matches",
+        "static_pp3_concurrent_matches",
+    ):
+        values = result.get(name)
+        if (
+            not isinstance(values, list)
+            or len(values) != 2
+            or any(v is not True for v in values)
+        ):
+            raise AssertionError("generation qualification failed: " + name)
+
+
 def exercise(run, root, replay, p, d, key, info, health, save):
     import hicache_transition_smoke as cache_probe
 
@@ -238,6 +254,10 @@ def exercise(run, root, replay, p, d, key, info, health, save):
                     enumerate(prompts),
                 )
             )
+        result["static_pp3_concurrent_matches"] = [
+            a["output_ids"] == b["output_ids"]
+            for a, b in zip(references, result["static_pp3_concurrent"])
+        ]
         mapped = lambda state: sum(
             r["e2e_kv_capacity"]["physical"]["mapped_memory_bytes"]
             for r in state["internal_states"]
@@ -320,10 +340,7 @@ def exercise(run, root, replay, p, d, key, info, health, save):
                     process.terminate()
                     process.wait(timeout=10)
         result["gpu_reuse"] = json.loads((run / "gpu_reuse_started.json").read_text())
-        if not all(result["serial_repeat_matches"]) or not all(result["outputs_match"]):
-            raise AssertionError(
-                "long-output static/concurrent equivalence failed; diagnostic controls preserved"
-            )
+        require_generation_checks(result)
         result["passed"] = True
         save(
             run / "completed.json",

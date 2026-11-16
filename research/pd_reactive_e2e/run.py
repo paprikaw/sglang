@@ -38,7 +38,7 @@ def endpoint(cfg):
 
 def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualification_smoke=False,
             decode_graph_batches=None, verify_migrated_state=False, probe_marlin_batching=False,
-            probe_batch_numerics=False):
+            probe_batch_numerics=False, marlin_canonical_k=False):
     if (verify_migrated_state or probe_marlin_batching or probe_batch_numerics) and not (qualification_smoke and concurrent_kv and mechanism=='inplace'):
         raise ValueError('State byte audit is a minimum diagnostic, not a performance run')
     if decode_graph_batches is not None:
@@ -71,6 +71,8 @@ def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualif
         cfg['launch_env']['ELASTIC_PD_LIGHTWEIGHT_STATUS']='1'
         cfg['launch_env']['ELASTIC_PD_STATUS_STACKS']=str(run/'status_stacks')
         cfg['launch_env']['ELASTIC_PD_STATIC_DECODE']=str(int(sid.startswith('d') and mechanism=='replica'))
+        if marlin_canonical_k:
+            cfg['launch_env']['SGLANG_MARLIN_MOE_CANONICAL_K']='1'
         if verify_migrated_state and sid.startswith('d'):
             cfg['launch_env']['SGLANG_ELASTIC_PP_VERIFY_STATE']='1'
         if probe_marlin_batching and sid.startswith('d'):
@@ -128,6 +130,7 @@ def prepare(run, mechanism, kvcached_capacity=False, concurrent_kv=False, qualif
     root['verify_migrated_state']=verify_migrated_state
     root['probe_marlin_batching']=probe_marlin_batching
     root['probe_batch_numerics']=probe_batch_numerics
+    root['marlin_canonical_k']=marlin_canonical_k
     if qualification_smoke:
         if not concurrent_kv or mechanism!='inplace':raise ValueError('smoke requires concurrent in-place arm')
         root.update(context_length=16384,max_total_tokens=12288,base_kv_capacity=8192)
@@ -660,13 +663,14 @@ if __name__=='__main__':
     p.add_argument('--verify-migrated-state',action='store_true')
     p.add_argument('--probe-marlin-batching',action='store_true')
     p.add_argument('--probe-batch-numerics',action='store_true')
+    p.add_argument('--marlin-canonical-k',action='store_true')
     p.add_argument('--worker',action='store_true');p.add_argument('--engine',action='store_true');p.add_argument('--client',action='store_true');p.add_argument('--reuse-probe',action='store_true')
     p.add_argument('--server',choices=['p','d0','d1']);a=p.parse_args()
     if a.reuse_probe:
         packet=json.loads(sys.stdin.readline());os.environ.update(packet['environment'])
         os.environ['CUDA_VISIBLE_DEVICES']='1'
         q.reuse_probe(a.run,json.loads((a.run/'config.json').read_text())['node_configs'][socket.gethostname().split('.')[0]])
-    elif a.prepare:prepare(a.run,a.mechanism,a.kvcached_capacity,a.concurrent_kv,a.qualification_smoke,a.decode_graph_batches,a.verify_migrated_state,a.probe_marlin_batching,a.probe_batch_numerics)
+    elif a.prepare:prepare(a.run,a.mechanism,a.kvcached_capacity,a.concurrent_kv,a.qualification_smoke,a.decode_graph_batches,a.verify_migrated_state,a.probe_marlin_batching,a.probe_batch_numerics,a.marlin_canonical_k)
     else:
         root=json.loads((a.run/'config.json').read_text())
         if a.engine:engine(a.run,root,a.server)

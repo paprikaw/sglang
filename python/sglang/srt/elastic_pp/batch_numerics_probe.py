@@ -46,7 +46,7 @@ def compare_batches(run):
             name: dict(
                 finite=bool(torch.isfinite(value).all()),
                 nonzero_values=int(torch.count_nonzero(value)),
-                rms=float(value.float().square().mean().sqrt()),
+                rms=float((value.float().square().sum() / value.numel()).sqrt()),
             )
             for name, value in reference.items()
         },
@@ -91,7 +91,7 @@ def probe_dense(method, layer, bias, forward):
     result.update(
         input_size=layer.input_size_per_partition,
         output_size=layer.output_size_per_partition,
-        input_rms=float(inputs[0].float().square().mean().sqrt()),
+        input_rms=float((inputs[0].float().square().sum() / inputs[0].numel()).sqrt()),
     )
     return result
 

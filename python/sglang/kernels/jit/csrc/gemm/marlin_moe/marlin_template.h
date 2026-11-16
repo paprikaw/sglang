@@ -405,6 +405,15 @@ __global__ void Marlin(
     }
   }
 
+  // A companion token can add experts and change `parallel`. Balanced stripes
+  // then split an unchanged expert's K reduction at different boundaries, even
+  // when token sorting is deterministic. Whole-K stripes keep each output tile
+  // in one CTA with the same accumulation order. Rounding upward preserves full
+  // work coverage when a CTA must visit several output/expert tiles.
+  if (canonical_k) {
+    iters = k_tiles * div_ceil(iters, k_tiles);
+  }
+
   int slice_row = (iters * blockIdx.x) % k_tiles;
   int slice_col_par = (iters * blockIdx.x) / k_tiles;
   int slice_col = slice_col_par;

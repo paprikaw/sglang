@@ -73,3 +73,9 @@ The next minimum adds one startup MoE operator probe using actual loaded Marlin 
 R9（`b1263047d1c0`）两条迁移输出仍不匹配串行参考，第4／280个token开始不同；三rank扩缩状态内容摘要、CPU恢复和独立64 GiB复用通过。Guard后检查拒绝，owned清理和release完成。启动Expert单个输入点无差异，不将它扩大为所有非零输入或层的算术验收。
 
 下一最小轮增加显式非零输入：Expert使用三档幅度；dense Marlin按几何选择加载权重，比B1／B2／B4；GDN packed使用每次重新克隆的私有状态，比同一行输出及递归状态。只保存范数／误差，普通启动不安装这些钩子，诊断标志禁止进入端到端性能轮。29项相关CPU检查通过；GPU待验，不累计为新的全套回归资格。
+
+## 2026-11-16：Marlin归约边界与R11候选
+
+R10两条迁移生成、缓存内容、CPU恢复、独立64 GiB复用及Guard清理通过，但静态PP2合批对照仍有一条不匹配。21个非零算子记录中，GPU1／2的Expert在只改变companion路由时出现6组可重复差异；dense与GDN所测输出／状态相等。不是缓存复制证据，也尚未证明它解释全部模型差异。
+
+候选以`SGLANG_MARLIN_MOE_CANONICAL_K=1`显式启用：Marlin MoE的每条计算条带按完整K归约对齐，不随活跃专家块数改变K切分，并禁止原子输出归约。默认关闭；P／D同时启用以保持算术路径一致，JIT specialization独立。还将PP2／PP3静态合批输出纳入最小轮门槛，禁止只靠迁移请求碰巧匹配通过。61项相关CPU检查通过；本地只做CPU检查，CUDA编译和算术／模型验收在已有A100节点的Guard租约内执行。R11 GPU待验。
