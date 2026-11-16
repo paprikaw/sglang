@@ -36,6 +36,9 @@ def probe(kwargs, forward):
         activation_dtype=str(hidden.dtype),
         weight_dtype=str(kwargs["w1"].dtype),
         deterministic=kwargs.get("deterministic", False),
+        input_rms=hidden[:1].float().square().mean().sqrt().item(),
+        reference_rms=reference.float().square().mean().sqrt().item(),
+        reference_nonzero_values=reference.count_nonzero().item(),
         single_repeat_equal=torch.equal(reference, repeat),
         cases={},
     )
@@ -68,6 +71,18 @@ def maybe_probe(kwargs, forward, directory):
         return
     _finished = True
     result = probe(kwargs, forward)
+    from sglang.srt.elastic_pp.batch_numerics_probe import synthetic_rows
+
+    result["synthetic_nonzero"] = {}
+    for amplitude in (0.25, 1.0, 4.0):
+        synthetic = dict(kwargs)
+        synthetic["hidden_states"] = synthetic_rows(
+            (1, kwargs["hidden_states"].shape[1]),
+            device=kwargs["hidden_states"].device,
+            dtype=kwargs["hidden_states"].dtype,
+            amplitude=amplitude,
+        )
+        result["synthetic_nonzero"][str(amplitude)] = probe(synthetic, forward)
     result.update(
         scope="startup MoE operator only; no cache, migration or performance claim",
         device=torch.cuda.current_device(),

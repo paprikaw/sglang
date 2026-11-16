@@ -213,6 +213,10 @@ def environment(cfg):
 def install_hooks():
     import fp8_marlin_adapter
     fp8_marlin_adapter.install()
+    numerical_probe = os.environ.get("ELASTIC_PD_BATCH_NUMERICS_PROBE_DIR")
+    if numerical_probe:
+        from sglang.srt.elastic_pp.batch_numerics_probe import install
+        install(numerical_probe)
     from sglang.srt.model_executor.model_runner import ModelRunner
     old_load = ModelRunner.load_model
 

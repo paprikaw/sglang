@@ -52,7 +52,7 @@ def test_pd_merged_batch_frontier_has_graph_coverage(monkeypatch, tmp_path,
     assert actual_limit == 4
 
 
-@pytest.mark.parametrize('probe_kind', ['verify_migrated_state', 'probe_marlin_batching'])
+@pytest.mark.parametrize('probe_kind', ['verify_migrated_state', 'probe_marlin_batching', 'probe_batch_numerics'])
 @pytest.mark.parametrize('qualification,concurrent,mechanism', [
     (False, True, 'inplace'), (True, False, 'inplace'), (True, True, 'replica')])
 def test_byte_audit_cannot_enter_a_performance_or_unsupported_run(

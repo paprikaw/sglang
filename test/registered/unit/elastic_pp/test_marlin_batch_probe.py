@@ -65,3 +65,23 @@ def test_probe_never_runs_inside_graph_capture(monkeypatch, inputs, tmp_path):
     )
     assert not module._finished
     assert not list(tmp_path.iterdir())
+
+
+def test_startup_zero_input_does_not_replace_nonzero_checks(
+    monkeypatch, inputs, tmp_path
+):
+    import json
+
+    import sglang.srt.elastic_pp.marlin_batch_probe as module
+
+    monkeypatch.setattr(module, "_finished", False)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    inputs["hidden_states"].zero_()
+    maybe_probe(inputs, lambda **kwargs: kwargs["hidden_states"] * 2, str(tmp_path))
+    result = json.loads((tmp_path / "marlin_batch_gpu0.json").read_text())
+    assert result["reference_nonzero_values"] == 0
+    assert len(result["synthetic_nonzero"]) == 3
+    for case in result["synthetic_nonzero"].values():
+        assert case["input_rms"] > 0 and case["reference_nonzero_values"] > 0
+        assert case["cases"]["shifted_routes"]["anchor_equal"]

@@ -67,3 +67,9 @@ The next opt-in minimum diagnostic hashes the actual source KV and allocated rec
 R8 GPU diagnostic completed: all three ranks passed both committed-state byte audits. Expansion verified96 KV/GDN tensors totaling734,183,424 logical bytes; shrink verified96 tensors totaling153,649,152 bytes, including retained layers. Both migrating outputs still differ (first token indices283/51, zero-based); serial repeats and CPU restore match. This establishes byte preservation only at these drained fences, not arbitrary cache history, Graph bindings or mathematical batch invariance. Audit-inclusive pauses1.117/0.221s are not performance results. Guard postcheck rejected the output mismatch; owned cleanup and lease release completed.
 
 The next minimum adds one startup MoE operator probe using actual loaded Marlin weights: keep one anchor input/routes/gate weights fixed; compare B1 against B2 with identical or shifted companion routes, and repeat each fixed batch. No attention, cache or PP migration participates, and only scalar error/count metrics are retained. This tests a numerical hypothesis without asserting it is the root cause. The regular runtime state audit and strict generation gates remain. 172 focused CPU checks passed, including fixed-anchor/composition controls and refusing diagnostics in performance runs; GPU validation is pending. The default probe flag is off and the regular Marlin argument values/output are preserved.
+
+## 2026-11-16：R9结束与非零算术隔离
+
+R9（`b1263047d1c0`）两条迁移输出仍不匹配串行参考，第4／280个token开始不同；三rank扩缩状态内容摘要、CPU恢复和独立64 GiB复用通过。Guard后检查拒绝，owned清理和release完成。启动Expert单个输入点无差异，不将它扩大为所有非零输入或层的算术验收。
+
+下一最小轮增加显式非零输入：Expert使用三档幅度；dense Marlin按几何选择加载权重，比B1／B2／B4；GDN packed使用每次重新克隆的私有状态，比同一行输出及递归状态。只保存范数／误差，普通启动不安装这些钩子，诊断标志禁止进入端到端性能轮。29项相关CPU检查通过；GPU待验，不累计为新的全套回归资格。
