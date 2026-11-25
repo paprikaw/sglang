@@ -1,5 +1,9 @@
 - [x] **KVCacheD容量与有界有限流验收完成。** 最小r5／r6容量／缓存／各方向512输出／独立64 GiB复用通过；最新E2E r6冻结67d60fa4f615，两组各76请求、四树、扩缩往返、缩后输出及Guard清理／release通过，逐请求输入／输出与引擎／协议配对一致。原地容量65536→98304→65536、最高槽位98213；控制4.176／2.397秒、fence最长1.705／0.977秒，退役层权重0、worker仍reserved3.25 GiB。原地／副本平均E2E35.84／25.15秒、worker GPU秒4472／3777，没有性能收益。CPU取整差0.12%、GPU映射差、单D一条P→D链、一轮伸缩、冷副本启动边界保留；不授予多请求或一般性能资格。[报告](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/KVCACHED_CAPACITY.md)。
 
+## 122B PP2 Decode replica startup with official SllmStore
+
+- Stage-local weight transport, resident HiCache and Decode CUDA Graph. Qualify against the canonical CPU loader with one real P→D request per new replica. GPU timings and generated-token equivalence are pending.
+
 # PP 原地伸缩＋HiCache：实现与实验清单
 
 - [ ] **2026-11-16：直接定位提交后的状态内容。** R7固定B4 Graph仍输出失败，CPU恢复也不匹配，暂停137/83 ms不授予性能资格；Guard后检查拒绝且清理/release完成。新增仅诊断启用的源／目标KV与已分配GDN逐字节摘要核对：共同暂停时取源，提交和Graph选择后、恢复服务前验证目标，覆盖迁移与保留层，失败禁止恢复。保留HiCache、真实权重offload、KV容量回收、四请求上限及默认1/2/4 Graph。165项相关CPU检查通过，GPU待验；先隔离状态与算术差异，再继续长缓存暂停优化，不扩大端到端网格。

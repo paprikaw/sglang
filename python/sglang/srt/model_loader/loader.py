@@ -1080,6 +1080,13 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_method.process_weights_after_loading(module)
 
 
+class SllmStoreStageLoader(DefaultModelLoader):
+    def _get_all_weights(self, model_config, model):
+        from sglang.srt.weight_cache.sllmstore_stage import iter_stage_weights
+
+        return iter_stage_weights(model_config, model, self.load_config, get_parallel())
+
+
 class LayeredModelLoader(DefaultModelLoader):
     """Model loader that loads weights layer by layer so that one can quantize a
     layer before loading another to make the peak memory envelope smaller."""
@@ -4311,6 +4318,8 @@ def get_model_loader(
 
         if os.environ.get("SGLANG_CPU_WEIGHT_CACHE_SOCKET"):
             raise ValueError("canonical and prepared CPU weight caches cannot be mixed")
+        if load_config.load_format == LoadFormat.SERVERLESS_LLM:
+            return CanonicalCpuModelLoader(load_config, SllmStoreStageLoader(load_config))
         if load_config.load_format not in (LoadFormat.AUTO, LoadFormat.SAFETENSORS):
             raise ValueError("canonical RAM bank requires normal safetensors loading")
         return CanonicalCpuModelLoader(load_config, DefaultModelLoader(load_config))
@@ -4328,6 +4337,9 @@ def get_model_loader(
                 "CPU daemon snapshots require the default checkpoint loader"
             )
         return CpuDaemonModelLoader(load_config, DefaultModelLoader(load_config))
+
+    if load_config.load_format == LoadFormat.SERVERLESS_LLM:
+        raise ValueError("The stage-local SllmStore loader requires an admitted canonical CPU bank")
 
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)

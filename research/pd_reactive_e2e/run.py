@@ -260,6 +260,8 @@ def engine(run, root, sid):
             flags[index+1:index+2]=[str(b) for b in root.get('decode_graph_batch_sizes',[1,2,4])]
         if remove:
             flags.extend(['--cuda-graph-bs-decode','1'])
+        if cfg.get("sllmstore_root"):
+            flags.extend(["--load-format", "serverless_llm"])
         save(run/'servers'/sid/'effective_launch.json',dict(argv=flags,source=root['engine_commit']))
         args=original(flags)
         from launch_checks import validate_prefill_alignment
@@ -336,6 +338,10 @@ def worker(run,root,sid):
         cmd=[PYTHON,str(GUARD/'model_cache_adapter.py'),'exec-local','--bindings',os.environ[h.GUARD_KEYS[3]],'--',
             PYTHON,str(Path(__file__).resolve()),'--engine','--server',sid,'--run',str(run)]
         env=q.environment(cfg)
+        if cfg.get("store_overlay"):
+            env["PYTHONPATH"] = cfg["store_overlay"] + os.pathsep + env["PYTHONPATH"]
+        if cfg.get("sllmstore_root"):
+            env["SGLANG_SLLMSTORE_STAGE_ROOT"] = cfg["sllmstore_root"]
         proc=subprocess.Popen(cmd,env=env,cwd=ENGINE,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,start_new_session=True)
         lifecycle['engine_spawned']=time.time()
@@ -665,7 +671,7 @@ if __name__=='__main__':
     p.add_argument('--probe-batch-numerics',action='store_true')
     p.add_argument('--marlin-canonical-k',action='store_true')
     p.add_argument('--worker',action='store_true');p.add_argument('--engine',action='store_true');p.add_argument('--client',action='store_true');p.add_argument('--reuse-probe',action='store_true')
-    p.add_argument('--server',choices=['p','d0','d1']);a=p.parse_args()
+    p.add_argument('--server',choices=['p','d0','d1','d_cpu','d_store']);a=p.parse_args()
     if a.reuse_probe:
         packet=json.loads(sys.stdin.readline());os.environ.update(packet['environment'])
         os.environ['CUDA_VISIBLE_DEVICES']='1'

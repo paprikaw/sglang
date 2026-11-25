@@ -18,6 +18,7 @@ class LoadFormat(str, enum.Enum):
     AUTO = "auto"
     PT = "pt"
     SAFETENSORS = "safetensors"
+    SERVERLESS_LLM = "serverless_llm"
     NPCACHE = "npcache"
     DUMMY = "dummy"
     SHARDED_STATE = "sharded_state"

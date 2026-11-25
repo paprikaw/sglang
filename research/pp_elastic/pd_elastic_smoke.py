@@ -253,6 +253,9 @@ def install_hooks():
         return result
     ModelRunner.load_model = load
     if os.environ["ELASTIC_PD_ROLE"] == "decode":
+        if os.environ.get("SGLANG_PP2_STARTUP_PROBE"):
+            from startup_timing_probe import install
+            install()
         import cache_probe
         cache_probe.install()
         if os.environ.get("ELASTIC_PD_STATIC_DECODE") == "1":

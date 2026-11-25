@@ -124,6 +124,7 @@ LOAD_FORMAT_CHOICES = [
     "dummy",
     "sharded_state",
     "presharded",
+    "serverless_llm",
     "gguf",
     "bitsandbytes",
     "mistral",
