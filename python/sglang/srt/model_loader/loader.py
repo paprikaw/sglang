@@ -1081,6 +1081,34 @@ class DefaultModelLoader(BaseModelLoader):
 
 
 class SllmStoreStageLoader(DefaultModelLoader):
+    def load_model(self, *, model_config, device_config):
+        if not os.environ.get("SGLANG_REPLICA_PREPARED_DIR"):
+            return super().load_model(model_config=model_config, device_config=device_config)
+        from pathlib import Path
+        from sglang.srt.weight_cache.replica_preparation import (
+            _active_prepared_weights, preparation_key, read_packet,
+        )
+        prep = Path(os.environ["SGLANG_REPLICA_PREPARED_DIR"])
+        root = Path(os.environ["SGLANG_SLLMSTORE_STAGE_ROOT"])
+        key = preparation_key(prep, self.load_config._canonical_weight_cache_key)
+        packet = read_packet(root, "packed.json", key)
+        token = _active_prepared_weights.set(packet)
+        try:
+            model = super().load_model(model_config=model_config, device_config=device_config)
+            rank = get_parallel().pp_rank
+            start, end = key["pp_layers"][rank]
+            loaded = packet.get("loaded_experts", {})
+            if set(loaded) != set(range(start, end)):
+                raise ValueError("Incomplete prepared Marlin stage restore")
+            logger.info("SllmStore prepared Marlin stage %s", json.dumps({
+                "pp": rank, "restored_layers": len(loaded),
+                "bytes": sum(size for size, _ in loaded.values()),
+                "load_s": sum(duration for _, duration in loaded.values()),
+            }))
+            return model
+        finally:
+            _active_prepared_weights.reset(token)
+
     def _get_all_weights(self, model_config, model):
         from sglang.srt.weight_cache.sllmstore_stage import iter_stage_weights
 

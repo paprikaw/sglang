@@ -17,7 +17,7 @@ q, h = harness.q, harness.h
 GIB = 1024**3
 
 
-def prepare(run, prior, nodes, overlay, port):
+def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
     nodes = list(nodes)
     if len(set(nodes)) != 2:
         raise ValueError("Expected different Prefill and Decode nodes")
@@ -59,6 +59,9 @@ def prepare(run, prior, nodes, overlay, port):
     run.mkdir(mode=0o700, parents=True)
     for name in ("cache", "task", "servers", "node_cleanup", "status_stacks"):
         (run / name).mkdir()
+    prep = run / "replica-preparation"
+    if prepared_replica:
+        prep.mkdir(mode=0o700)
     key = run / "admin.key"
     key.write_text(secrets.token_urlsafe(32))
     key.chmod(0o600)
@@ -66,11 +69,18 @@ def prepare(run, prior, nodes, overlay, port):
     # Two PP2 replicas each allocate two 32-GiB rank caches, including
     # transient old/new pools; allow 128 GiB for CPU weight offload. The
     # 122B official host pool, rounded to 32-MiB chunks, is <120 GiB.
-    # 512 GiB covers these allocations; Guard adds its separate 32-GiB margin.
+    # The prepared comparison has one 136-GiB Store used sequentially. Its
+    # peak preparation includes two independent <=64-GiB HiCache banks, two
+    # <=64-GiB sealed stage exports, <=16 GiB of dense staging and 8 GiB for
+    # transient copies. The raw control retires before export. Guard adds its
+    # separate headroom and canonical-weight reservation in both modes.
     cache.update(
         usage_logs={n: [] for n in nodes},
         node_specs={},
-        hicache_reserve_bytes_per_node={nodes[0]: 160 * GIB, nodes[1]: 512 * GIB},
+        hicache_reserve_bytes_per_node={
+            nodes[0]: 160 * GIB,
+            nodes[1]: (416 if prepared_replica else 512) * GIB,
+        },
         cpu_memory_budget=dict(
             schema_version=1, kv_banks_per_node={n: [] for n in nodes}
         ),
@@ -88,7 +98,7 @@ def prepare(run, prior, nodes, overlay, port):
     for sid, source, node, port_offset in [
         ("p", "p", nodes[0], 1),
         ("d0", "d0", nodes[1], 11),
-        ("d_cpu", "d1", nodes[1], 21),
+        ("d_raw" if prepared_replica else "d_cpu", "d1", nodes[1], 21),
         ("d_store", "d1", nodes[1], 31),
     ]:
         cfg = copy.deepcopy(originals[source])
@@ -113,8 +123,22 @@ def prepare(run, prior, nodes, overlay, port):
         if sid != "p":
             cfg["launch_env"]["KVCACHED_IPC_NAME"] = run.name + "-" + sid
             cfg["launch_env"]["SGLANG_PP2_STARTUP_PROBE"] = "1"
-        if sid == "d_store":
+        if sid in ("d_store", "d_raw"):
             cfg["sllmstore_root"] = "/tmp/" + run.name + "-weights"
+        if prepared_replica and sid in ("d0", "d_store"):
+            cfg["launch_env"].update(
+                SGLANG_REPLICA_ENGINE_COMMIT=rev,
+                SGLANG_REPLICA_MARLIN_SHA256=q.describe(
+                    ENGINE
+                    / "research/pp_elastic/runtime_profiles/agentx_a100/fp8_marlin_adapter.py"
+                )["sha256"],
+            )
+            name = (
+                "SGLANG_REPLICA_EXPORT_DIR"
+                if sid == "d0"
+                else "SGLANG_REPLICA_PREPARED_DIR"
+            )
+            cfg["launch_env"][name] = str(prep)
         use = dict(
             id=run.name + "." + sid,
             path=str(run / "cache" / (sid + ".log")),
@@ -143,7 +167,9 @@ def prepare(run, prior, nodes, overlay, port):
         admin_key_file=str(key),
         engine_root=str(ENGINE),
         engine_commit=rev,
-        store_reserve_bytes=128 * GIB,
+        prepared_replica=prepared_replica,
+        store_reserve_bytes=(136 if prepared_replica else 128) * GIB,
+        spare_hicache_reserve_bytes=64 * GIB if prepared_replica else 0,
         scope="two fresh fixed PP2 starts, one measured request each",
     )
     # Native status polling, Graph B1/B2/B4, 32-GiB-per-replica HiCache flags
@@ -187,6 +213,13 @@ def prepare(run, prior, nodes, overlay, port):
             ENGINE / "python/sglang/srt/weight_cache/sllmstore_stage.py",
         ]
     )
+    if prepared_replica:
+        frozen.extend(
+            [
+                ENGINE / "python/sglang/srt/weight_cache/replica_preparation.py",
+                ENGINE / "python/sglang/srt/elastic_pp/replica_host_cache.py",
+            ]
+        )
     native = overlay / "sllm_store"
     frozen.extend(
         p for p in native.rglob("*") if p.is_file() and p.suffix in (".py", ".so")
@@ -260,5 +293,13 @@ if __name__ == "__main__":
     p.add_argument("--nodes", nargs=2, required=True)
     p.add_argument("--overlay", type=Path, required=True)
     p.add_argument("--port", type=int, default=30720)
+    p.add_argument("--prepared-replica", action="store_true")
     a = p.parse_args()
-    prepare(a.run.resolve(), a.prior.resolve(), a.nodes, a.overlay.resolve(), a.port)
+    prepare(
+        a.run.resolve(),
+        a.prior.resolve(),
+        a.nodes,
+        a.overlay.resolve(),
+        a.port,
+        a.prepared_replica,
+    )

@@ -41,64 +41,120 @@ def store_service(run, config):
         os.environ["SGLANG_CANONICAL_WEIGHT_CACHE_SOCKET"],
         os.environ["SGLANG_CANONICAL_WEIGHT_CACHE_SOURCE_COMMIT"],
     ) as (view, bank):
+        prepared = config.get("prepared_replica", False)
         manifest = prepare_indices(root, view, bank, [[0, 24], [24, 48]])
-        try:
+        chunk = 32 << 20
 
-            async def serve():
-                chunk = 32 << 20
-                pool_bytes = sum(
-                    ((root / "store" / n / "tensor.data_0").stat().st_size + chunk - 1)
-                    // chunk
-                    * chunk
-                    for n in manifest["parts"]
-                )
-                if pool_bytes > config["store_reserve_bytes"]:
-                    raise ValueError(
-                        "Official Store host pool exceeds the frozen RAM reservation"
-                    )
-                service = server.StorageServicer(
-                    str(root / "store"), pool_bytes, 4, chunk, True
-                )
-                rpc = grpc.aio.server(options=(("grpc.so_reuseport", 0),))
-                storage_pb2_grpc.add_StorageServicer_to_server(service, rpc)
-                if rpc.add_insecure_port("127.0.0.1:8073") != 8073:
-                    raise RuntimeError("SllmStore loopback listener unavailable")
-                await rpc.start()
+        def rounded_size(names):
+            return sum(
+                ((root / "store" / n / "tensor.data_0").stat().st_size + chunk - 1)
+                // chunk
+                * chunk
+                for n in names
+            )
 
-                def prewarm():
-                    client = SllmStoreClient()
-                    # Native ToHost emits this receipt only after its read threads finish.
-                    with (run / "store.log").open(errors="replace") as log:
+        pool_bytes = (
+            config["store_reserve_bytes"]
+            if prepared
+            else rounded_size(manifest["parts"])
+        )
+        if pool_bytes > config["store_reserve_bytes"]:
+            raise ValueError("Official Store exceeds its admitted pinned budget")
+
+        def prewarm(names):
+            if rounded_size(names) > pool_bytes:
+                raise ValueError(
+                    "Official Store cannot keep this entire representation warm"
+                )
+            client = SllmStoreClient()
+            with (run / "store.log").open(errors="replace") as log:
+                for name in names:
+                    size = (root / "store" / name / "tensor.data_0").stat().st_size
+                    if client.register_model(name) != size or not client.load_into_cpu(
+                        name
+                    ):
+                        raise RuntimeError(f"Store registration/load failed for {name}")
+                    deadline = time.monotonic() + 90
+                    marker = f"Finished loading model {name} from disk"
+                    while not any(marker in line for line in log):
+                        if time.monotonic() > deadline:
+                            raise TimeoutError(f"No host-ready receipt for {name}")
+                        time.sleep(0.08)
+
+        async def serve():
+            from sglang.srt.elastic_pp.replica_host_cache import prepare_spare
+            from sglang.srt.weight_cache.replica_preparation import (
+                prepare_dense_files,
+                preparation_key,
+                publish,
+                register_stage_files,
+            )
+
+            service = server.StorageServicer(
+                str(root / "store"), pool_bytes, 4, chunk, True
+            )
+            rpc = grpc.aio.server(options=(("grpc.so_reuseport", 0),))
+            storage_pb2_grpc.add_StorageServicer_to_server(service, rpc)
+            if rpc.add_insecure_port("127.0.0.1:8073") != 8073:
+                raise RuntimeError("SllmStore loopback listener unavailable")
+            await rpc.start()
+            spare, fds = None, []
+            try:
+                started = time.monotonic()
+                await asyncio.to_thread(prewarm, manifest["parts"])
+                h.save(
+                    run / "store_ready.json",
+                    dict(
+                        passed=True,
+                        host_pool_bytes=pool_bytes,
+                        prewarm_s=time.monotonic() - started,
+                        **manifest,
+                    ),
+                )
+                while not (run / "stop_store").exists():
+                    if prepared and spare is None and (run / "prepare-packed").exists():
+                        # No raw consumer remains. Reuse the same pinned region
+                        # and the same native Store server in both measurements.
+                        started = time.monotonic()
+                        client = SllmStoreClient()
                         for name in manifest["parts"]:
-                            size = (
-                                (root / "store" / name / "tensor.data_0").stat().st_size
-                            )
-                            if client.register_model(
-                                name
-                            ) != size or not client.load_into_cpu(name):
+                            if client.unload_from_cpu(name) is False:
                                 raise RuntimeError(
-                                    f"Store host registration/load failed for {name}"
+                                    f"Could not retire raw Store weights: {name}"
                                 )
-                            until = time.monotonic() + 90
-                            marker = f"Finished loading model {name} from disk"
-                            while not any(marker in line for line in log):
-                                if time.monotonic() > until:
-                                    raise TimeoutError(
-                                        f"No host-ready receipt for {name}"
-                                    )
-                                time.sleep(0.08)
+                        preparation = run / "replica-preparation"
+                        key = preparation_key(preparation, bank["group_key"])
+                        parts = register_stage_files(root, preparation, key)
+                        parts += prepare_dense_files(
+                            root, view, bank, manifest["partitions"], fds, 16 << 30
+                        )
+                        used = rounded_size(parts)
+                        await asyncio.to_thread(prewarm, parts)
+                        for fd in fds:
+                            os.close(fd)
+                        fds.clear()
+                        publish(preparation / "weights-consumed.json", dict(key=key))
+                        spare = prepare_spare(
+                            preparation, key, config["spare_hicache_reserve_bytes"]
+                        )
+                        h.save(
+                            run / "store_packed_ready.json",
+                            dict(
+                                passed=True,
+                                host_pool_bytes=pool_bytes,
+                                rounded_payload_bytes=used,
+                                preparation_s=time.monotonic() - started,
+                            ),
+                        )
+                    await asyncio.sleep(0.2)
+            finally:
+                for fd in fds:
+                    os.close(fd)
+                if spare is not None:
+                    spare.close()
+                await rpc.stop(1)
 
-                try:
-                    await asyncio.to_thread(prewarm)
-                    h.save(
-                        run / "store_ready.json",
-                        dict(passed=True, host_pool_bytes=pool_bytes, **manifest),
-                    )
-                    while not (run / "stop_store").exists():
-                        await asyncio.sleep(0.4)
-                finally:
-                    await rpc.stop(1)
-
+        try:
             asyncio.run(serve())
         finally:
             shutil.rmtree(root)
@@ -234,6 +290,113 @@ def request(prefill, decode, key, tokens):
     )
 
 
+def prepare_history(run, servers, key, tokens, anchor, wait_for_packed):
+    import agentx_replay as replay
+
+    d = servers["d0"]
+    root = run / "replica-preparation"
+    if request(servers["p"], d, key, tokens)["output"] != anchor["output"]:
+        raise RuntimeError("Donor output changed before prefix snapshot")
+    start = time.perf_counter()
+    deadline = start + 480
+    while time.perf_counter() < deadline:
+        ok = replay.http(
+            d["node"],
+            d["port"],
+            "/set_internal_state",
+            key,
+            {"server_args": {"agentx_cache_cmd": 4}},
+            420,
+        )
+        if isinstance(ok, list) and len(ok) == 2 and all(value is True for value in ok):
+            break
+        time.sleep(0.25)
+    else:
+        raise TimeoutError("Donor failed to export both processed Marlin stages")
+    export_wall_s = time.perf_counter() - start
+    (run / "prepare-packed").touch(exist_ok=False)
+    packed = wait_for_packed()
+    start = time.perf_counter()
+    deadline = start + 75
+    while time.perf_counter() < deadline:
+        ok = replay.http(
+            d["node"],
+            d["port"],
+            "/set_internal_state",
+            key,
+            {"server_args": {"agentx_cache_cmd": 3}},
+            45,
+        )
+        if isinstance(ok, list) and len(ok) == 2 and all(value is True for value in ok):
+            break
+        time.sleep(0.2)
+    else:
+        raise TimeoutError("Donor did not publish a drained, host-backed KV/GDN prefix")
+    history = [json.loads((root / f"history-{r}.json").read_text()) for r in (0, 1)]
+    if (
+        history[0]["nodes"] != history[1]["nodes"]
+        or min(history[0]["rows"].values()) < 1
+    ):
+        raise ValueError("Donor ranks disagree on the historical prefix")
+    weights = [json.loads((root / f"weights-{r}.json").read_text()) for r in (0, 1)]
+    spare = json.loads((root / "spare.json").read_text())
+    for rank in (0, 1):
+        released = json.loads((root / f"weights-released-{rank}.json").read_text())
+        if released["key"] != spare["key"]:
+            raise RuntimeError("Donor weight staging release has a foreign identity")
+    h.save(
+        run / "replica_preparation_cost.json",
+        dict(
+            donor_weight_export_wall_s=export_wall_s,
+            store_conversion_and_prewarm_s=packed["preparation_s"],
+            prefix_snapshot_wall_s=time.perf_counter() - start,
+            prefix_payload_bytes=sum(x["bytes"] for x in history),
+            historical_rows=history[0]["rows"],
+            prefix_copy_rank_s=[x["seconds"] for x in history],
+            marlin_export_rank_s=[x["seconds"] for x in weights],
+            marlin_export_bytes=sum(x["bytes"] for x in weights),
+            spare_hicache_bytes=spare["bytes"],
+            spare_hicache_allocation_s=spare["seconds"],
+            official_store_pinned_bytes=json.loads(
+                (run / "store_ready.json").read_text()
+            )["host_pool_bytes"],
+        ),
+    )
+
+
+def qualify_history(run, servers, key, tokens, anchor, row):
+    import agentx_replay as replay
+
+    target = servers["d_store"]
+    info = replay.http(target["node"], target["port"], "/get_server_info", key)
+    events_by_rank = [
+        [e for e in state.get("agentx_restores", []) if e.get("room") == row["room"]]
+        for state in info["internal_states"]
+    ]
+    row["first_request_historical_restore"] = events_by_rank
+    h.save(
+        run / "first_request_history.json", dict(room=row["room"], ranks=events_by_rank)
+    )
+    if len(events_by_rank) != 2 or any(
+        not any(
+            e["loaded_tokens"] > 0
+            and e["host_gdn_to_device_cache"]
+            and not e["copy_mamba_to_request"]
+            for e in rank
+        )
+        for rank in events_by_rank
+    ):
+        raise RuntimeError("First target request lacks two-rank KV/GDN CPU restore")
+    # Independent writes must preserve both caches and the original output.
+    branch = tokens[:-64] + [1337] * 64
+    newer = request(servers["p"], target, key, branch)
+    donor = request(servers["p"], servers["d0"], key, branch)
+    original = request(servers["p"], servers["d0"], key, tokens)
+    if newer["output"] != donor["output"] or original["output"] != anchor["output"]:
+        raise RuntimeError("Cross-replica prefix branch or donor reference changed")
+    row["independent_branch_outputs_match"] = True
+
+
 def measure(run, config):
     workers, handles = {}, []
     reports, errors = [], []
@@ -305,8 +468,8 @@ def measure(run, config):
 
     def wait_ready(sid):
         path = (
-            run / "store_ready.json"
-            if sid == "store"
+            run / ("store_ready.json" if sid == "store" else "store_packed_ready.json")
+            if sid in ("store", "packed")
             else run / "servers" / sid / "ready.json"
         )
         deadline = time.monotonic() + 600
@@ -339,14 +502,24 @@ def measure(run, config):
         for cfg in config["node_configs"].values():
             h.authenticate(run, cfg, os.environ)
         progress("warm Prefill, resident Decode and host weight pools")
-        for sid in ("p", "d0", "store"):
+        prepared = config.get("prepared_replica", False)
+        for sid in ("p", "d0"):
             spawn(sid)
-        for sid in ("p", "d0", "store"):
+        if not prepared:
+            spawn("store")
+        for sid in ("p", "d0"):
             wait_ready(sid)
+        if prepared:
+            spawn("store")
+        wait_ready("store")
         tokens = [1000 + i % 123 for i in range(4608)]
         anchor = request(servers["p"], servers["d0"], key, tokens)
         anchor_hash = hashlib.sha256(json.dumps(anchor["output"]).encode()).hexdigest()
-        for sid in ("d_cpu", "d_store"):
+        for sid in ("d_raw" if prepared else "d_cpu", "d_store"):
+            if prepared and sid == "d_store":
+                prepare_history(
+                    run, servers, key, tokens, anchor, lambda: wait_ready("packed")
+                )
             # The same P is warm, and the old D remains serving on the same GPUs.
             warm = request(servers["p"], servers["d0"], key, tokens)
             if warm["output"] != anchor["output"]:
@@ -402,6 +575,9 @@ def measure(run, config):
                 raise RuntimeError(
                     f"Real output, two PP handoffs, or two Graph replays differ for {sid}"
                 )
+            if prepared and sid == "d_store":
+                qualify_history(run, servers, key, tokens, anchor, row)
+                h.save(run / "measurements.json", reports)
             retire(sid)
         if reports[0]["prefill_hit"] != reports[1]["prefill_hit"]:
             raise RuntimeError("Warm Prefill hit counts differ")

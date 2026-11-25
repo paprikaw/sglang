@@ -51,6 +51,7 @@ class CanonicalCpuModelLoader:
             view_config = copy.copy(model_config)
             view_config.model_path = view
             self.load_config._canonical_weight_cache_view = view
+            self.load_config._canonical_weight_cache_key = bank["group_key"]
             self.load_config.model_loader_extra_config = scoped_extra
             try:
                 with flags.override(weight_loader_prefetch_checkpoints=False):
@@ -63,6 +64,7 @@ class CanonicalCpuModelLoader:
                 view_config.model_path = model_config.model_path
                 self.load_config.model_loader_extra_config = original_extra
                 del self.load_config._canonical_weight_cache_view
+                del self.load_config._canonical_weight_cache_key
             model._canonical_cpu_weight_cache_key = bank["group_key"]
         logger.info(
             "CPU weight cache load: source=canonical_cpu_daemon key=%s elapsed=%.3fs",

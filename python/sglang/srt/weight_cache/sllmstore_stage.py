@@ -30,7 +30,7 @@ def read_header(path):
         return 8 + length, json.loads(f.read(length))
 
 
-def stage_index(header, base, start, end):
+def stage_index(header, base, start, end, *, omit_packed_experts=False):
     """Coalesce contiguous tensor ranges. The official Store moves opaque bytes.
 
     FP8 is reinterpreted on the GPU because the Store's native dtype table does
@@ -42,6 +42,8 @@ def stage_index(header, base, start, end):
             continue
         if name.startswith(LAYER):
             if not start <= int(name[len(LAYER) :].split(".", 1)[0]) < end:
+                continue
+            if omit_packed_experts and ".mlp.experts." in name:
                 continue
         elif name not in GLOBAL:
             raise ValueError(f"Unexpected language model tensor {name}")
@@ -130,14 +132,15 @@ def iter_stage_weights(model_config, model, load_config, parallel):
     if manifest["version"] != 1 or manifest["partitions"][rank] != [start, end]:
         raise ValueError("SllmStore checkpoint and live PP layer ranges disagree")
     client = SllmStoreClient()
-    idx_root = root / f"pp{rank}"
+    packed = bool(os.environ.get("SGLANG_REPLICA_PREPARED_DIR"))
+    idx_root = (root / "packed" if packed else root) / f"pp{rank}"
     num_bytes = count = parts = 0
     loaded_layers = set()
     load_s = 0.0
     for source in sorted(view.glob("*.safetensors")):
         name = source.name
         base, header = read_header(source)
-        index, views = stage_index(header, base, start, end)
+        index, views = stage_index(header, base, start, end, omit_packed_experts=packed)
         profiler = getattr(model, "_elastic_pp_weight_profiler", None)
         if profiler is not None:
             # Elastic PP compares whole-checkpoint metadata between ranks even
@@ -161,19 +164,24 @@ def iter_stage_weights(model_config, model, load_config, parallel):
                     )
         if not index:
             continue
+        storage_name = name
+        if packed:
+            from sglang.srt.weight_cache.replica_preparation import compact_index
+            storage_name = f"dense-pp{rank}-{name}"
+            index = compact_index(index)
         # The resident store and this worker must see the same sealed memfd.
         # An equally named disk file or a stale store from another bank is invalid.
         backing = root / "store" / name / "tensor.data_0"
         if (
             not source.samefile(backing)
-            or json.loads((idx_root / name / "tensor_index.json").read_text()) != index
+            or json.loads((idx_root / storage_name / "tensor_index.json").read_text()) != index
         ):
             raise RuntimeError(f"SllmStore backing or stage index differs for {name}")
         before = time.perf_counter()
         replica, spans = load_dict_non_blocking(
-            name, {"": torch.cuda.current_device()}, storage_path=str(idx_root)
+            storage_name, {"": torch.cuda.current_device()}, storage_path=str(idx_root)
         )
-        if client.confirm_model_loaded(name, replica) is False:
+        if client.confirm_model_loaded(storage_name, replica) is False:
             raise RuntimeError(f"SllmStore GPU transfer failed for {name}")
         load_s += time.perf_counter() - before
         if set(spans) != set(index):

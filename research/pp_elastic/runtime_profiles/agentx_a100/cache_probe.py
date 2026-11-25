@@ -56,10 +56,20 @@ def install():
 
     @wraps(old_load)
     def load(self, params):
+        import os
+        inspect_history = bool(os.environ.get("SGLANG_REPLICA_PREPARED_DIR"))
+        if inspect_history:
+            from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+            node = self.tree_core.node_by_id(params.best_match_node)
+            recurrent = node.component_data[ComponentType.MAMBA]
+            host_only_gdn = recurrent.host_value is not None and recurrent.value is None
         result = old_load(self, params)
         events = getattr(self, '_agentx_restores', [])
         events.append({'time': time.time(), 'copy_mamba_to_request': params.copy_mamba_to_request,
                        'loaded_tokens': len(result[0]) if result is not None else 0})
+        if inspect_history:
+            events[-1].update(room=getattr(params.req, 'bootstrap_room', None),
+                              host_gdn_to_device_cache=host_only_gdn and recurrent.value is not None)
         self._agentx_restores = events[-128:]
         return result
 
@@ -68,6 +78,24 @@ def install():
         if set(req.server_args) != {'agentx_cache_cmd'}:
             return old_set(self, req)
         cmd = int(req.server_args['agentx_cache_cmd'])
+        if cmd in (3, 4):
+            import os
+            if not os.environ.get("SGLANG_REPLICA_EXPORT_DIR"):
+                raise ValueError("Prefix export requires a prepared donor")
+            if cmd == 4:
+                from pathlib import Path
+                from sglang.srt.weight_cache.replica_preparation import export_stage
+                root = Path(os.environ["SGLANG_REPLICA_EXPORT_DIR"])
+                runner = self.tp_worker.model_runner
+                if not self.is_fully_idle():
+                    return SetInternalStateReqOutput(updated=False)
+                if not (root / f"weights-{runner.ps.pp_rank}.json").exists():
+                    layers = [(n,m) for n,m in runner.model.named_modules()
+                              if hasattr(m, "_qwen_a100_fp8_marlin_geometry")]
+                    export_stage(runner, layers, root)
+                return SetInternalStateReqOutput(updated=True)
+            from sglang.srt.elastic_pp.replica_host_cache import seed_history
+            return SetInternalStateReqOutput(updated=seed_history(self))
         if cmd not in (1, 2):
             raise ValueError('Unknown cache diagnostic command')
         if not self.is_fully_idle():

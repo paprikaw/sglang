@@ -2,6 +2,10 @@
 
 ## 122B PP2 Decode replica startup with official SllmStore
 
+- [ ] Prepared PP2 replica on one Decode node. Both ranks bind the preallocated CPU bank, import the donor's KV/GDN prefix snapshot with independent writable slots, and load the sealed stage-local Marlin tensors through the official Store. Validate first-request CPU hits on both ranks, donor/receiver branch outputs, real handoff, Graph replay, preparation costs and GPU cleanup. Cross-node CPU synchronization is a separate scope.
+
+- [x] Prepared replica CPU verification, 95 tests passed. This includes native host tree insertion, separate writable KV/GDN slots, compact dense weight indices and sealed Marlin storage. The two-node A100 handoff has its own acceptance above.
+
 - [x] One paired startup at the immutable r2 tag, `d83b53624e`. On two A100 nodes, the CPU loader took 110.99 s from replica trigger to the first Decode-generated token. Official SllmStore took 100.67 s with a prewarmed 119.56 GiB host pool. Both new replicas completed real transfers and CUDA Graph replays on both PP stages. The eight greedy outputs matched the resident replica, warm Prefill hit 4,544 tokens in both arms, and Guard verified cleanup and release. Evidence is archived under `sllmstore_pp2_startup_20261125_r2`. This is a fixed-PP2 startup measurement with one observation per method.
 
 # PP 原地伸缩＋HiCache：实现与实验清单

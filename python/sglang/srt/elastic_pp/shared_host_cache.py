@@ -518,6 +518,23 @@ def initialize_scheduler_shared_host(scheduler):
     schema = merge_schemas(
         [x["schema"] for x in sources], sum(x.size for x in topology.layer_ranges)
     )
+    attached = getattr(mr, "_replica_attached_bank", None)
+    if attached is not None:
+        import json
+        from sglang.srt.elastic_pp.replica_host_cache import restore_history
+
+        if (json.loads(json.dumps(schema)) != attached.schema
+                or source._elastic_pp_shared_host_bank is not attached):
+            raise RuntimeError("Final replica cache views differ from prepared storage")
+        result = consensus("imported-history", lambda: restore_history(
+            source, mr, Path(os.environ["SGLANG_REPLICA_PREPARED_DIR"])))
+        mr._elastic_pp_shared_host_bank = attached
+        mr._elastic_pp_shared_host_startup = dict(
+            logical_bytes=attached.bytes, capacities=schema["capacities"],
+            layers=schema["layers"], historical_payload_copied_bytes=0,
+            attach_seconds=mr._replica_attach_seconds, imported_history=result)
+        logger.info("FIXED_PP2_IMPORTED_HISTORY %s", json.dumps(mr._elastic_pp_shared_host_startup))
+        return
     bank = None
     clone = None
     pin = torch.device(mr.device).type == "cuda"
@@ -593,6 +610,9 @@ def initialize_scheduler_shared_host(scheduler):
             layers=schema["layers"],
             capacities=schema["capacities"],
         )
+        if os.environ.get("SGLANG_REPLICA_EXPORT_DIR"):
+            from sglang.srt.elastic_pp.replica_host_cache import publish_schema
+            publish_schema(mr, bank)
     except BaseException:
         if clone is not None and scheduler.tree_cache is not clone:
             discard_host_cache(clone)
