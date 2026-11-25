@@ -19,6 +19,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
+def test_endpoint_storage_plan_excludes_decoder_owners_and_tied_aliases():
+    model = nn.Module()
+    model.decoder = nn.Linear(3, 3)
+    model.tied_weight = model.decoder.weight
+    model.head = nn.Linear(3, 4, bias=False)
+    decoder, _ = weight_storage_plan(model.decoder, device_type="cpu")
+    endpoint, _ = weight_storage_plan(
+        model, device_type="cpu", exclude_storage_keys=decoder
+    )
+    assert len(endpoint) == 1
+    assert next(iter(endpoint.values()))["source"] is model.head.weight
+
+
 def test_startup_conversion_reclaims_old_allocator_blocks_between_layers(monkeypatch):
     # Three 3-byte layers plus two cached loader bytes nearly fill a 12-byte
     # driver budget. VMM cannot reuse PyTorch's cached free blocks. Delaying

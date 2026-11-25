@@ -252,12 +252,49 @@ def prepare_dense_files(root, view, bank, partitions, owned_fds, cap):
     return parts
 
 
+def packed_expert_views(entry, root, rank, expected_shapes):
+    """Return typed views of one completed official Store GPU transfer."""
+    import torch
+    from sllm_store.client import SllmStoreClient
+    from sllm_store.torch import load_dict_non_blocking
+
+    name = entry["name"]
+    if set(entry["tensors"]) != set(EXPERT_DTYPES):
+        raise ValueError("Incomplete Marlin tensor set")
+    replica, spans = load_dict_non_blocking(
+        name,
+        {"": torch.cuda.current_device()},
+        storage_path=str(root / "packed" / f"pp{rank}"),
+    )
+    if SllmStoreClient().confirm_model_loaded(name, replica) is False:
+        raise RuntimeError(f"Official Store did not complete {name}")
+    blob = spans["blob"]
+    if blob.dtype != torch.uint8 or blob.numel() != entry["size"]:
+        raise ValueError("Invalid Store payload size")
+    views = {}
+    offset = 0
+    for field, expected_dtype in EXPERT_DTYPES.items():
+        begin, size, shape, dtype = entry["tensors"][field]
+        actual_dtype = getattr(torch, expected_dtype)
+        if (
+            dtype != expected_dtype
+            or tuple(shape) != expected_shapes[field]
+            or offset != begin
+            or math.prod(shape) * actual_dtype.itemsize != size
+        ):
+            raise ValueError(f"Invalid packed tensor extent for {field}")
+        weight = blob.narrow(0, begin, size).view(actual_dtype).view(shape)
+        views[field] = weight
+        offset += size
+    if offset != entry["size"]:
+        raise ValueError("Trailing data in packed expert image")
+    return views
+
+
 def install_expert(layer, geometry, root):
     import torch
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
     from sglang.srt.runtime_context import get_parallel
-    from sllm_store.client import SllmStoreClient
-    from sllm_store.torch import load_dict_non_blocking
 
     # Set by the stage iterator only after checking the canonical bank and index.
     packet = _active_prepared_weights.get()
@@ -273,37 +310,10 @@ def install_expert(layer, geometry, root):
         raise ValueError("Duplicate prepared Marlin layer")
     before = time.perf_counter()
     entry = packet["layers"][str(idx)]
-    name = entry["name"]
     device = layer.w13_weight.device
-    if set(entry["tensors"]) != set(EXPERT_DTYPES):
-        raise ValueError("Incomplete Marlin tensor set")
-    replica, spans = load_dict_non_blocking(
-        name,
-        {"": torch.cuda.current_device()},
-        storage_path=str(root / "packed" / f"pp{rank}"),
-    )
-    if SllmStoreClient().confirm_model_loaded(name, replica) is False:
-        raise RuntimeError(f"Official Store did not complete {name}")
-    blob = spans["blob"]
-    if blob.dtype != torch.uint8 or blob.numel() != entry["size"]:
-        raise ValueError("Invalid Store payload size")
-    offset = 0
-    for field, expected_dtype in EXPERT_DTYPES.items():
-        begin, size, shape, dtype = entry["tensors"][field]
-        actual_dtype = getattr(torch, expected_dtype)
-        if (
-            dtype != expected_dtype
-            or tuple(shape) != geometry.packed_shapes[field]
-            or offset != begin
-            or math.prod(shape) * actual_dtype.itemsize != size
-        ):
-            raise ValueError(f"Invalid packed tensor extent for {field}")
-        weight = blob.narrow(0, begin, size).view(actual_dtype).view(shape)
-        # Copy into SGLang-owned storage before dropping the Store's CUDA IPC allocation.
+    views = packed_expert_views(entry, root, rank, geometry.packed_shapes)
+    for field, weight in views.items():
         setattr(layer, field, torch.nn.Parameter(weight.clone(), requires_grad=False))
-        offset += size
-    if offset != entry["size"]:
-        raise ValueError("Trailing data in packed expert image")
     del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     layer.workspace = marlin_make_workspace(device, 4)
     torch.cuda.synchronize()

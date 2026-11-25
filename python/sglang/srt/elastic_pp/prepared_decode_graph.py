@@ -8,6 +8,7 @@ Graphs retain addresses, while inactive layer weights have no physical pages.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -358,6 +359,10 @@ def init_prepared_graph_bank(mr):
         mr._elastic_pp_weight_backing = mr._elastic_pp_model_method(
             "enable_elastic_pp_evictable_weights"
         )()
+        if directory := os.environ.get("SGLANG_REPLICA_STANDBY_DIR"):
+            from sglang.srt.elastic_pp.replica_standby import ReplicaStandby
+
+            mr._replica_standby = ReplicaStandby(mr, directory)
     mr.token_to_kv_pool.retain_elastic_pp_graph_buffers()
     mr._elastic_pp_prepared_graphs = PreparedDecodeGraphBank(mr, partitions)
 

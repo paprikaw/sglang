@@ -190,6 +190,23 @@ def test_replica_snapshot_uses_native_radix_and_independent_rows(tmp_path, monke
                 4 + r,
                 5 + r,
             ]
+        # Freeze the common history before the first consumer writes into its bank.
+        identity = history.contract(runner(0), tmp_path)["key"]
+        records, seed = history.snapshot_seed(bank, tmp_path, identity, 4096)
+        bank.regions["full.kv"].tensor.zero_()
+        target = tmp_path / "next-generation"
+        target.mkdir()
+        clone = history.new_seeded_spare(tmp_path, target, identity, 4096, records, seed)
+        try:
+            assert clone.regions["full.kv"].tensor[0, :2, 0, 0].tolist() == [6, 4]
+            assert bank.regions["full.kv"].tensor.count_nonzero() == 0
+            clone.regions["mamba.temporal"].tensor.zero_()
+            assert seed["mamba.temporal"][0, 0].tolist() == [4, 5]
+        finally:
+            clone.close()
+        (tmp_path / "consumer-0.json").touch()
+        with pytest.raises(RuntimeError, match="writable consumer"):
+            history.snapshot_seed(bank, tmp_path, identity, 4096)
         dst = cache()
         out = history.restore_history(dst, runner(0), tmp_path)
         assert out["host_rows"] == {"full": 2, "mamba": 1}
