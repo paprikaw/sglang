@@ -63,10 +63,14 @@ def prepare(run, prior, nodes, overlay, port):
     key.write_text(secrets.token_urlsafe(32))
     key.chmod(0o600)
     cache = spec["model_cache"]
+    # Two PP2 replicas each allocate two 32-GiB rank caches, including
+    # transient old/new pools; allow 128 GiB for CPU weight offload. The
+    # 122B official host pool, rounded to 32-MiB chunks, is <120 GiB.
+    # 512 GiB covers these allocations; Guard adds its separate 32-GiB margin.
     cache.update(
         usage_logs={n: [] for n in nodes},
         node_specs={},
-        hicache_reserve_bytes_per_node={nodes[0]: 160 * GIB, nodes[1]: 528 * GIB},
+        hicache_reserve_bytes_per_node={nodes[0]: 160 * GIB, nodes[1]: 512 * GIB},
         cpu_memory_budget=dict(
             schema_version=1, kv_banks_per_node={n: [] for n in nodes}
         ),

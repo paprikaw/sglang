@@ -138,6 +138,27 @@ def iter_stage_weights(model_config, model, load_config, parallel):
         name = source.name
         base, header = read_header(source)
         index, views = stage_index(header, base, start, end)
+        profiler = getattr(model, "_elastic_pp_weight_profiler", None)
+        if profiler is not None:
+            # Elastic PP compares whole-checkpoint metadata between ranks even
+            # for a static replica. Only the locally consumed values use H2D.
+            from sglang.srt.elastic_pp.weight_profile import WeightTensorMetadata
+            from sglang.srt.layers.utils import get_layer_id
+
+            local_names = {row[0] for row in views}
+            _, full = stage_index(header, base, 0, model.config.num_hidden_layers)
+            for key, _, _, size, dtype, shape in full:
+                if key not in local_names:
+                    profiler.record_checkpoint_metadata(
+                        WeightTensorMetadata(
+                            key,
+                            tuple(shape),
+                            f"torch.{dtype}",
+                            size,
+                            get_layer_id(key),
+                            "checkpoint",
+                        )
+                    )
         if not index:
             continue
         # The resident store and this worker must see the same sealed memfd.
