@@ -319,3 +319,28 @@ def test_install_expert_owns_packed_storage(monkeypatch, tmp_path):
             weights.install_expert(layer, NS(packed_shapes=expected_shapes), tmp_path)
     finally:
         weights._active_prepared_weights.reset(token)
+
+
+def test_raw_weight_retirement_keeps_store_event_loop_responsive():
+    import asyncio
+    import threading
+    from replica_startup import unload_store_weights
+
+    async def probe():
+        loop = asyncio.get_running_loop()
+        retired = []
+
+        def unload(name):
+            serviced = threading.Event()
+            loop.call_soon_threadsafe(serviced.set)
+            assert serviced.wait(2)
+            retired.append(name)
+            return name != "missing"
+
+        client = NS(unload_from_cpu=unload)
+        await unload_store_weights(client, ["stage0", "stage1"])
+        with pytest.raises(RuntimeError, match="missing"):
+            await unload_store_weights(client, ["missing", "unused"])
+        assert retired == ["stage0", "stage1", "missing"]
+
+    asyncio.run(probe())

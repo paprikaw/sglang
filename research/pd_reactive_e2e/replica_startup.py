@@ -24,6 +24,15 @@ HERE = Path(__file__).resolve()
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
 
+async def unload_store_weights(client, names):
+    import asyncio
+
+    # The gRPC server receiving these blocking client calls uses this event loop.
+    for name in names:
+        if await asyncio.to_thread(client.unload_from_cpu, name) is False:
+            raise RuntimeError(f"Could not retire raw Store weights: {name}")
+
+
 def store_service(run, config):
     import asyncio
     import grpc
@@ -116,12 +125,7 @@ def store_service(run, config):
                         # No raw consumer remains. Reuse the same pinned region
                         # and the same native Store server in both measurements.
                         started = time.monotonic()
-                        client = SllmStoreClient()
-                        for name in manifest["parts"]:
-                            if client.unload_from_cpu(name) is False:
-                                raise RuntimeError(
-                                    f"Could not retire raw Store weights: {name}"
-                                )
+                        await unload_store_weights(SllmStoreClient(), manifest["parts"])
                         preparation = run / "replica-preparation"
                         key = preparation_key(preparation, bank["group_key"])
                         parts = register_stage_files(root, preparation, key)
