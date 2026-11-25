@@ -122,6 +122,8 @@ def test_empty_startup_keeps_endpoints_alive_and_restores_on_error(fail):
     transport = object.__new__(ElasticPPKVTransport)
     endpoint, receiver = object(), NS(generation=None)
     transport._nixl_endpoint, transport._nixl_receiver = endpoint, receiver
+    transport._content_audit = object()
+    audit = transport._content_audit
     transport._live_patch = None
     try:
         with transport.empty_startup_transport():
@@ -132,6 +134,7 @@ def test_empty_startup_keeps_endpoints_alive_and_restores_on_error(fail):
         assert fail
     assert transport._nixl_endpoint is endpoint
     assert transport._nixl_receiver is receiver
+    assert transport._content_audit is audit
     assert receiver.generation is None
 
 
@@ -141,6 +144,7 @@ def test_startup_cannot_suspend_a_serving_nixl_generation():
     transport = object.__new__(ElasticPPKVTransport)
     transport._nixl_endpoint = object()
     transport._nixl_receiver = NS(generation=1)
+    transport._content_audit = None
     transport._live_patch = None
     with pytest.raises(RuntimeError, match="live NIXL"):
         with transport.empty_startup_transport():

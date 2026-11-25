@@ -2,6 +2,8 @@
 
 ## 122B PP2 Decode replica startup with official SllmStore
 
+- [ ] Fixed PP2 standby on A100. Prestart both Decode workers, attach historical HiCache and capture B1/B2/B4 Graphs. Evict all stage weight pages, then activate both stages using the prepared Store. The paired fresh-process control uses identical CPU cache history, weight format and real P→D output checks. 59 CPU regressions passed. GPU qualification and resource/timing measurements pending.
+
 - [x] Prepared fixed PP2 replica, two A100 nodes, r6. Plain and prepared official SllmStore took 101.23 s and 59.39 s to the first Decode token. Both ranks restored 4,608 KV tokens and one GDN checkpoint on the first handoff, replayed the graph and matched the donor output. Divergent suffix and donor revisit passed. Pretrigger phases totaled 220.45 s. Guard passed and released both nodes. [Paired startup and phase costs](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/runs/sllmstore_pp2_shared_history_20261125_r6_111_069/REPORT.md). Cross-node CPU synchronization remains open.
 
 - A100 preparation reached both resident endpoints and a warm 136-GiB Store in the first admitted attempt. The worker CLI rejected the new raw-control name before either new replica was timed. The rejected run is retained; both control names have been checked through the normal CLI.

@@ -40,7 +40,7 @@ def _storage_key(tensor):
     return (str(tensor.device), storage.data_ptr(), storage.nbytes())
 
 
-def weight_storage_plan(layer, *, device_type="cuda"):
+def weight_storage_plan(layer, *, device_type="cuda", exclude_storage_keys=()):
     """Pack parameter storages and find all their views before rebinding anything.
 
     Non-persistent shared position/rotary caches are not layer weights. Persistent
@@ -60,7 +60,9 @@ def weight_storage_plan(layer, *, device_type="cuda"):
             continue
         if tensor.layout != torch.strided:
             raise ValueError("evictable weights require strided tensors")
-        groups.setdefault(_storage_key(tensor), {"source": tensor, "views": []})
+        key = _storage_key(tensor)
+        if key not in exclude_storage_keys:
+            groups.setdefault(key, {"source": tensor, "views": []})
     offset = 0
     for key, group in groups.items():
         offset = (offset + 255) // 256 * 256
@@ -114,7 +116,7 @@ def copy_and_rebind_weight_storages(groups, storage):
 
 
 class LayerWeightBacking:
-    def __init__(self, layer, device_id, *, previous_storage_keys=()):
+    def __init__(self, layer, device_id, *, previous_storage_keys=(), exclude_storage_keys=()):
         from sglang.srt.cuda_vmm_utils import (
             VmmReservation,
             get_allocation_granularity,
@@ -122,7 +124,7 @@ class LayerWeightBacking:
             tensor_from_pointer,
         )
 
-        groups, used = weight_storage_plan(layer)
+        groups, used = weight_storage_plan(layer, exclude_storage_keys=exclude_storage_keys)
         if set(groups).intersection(previous_storage_keys):
             raise ValueError(
                 "cross-layer shared weights cannot be evicted independently"

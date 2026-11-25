@@ -351,13 +351,38 @@ def worker(run,root,sid):
         thread.start();children.append(dict(process=proc,identity=identity,log_thread=thread))
         save(directory/'identity.json',identity);save(directory/'lifecycle.json',lifecycle)
         deadline=time.monotonic()+1200
+        standby_dir = cfg['launch_env'].get('SGLANG_REPLICA_STANDBY_DIR')
+        standby_root = Path(standby_dir) if standby_dir else None
         while not stop.wait(.5):
             if proc.poll() is not None:raise RuntimeError('engine exited before readiness')
+            if time.monotonic()>deadline:raise TimeoutError('engine ready deadline')
+            if standby_root:
+                if 'standby' not in lifecycle:
+                    paths = [standby_root / f'parked-{rank}.json' for rank in (0, 1)]
+                    if not all(path.is_file() for path in paths):
+                        continue
+                    ranks = [json.loads(path.read_text()) for path in paths]
+                    if ([r['rank'] for r in ranks] != [0, 1] or
+                            len({r['pid'] for r in ranks}) != 2 or
+                            len({r['ticket'] for r in ranks}) != 2 or
+                            ranks[0]['key'] != ranks[1]['key'] or
+                            any(r['weight_mapped_bytes'] != 0 for r in ranks)):
+                        raise RuntimeError('Inconsistent parked PP2 worker identities')
+                    # Static frontend metadata is available while both schedulers wait.
+                    try:
+                        h.http_json(cfg['port'], '/model_info', h.read_key(cfg), timeout=2)
+                    except Exception:
+                        continue
+                    lifecycle['standby'] = time.time()
+                    save(directory/'lifecycle.json', lifecycle)
+                    save(directory/'standby.json', dict(unix=lifecycle['standby'], ranks=ranks))
+                if not all((standby_root / f'restored-{i}.json').is_file() for i in (0, 1)):
+                    continue
             try:
                 h.http_json(cfg['port'],'/get_server_info',h.read_key(cfg),timeout=2)
                 break
             except Exception:
-                if time.monotonic()>deadline:raise TimeoutError('engine ready deadline')
+                continue
         if stop.is_set():raise InterruptedError('stopped before readiness')
         lifecycle['ready']=time.time();save(directory/'lifecycle.json',lifecycle)
         save(directory/'ready.json',dict(passed=True,unix=time.time()))
@@ -671,7 +696,7 @@ if __name__=='__main__':
     p.add_argument('--probe-batch-numerics',action='store_true')
     p.add_argument('--marlin-canonical-k',action='store_true')
     p.add_argument('--worker',action='store_true');p.add_argument('--engine',action='store_true');p.add_argument('--client',action='store_true');p.add_argument('--reuse-probe',action='store_true')
-    p.add_argument('--server',choices=['p','d0','d1','d_cpu','d_raw','d_store']);a=p.parse_args()
+    p.add_argument('--server',choices=['p','d0','d1','d_cpu','d_raw','d_store','d_fresh']);a=p.parse_args()
     if a.reuse_probe:
         packet=json.loads(sys.stdin.readline());os.environ.update(packet['environment'])
         os.environ['CUDA_VISIBLE_DEVICES']='1'

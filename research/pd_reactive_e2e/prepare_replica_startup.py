@@ -35,7 +35,9 @@ def prepared_host_reservation():
     )
 
 
-def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
+def prepare(run, prior, nodes, overlay, port, prepared_replica=False, standby_replica=False):
+    if standby_replica and not prepared_replica:
+        raise ValueError("A standby replica requires prepared SllmStore weights and HiCache")
     nodes = list(nodes)
     if len(set(nodes)) != 2:
         raise ValueError("Expected different Prefill and Decode nodes")
@@ -80,6 +82,9 @@ def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
     prep = run / "replica-preparation"
     if prepared_replica:
         prep.mkdir(mode=0o700)
+    standby_dir = run / "replica-standby"
+    if standby_replica:
+        standby_dir.mkdir(mode=0o700)
     key = run / "admin.key"
     key.write_text(secrets.token_urlsafe(32))
     key.chmod(0o600)
@@ -89,6 +94,10 @@ def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
     # 122B official host pool, rounded to 32-MiB chunks, is <120 GiB.
     # Guard adds its own headroom and the canonical weight reservation.
     prepared_budget = prepared_host_reservation()
+    if standby_replica:
+        # One donor and one target HiCache; the frozen prefix and processed
+        # dense tensors fit well below the already admitted export-phase peak.
+        prepared_budget["phase_gib"]["standby_seed_and_dense"] = 2 * 64 + 1 + 2 * 8
     cache.update(
         usage_logs={n: [] for n in nodes},
         node_specs={},
@@ -113,7 +122,7 @@ def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
     for sid, source, node, port_offset in [
         ("p", "p", nodes[0], 1),
         ("d0", "d0", nodes[1], 11),
-        ("d_raw" if prepared_replica else "d_cpu", "d1", nodes[1], 21),
+        ("d_fresh" if standby_replica else ("d_raw" if prepared_replica else "d_cpu"), "d1", nodes[1], 21),
         ("d_store", "d1", nodes[1], 31),
     ]:
         cfg = copy.deepcopy(originals[source])
@@ -138,9 +147,9 @@ def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
         if sid != "p":
             cfg["launch_env"]["KVCACHED_IPC_NAME"] = run.name + "-" + sid
             cfg["launch_env"]["SGLANG_PP2_STARTUP_PROBE"] = "1"
-        if sid in ("d_store", "d_raw"):
+        if sid in ("d_store", "d_raw", "d_fresh"):
             cfg["sllmstore_root"] = "/tmp/" + run.name + "-weights"
-        if prepared_replica and sid in ("d0", "d_store"):
+        if prepared_replica and sid in ("d0", "d_store", "d_fresh"):
             cfg["launch_env"].update(
                 SGLANG_REPLICA_ENGINE_COMMIT=rev,
                 SGLANG_REPLICA_MARLIN_SHA256=q.describe(
@@ -154,6 +163,9 @@ def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
                 else "SGLANG_REPLICA_PREPARED_DIR"
             )
             cfg["launch_env"][name] = str(prep)
+            if standby_replica and sid == "d_store":
+                cfg["launch_env"].update(SGLANG_REPLICA_PREPARED_DIR=str(standby_dir),
+                                         SGLANG_REPLICA_STANDBY_DIR=str(standby_dir))
         use = dict(
             id=run.name + "." + sid,
             path=str(run / "cache" / (sid + ".log")),
@@ -183,10 +195,12 @@ def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
         engine_root=str(ENGINE),
         engine_commit=rev,
         prepared_replica=prepared_replica,
+        standby_replica=standby_replica,
         prepared_cpu_budget=prepared_budget if prepared_replica else None,
         store_reserve_bytes=(136 if prepared_replica else 128) * GIB,
         spare_hicache_reserve_bytes=64 * GIB if prepared_replica else 0,
-        scope="two fresh fixed PP2 starts, one measured request each",
+        scope=("prepared fresh process vs nonresident standby PP2, one real request each"
+               if standby_replica else "two fresh fixed PP2 starts, one measured request each"),
     )
     # Native status polling, Graph B1/B2/B4, 32-GiB-per-replica HiCache flags
     # and the existing D process are identical for both arms.
@@ -199,7 +213,7 @@ def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
         tasks=[
             dict(
                 id="comparison",
-                label="Two fresh PP2 startups",
+                label="Prepared PP2 activation" if standby_replica else "Two fresh PP2 startups",
                 expected=1,
                 root=str(run / "task"),
                 nodes=nodes,
@@ -237,6 +251,8 @@ def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
             ]
         )
     native = overlay / "sllm_store"
+    if standby_replica:
+        frozen.append(ENGINE / "python/sglang/srt/elastic_pp/replica_standby.py")
     frozen.extend(
         p for p in native.rglob("*") if p.is_file() and p.suffix in (".py", ".so")
     )
@@ -310,6 +326,7 @@ if __name__ == "__main__":
     p.add_argument("--overlay", type=Path, required=True)
     p.add_argument("--port", type=int, default=30720)
     p.add_argument("--prepared-replica", action="store_true")
+    p.add_argument("--standby-replica", action="store_true")
     a = p.parse_args()
     prepare(
         a.run.resolve(),
@@ -318,4 +335,5 @@ if __name__ == "__main__":
         a.overlay.resolve(),
         a.port,
         a.prepared_replica,
+        a.standby_replica,
     )

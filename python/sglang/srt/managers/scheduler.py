@@ -5434,8 +5434,15 @@ def run_scheduler_process(
             dp_rank,
         )
 
-        # Send initialization info back to the parent process
+        standby = getattr(scheduler.tp_worker.model_runner, "_replica_standby", None)
+        if os.environ.get("SGLANG_REPLICA_STANDBY_DIR") and standby is None:
+            raise RuntimeError("Requested replica standby was not initialized")
+        if standby is not None:
+            standby.park()
+        # The front end may initialize while its unrouted workers are parked.
         pipe_writer.send(scheduler.get_init_info())
+        if standby is not None:
+            standby.wait_and_restore()
 
         # Run the event loop (blocks until a ShutdownReq sets gracefully_exit)
         scheduler.run_event_loop()

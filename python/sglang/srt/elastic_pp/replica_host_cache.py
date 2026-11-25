@@ -92,6 +92,51 @@ def connect(mr, root, pin):
     return SharedHostBank.attach(spare["descriptor"], pin_memory=pin)
 
 
+def seed_views(bank, rows):
+    """Only committed prefix rows are needed to seed another writable generation."""
+    if set(rows) != {"full", "mamba"} or any(
+        not 0 < rows[kind] <= bank.schema["capacities"][kind] for kind in rows
+    ):
+        raise ValueError("Replica snapshot has invalid host row counts")
+    views = {}
+    for name, region in bank.regions.items():
+        if name == "full.kv":
+            views[name] = region.tensor[:, :rows["full"]]
+        elif name.startswith("mamba."):
+            views[name] = region.tensor[:rows["mamba"]]
+        else:
+            raise ValueError(f"Unknown host cache region {name}")
+    return views
+
+
+def snapshot_seed(bank, root, key, byte_cap):
+    if any((root / f"consumer-{rank}.json").exists() for rank in (0, 1)):
+        raise RuntimeError("Cannot snapshot a bank after it gained a writable consumer")
+    history = [read_packet(root, f"history-{i}.json", key) for i in (0, 1)]
+    if (history[0]["rows"] != history[1]["rows"] or
+            history[0]["nodes"] != history[1]["nodes"]):
+        raise ValueError("Stage prefix metadata must agree before cloning a seed")
+    views = seed_views(bank, history[0]["rows"])
+    size = sum(t.numel()*t.element_size() for t in views.values())
+    if size != sum(h["bytes"] for h in history) or size > byte_cap:
+        raise ValueError("Seed byte coverage or admitted CPU size differs")
+    return history, {k: t.clone() for k,t in views.items()}
+
+
+def new_seeded_spare(source, target, key, cap, history, seed):
+    publish(target / "source-schema.json", read_packet(source, "source-schema.json", key))
+    bank = prepare_spare(target, key, cap)
+    try:
+        for name, dest in seed_views(bank, history[0]["rows"]).items():
+            dest.copy_(seed[name])
+        for rank, record in enumerate(history):
+            publish(target / f"history-{rank}.json", record)
+    except BaseException:
+        bank.close()
+        raise
+    return bank
+
+
 def initialize_cache(cache, params, ctx, server_args):
     root = Path(os.environ["SGLANG_REPLICA_PREPARED_DIR"])
     mr = ctx.tp_worker.model_runner

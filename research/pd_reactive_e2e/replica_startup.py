@@ -106,7 +106,9 @@ def store_service(run, config):
                         time.sleep(0.08)
 
         async def serve():
-            from sglang.srt.elastic_pp.replica_host_cache import prepare_spare
+            from sglang.srt.elastic_pp.replica_host_cache import (
+                new_seeded_spare, prepare_spare, snapshot_seed,
+            )
             from sglang.srt.weight_cache.replica_preparation import (
                 prepare_dense_files,
                 preparation_key,
@@ -122,7 +124,7 @@ def store_service(run, config):
             if rpc.add_insecure_port("127.0.0.1:8073") != 8073:
                 raise RuntimeError("SllmStore loopback listener unavailable")
             await rpc.start()
-            spare, fds = None, []
+            spare, seed, fds = None, None, []
             try:
                 started = time.monotonic()
                 await asyncio.to_thread(prewarm, manifest["parts"])
@@ -167,6 +169,21 @@ def store_service(run, config):
                                 preparation_s=time.monotonic() - started,
                             ),
                         )
+                    if (config.get("standby_replica") and seed is None
+                            and (run / "freeze-prefix").is_file()):
+                        history, seed = snapshot_seed(spare, preparation, key, 1 << 30)
+                        h.save(run / "prefix_frozen.json", dict(
+                            seed_bytes=sum(t.numel()*t.element_size() for t in seed.values())))
+                    if (seed and (run / "replace-spare").is_file()
+                            and not (run / "standby_spare_ready.json").exists()):
+                        retired = json.loads((run / "servers/d_fresh/cleanup.json").read_text())
+                        if not retired["cleanup_verified"]:
+                            raise RuntimeError("Previous writable consumer is still present")
+                        spare.close()
+                        spare = new_seeded_spare(preparation, run / "replica-standby", key,
+                            config["spare_hicache_reserve_bytes"], history, seed)
+                        seed.clear()
+                        h.save(run / "standby_spare_ready.json", dict(bytes=spare.bytes))
                     await asyncio.sleep(0.2)
             finally:
                 for fd in fds:
@@ -398,7 +415,7 @@ def donor_published(reply, root, kind):
 
 
 def qualify_history(run, servers, key, tokens, anchor, row):
-    target = servers["d_store"]
+    target = servers[row["method"]]
     log = Path(target["layouts"][0]["usage_logs"][0]["path"])
     deadline = time.monotonic() + 8
     while True:
@@ -409,7 +426,8 @@ def qualify_history(run, servers, key, tokens, anchor, row):
         time.sleep(0.1)
     row["first_request_historical_restore"] = events_by_rank
     h.save(
-        run / "first_request_history.json", dict(room=row["room"], ranks=events_by_rank)
+        run / ("first_request_history_fresh.json" if row["method"] == "d_fresh"
+               else "first_request_history.json"), dict(room=row["room"], ranks=events_by_rank)
     )
     if len(events_by_rank) != 2 or any(
         not any(
@@ -500,21 +518,21 @@ def measure(run, config):
             raise RuntimeError(f"Invalid remote artifact {path.name}")
         return json.loads(path.read_text())
 
-    def wait_ready(sid):
-        path = (
-            run / ("store_ready.json" if sid == "store" else "store_packed_ready.json")
-            if sid in ("store", "packed")
-            else run / "servers" / sid / "ready.json"
-        )
+    def wait_artifact(path):
         deadline = time.monotonic() + 600
         while not path.exists():
             if stopped.is_set() or time.monotonic() > deadline:
-                raise RuntimeError(f"Stopped or timed out waiting for {sid}")
+                raise RuntimeError(f"Stopped or timed out waiting for {path.name}")
             for name, proc in workers.items():
                 if proc.poll() is not None:
-                    raise RuntimeError(f"{name} exited before {sid} became ready")
+                    raise RuntimeError(f"{name} exited before {path.name}")
             time.sleep(0.10)
         return read_visible(path)
+
+    def wait_ready(sid):
+        if sid in ("store", "packed"):
+            return wait_artifact(run / ("store_ready.json" if sid == "store" else "store_packed_ready.json"))
+        return wait_artifact(run / "servers" / sid / "ready.json")
 
     def retire(sid):
         proc = workers.pop(sid)
@@ -549,11 +567,28 @@ def measure(run, config):
         tokens = [1000 + i % 123 for i in range(4608)]
         anchor = request(servers["p"], servers["d0"], key, tokens)
         anchor_hash = hashlib.sha256(json.dumps(anchor["output"]).encode()).hexdigest()
-        for sid in ("d_raw" if prepared else "d_cpu", "d_store"):
-            if prepared and sid == "d_store":
+        standby = config.get("standby_replica", False)
+        first = "d_fresh" if standby else ("d_raw" if prepared else "d_cpu")
+        for sid in (first, "d_store"):
+            if prepared and sid == ("d_fresh" if standby else "d_store"):
                 prepare_history(
                     run, servers, key, tokens, anchor, lambda: wait_ready("packed")
                 )
+                if standby:
+                    (run / "freeze-prefix").touch(exist_ok=False)
+                    wait_artifact(run / "prefix_frozen.json")
+            parked = None
+            if standby and sid == "d_store":
+                (run / "replace-spare").touch(exist_ok=False)
+                wait_artifact(run / "standby_spare_ready.json")
+                progress("prepare standby PP2 and physically offload both stages")
+                preparation_start = time.perf_counter()
+                spawn(sid)
+                parked = wait_artifact(run / "servers" / sid / "standby.json")["ranks"]
+                standby_setup_s = time.perf_counter() - preparation_start
+                activation = run / "replica-standby" / "controller.json"
+                h.save(activation, dict(key=parked[0]["key"],
+                                         tickets=[r["ticket"] for r in parked]))
             # The same P is warm, and the old D remains serving on the same GPUs.
             warm = request(servers["p"], servers["d0"], key, tokens)
             if warm["output"] != anchor["output"]:
@@ -561,7 +596,10 @@ def measure(run, config):
             progress("trigger " + sid)
             trigger_unix = time.time()
             start = time.perf_counter()
-            spawn(sid)
+            if parked:
+                os.link(activation, activation.with_name("activate.json"))
+            else:
+                spawn(sid)
             ready = wait_ready(sid)
             routable = time.perf_counter()
             result = request(servers["p"], servers[sid], key, tokens)
@@ -609,7 +647,21 @@ def measure(run, config):
                 raise RuntimeError(
                     f"Real output, two PP handoffs, or two Graph replays differ for {sid}"
                 )
-            if prepared and sid == "d_store":
+            if parked:
+                restored = [read_visible(run / "replica-standby" / f"restored-{i}.json")
+                            for i in (0,1)]
+                for i, (before, after) in enumerate(zip(parked, restored)):
+                    if (before["rank"] != i or after["rank"] != i or before["pid"] != after["pid"]
+                            or before["key"] != after["key"] or before["ticket"] != after["ticket"]
+                            or before["weight_mapped_bytes"] != 0
+                            or after["mapped_weight_bytes"] != before["evicted_bytes"]
+                            or after["expert_store_bytes"] + after["dense_h2d_bytes"] != before["weight_bytes"]
+                            or before["graph_objects"] != after["graph_objects"]
+                            or before["graph_batches"] != after["graph_batches"]
+                            or before["host_bytes"] != after["host_bytes"]):
+                        raise RuntimeError("Incomplete paired standby activation evidence")
+                row.update(standby_setup_s=standby_setup_s, parked=parked, restored=restored)
+            if prepared and (sid == "d_store" or standby):
                 qualify_history(run, servers, key, tokens, anchor, row)
                 h.save(run / "measurements.json", reports)
             retire(sid)
