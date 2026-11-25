@@ -385,6 +385,9 @@ def test_hybrid_transport_uses_request_slots_not_token_slots(
         for rank in range(2)
     ]
     source_state = pools[0].mamba_pool.mamba_cache
+    for pool in pools:
+        pool.req_to_token_pool.mamba_allocator.alloc(2)
+    live_recurrent = torch.tensor([0, 1, 2])
     source_state.temporal[1].copy_(torch.arange(5 * 18).reshape(5, 2, 3, 3))
     source_state.conv[0][1].fill_(23)
     token_slots = torch.tensor([6, 7])  # Outside the five recurrent slots.
@@ -412,6 +415,14 @@ def test_hybrid_transport_uses_request_slots_not_token_slots(
     for phase, slots in (("bulk", token_slots), ("delta", token_slots[:0])):
         for transport in transports:
             transport.exchange_phase(transition, phase=phase, slot_ids=slots)
+            if phase == "bulk" and transport.rank == 0:
+                state_chunks = [
+                    p["__elastic_pp_recurrent_slots__"]
+                    for p in mailbox.payloads[(0, 1)]
+                    if "__elastic_pp_recurrent_slots__" in p
+                ]
+                assert state_chunks
+                assert set(torch.cat(state_chunks).tolist()) == {0, 1, 2}
     assert pools[1].req_to_token_pool.mamba_map == {}
     assert not pools[1].elastic_pp_kv_ready(generation=1)
     for transport in transports:
@@ -419,10 +430,12 @@ def test_hybrid_transport_uses_request_slots_not_token_slots(
     pools[1].commit_elastic_pp_kv_layers(generation=1)
     assert pools[1].req_to_token_pool.mamba_map == {2: 0}
     assert torch.equal(
-        pools[1].mamba_pool.mamba_cache.temporal[0], source_state.temporal[1]
+        pools[1].mamba_pool.mamba_cache.temporal[0][live_recurrent],
+        source_state.temporal[1][live_recurrent],
     )
     assert torch.equal(
-        pools[1].mamba_pool.mamba_cache.conv[0][0], source_state.conv[0][1]
+        pools[1].mamba_pool.mamba_cache.conv[0][0][live_recurrent],
+        source_state.conv[0][1][live_recurrent],
     )
     for layer_id in (1, 3):
         if (

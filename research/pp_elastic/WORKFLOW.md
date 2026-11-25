@@ -8,6 +8,8 @@
 
 **二期集成。** [任务PR #4](https://github.com/paprikaw/sglang/pull/4)于2026-11-11以`69dc304d8072`合入项目，项目整棵树与通过992项CPU检查的`4d7638b01ac2`一致。当前native／HiCache／NIXL在线KV迁移与启动预捕获已有有限A100验证；[总PR #5](https://github.com/paprikaw/sglang/pull/5)负责合回`codex/pp-elastic-integration`，其GitHub合并记录是共同基线状态的依据。本轮直接实施和审查，没有新增独立reviewer；全仓CI欠账及未测组合见[审查记录](REVIEW_20261111.md)。下一阶段仍从共同集成分支派生任务分支，不回到旧的脏autoscaling工作区。
 
+**当前集成入口（2026-11-13）。** 权重CPU缓存及低干扰交接的[PR #10](https://github.com/paprikaw/sglang/pull/10)已合入项目`8570a9153a76`；[总PR #12](https://github.com/paprikaw/sglang/pull/12)指向共同基线。共享CPU池[PR #11](https://github.com/paprikaw/sglang/pull/11)以项目为基点，1206项CPU与有界同源A100对照通过，但尚未合入项目，独立审查及未测范围在清单中保留。两PR维持Draft，不把任务分支的结果当作总PR已经包含的代码。
+
 **子任务。** 需要并行时，每位 agent 从明确的项目提交建立独立的 `codex/` 任务分支和 worktree，并向项目分支开一个 Draft PR。按可独立检查的任务划分 PR，而不是每个 commit 都开 PR。依赖其他子任务时写清依赖链接和起始 SHA；优先等依赖合入项目分支后再开展，确需堆叠时明确标注。主 agent 在总 PR 里用列表维护任务、负责人、子 PR、依赖、已合入状态和测试结果。
 
 **提交频率。** 完成一个可检查的修改点、开始长实验前、交接或结束工作前，均提交并推送。持续实现时尽量每 30–60 分钟形成一次有意义的检查点；未完成内容如实标注，PR 保持 Draft。一次 PR 可以持续增加提交。只提交本任务文件，不把历史脏工作区、其他人的修改、权重、密钥和大量结果一并加入。

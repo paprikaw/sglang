@@ -171,7 +171,11 @@ def prepare_layer(layer, config, native_prepare, torch_module, check_support):
     # Existing helper: E,Nblocks,Kgroups -> E,Kgroups,Nblocks, repeat each
     # output block 128 times, native Marlin scale permutation + exponent-bias
     # fusion. scale_inv already multiplies dequantized FP8: do not reciprocate.
-    native_prepare(_LocalExpertsView(layer, geometry.local_experts), size_k_first=False)
+    if os.environ.get("SGLANG_REPLICA_PREPARED_DIR"):
+        from sglang.srt.weight_cache.replica_preparation import install_expert
+        install_expert(layer, geometry, Path(os.environ["SGLANG_SLLMSTORE_STAGE_ROOT"]))
+    else:
+        native_prepare(_LocalExpertsView(layer, geometry.local_experts), size_k_first=False)
     validate_shapes(layer, geometry.packed_shapes)
     layer._qwen_a100_fp8_marlin_prepared = True
     layer._qwen_a100_fp8_marlin_geometry = geometry

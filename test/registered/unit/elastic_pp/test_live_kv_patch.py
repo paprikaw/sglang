@@ -7,13 +7,20 @@ from sglang.srt.elastic_pp.kv_transport import ElasticPPKVTransport
 from sglang.srt.elastic_pp.live_kv_patch import LiveKVSnapshot
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+from sglang.srt.mem_cache.kvcached_pool import KVCacheDTokenToKVPoolAllocator
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
-def fixture(*, size=4, max_rows=2, need_sort=False):
-    allocator = TokenToKVPoolAllocator(size, torch.float32, "cpu", object(), need_sort)
+def fixture(*, size=4, max_rows=2, need_sort=False, backend="native"):
+    if backend == "kvcached":
+        pool = SimpleNamespace(kvcached_allocator=SimpleNamespace(clear=lambda: None),
+            attach_logical_allocator=lambda allocator: None)
+        allocator = KVCacheDTokenToKVPoolAllocator(size, torch.float32, "cpu", pool, need_sort)
+        allocator.set_serving_capacity(size, initialize=True)
+    else:
+        allocator = TokenToKVPoolAllocator(size, torch.float32, "cpu", object(), need_sort)
     source = {
         7: (
             torch.arange((size + 1) * 2).view(size + 1, 2).float(),
@@ -33,6 +40,26 @@ def fixture(*, size=4, max_rows=2, need_sort=False):
 
 def ready():
     return SimpleNamespace(synchronize=lambda: None)
+
+
+def test_retire_only_incarnations_acknowledged_by_target():
+    allocator, source, slots, patch = fixture(size=4, max_rows=1)
+    retired = []
+    patch.copier.forget = lambda slot, epoch: retired.append((slot, epoch))
+    unpublished = allocator.alloc(1)
+    allocator.free(unpublished)
+    assert retired == []
+    patch.progress(slots, ready())
+    # Rewriting a published but never submitted row also needs no invalidation.
+    patch.prepare_writes(slots[1:])
+    assert retired == []
+    # A pinned free must first finish its copy, then retire that incarnation.
+    allocator.free(slots[:1])
+    assert retired == [(int(slots[0]), 1)]
+    again = allocator.alloc(1)
+    allocator.free(again)
+    assert retired == [(int(slots[0]), 1)]
+    patch.abort()
 
 
 def test_real_allocator_online_snapshot_and_fence_include_unpublished_loadback():
@@ -57,8 +84,9 @@ def test_real_allocator_online_snapshot_and_fence_include_unpublished_loadback()
 
 
 @pytest.mark.parametrize("need_sort", [False, True])
-def test_free_waits_for_snapshot_then_reused_slot_gets_a_new_epoch(need_sort):
-    allocator, source, slots, patch = fixture(size=2, need_sort=need_sort)
+@pytest.mark.parametrize("backend", ["native", "kvcached"])
+def test_free_waits_for_snapshot_then_reused_slot_gets_a_new_epoch(need_sort, backend):
+    allocator, source, slots, patch = fixture(size=2, need_sort=need_sort, backend=backend)
     patch.progress(slots, ready())
     allocator.free(slots[:1])
     assert patch.free_waits == 1
@@ -71,8 +99,9 @@ def test_free_waits_for_snapshot_then_reused_slot_gets_a_new_epoch(need_sort):
     assert patch.export(7, again)[0].tolist() == [[123, 123]]
 
 
-def test_grouped_frees_pin_until_the_actual_allocator_release():
-    allocator, source, slots, patch = fixture(size=2)
+@pytest.mark.parametrize("backend", ["native", "kvcached"])
+def test_grouped_frees_pin_until_the_actual_allocator_release(backend):
+    allocator, source, slots, patch = fixture(size=2, backend=backend)
     patch.progress(slots, ready())
     allocator.free_group_begin()
     allocator.free(slots[:1])
@@ -92,6 +121,69 @@ def test_abort_drains_pending_copy_and_preserves_serving_allocator():
     allocator.free(slots)
     allocator.clear()
     assert allocator.available_size() == allocator.size
+
+
+def test_idle_base_catches_up_online_without_publishing_later_loadback():
+    allocator, source, slots, patch = fixture(size=128, max_rows=4)
+    allocator.alloc(62)
+    patch.seed_initial_base()
+    patch.start_initial_base(ready())
+    later = allocator.alloc(1)
+    # Polling an idle pipeline must progress the base without a fake forward.
+    for _ in range(18):
+        patch.poll_online()
+    assert patch.forward_checkpoints == 0
+    assert patch.online_completed_rows == 64
+    assert patch.unacknowledged_rows == 1
+    assert later.item() not in patch.published
+    patch.finish_at_fence(allocator.elastic_pp_live_slots(), ready())
+    assert patch.metrics()['fence']['rows_copied_at_fence'] == 1
+
+
+def test_preparation_wait_reads_counters_while_scheduler_advances_base():
+    import threading
+
+    allocator, source, slots, patch = fixture(size=128, max_rows=4)
+    allocator.alloc(62)
+    patch.seed_initial_base()
+    patch.start_initial_base(ready())
+    transport = ElasticPPKVTransport.__new__(ElasticPPKVTransport)
+    transport._live_patch = patch
+    transport._live_patch_error = None
+    errors = []
+    done = threading.Event()
+
+    def wait():
+        try:
+            transport.wait_initial_live_base(timeout=1)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=wait)
+    worker.start()
+    assert not done.wait(.005)
+    for _ in range(18):
+        patch.poll_online()
+    worker.join(1)
+    assert done.is_set() and not errors
+    patch.finish_at_fence(allocator.elastic_pp_live_slots(), ready())
+    assert patch.metrics()['fence']['rows_copied_at_fence'] == 0
+
+
+def test_online_base_timeout_leaves_source_unfenced():
+    allocator, source, slots, patch = fixture(size=32, max_rows=2)
+    allocator.alloc(10)
+    patch.seed_initial_base()
+    patch.start_initial_base(ready())
+    transport = ElasticPPKVTransport.__new__(ElasticPPKVTransport)
+    transport._live_patch = patch
+    transport._live_patch_error = None
+    with pytest.raises(TimeoutError, match='catch up'):
+        transport.wait_initial_live_base(timeout=0)
+    assert patch.active and patch.session.phase == 'copying'
+    patch.abort()
 
 
 def test_copy_failure_aborts_only_patch_and_rejects_transition(monkeypatch):

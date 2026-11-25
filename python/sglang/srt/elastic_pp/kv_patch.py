@@ -11,11 +11,11 @@ from __future__ import annotations
 
 import threading
 from contextlib import nullcontext
-from dataclasses import dataclass
+from itertools import islice
+from typing import NamedTuple
 
 
-@dataclass(frozen=True)
-class KVRowStamp:
+class KVRowStamp(NamedTuple):
     slot: int
     incarnation: int
     ready: object
@@ -35,6 +35,7 @@ class ContinuousKVPatch:
         self.max_rows = max_rows
         self._epochs = {}
         self._live = {}
+        self._dirty = {}
         self._acked = {}
         self._pending = None
         self._pinned = set()
@@ -46,6 +47,12 @@ class ContinuousKVPatch:
     def phase(self):
         with self._lock:
             return self._phase
+
+    @property
+    def unacknowledged_rows(self):
+        """Include unpublished/new incarnations; do not inspect GPU state."""
+        with self._lock:
+            return len(self._live) - len(self._acked)
 
     def _check(self, generation, *, mutable=False):
         if generation != self.generation:
@@ -65,6 +72,27 @@ class ContinuousKVPatch:
             self._live[slot] = KVRowStamp(slot, epoch, None)
             return epoch
 
+    def allocate_many(self, slots, *, generation):
+        """Register a scheduler-owned snapshot under one checked lock.
+
+        Validate the complete batch before changing any incarnation. Later
+        free/reuse and copying still use the same per-row stamps and pins.
+        """
+        slots = tuple(slots)
+        with self._lock:
+            self._check(generation, mutable=True)
+            if len(set(slots)) != len(slots) or any(
+                not 0 <= slot < self.capacity or slot in self._live for slot in slots
+            ):
+                raise ValueError("KV patch slot is outside capacity or already live")
+            epochs = {slot: self._epochs.get(slot, 0) + 1 for slot in slots}
+            rows = {
+                slot: KVRowStamp(slot, epoch, None) for slot, epoch in epochs.items()
+            }
+            self._epochs.update(epochs)
+            self._live.update(rows)
+            return epochs
+
     def publish(self, slot, incarnation, *, ready, generation):
         with self._lock:
             self._check(generation, mutable=True)
@@ -76,8 +104,29 @@ class ContinuousKVPatch:
                     "publish one completed immutable KV write per incarnation"
                 )
             self._live[slot] = KVRowStamp(slot, incarnation, ready)
+            self._dirty[slot] = self._live[slot]
+
+    def publish_many(self, versions, *, ready, generation):
+        """Publish one common ready event without a lock/check per row."""
+        with self._lock:
+            self._check(generation, mutable=True)
+            rows, seen = {}, set()
+            for slot, incarnation in versions:
+                row = self._live.get(slot)
+                if row is None or row.incarnation != incarnation:
+                    raise ValueError("stale KV row incarnation")
+                if ready is None or row.ready is not None or slot in seen:
+                    raise ValueError(
+                        "publish one completed immutable KV write per incarnation"
+                    )
+                seen.add(slot)
+                rows[slot] = KVRowStamp(slot, incarnation, ready)
+            # A malformed later entry must not publish an earlier valid row.
+            self._live.update(rows)
+            self._dirty.update(rows)
 
     def free(self, slot, incarnation, *, generation):
+        """Drop one incarnation; return whether the target had acknowledged it."""
         with self._lock:
             self._check(generation, mutable=True)
             row = self._live.get(slot)
@@ -86,34 +135,38 @@ class ContinuousKVPatch:
             if slot in self._pinned:
                 raise KVPatchBusy("KV row copy is in flight; defer free/reuse")
             del self._live[slot]
-            self._acked.pop(slot, None)
+            self._dirty.pop(slot, None)
+            return self._acked.pop(slot, None) == incarnation
 
     def dirty_rows(self):
         with self._lock:
-            return tuple(
-                row
-                for slot, row in sorted(self._live.items())
-                if row.ready is not None and self._acked.get(slot) != row.incarnation
-            )
+            return tuple(self._dirty[slot] for slot in sorted(self._dirty))
 
     def submit(self, *, generation):
         with self._lock:
             self._check(generation)
             if self._pending is not None:
                 raise KVPatchBusy("only one bounded KV copy round may be in flight")
-            rows = self.dirty_rows()[: self.max_rows]
-            if not rows:
-                return False
-            self._pinned.update(row.slot for row in rows)
-            try:
-                completion = self.copier.submit(rows)
-            except BaseException:
-                # Keep logical pins until abort drains partial GPU submissions.
-                self._phase = "failed"
-                raise
-            self._pending = (rows, completion)
-            self.rounds += 1
-            return True
+            # Preserve a ready frontier rather than sorting the full live KV
+            # set at every scheduler poll. Completion/free retires each entry.
+            return self._submit_rows(
+                tuple(islice(self._dirty.values(), self.max_rows))
+            )
+
+    def _submit_rows(self, rows):
+        # Called only with the session lock held and no outstanding copy.
+        if not rows:
+            return False
+        self._pinned.update(row.slot for row in rows)
+        try:
+            completion = self.copier.submit(rows)
+        except BaseException:
+            # Keep logical pins until abort drains partial GPU submissions.
+            self._phase = "failed"
+            raise
+        self._pending = (rows, completion)
+        self.rounds += 1
+        return True
 
     def poll(self, *, generation, wait=False):
         with self._lock:
@@ -133,6 +186,7 @@ class ContinuousKVPatch:
                 current = self._live.get(row.slot)
                 if current is not None and current.incarnation == row.incarnation:
                     self._acked[row.slot] = row.incarnation
+                    self._dirty.pop(row.slot, None)
             self.rows_copied += len(rows)
             self._pinned.clear()
             self._pending = None
@@ -148,13 +202,15 @@ class ContinuousKVPatch:
             if any(row.ready is None for row in self._live.values()):
                 raise RuntimeError("unpublished KV writes at the migration fence")
             self.poll(generation=generation, wait=True)
-            for _ in range(max_rounds):
-                if not self.dirty_rows():
-                    self._phase = "complete"
-                    return dict(rounds=self.rounds, rows_copied=self.rows_copied)
-                self.submit(generation=generation)
+            # Writers are fenced and the session lock excludes free/reuse.
+            # Snapshot remaining immutable incarnations once; rescanning and
+            # sorting the entire live set per 256-row copy is quadratic.
+            rows = self.dirty_rows()
+            limit = min(len(rows), max_rounds * self.max_rows)
+            for offset in range(0, limit, self.max_rows):
+                self._submit_rows(rows[offset:offset + self.max_rows])
                 self.poll(generation=generation, wait=True)
-            if not self.dirty_rows():
+            if limit == len(rows):
                 self._phase = "complete"
                 return dict(rounds=self.rounds, rows_copied=self.rows_copied)
             raise RuntimeError("KV patch did not converge within final round bound")

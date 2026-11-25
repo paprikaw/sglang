@@ -490,7 +490,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             swa_len + swa_reserved,
         )
 
-    def _init_kv_manager(self) -> CommonKVManager:
+    def _build_kv_args(self):
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
         kv_args = kv_args_class()
 
@@ -540,6 +540,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
+        full_pool = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
+        if getattr(full_pool, "capacity_managed", False):
+            kv_args.kv_registration_regions = full_pool.pd_registration_regions()
+            kv_args.kv_row_strides = [int(t.stride(0)) * t.element_size()
+                                      for t in full_pool.k_buffer + full_pool.v_buffer]
         kv_args.kv_layer_ids = (
             self.token_to_kv_pool.get_kv_layer_ids()
             if self.draft_token_to_kv_pool is None
@@ -564,6 +569,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         kv_args.ib_device = get_disagg().disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.ps.gpu_id
+        return kv_args
+
+    def _init_kv_manager(self) -> CommonKVManager:
+        kv_args = self._build_kv_args()
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
         kv_manager = kv_manager_class(
             kv_args,
@@ -1068,6 +1077,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if is_pp_mode and rids_to_check is not None:
             raise ValueError("rids_to_check cannot be used in PP mode")
 
+        from sglang.srt.elastic_pp.pd_capacity import (
+            clear_capacity_waiter,
+            prune_capacity_waiters,
+            record_capacity_waiter,
+        )
+
+        prune_capacity_waiters(self)
         self._resolve_pending_reqs()
         self._update_handshake_waiters(rids_to_check, pp_good_rids, pp_bad_rids)
         if is_pp_mode:
@@ -1081,7 +1097,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Otherwise it is possible for one request running decode out of memory, while all other requests are in the transfer queue that cannot be retracted.
         retractable_tokens = sum(
             len(r.origin_input_ids) + len(r.output_ids)
-            for r in self.scheduler.running_batch.reqs
+            for r in self._capacity_running_reqs()
         )
 
         uses_swa_tail_prealloc = self._uses_swa_tail_prealloc()
@@ -1157,6 +1173,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             if i in indices_to_remove:
                 continue
+
+            previous_wait = getattr(self, "_elastic_kv_waits", {}).get(decode_req.req.rid)
+            clear_capacity_waiter(self, decode_req.req.rid)
 
             if not decode_req.waiting_for_input:
                 continue
@@ -1248,19 +1267,21 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 required_alloc_tokens + self.num_reserved_decode_tokens
             )
 
-            if (
-                max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    - prefix_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
+            capacity_required = max(
+                required_tokens_for_request,
+                origin_input_len
+                - prefix_len
+                + min(decode_req.req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                - retractable_tokens,
+            )
+            if capacity_required > full_allocatable_tokens:
+                if previous_wait is not None:
+                    self._elastic_kv_waits[decode_req.req.rid] = previous_wait
+                record_capacity_waiter(
+                    self, decode_req.req.rid,
+                    required_tokens=capacity_required,
+                    available_tokens=full_allocatable_tokens,
                 )
-                > full_allocatable_tokens
-            ):
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self._release_matched_prefix_lock(decode_req.req)
                 break
@@ -1552,18 +1573,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
                     + len(x.origin_input_ids)
                     - retractable_tokens
-                    for x in self.scheduler.running_batch.reqs
+                    for x in self._capacity_running_reqs()
                 ]
             )
             if retractable_tokens is not None
-            and len(self.scheduler.running_batch.reqs) > 0
+            and len(self._capacity_running_reqs()) > 0
             else 0
         )
         return need_space_for_single_req
 
+    def _capacity_running_reqs(self):
+        from sglang.srt.elastic_pp.pd_capacity import capacity_running_reqs
+
+        return capacity_running_reqs(self.scheduler)
+
     def _active_req_count(self, extra_reserved_reqs: int = 0) -> int:
         return (
-            len(self.scheduler.running_batch.reqs)
+            len(self._capacity_running_reqs())
             + len(self.transfer_queue.queue)
             + len(self.scheduler.waiting_queue)
             + extra_reserved_reqs
@@ -2593,6 +2619,13 @@ class SchedulerDisaggregationDecodeMixin:
         curr_batch_size = running_batch.batch_size()
 
         batch_size = min(self.req_to_token_pool.size, self.max_running_requests)
+        if self.ps.pp_size > 1:
+            # This is one PP slot, not the whole instance. Keep new P/D
+            # requests queued for another slot when this microbatch is full.
+            # Native prebuilt merging must honor the same cap as Prefill.
+            microbatch_cap = get_parallel().pp_max_micro_batch_size
+            if microbatch_cap is not None:
+                batch_size = min(batch_size, microbatch_cap)
 
         num_not_used_batch = batch_size - curr_batch_size
 

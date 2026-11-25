@@ -189,7 +189,12 @@ def _create_unified_radix_cache(
         ctx.enable_hierarchical_cache
         or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
     ):
-        cache.init_hicache(server_args, params)
+        import os
+        if os.environ.get("SGLANG_REPLICA_PREPARED_DIR"):
+            from sglang.srt.elastic_pp.replica_host_cache import initialize_cache
+            initialize_cache(cache, params, ctx, server_args)
+        else:
+            cache.init_hicache(server_args, params)
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
         )

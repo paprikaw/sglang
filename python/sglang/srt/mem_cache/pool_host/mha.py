@@ -191,6 +191,10 @@ class MHATokenToKVPoolHost(HostKVCache):
             pin_memory=self.pin_memory,
             allocator=self.allocator,
         )
+        if self.layout == "page_first":
+            # A PP view spans only some layers of a full-model shared slab.
+            # Its token-row pitch still spans all physical layers in that slab.
+            self.layout_dim = buffer[0].stride(0) * buffer.element_size()
         return buffer
 
     def _init_write_back_staging_buffers(self):
@@ -198,6 +202,9 @@ class MHATokenToKVPoolHost(HostKVCache):
         self.staging_token_capacity = 0
         self.staging_k_buffer = None
         self.staging_v_buffer = None
+        if getattr(self.allocator, "shared_host_backing", False):
+            self.can_use_write_back_jit = False
+            return
         self.can_use_write_back_jit = False
         if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
             return
@@ -383,6 +390,21 @@ class MHATokenToKVPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
     ):
+        if getattr(device_pool, "capacity_managed", False):
+            if io_backend != "kernel" or self.layout != "page_first" or not self.can_use_jit:
+                raise ValueError("capacity-managed packed KV requires page_first JIT HiCache I/O")
+            for layer in range(device_pool.layer_num):
+                host_layer = self._host_layer_index(layer)
+                jit_transfer_hicache_one_layer(
+                    k_cache_dst=self.k_data_refs[host_layer],
+                    v_cache_dst=self.v_data_refs[host_layer],
+                    indices_dst=host_indices,
+                    k_cache_src=device_pool.k_buffer[layer],
+                    v_cache_src=device_pool.v_buffer[layer],
+                    indices_src=device_indices,
+                    element_dim=self.element_dim,
+                )
+            return
         if io_backend == "kernel_ascend":
             # NPU pools use contiguous multi-layer tensors and intentionally do
             # not build the CUDA-style k_data_ptrs/v_data_ptrs arrays.

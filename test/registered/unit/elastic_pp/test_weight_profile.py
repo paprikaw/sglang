@@ -34,6 +34,21 @@ def _consume(iterable):
     return list(iterable)
 
 
+def test_stage_local_values_and_remote_headers_match_full_checkpoint():
+    local = ("model.layers.0.weight", torch.zeros(2, dtype=torch.float16))
+    remote = [("model.layers.1.weight", torch.zeros(3, dtype=torch.float16)),
+              ("model.layers.2.weight", torch.zeros(4, dtype=torch.float16))]
+    full = FirstLoadWeightProfiler(3)
+    _consume(full.record_initial_stream([local, *remote]))
+    stage = FirstLoadWeightProfiler(3)
+    for name, value in remote:
+        stage.record_checkpoint_metadata(
+            WeightTensorMetadata.from_tensor(name, value, kind="checkpoint")
+        )
+    _consume(stage.record_initial_stream([local]))
+    assert stage.finalize(_ResidentModel()) == full.finalize(_ResidentModel())
+
+
 def test_first_stream_profiles_all_layers_and_calibrates_resident_bytes():
     profiler = FirstLoadWeightProfiler(num_hidden_layers=3)
     checkpoint = [

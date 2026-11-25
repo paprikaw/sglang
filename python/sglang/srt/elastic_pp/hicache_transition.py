@@ -12,6 +12,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
+from threading import Thread
 
 import torch
 
@@ -455,12 +456,19 @@ def clone_host_allocator(source, target):
         raise RuntimeError("source host allocator free lists and used slots disagree")
     if used[limit:].any():
         raise RuntimeError("target host pool cannot preserve live high host slots")
-    target.free_slots = free[free < target.logical_size].clone()
-    target.release_slots = [
-        v[v < target.logical_size].clone()
-        for v in releases
-        if (v < target.logical_size).any()
-    ]
+    if target.logical_size >= source.logical_size:
+        # The complete source-capacity validation above still applies. There
+        # is nothing to clip, so avoid boolean indexing followed by a second
+        # copy of the already-private result.
+        target.free_slots = free.clone()
+        target.release_slots = [v.clone() for v in releases if v.numel()]
+    else:
+        target.free_slots = free[free < target.logical_size]
+        target.release_slots = []
+        for value in releases:
+            clipped = value[value < target.logical_size]
+            if clipped.numel():
+                target.release_slots.append(clipped)
     target.num_release_slots = sum(len(v) for v in target.release_slots)
     if hasattr(target, "slot_used"):
         target.slot_used.zero_()
@@ -576,6 +584,7 @@ def prepare_target_host_cache(
     prepared=None,
     preloaded=None,
     verified_preloaded=None,
+    reuse_shared=False,
 ):
     """Build target L2 while keeping allocation failures safe for GPU rollback."""
     try:
@@ -590,6 +599,7 @@ def prepare_target_host_cache(
             prepared=prepared,
             preloaded=preloaded,
             verified_preloaded=verified_preloaded,
+            reuse_shared=reuse_shared,
         )
     except BaseException as exc:
         from sglang.srt.elastic_pp.backing_spill import discard_tensor_tracebacks
@@ -733,6 +743,7 @@ def _prepare_target_host_cache(
     prepared=None,
     preloaded=None,
     verified_preloaded=None,
+    reuse_shared=False,
 ):
     """Build replacement L2 backing without resetting the live radix tree.
 
@@ -758,12 +769,20 @@ def _prepare_target_host_cache(
     clone = clone_cache_runtime_metadata(cache)
     clone.sidecar_pool_specs = []
     clone.token_to_kv_pool_allocator = allocator
+    if reuse_shared:
+        from sglang.srt.elastic_pp.shared_host_cache import detach_inherited_host_stack
+
+        detach_inherited_host_stack(clone)
     clone.req_to_token_pool = req or cache.req_to_token_pool
     params = dataclasses.replace(
         cache._hicache_init_params,
         token_to_kv_pool_allocator=allocator,
         req_to_token_pool=clone.req_to_token_pool,
     )
+    if reuse_shared:
+        from sglang.srt.elastic_pp.shared_host_cache import shared_host_params
+
+        params = shared_host_params(params)
     metrics["host_target_metadata_seconds"] = time.monotonic() - started
     try:
         started = time.monotonic()
@@ -789,6 +808,25 @@ def _prepare_target_host_cache(
                 metadata.get(old_entry.name, old_entry.host_pool), new_pool
             )
         metrics["host_target_allocator_seconds"] = time.monotonic() - started
+        if reuse_shared:
+            if not hasattr(cache, "_elastic_pp_shared_host_bank"):
+                raise RuntimeError("missing shared CPU backing owner")
+            for entry in clone.host_pool_group.entries:
+                host = entry.host_pool
+                if getattr(host, "layer_num", getattr(host, "num_mamba_layers", 0)):
+                    allocator = getattr(host, "allocator", None)
+                    if (
+                        not getattr(allocator, "shared_host_backing", False)
+                        or allocator.bank is not cache._elastic_pp_shared_host_bank
+                    ):
+                        raise RuntimeError(
+                            "target host pool does not borrow shared backing"
+                        )
+            clone._elastic_pp_shared_host_bank = cache._elastic_pp_shared_host_bank
+            clone._elastic_pp_projected_pool = projected
+            metrics["host_shared_reuse"] = True
+            metrics["host_historical_payload_copied_bytes"] = 0
+            return clone
         started = time.monotonic()
         old_views = (
             {}
@@ -915,10 +953,118 @@ def rebind_cache_device_pools(cache, device_pool, *, refresh_recurrent_pointers=
     cache.__dict__.pop("_elastic_pp_projected_pool", None)
 
 
+_HOST_ALLOCATOR_FIELDS = (
+    "logical_size",
+    "free_slots",
+    "release_slots",
+    "num_release_slots",
+    "mem_state",
+    "slot_used",
+)
+_HOST_ALLOCATOR_MANIFEST = "__elastic_host_allocator_manifest__"
+_HOST_ALLOCATOR_TENSOR_PREFIX = "__elastic_host_allocator_tensor_"
+
+
+def canonical_host_allocator_wire(cache, generation):
+    """Snapshot drained, fenced allocators into owned native CPU payloads.
+
+    GroupCoordinator only separates top-level tensors from pickled metadata.
+    Keep every allocator tensor at the top level, preserving dtype and order.
+    Copy each tensor once into a contiguous private payload. Source allocator
+    mutation or rollback cannot change an already-issued send's contents.
+    """
+    from numbers import Number
+
+    wire = {}
+
+    def encode(value):
+        if isinstance(value, torch.Tensor):
+            if value.device.type != "cpu":
+                raise ValueError(
+                    "canonical host allocator tensors must be CPU resident"
+                )
+            key = _HOST_ALLOCATOR_TENSOR_PREFIX + str(len(wire))
+            wire[key] = value.detach().clone(memory_format=torch.contiguous_format)
+            return ("tensor", key)
+        if isinstance(value, (list, tuple)):
+            return (
+                "list" if isinstance(value, list) else "tuple",
+                [encode(item) for item in value],
+            )
+        if value is None or isinstance(value, (Number, str)):
+            return ("value", value)
+        raise TypeError("unsupported canonical host allocator metadata leaf")
+
+    pools = []
+    names = set()
+    for entry in cache.host_pool_group.entries:
+        if entry.name in names:
+            raise ValueError("duplicate canonical host allocator name")
+        names.add(entry.name)
+        pools.append(
+            (
+                entry.name,
+                {
+                    name: encode(getattr(entry.host_pool, name))
+                    for name in _HOST_ALLOCATOR_FIELDS
+                    if hasattr(entry.host_pool, name)
+                },
+            )
+        )
+    wire[_HOST_ALLOCATOR_MANIFEST] = dict(version=1, generation=generation, pools=pools)
+    return wire
+
+
+def restore_canonical_host_allocators(wire, generation):
+    """Validate the native tensor envelope before constructing a dormant cache."""
+    manifest = wire.get(_HOST_ALLOCATOR_MANIFEST)
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("version") != 1
+        or manifest.get("generation") != generation
+    ):
+        raise RuntimeError("canonical host allocator wire version/generation mismatch")
+    used = set()
+
+    def decode(record):
+        if not isinstance(record, (tuple, list)) or len(record) != 2:
+            raise RuntimeError("invalid canonical host allocator field")
+        kind, value = record
+        if kind == "tensor":
+            if (
+                not isinstance(value, str)
+                or not value.startswith(_HOST_ALLOCATOR_TENSOR_PREFIX)
+                or value in used
+            ):
+                raise RuntimeError("invalid canonical host allocator tensor")
+            tensor = wire.get(value)
+            if not isinstance(tensor, torch.Tensor) or tensor.device.type != "cpu":
+                raise RuntimeError("invalid canonical host allocator tensor")
+            used.add(value)
+            return tensor
+        if kind in {"list", "tuple"}:
+            values = [decode(item) for item in value]
+            return values if kind == "list" else tuple(values)
+        if kind == "value":
+            return value
+        raise RuntimeError("unknown canonical host allocator field encoding")
+
+    result = {}
+    for name, fields in manifest["pools"]:
+        if name in result or set(fields) - set(_HOST_ALLOCATOR_FIELDS):
+            raise RuntimeError("invalid canonical host allocator pool")
+        result[name] = {field: decode(value) for field, value in fields.items()}
+    if used != {key for key in wire if key.startswith(_HOST_ALLOCATOR_TENSOR_PREFIX)}:
+        raise RuntimeError("canonical host allocator tensor manifest is incomplete")
+    return result
+
+
 class SchedulerHiCacheTransition:
     """Coordinator-facing transaction; source remains owned through publish."""
 
-    def __init__(self, *, scheduler, model_runner, group, rank):
+    def __init__(
+        self, *, scheduler, model_runner, group, rank, overlap_shared_metadata=False
+    ):
         self.scheduler, self.model_runner = scheduler, model_runner
         self.group, self.rank = group, rank
         self.adapter = None
@@ -928,6 +1074,24 @@ class SchedulerHiCacheTransition:
         self._source_cache = None
         self._last_metrics = {}
         self._phase_metrics = {}
+        self.shared_host = bool(
+            getattr(
+                getattr(model_runner, "server_args", None),
+                "elastic_pp_hicache_shared_host",
+                False,
+            )
+        )
+        self.shared_bank = getattr(model_runner, "_elastic_pp_shared_host_bank", None)
+        if self.shared_host and self.shared_bank is None:
+            raise RuntimeError("shared CPU backing must be installed at startup")
+        self.overlap_shared_metadata = bool(
+            overlap_shared_metadata and self.shared_host
+        )
+        self._metadata_hash_thread = None
+        self._metadata_hash_report = None
+        self._metadata_hash_generation = None
+        self.initial_base_ready = False
+        self._shared_verified_generation = None
         self.fast_copy = bool(
             getattr(
                 getattr(model_runner, "server_args", None),
@@ -965,9 +1129,26 @@ class SchedulerHiCacheTransition:
         self.precopy = None
         self.prepared_host = None
         self._background_metrics = {}
+        if self.shared_host:
+            # The shared path never snapshots or precopies historical CPU data.
+            self.background = False
+            self.batch_io = False
 
     def begin_background(self, transition):
         """Scheduler-only CPU snapshot. Never drain or mutate active HiCache I/O."""
+        if self.shared_host:
+            self._background_metrics = {}
+            self._shared_verified_generation = None
+            self.initial_base_ready = False
+            try:
+                assert_host_quiescent(
+                    self.scheduler.tree_cache, allow_pp_control_sends=True
+                )
+                self.initial_base_ready = True
+            except RuntimeError:
+                # A busy loadback must not mark newly allocated GPU rows ready.
+                pass
+            return
         if not self.background:
             return
         if self.precopy is not None or self.prepared_host is not None:
@@ -1132,10 +1313,14 @@ class SchedulerHiCacheTransition:
         cache = self.scheduler.tree_cache
         self._phase_metrics = dict(self._background_metrics)
         started = time.monotonic()
-        drain_host_io_at_fence(cache, self.group)
+        self._phase_metrics.update(drain_host_io_at_fence(cache, self.group))
         self._phase_metrics["host_io_drain_seconds"] = time.monotonic() - started
         started = time.monotonic()
         self._source_cache = cache
+        if self.overlap_shared_metadata and self.rank in transition.source.active_ranks:
+            # I/O is drained and the scheduler is fenced. The source CPU tree
+            # and allocator stay read-only until this task has been joined.
+            self._start_metadata_hash(cache, transition)
         canonical = transition.source.first_rank
         dormant = [
             r
@@ -1146,39 +1331,55 @@ class SchedulerHiCacheTransition:
         prepare_error = None
         if self.rank == canonical and dormant:
             try:
+                snapshot_started = time.monotonic()
+                tree = snapshot_tree_metadata(cache)
+                self._phase_metrics["host_canonical_tree_snapshot_seconds"] = (
+                    time.monotonic() - snapshot_started
+                )
+                snapshot_started = time.monotonic()
                 metadata = {}
-                for entry in cache.host_pool_group.entries:
-                    pool = entry.host_pool
-                    metadata[entry.name] = {
-                        name: copy.deepcopy(getattr(pool, name))
-                        for name in (
-                            "logical_size",
-                            "free_slots",
-                            "release_slots",
-                            "num_release_slots",
-                            "mem_state",
-                            "slot_used",
-                        )
-                        if hasattr(pool, name)
-                    }
+                if self.overlap_shared_metadata:
+                    allocator_wire = canonical_host_allocator_wire(
+                        cache, transition.target.generation
+                    )
+                else:
+                    for entry in cache.host_pool_group.entries:
+                        pool = entry.host_pool
+                        metadata[entry.name] = {
+                            name: copy.deepcopy(getattr(pool, name))
+                            for name in _HOST_ALLOCATOR_FIELDS
+                            if hasattr(pool, name)
+                        }
+                    allocator_wire = {"allocators": metadata}
+                self._phase_metrics["host_canonical_allocator_pack_seconds"] = (
+                    time.monotonic() - snapshot_started
+                )
                 canonical_wire = {
-                    "tree": snapshot_tree_metadata(cache),
-                    "allocators": metadata,
+                    "tree": tree,
                     "requests": self.scheduler._elastic_pp_request_cache_state(),
+                    **allocator_wire,
                 }
             except Exception as exc:
                 prepare_error = exc
                 canonical_wire = {"error": f"{type(exc).__name__}: {exc}"}
         for destination in dormant:
             if self.rank == canonical:
+                wire_started = time.monotonic()
                 ElasticPPLayerTransport.wait(
                     self.group.send_tensor_dict(
                         canonical_wire, dst=destination, async_send=True
                     )
                     or ()
                 )
+                self._phase_metrics["host_canonical_send_seconds"] = (
+                    time.monotonic() - wire_started
+                )
             elif self.rank == destination:
+                wire_started = time.monotonic()
                 wire = self.group.recv_tensor_dict(src=canonical)
+                self._phase_metrics["host_canonical_recv_seconds"] = (
+                    time.monotonic() - wire_started
+                )
                 if "error" in wire:
                     prepare_error = RuntimeError(
                         "canonical HiCache snapshot failed: " + wire["error"]
@@ -1194,12 +1395,18 @@ class SchedulerHiCacheTransition:
                     )
                     continue
                 self._request_state = records
+                metadata = (
+                    restore_canonical_host_allocators(
+                        wire, transition.target.generation
+                    )
+                    if self.overlap_shared_metadata
+                    else wire["allocators"]
+                )
                 shadow = clone_cache_runtime_metadata(cache)
                 shadow.tree_core = restore_tree_metadata(wire["tree"], shadow)
                 shadow.session_refs.tree_core = shadow.tree_core
                 shadow._elastic_host_allocator_metadata = {
-                    name: SimpleNamespace(**data)
-                    for name, data in wire["allocators"].items()
+                    name: SimpleNamespace(**data) for name, data in metadata.items()
                 }
                 cache = shadow
         if prepare_error is not None:
@@ -1211,7 +1418,7 @@ class SchedulerHiCacheTransition:
             cache=cache,
             pools=(
                 cache_host_views(cache)
-                if self.rank in transition.source.active_ranks
+                if self.rank in transition.source.active_ranks and not self.shared_host
                 else {}
             ),
             group=self.group,
@@ -1220,14 +1427,129 @@ class SchedulerHiCacheTransition:
         )
         self.adapter.precopy = self.precopy
         self.adapter.prepare_transition(transition)
+        if self.shared_host:
+            return
         started = time.monotonic()
         self.adapter.snapshot_at_fence(transition)
         self._phase_metrics["host_snapshot_gather_seconds"] = time.monotonic() - started
 
+    def _inspect_shared_metadata(self, cache, transition, *, background=False):
+        from sglang.srt.elastic_pp.shared_host_cache import metadata_signature
+
+        started = time.monotonic()
+        self._phase_metrics["host_metadata_hash_started_monotonic"] = started
+        self._phase_metrics["host_metadata_hash_background"] = background
+        try:
+            signature = (
+                metadata_signature(cache)
+                if self.rank in transition.source.active_ranks
+                else None
+            )
+            return dict(rank=self.rank, signature=signature, error=None)
+        except BaseException as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self._phase_metrics["host_metadata_hash_error"] = error
+            return dict(rank=self.rank, signature=None, error=error)
+        finally:
+            finished = time.monotonic()
+            self._phase_metrics["host_metadata_hash_finished_monotonic"] = finished
+            self._phase_metrics["host_metadata_hash_seconds"] = finished - started
+
+    def _start_metadata_hash(self, cache, transition):
+        if self._metadata_hash_thread is not None:
+            raise RuntimeError("previous shared CPU metadata inspection is unjoined")
+        self._metadata_hash_report = None
+        self._metadata_hash_generation = transition.target.generation
+
+        def inspect():
+            self._metadata_hash_report = self._inspect_shared_metadata(
+                cache, transition, background=True
+            )
+
+        worker = Thread(
+            target=inspect,
+            name=(
+                f"elastic-pp-host-metadata-g{transition.target.generation}-r{self.rank}"
+            ),
+            daemon=True,
+        )
+        # Assign only after start succeeds; abort must never join an unstarted
+        # thread. The callback only reads source CPU metadata, never CUDA state.
+        worker.start()
+        self._metadata_hash_thread = worker
+
+    def _join_metadata_hash(self):
+        worker = self._metadata_hash_thread
+        if worker is not None:
+            started = time.monotonic()
+            worker.join()
+            finished = time.monotonic()
+            self._phase_metrics["host_metadata_hash_join_seconds"] = finished - started
+            self._phase_metrics["host_metadata_hash_joined_monotonic"] = finished
+            self._metadata_hash_thread = None
+
     def exchange_at_fence(self, transition):
+        if self.shared_host:
+            if self._metadata_hash_thread is not None:
+                self._join_metadata_hash()
+                report = self._metadata_hash_report
+                if (
+                    self._metadata_hash_generation != transition.target.generation
+                    or report is None
+                ):
+                    report = dict(
+                        rank=self.rank,
+                        signature=None,
+                        error="shared CPU metadata generation mismatch",
+                    )
+            else:
+                report = self._inspect_shared_metadata(self._source_cache, transition)
+            started = time.monotonic()
+            try:
+                reports = self.group.all_gather_object(report)
+            finally:
+                self._phase_metrics["host_metadata_consensus_seconds"] = (
+                    time.monotonic() - started
+                )
+            if len(reports) != transition.source.max_pp_size or any(
+                x["error"] for x in reports
+            ):
+                raise RuntimeError(f"shared CPU metadata inspection failed: {reports}")
+            if {x["rank"] for x in reports} != set(
+                range(transition.source.max_pp_size)
+            ):
+                raise RuntimeError("shared CPU metadata ranks are incomplete")
+            signatures = {
+                x["signature"]
+                for x in reports
+                if x["rank"] in transition.source.active_ranks
+            }
+            if len(signatures) != 1 or None in signatures:
+                raise RuntimeError(
+                    "shared CPU prefix slots or allocator state differ across ranks"
+                )
+            self._shared_verified_generation = transition.target.generation
+            return
         self.adapter.exchange_at_fence(transition)
 
     def apply_staged(self, transition):
+        if self.shared_host:
+            from sglang.srt.elastic_pp.shared_host_cache import use_shared_host_bank
+
+            if self._shared_verified_generation != transition.target.generation:
+                raise RuntimeError(
+                    "shared CPU layer views require validated slot metadata"
+                )
+            with use_shared_host_bank(self.shared_bank):
+                self.target_cache = prepare_target_host_cache(
+                    self.adapter.cache,
+                    device_pool=self.model_runner.token_to_kv_pool,
+                    target=transition.target.layer_range(self.rank),
+                    generation=transition.target.generation,
+                    metrics=self._phase_metrics,
+                    reuse_shared=True,
+                )
+            return
         self.target_cache = prepare_target_host_cache(
             self.adapter.cache,
             device_pool=self.model_runner.token_to_kv_pool,
@@ -1293,6 +1615,9 @@ class SchedulerHiCacheTransition:
         self._reset_precopy()
 
     def abort(self, transition):
+        # An error in canonical metadata or a peer must not let rollback or
+        # target destruction overtake this read of the live source CPU pools.
+        self._join_metadata_hash()
         if self.adapter is not None:
             self.adapter.abort(transition)
         if self.target_cache is not None:
@@ -1343,9 +1668,11 @@ def snapshot_tree_metadata(cache):
         for data in node.component_data:
             for value in vars(data).values():
                 if isinstance(value, torch.Tensor):
-                    memo[id(value)] = value.detach().cpu().clone()
+                    if id(value) not in memo:
+                        memo[id(value)] = value.detach().to(device="cpu", copy=True)
     empty = tree._empty_match_result.device_indices
-    memo[id(empty)] = empty.detach().cpu().clone()
+    if id(empty) not in memo:
+        memo[id(empty)] = empty.detach().to(device="cpu", copy=True)
     cloned = copy.deepcopy(tree, memo)
     cloned.device = "cpu"
     return pickle.dumps(cloned, protocol=5)
@@ -1397,6 +1724,7 @@ def build_dormant_host_stack(clone, *, source, projected, params):
     import copy
     import threading
 
+    from sglang.srt.elastic_pp.shared_host_cache import shared_pool_capacity
     from sglang.srt.mem_cache.hicache_storage import PoolName
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         HybridCacheController,
@@ -1422,8 +1750,17 @@ def build_dormant_host_stack(clone, *, source, projected, params):
         # --hicache-size is fixed. The dormant target must join the same
         # collectives with a neutral value and adopt the new topology's
         # capacity, rather than retaining the source topology's capacity.
+        shared_size = shared_pool_capacity(
+            "full" if entry.name == PoolName.KV else "mamba"
+        )
         entry.host_pool = LogicalHostPool(
-            _logical_host_pool_size(entry.device_pool.size, old.host_pool.page_size),
+            (
+                shared_size
+                if shared_size is not None
+                else _logical_host_pool_size(
+                    entry.device_pool.size, old.host_pool.page_size
+                )
+            ),
             old.host_pool.page_size,
             old.host_pool.layout,
         )
@@ -1460,44 +1797,84 @@ def build_dormant_host_stack(clone, *, source, projected, params):
 
 
 def drain_host_io_at_fence(cache, group, timeout_s=15.0):
-    """All resident ranks poll in the same order, even locally idle ranks."""
-    import time
+    """Retire existing cache work without creating idle PP readiness packets.
+
+    The scheduler has drained and aligned its pre-fence PP event rounds before
+    entering here. Retire those sends first, then make a group-wide decision:
+    an idle local rank must still poll when a peer has I/O. Only a globally
+    idle group may skip another event round. The CPU migration group is
+    separate from the old cache's PP control communicator.
+    """
 
     deadline = time.monotonic() + timeout_s
+    metrics = dict(
+        host_io_status_rounds=0,
+        host_io_event_rounds=0,
+        host_io_async_wait_seconds=0.0,
+        host_io_status_seconds=0.0,
+        host_io_submit_seconds=0.0,
+        host_io_event_seconds=0.0,
+        host_io_async_work_before=len(getattr(cache, "work_list", ())),
+        host_io_async_work_after=0,
+    )
+    controller = cache.cache_controller
+
+    def pending_io():
+        return any(
+            getattr(owner, name, None)
+            for owner, names in (
+                (
+                    cache,
+                    (
+                        "ongoing_backup",
+                        "ongoing_load_back",
+                        "ongoing_prefetch",
+                        "ongoing_write_through",
+                        "work_list",
+                    ),
+                ),
+                (
+                    controller,
+                    ("load_queue", "write_queue", "ack_load_queue", "ack_write_queue"),
+                ),
+            )
+            for name in names
+        )
+
     while True:
-        controller = cache.cache_controller
+        started = time.monotonic()
+        cache._drain_async_work()
+        metrics["host_io_async_wait_seconds"] += time.monotonic() - started
+        metrics["host_io_async_work_after"] = len(getattr(cache, "work_list", ()))
+        pending = bool(pending_io())
+        expired = time.monotonic() >= deadline
+        started = time.monotonic()
+        if hasattr(group, "all_reduce_cpu"):
+            # SUM implements group-wide OR for both nonnegative flags, without
+            # object serialization and its second size/payload collective.
+            status = torch.tensor([pending, expired], dtype=torch.int64, device="cpu")
+            group.all_reduce_cpu(status)
+            pending, expired = (bool(v) for v in status.tolist())
+        else:
+            statuses = group.all_gather_object({"pending": pending, "expired": expired})
+            pending = any(s["pending"] for s in statuses)
+            expired = any(s["expired"] for s in statuses)
+        metrics["host_io_status_seconds"] += time.monotonic() - started
+        metrics["host_io_status_rounds"] += 1
+        if not pending:
+            return metrics
+        if expired:
+            raise RuntimeError("timed out retiring HiCache I/O at elastic PP fence")
+        started = time.monotonic()
         if controller.load_queue:
             controller.start_loading()
         if controller.write_queue:
             controller.start_writing()
+        metrics["host_io_submit_seconds"] += time.monotonic() - started
+        started = time.monotonic()
         cache.check_hicache_events()
-        cache._drain_async_work()
-        pending = any(
-            getattr(cache, name, None)
-            for name in (
-                "ongoing_backup",
-                "ongoing_load_back",
-                "ongoing_prefetch",
-                "ongoing_write_through",
-                "work_list",
-            )
-        )
-        pending = pending or any(
-            getattr(controller, name, None)
-            for name in (
-                "load_queue",
-                "write_queue",
-                "ack_load_queue",
-                "ack_write_queue",
-            )
-        )
-        statuses = group.all_gather_object(
-            {"pending": bool(pending), "expired": time.monotonic() >= deadline}
-        )
-        if not any(s["pending"] for s in statuses):
-            return
-        if any(s["expired"] for s in statuses):
-            raise RuntimeError("timed out retiring HiCache I/O at elastic PP fence")
+        metrics["host_io_event_seconds"] += time.monotonic() - started
+        metrics["host_io_event_rounds"] += 1
 
 
 def publish_scheduler_cache(scheduler, clone, model_runner):
@@ -1509,6 +1886,8 @@ def publish_scheduler_cache(scheduler, clone, model_runner):
         "policy",
         "schedule_policy",
         "session_controller",
+        "disagg_decode_prealloc_queue",
+        "disagg_decode_transfer_queue",
         "running_batch",
         "last_batch",
         "running_mbs",

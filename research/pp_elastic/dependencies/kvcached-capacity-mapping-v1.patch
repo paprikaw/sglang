@@ -1,0 +1,2213 @@
+diff --git a/csrc/allocator.cpp b/csrc/allocator.cpp
+index 9adb271..5968fd4 100644
+--- a/csrc/allocator.cpp
++++ b/csrc/allocator.cpp
+@@ -45,8 +45,9 @@ static inline size_t get_v_base_offset(const torch::Tensor &tensor) {
+ 
+ FTensorAllocator::FTensorAllocator(const torch::Device &device,
+                                    bool contiguous_layout)
+-    : dev_(device), num_layers_(0), contiguous_layout_(contiguous_layout),
+-      unified_pool_(false), kv_tensor_size_per_layer_(0) {
++    : dev_(device), num_layers_(0), layer_group_granularity_(1),
++      contiguous_layout_(contiguous_layout), unified_pool_(false),
++      kv_tensor_size_per_layer_(0) {
+   if (dev_.is_cuda()) {
+     init_cuda_();
+   }
+@@ -112,11 +113,23 @@ void FTensorAllocator::shutdown() {
+ 
+ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
+     size_t size, torch::Dtype dtype, const std::string &dev_str,
+-    int64_t num_layers, int64_t num_kv_buffers, bool unified_pool) {
++    int64_t num_layers, int64_t num_kv_buffers, bool unified_pool,
++    int64_t layer_group_granularity, size_t contiguous_page_size,
++    size_t contiguous_total_size) {
+   std::lock_guard<std::mutex> lock(mtx_);
+ 
+   assert(num_layers_ == 0 || num_layers_ == num_layers);
+   num_layers_ = num_layers;
++  if (layer_group_granularity <= 0) {
++    layer_group_granularity = 1;
++  }
++  if (layer_group_granularity > num_layers) {
++    layer_group_granularity = num_layers;
++  }
++  ASSERT(num_layers % layer_group_granularity == 0,
++         "num_layers (%ld) must be divisible by layer_group_granularity (%ld)",
++         num_layers, layer_group_granularity);
++  layer_group_granularity_ = layer_group_granularity;
+   unified_pool_ = unified_pool;
+   // Ensure size is aligned to page size.
+   size_t aligned_size = size;
+@@ -128,16 +141,20 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors(
+   kv_tensor_size_per_layer_ = aligned_size;
+ 
+   if (contiguous_layout_) {
+-    // For contiguous layout, we use compound page which groups all layers
+-    // together for a single page. num_kv_buffers is 2 for MHA (K+V) and
+-    // 1 for MLA (combined KV).
+-    size_t compound_page_size = kPageSize * num_layers * num_kv_buffers;
+-    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, compound_page_size);
+-    // We can use the aligned size directly for contiguous layout too because
+-    // both compound_page_size and aligned_size are already/will be multiplied
+-    // by num_layers.
+-    return create_kv_tensors_contiguous_(aligned_size, dtype, dev_str,
+-                                         num_layers, compound_page_size);
++    size_t page_size = contiguous_page_size > 0
++                           ? contiguous_page_size
++                           : kPageSize * layer_group_granularity_ *
++                                 num_kv_buffers;
++    size_t total_size =
++        contiguous_total_size > 0 ? contiguous_total_size : aligned_size * num_layers;
++    ASSERT(page_size % kPageSize == 0,
++           "contiguous page size %zu must be a multiple of base page size %zu",
++           page_size, kPageSize);
++    ASSERT(total_size % page_size == 0,
++           "contiguous tensor size %zu must be aligned to page size %zu",
++           total_size, page_size);
++    zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID, page_size);
++    return create_kv_tensors_contiguous_(total_size, dtype, dev_str, page_size);
+   } else {
+     zero_page_ = make_shared_page(dev_, ZERO_PAGE_ID);
+     return create_kv_tensors_per_layer_(kv_prefix, aligned_size, dtype, dev_str,
+@@ -164,8 +181,10 @@ bool FTensorAllocator::map_to_kv_tensors(const std::vector<offset_t> &offsets) {
+     auto tensor = ftensor->get_tensor();
+ 
+     for (auto offset : offsets) {
+-      // Map K and V regions for this block (covers all layers)
+-      ftensor->map(offset);
++      // Each offset addresses one independently owned physical layer group.
++      if (!ftensor->map(offset)) {
++        return false;
++      }
+     }
+   } else if (unified_pool_) {
+     // Unified pool: K and V share a single block-interleaved FTensor per
+@@ -215,8 +234,9 @@ bool FTensorAllocator::unmap_from_kv_tensors(
+     auto tensor = ftensor->get_tensor();
+ 
+     for (auto offset : offsets) {
+-      // Unmap K and V regions for this block (covers all layers)
+-      ftensor->unmap(offset);
++      if (!ftensor->unmap(offset)) {
++        return false;
++      }
+     }
+   } else if (unified_pool_) {
+     // Unified pool: single unmap per pid.
+@@ -267,17 +287,13 @@ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_per_layer_(
+ }
+ 
+ std::vector<torch::Tensor> FTensorAllocator::create_kv_tensors_contiguous_(
+-    size_t size, torch::Dtype dtype, const std::string &dev_str,
+-    int64_t num_layers, size_t compound_page_size) {
+-  // In contiguous layout, Python passes per-layer size, and we multiply by
+-  // num_layers to get total size
+-  size_t total_kv_size = size * num_layers;
+-
++    size_t total_kv_size, torch::Dtype dtype, const std::string &dev_str,
++    size_t page_size) {
+   // Create the single contiguous KV tensor (contains K and V for all layers)
+   auto contiguous_name = std::string(kv_prefix) + "contiguous";
+   contiguous_kv_tensor_ =
+       std::make_unique<FTensor>(contiguous_name, total_kv_size, dtype, dev_,
+-                                zero_page_, compound_page_size);
++                                zero_page_, page_size);
+ 
+   // Get the contiguous tensor
+   auto contiguous_tensor = contiguous_kv_tensor_->get_tensor();
+diff --git a/csrc/ftensor.cpp b/csrc/ftensor.cpp
+index c2eae1d..7a3ed04 100644
+--- a/csrc/ftensor.cpp
++++ b/csrc/ftensor.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include <fcntl.h>
++#include <cstring>
+ #include <sys/mman.h>
+ 
+ #include "constants.hpp"
+@@ -97,6 +98,21 @@ bool FTensor::map(offset_t offset) {
+ 
+   mapping_[page_id] = make_unique_page(dev_, page_id, page_size_);
+   mapping_[page_id]->map(vaddr);
++  if (dev_.is_cuda()) {
++    // Initialize only this newly mapped page. The legacy/default stream may
++    // depend on an unrelated persistent NCCL receive during elastic PP.
++    cudaStream_t init_stream;
++    CHECK_RT(cudaStreamCreateWithFlags(&init_stream, cudaStreamNonBlocking));
++    auto status = cudaMemsetAsync(vaddr, 0, page_size_, init_stream);
++    if (status == cudaSuccess) {
++      status = cudaStreamSynchronize(init_stream);
++    }
++    const auto destroy_status = cudaStreamDestroy(init_stream);
++    CHECK_RT(status);
++    CHECK_RT(destroy_status);
++  } else {
++    std::memset(vaddr, 0, page_size_);
++  }
+   return true;
+ }
+ 
+diff --git a/csrc/inc/allocator.hpp b/csrc/inc/allocator.hpp
+index 182837c..de8a108 100644
+--- a/csrc/inc/allocator.hpp
++++ b/csrc/inc/allocator.hpp
+@@ -29,7 +29,10 @@ public:
+                                                const std::string &dev_str,
+                                                int64_t num_layers,
+                                                int64_t num_kv_buffers = 2,
+-                                               bool unified_pool = false);
++                                               bool unified_pool = false,
++                                               int64_t layer_group_granularity = 1,
++                                               size_t contiguous_page_size = 0,
++                                               size_t contiguous_total_size = 0);
+   bool kv_tensors_created();
+   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
+   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
+@@ -52,9 +55,9 @@ private:
+                                torch::Dtype dtype, const std::string &dev_str,
+                                int64_t num_layers);
+   std::vector<torch::Tensor>
+-  create_kv_tensors_contiguous_(size_t size, torch::Dtype dtype,
+-                                const std::string &dev_str, int64_t num_layers,
+-                                size_t compound_page_size);
++  create_kv_tensors_contiguous_(size_t total_size, torch::Dtype dtype,
++                                const std::string &dev_str,
++                                size_t page_size);
+   torch::Tensor create_ftensor_(size_t size, torch::Dtype dtype,
+                                 const std::string &dev_str,
+                                 std::string name = "");
+@@ -74,6 +77,7 @@ private:
+   torch::Device dev_;
+ 
+   int64_t num_layers_;
++  int64_t layer_group_granularity_;
+   bool contiguous_layout_;
+   bool unified_pool_;
+   size_t kv_tensor_size_per_layer_;
+diff --git a/csrc/inc/page_allocator.hpp b/csrc/inc/page_allocator.hpp
+index ff52cca..5eb41ee 100644
+--- a/csrc/inc/page_allocator.hpp
++++ b/csrc/inc/page_allocator.hpp
+@@ -26,9 +26,11 @@ namespace kvcached {
+ 
+ // Callback function types for multi-process support
+ using BroadcastMapCallback =
+-    std::function<void(int64_t, const std::vector<offset_t> &)>;
++    std::function<void(int64_t, const std::vector<offset_t> &, int64_t,
++                       int64_t)>;
+ using BroadcastUnmapCallback =
+-    std::function<void(int64_t, const std::vector<offset_t> &)>;
++    std::function<void(int64_t, const std::vector<offset_t> &, int64_t,
++                       int64_t)>;
+ using ShouldUseWorkerIpcCallback = std::function<bool()>;
+ 
+ // Independent InternalPage class
+@@ -43,6 +45,7 @@ public:
+ 
+   InternalPage(page_id_t id, int64_t size);
+   void init(int64_t block_mem_size);
++  void cap_blocks(int64_t max_num_blocks);
+   std::vector<int64_t> alloc(int64_t num_blocks = 1);
+   void free(int64_t block_id);
+   void free_batch(const std::vector<int64_t> &block_ids);
+@@ -62,7 +65,9 @@ public:
+                 int64_t page_size, int64_t world_size = 1, int64_t pp_rank = 0,
+                 bool async_sched = false, bool contiguous_layout = true,
+                 bool enable_page_prealloc = true, int64_t num_kv_buffers = 2,
+-                int64_t group_id = 0, const std::string &ipc_name = "");
++                int64_t group_id = 0, const std::string &ipc_name = "",
++                int64_t layer_group_granularity = 1,
++                int64_t map_page_size = 0);
+ 
+   ~PageAllocator();
+ 
+@@ -130,10 +135,15 @@ private:
+   // Configuration
+   int64_t num_layers_;
+   int64_t mem_size_per_layer_;
++  int64_t virtual_pages_per_layer_;
+   int64_t page_size_;
++  int64_t map_page_size_;
+   int64_t world_size_;
+   int64_t pp_rank_;
+   int64_t num_kv_buffers_;
++  int64_t layer_group_granularity_;
++  int64_t num_layer_groups_;
++  bool block_level_layer_groups_;
+   int64_t group_id_;
+   bool async_sched_;
+   bool contiguous_layout_;
+diff --git a/csrc/page.cpp b/csrc/page.cpp
+index 55d51de..8aed71f 100644
+--- a/csrc/page.cpp
++++ b/csrc/page.cpp
+@@ -2,6 +2,8 @@
+ // SPDX-License-Identifier: Apache-2.0
+ 
+ #include <cuda_runtime.h>
++#include <cstdlib>
++#include <cstring>
+ 
+ #include "constants.hpp"
+ #include "cuda_utils.hpp"
+@@ -22,10 +24,30 @@ GPUPage::GPUPage(page_id_t page_id, int dev_idx, size_t page_size)
+               .id = dev_,
+           },
+   };
++  const char *rdma = std::getenv("KVCACHED_GPU_DIRECT_RDMA_REQUIRED");
++  if (rdma != nullptr && std::strcmp(rdma, "1") == 0) {
++    int supported = 0;
++    CHECK_DRV(cuDeviceGetAttribute(
++        &supported, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
++        dev_));
++    ASSERT(supported != 0, "This device cannot register CUDA VMM pages for GPUDirect RDMA");
++    prop.allocFlags.gpuDirectRDMACapable = 1;
++  }
+   CHECK_DRV(cuMemCreate(&handle_, page_size_, &prop, 0));
+ }
+ 
+-GPUPage::~GPUPage() { CHECK_DRV(cuMemRelease(handle_)); }
++GPUPage::~GPUPage() {
++  if (handle_ == 0) {
++    return;
++  }
++  CUresult res = cuMemRelease(handle_);
++  if (res != CUDA_SUCCESS) {
++    const char *err = nullptr;
++    (void)cuGetErrorString(res, &err);
++    LOGGER(ERROR, "cuMemRelease during GPUPage cleanup failed: %s",
++           err ? err : "unknown");
++  }
++}
+ 
+ bool GPUPage::map(generic_ptr_t vaddr, bool set_access) {
+   CUmemAccessDesc accessDesc_{
+diff --git a/csrc/page_allocator.cpp b/csrc/page_allocator.cpp
+index 1e3fbc8..372ff31 100644
+--- a/csrc/page_allocator.cpp
++++ b/csrc/page_allocator.cpp
+@@ -21,6 +21,10 @@ namespace kvcached {
+ // Constants
+ constexpr double PREALLOC_THREAD_TIMEOUT = 2.0; // seconds
+ 
++static int64_t ceil_div(int64_t x, int64_t y) {
++  return (x + y - 1) / y;
++}
++
+ // Environment variable based constants
+ const int64_t MIN_RESERVED_PAGES = []() {
+   const char *env_val = std::getenv("KVCACHED_MIN_RESERVED_PAGES");
+@@ -53,6 +57,20 @@ void InternalPage::init(int64_t block_mem_size) {
+   }
+ }
+ 
++void InternalPage::cap_blocks(int64_t max_num_blocks) {
++  if (end_block <= max_num_blocks) {
++    return;
++  }
++  end_block = std::max(start_block, max_num_blocks);
++  free_list.erase(
++      std::remove_if(free_list.begin(), free_list.end(),
++                     [max_num_blocks](int64_t block_id) {
++                       return block_id >= max_num_blocks;
++                     }),
++      free_list.end());
++  num_kv_blocks = static_cast<int64_t>(free_list.size());
++}
++
+ std::vector<int64_t> InternalPage::alloc(int64_t num_blocks) {
+   if (free_list.size() < static_cast<size_t>(num_blocks)) {
+     throw std::runtime_error("Not enough free blocks in page");
+@@ -106,19 +124,49 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
+                              int64_t pp_rank, bool async_sched,
+                              bool contiguous_layout, bool enable_page_prealloc,
+                              int64_t num_kv_buffers, int64_t group_id,
+-                             const std::string &ipc_name)
++                             const std::string &ipc_name,
++                             int64_t layer_group_granularity,
++                             int64_t map_page_size)
+     : num_layers_(num_layers), mem_size_per_layer_(mem_size_per_layer),
+       page_size_(page_size), world_size_(world_size), pp_rank_(pp_rank),
+-      num_kv_buffers_(num_kv_buffers), group_id_(group_id),
++      num_kv_buffers_(num_kv_buffers),
++      layer_group_granularity_(layer_group_granularity <= 0
++                                   ? 1
++                                   : std::min(layer_group_granularity,
++                                              num_layers)),
++      num_layer_groups_((num_layers + layer_group_granularity_ - 1) /
++                        layer_group_granularity_),
++      block_level_layer_groups_(contiguous_layout &&
++                                layer_group_granularity_ > 1),
++      group_id_(group_id),
+       async_sched_(async_sched), contiguous_layout_(contiguous_layout),
+       enable_page_prealloc_(enable_page_prealloc),
+       gpu_utilization_(GPU_UTILIZATION),
+-      num_free_pages_(mem_size_per_layer / page_size),
+-      num_total_pages_(mem_size_per_layer / page_size),
++      num_free_pages_(ceil_div(mem_size_per_layer, page_size)),
++      num_total_pages_(ceil_div(mem_size_per_layer, page_size)),
+       min_reserved_pages_(std::min(num_free_pages_, MIN_RESERVED_PAGES)),
+       max_reserved_pages_(std::min(num_free_pages_, MAX_RESERVED_PAGES)),
+       prealloc_running_(false), prealloc_needed_(false),
+-      total_memory_size_(mem_size_per_layer * num_layers * num_kv_buffers) {
++      total_memory_size_(0) {
++  virtual_pages_per_layer_ = num_total_pages_;
++  if (num_layers_ % layer_group_granularity_ != 0) {
++    throw std::runtime_error(
++        "num_layers must be divisible by layer_group_granularity");
++  }
++  map_page_size_ =
++      map_page_size > 0
++          ? map_page_size
++          : (contiguous_layout_
++                 ? page_size_ * layer_group_granularity_ * num_kv_buffers_
++                 : page_size_);
++  if (map_page_size_ % page_size_ != 0) {
++    throw std::runtime_error(
++        "map_page_size must be a multiple of allocator page_size");
++  }
++  total_memory_size_ =
++      contiguous_layout_
++          ? num_total_pages_ * num_layer_groups_ * map_page_size_
++          : mem_size_per_layer * num_layers_ * num_kv_buffers_;
+ 
+   // Initialize free page list
+   for (int64_t i = 0; i < num_free_pages_; ++i) {
+@@ -134,8 +182,7 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
+             << "mem_size_per_layer=" << mem_size_per_layer / (1024 * 1024)
+             << "MB, "
+             << "total_mem_size="
+-            << (num_kv_buffers * num_layers * mem_size_per_layer) /
+-                   (1024 * 1024)
++            << total_memory_size_ / (1024 * 1024)
+             << "MB, "
+             << "page_size=" << page_size / (1024 * 1024) << "MB, "
+             << "world_size=" << world_size << ", "
+@@ -144,6 +191,10 @@ PageAllocator::PageAllocator(int64_t num_layers, int64_t mem_size_per_layer,
+             << "contiguous_layout=" << contiguous_layout << ", "
+             << "enable_prealloc=" << enable_page_prealloc << ", "
+             << "num_kv_buffers=" << num_kv_buffers << ", "
++            << "layer_group_granularity=" << layer_group_granularity_ << ", "
++            << "num_layer_groups=" << num_layer_groups_ << ", "
++            << "block_level_layer_groups=" << block_level_layer_groups_ << ", "
++            << "map_page_size=" << map_page_size_ / (1024 * 1024) << "MB, "
+             << "group_id=" << group_id << ", "
+             << "min_reserved_pages=" << min_reserved_pages_ << ", "
+             << "max_reserved_pages=" << max_reserved_pages_ << std::endl;
+@@ -207,7 +258,7 @@ std::shared_ptr<InternalPage> PageAllocator::alloc_page() {
+           "Inconsistent page allocator state: no free pages available");
+     }
+ 
+-    // Wait for background preallocation
++    // Wait for the background preallocation worker to publish reserved pages.
+     cond_.wait(lock);
+   }
+ 
+@@ -311,7 +362,7 @@ void PageAllocator::free_pages(const std::vector<page_id_t> &page_ids) {
+ }
+ 
+ bool PageAllocator::resize(int64_t new_mem_size) {
+-  int64_t new_num_pages = new_mem_size / page_size_;
++  int64_t new_num_pages = ceil_div(new_mem_size, page_size_);
+ 
+   std::vector<page_id_t> pages_to_unmap;
+ 
+@@ -448,11 +499,10 @@ int64_t PageAllocator::get_avail_physical_pages() const {
+   avail_phy_mem_size =
+       std::max(avail_phy_mem_size - headroom, static_cast<size_t>(0));
+ 
+-  // Calculate available pages considering layers and KV buffers
+-  int64_t avail_phy_pages = avail_phy_mem_size / page_size_;
+-  int64_t avail_pages_per_layer =
+-      avail_phy_pages / num_layers_ / num_kv_buffers_;
+-  return avail_pages_per_layer;
++  int64_t physical_bytes_per_logical_page =
++      contiguous_layout_ ? num_layer_groups_ * map_page_size_
++                         : num_layers_ * num_kv_buffers_ * page_size_;
++  return avail_phy_mem_size / physical_bytes_per_logical_page;
+ }
+ 
+ page_id_t PageAllocator::get_page_id(int64_t block_id,
+@@ -465,8 +515,11 @@ PageAllocator::check_and_get_resize_target(int64_t current_mem_size) const {
+   if (!mem_info_tracker_) {
+     return -1;
+   }
++  int64_t physical_to_logical_factor =
++      contiguous_layout_ ? (num_layer_groups_ * map_page_size_) / page_size_
++                         : num_layers_ * num_kv_buffers_;
+   return mem_info_tracker_->check_and_get_resize_target(
+-      current_mem_size, num_layers_, num_kv_buffers_);
++      current_mem_size, physical_to_logical_factor, 1);
+ }
+ 
+ std::unordered_map<page_id_t, std::vector<int64_t>>
+@@ -619,11 +672,16 @@ void PageAllocator::prealloc_worker() {
+ 
+ void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
+   std::vector<offset_t> offsets;
+-  offsets.reserve(page_ids.size());
++  offsets.reserve(contiguous_layout_ ? page_ids.size() * num_layer_groups_
++                                     : page_ids.size());
+ 
+   if (contiguous_layout_) {
++    const offset_t group_total_span = virtual_pages_per_layer_ * map_page_size_;
+     for (page_id_t pid : page_ids) {
+-      offsets.push_back(pid * page_size_ * num_layers_ * num_kv_buffers_);
++      for (int64_t group_idx = 0; group_idx < num_layer_groups_; ++group_idx) {
++        offsets.push_back(group_idx * group_total_span +
++                          pid * map_page_size_);
++      }
+     }
+   } else {
+     for (page_id_t pid : page_ids) {
+@@ -633,7 +691,7 @@ void PageAllocator::map_pages(const std::vector<page_id_t> &page_ids) {
+ 
+   if ((world_size_ > 1 || should_use_worker_ipc()) && broadcast_map_callback_) {
+     // Multi-process mode: execute map on all TP workers via broadcast callback
+-    broadcast_map_callback_(world_size_, offsets);
++    broadcast_map_callback_(world_size_, offsets, pp_rank_, group_id_);
+   } else {
+     // Single-process mode: directly call FTensorAllocator
+     auto allocator = FTensorAllocator::global_allocator(group_id_);
+@@ -650,11 +708,16 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
+   auto start_time = std::chrono::steady_clock::now();
+ 
+   std::vector<offset_t> offsets;
+-  offsets.reserve(page_ids.size());
++  offsets.reserve(contiguous_layout_ ? page_ids.size() * num_layer_groups_
++                                     : page_ids.size());
+ 
+   if (contiguous_layout_) {
++    const offset_t group_total_span = virtual_pages_per_layer_ * map_page_size_;
+     for (page_id_t pid : page_ids) {
+-      offsets.push_back(pid * page_size_ * num_layers_ * num_kv_buffers_);
++      for (int64_t group_idx = 0; group_idx < num_layer_groups_; ++group_idx) {
++        offsets.push_back(group_idx * group_total_span +
++                          pid * map_page_size_);
++      }
+     }
+   } else {
+     for (page_id_t pid : page_ids) {
+@@ -666,7 +729,7 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
+       broadcast_unmap_callback_) {
+     // Multi-process mode: execute unmap on all TP workers via broadcast
+     // callback
+-    broadcast_unmap_callback_(world_size_, offsets);
++    broadcast_unmap_callback_(world_size_, offsets, pp_rank_, group_id_);
+   } else {
+     // Need to synchronize CUDA first in async scheduling mode
+     if (async_sched_) {
+@@ -689,11 +752,17 @@ void PageAllocator::unmap_pages(const std::vector<page_id_t> &page_ids) {
+ void PageAllocator::update_memory_usage() {
+   // Calculate currently used physical memory (excluding preallocated pages)
+   int64_t used_phy_mem_size =
+-      get_num_inuse_pages() * num_layers_ * page_size_ * num_kv_buffers_;
++      contiguous_layout_
++          ? get_num_inuse_pages() * num_layer_groups_ * map_page_size_
++          : get_num_inuse_pages() * num_layers_ * page_size_ *
++                num_kv_buffers_;
+   // Calculate physical memory occupied by preallocated pages
+   int64_t prealloc_phy_mem_size =
+-      static_cast<int64_t>(reserved_page_list_.size()) * num_layers_ *
+-      page_size_ * num_kv_buffers_;
++      contiguous_layout_
++          ? static_cast<int64_t>(reserved_page_list_.size()) *
++                num_layer_groups_ * map_page_size_
++          : static_cast<int64_t>(reserved_page_list_.size()) * num_layers_ *
++                page_size_ * num_kv_buffers_;
+ 
+   if (mem_info_tracker_) {
+     mem_info_tracker_->update_memory_usage(used_phy_mem_size,
+@@ -770,8 +839,11 @@ void PageAllocator::resize_watcher() {
+       break;
+     }
+     if (mem_info_tracker_) {
++      int64_t physical_to_logical_factor =
++          contiguous_layout_ ? (num_layer_groups_ * map_page_size_) / page_size_
++                             : num_layers_ * num_kv_buffers_;
+       int64_t target = mem_info_tracker_->check_and_get_resize_target(
+-          mem_size_per_layer_, num_layers_, num_kv_buffers_);
++          mem_size_per_layer_, physical_to_logical_factor, 1);
+       resize_target_.store(target, std::memory_order_relaxed);
+     }
+   }
+@@ -782,4 +854,4 @@ int64_t PageAllocator::get_resize_target() const {
+   return resize_target_.load(std::memory_order_relaxed);
+ }
+ 
+-} // namespace kvcached
+\ No newline at end of file
++} // namespace kvcached
+diff --git a/csrc/torch_bindings.cpp b/csrc/torch_bindings.cpp
+index b59925d..e2c8b53 100644
+--- a/csrc/torch_bindings.cpp
++++ b/csrc/torch_bindings.cpp
+@@ -30,12 +30,18 @@ void shutdown_kvcached() {
+ std::vector<torch::Tensor>
+ create_kv_tensors(size_t size, size_t dtype_size, const std::string &dev_str,
+                   int64_t num_layers, int64_t num_kv_buffers = 2,
+-                  int64_t group_id = 0, bool unified_pool = false) {
++                  int64_t group_id = 0, bool unified_pool = false,
++                  int64_t layer_group_granularity = 1,
++                  size_t contiguous_page_size = 0,
++                  size_t contiguous_total_size = 0) {
+   py::gil_scoped_release release;
+   auto allocator = FTensorAllocator::global_allocator(group_id);
+   auto dtype_ = torch_dtype_from_size(dtype_size);
+   return allocator->create_kv_tensors(size, dtype_, dev_str, num_layers,
+-                                      num_kv_buffers, unified_pool);
++                                      num_kv_buffers, unified_pool,
++                                      layer_group_granularity,
++                                      contiguous_page_size,
++                                      contiguous_total_size);
+ }
+ 
+ bool kv_tensors_created(int64_t group_id = 0) {
+@@ -64,51 +70,61 @@ std::shared_ptr<PageAllocator> create_page_allocator(
+     int64_t world_size = 1, int64_t pp_rank = 0, bool async_sched = false,
+     bool contiguous_layout = true, bool enable_page_prealloc = true,
+     int64_t num_kv_buffers = 2, int64_t group_id = 0,
+-    const std::string &ipc_name = "") {
++    const std::string &ipc_name = "",
++    int64_t layer_group_granularity = 1,
++    int64_t map_page_size = 0) {
+ 
+   return std::make_shared<PageAllocator>(
+       num_layers, mem_size_per_layer, page_size, world_size, pp_rank,
+       async_sched, contiguous_layout, enable_page_prealloc, num_kv_buffers,
+-      group_id, ipc_name);
++      group_id, ipc_name, layer_group_granularity, map_page_size);
+ }
+ 
+ // PageAllocator method bindings
+ void page_allocator_start_prealloc_thread(
+     std::shared_ptr<PageAllocator> allocator) {
++  py::gil_scoped_release release;
+   allocator->start_prealloc_thread();
+ }
+ 
+ void page_allocator_stop_prealloc_thread(
+     std::shared_ptr<PageAllocator> allocator) {
++  py::gil_scoped_release release;
+   allocator->stop_prealloc_thread();
+ }
+ 
+ std::shared_ptr<InternalPage>
+ page_allocator_alloc_page(std::shared_ptr<PageAllocator> allocator) {
++  py::gil_scoped_release release;
+   return allocator->alloc_page();
+ }
+ 
+ void page_allocator_free_page(std::shared_ptr<PageAllocator> allocator,
+                               page_id_t page_id) {
++  py::gil_scoped_release release;
+   allocator->free_page(page_id);
+ }
+ 
+ void page_allocator_free_pages(std::shared_ptr<PageAllocator> allocator,
+                                const std::vector<page_id_t> &page_ids) {
++  py::gil_scoped_release release;
+   allocator->free_pages(page_ids);
+ }
+ 
+ bool page_allocator_resize(std::shared_ptr<PageAllocator> allocator,
+                            int64_t new_mem_size) {
++  py::gil_scoped_release release;
+   return allocator->resize(new_mem_size);
+ }
+ 
+ void page_allocator_trim(std::shared_ptr<PageAllocator> allocator) {
++  py::gil_scoped_release release;
+   allocator->trim();
+ }
+ 
+ void page_allocator_reset_free_page_order(
+     std::shared_ptr<PageAllocator> allocator) {
++  py::gil_scoped_release release;
+   allocator->reset_free_page_order();
+ }
+ 
+@@ -180,6 +196,7 @@ page_allocator_group_indices_by_page(std::shared_ptr<PageAllocator> allocator,
+ 
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+   m.doc() = "kvcached VMM plugin";
++  m.attr("elastic_pp_layer_mapping_abi_version") = 1;
+ 
+   m.def("init_kvcached", &kvcached::init_kvcached, "Initialize kvcached",
+         py::arg("dev_str"), py::arg("page_size") = 0,
+@@ -188,11 +205,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+   m.def("create_kv_tensors", &kvcached::create_kv_tensors, "create_kv_tensors",
+         py::arg("size"), py::arg("dtype_size"), py::arg("dev_str"),
+         py::arg("num_layers"), py::arg("num_kv_buffers") = 2,
+-        py::arg("group_id") = 0, py::arg("unified_pool") = false);
++        py::arg("group_id") = 0, py::arg("unified_pool") = false,
++        py::arg("layer_group_granularity") = 1,
++        py::arg("contiguous_page_size") = 0,
++        py::arg("contiguous_total_size") = 0);
+   m.def("kv_tensors_created", &kvcached::kv_tensors_created,
+         "kv_tensors_created", py::arg("group_id") = 0);
+   m.def("map_to_kv_tensors", &kvcached::map_to_kv_tensors, "map_to_kv_tensors",
+         py::arg("offsets"), py::arg("group_id") = 0);
++  m.attr("elastic_pp_stream_mapping_abi_version") = 1;
++  m.attr("elastic_pp_rdma_mapping_abi_version") = 1;
+   m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
+         "unmap_from_kv_tensors", py::arg("offsets"), py::arg("group_id") = 0);
+ 
+@@ -205,7 +227,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+            py::arg("async_sched") = false, py::arg("contiguous_layout") = true,
+            py::arg("enable_page_prealloc") = true,
+            py::arg("num_kv_buffers") = 2, py::arg("group_id") = 0,
+-           py::arg("ipc_name") = "")
++           py::arg("ipc_name") = "",
++           py::arg("layer_group_granularity") = 1,
++           py::arg("map_page_size") = 0)
+       .def("start_prealloc_thread",
+            &kvcached::page_allocator_start_prealloc_thread)
+       .def("stop_prealloc_thread",
+@@ -245,6 +269,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+       .def_readonly("page_id", &kvcached::InternalPage::page_id)
+       .def_readonly("page_size", &kvcached::InternalPage::page_size)
+       .def("init", &kvcached::InternalPage::init)
++      .def("cap_blocks", &kvcached::InternalPage::cap_blocks)
+       .def("alloc", &kvcached::InternalPage::alloc)
+       .def("free", &kvcached::InternalPage::free)
+       .def("free_batch", &kvcached::InternalPage::free_batch)
+diff --git a/kvcached/integration/vllm/interfaces.py b/kvcached/integration/vllm/interfaces.py
+index 1168436..d8bf2e3 100644
+--- a/kvcached/integration/vllm/interfaces.py
++++ b/kvcached/integration/vllm/interfaces.py
+@@ -8,7 +8,13 @@ import torch
+ 
+ from kvcached.kv_cache_manager import KVCacheManager
+ from kvcached.tp_ipc_util import start_worker_listener_thread
+-from kvcached.utils import CONTIGUOUS_LAYOUT, PAGE_SIZE, get_kvcached_logger
++from kvcached.utils import (
++    CONTIGUOUS_LAYOUT,
++    LAYER_STACKING,
++    PAGE_SIZE,
++    get_physical_block_size,
++    get_kvcached_logger,
++)
+ from kvcached.vmm_ops import (
+     create_kv_tensors,
+     init_kvcached as _init_kvcached_impl,
+@@ -26,9 +32,57 @@ _contiguous_layout: bool = CONTIGUOUS_LAYOUT
+ _is_worker: bool = False
+ 
+ 
++def _align_up(value: int, alignment: int) -> int:
++    return ((value + alignment - 1) // alignment) * alignment
++
++
+ def should_use_worker_ipc() -> bool:
+     return _kvcached_initialized and not _is_worker
+ 
++
++def _resolve_physical_layer_block_size(
++    num_layers: int,
++    block_mem_bytes: int,
++    physical_block_size: Optional[int],
++) -> Tuple[int, int]:
++    """Resolve per-layer physical block size and stacking factor."""
++    env_physical_block_size = get_physical_block_size()
++    if physical_block_size is None:
++        physical_block_size = env_physical_block_size
++    if physical_block_size is None:
++        physical_block_size = PAGE_SIZE
++    physical_block_size = int(physical_block_size)
++    if physical_block_size <= 0:
++        raise ValueError(
++            "physical_block_size must be positive, got "
++            f"{physical_block_size}")
++    if physical_block_size > PAGE_SIZE:
++        raise ValueError(
++            "physical_block_size must be no larger than PAGE_SIZE "
++            f"({PAGE_SIZE}), got {physical_block_size}")
++    if PAGE_SIZE % physical_block_size != 0:
++        raise ValueError(
++            "PAGE_SIZE must be divisible by physical_block_size: "
++            f"PAGE_SIZE={PAGE_SIZE}, "
++            f"physical_block_size={physical_block_size}")
++    layer_group_granularity = PAGE_SIZE // physical_block_size
++    if layer_group_granularity > 1 and num_layers % layer_group_granularity != 0:
++        raise ValueError(
++            f"num_layers ({num_layers}) must be divisible by derived "
++            f"layer_group_granularity ({layer_group_granularity})")
++    if layer_group_granularity > 1:
++        if physical_block_size < block_mem_bytes:
++            raise ValueError(
++                "physical_block_size "
++                f"({physical_block_size}) is smaller than one "
++                f"PageAttention block ({block_mem_bytes})")
++        if physical_block_size % block_mem_bytes != 0:
++            raise ValueError(
++                "physical_block_size "
++                f"({physical_block_size}) must be divisible by "
++                f"PageAttention block size ({block_mem_bytes})")
++    return int(layer_group_granularity), int(physical_block_size)
++
+ def init_kvcached(
+     tp_rank: int = 0,
+     world_size: int = 1,
+@@ -94,6 +148,7 @@ def alloc_kv_cache(
+     kv_layout: str = "NHD",  # NHD: (num_tokens, head_num, head_dim)
+     group_id: int = 0,
+     kernel_block_size: Optional[int] = None,
++    physical_block_size: Optional[int] = None,
+ ) -> List[torch.Tensor]:
+     """Allocate KV cache tensors for all supported attention types.
+ 
+@@ -195,23 +250,73 @@ def alloc_kv_cache(
+ 
+     assert torch.cuda.is_available(), "CUDA is not available."
+ 
+-    # --- Compute per-layer memory budget and number of blocks ---
+-    gpu_mem_bytes = torch.cuda.get_device_properties(device).total_memory
+-    gpu_mem_bytes_per_layer_k_or_v = gpu_mem_bytes // num_layers // num_k_or_v
+-    # Round down to 2 * PAGE_SIZE for MLA backend.
+-    # The get_v_base_offset() requires the ftensor size (which equals
+-    # gpu_mem_bytes_per_layer_k_or_v * num_k_or_v) to be a multiple of
+-    # 2 * PAGE_SIZE. When num_k_or_v == 1 (MLA), we must align this value
+-    # to 2 * PAGE_SIZE directly. For MHA/GQA (num_k_or_v == 2), aligning
+-    # to PAGE_SIZE suffices because ftensor_bytes = 2 * aligned_value is
+-    # automatically 2*PAGE_SIZE-aligned.
+-    alignment = 2 * PAGE_SIZE if is_mla else PAGE_SIZE
+-    gpu_mem_bytes_per_layer_k_or_v = (gpu_mem_bytes_per_layer_k_or_v // alignment) * alignment
+-
+-    num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_bytes
+-    if requested_num_blocks > num_blocks_per_layer:
++    layer_group_granularity, physical_block_size = (
++        _resolve_physical_layer_block_size(
++            int(num_layers), int(block_mem_bytes), physical_block_size))
++    if layer_group_granularity > 1 and not _contiguous_layout:
++        raise ValueError(
++            "physical layer stacking is currently supported only with "
++            "KVCACHED_CONTIGUOUS_LAYOUT=true")
++    block_level_layer_groups = _contiguous_layout and (LAYER_STACKING or layer_group_granularity > 1)
++
++    # --- Compute virtual tensor budget and number of blocks ---
++    # The vLLM KVCacheManager already decided the logical block capacity.
++    requested_bytes_per_layer_k_or_v = requested_num_blocks * block_mem_bytes
++    contiguous_page_size = 0
++    contiguous_total_size = 0
++    packed_block_stride_bytes = block_mem_bytes * num_k_or_v
++    blocks_per_physical_page = 0
++    if block_level_layer_groups:
++        group_block_bytes = (
++            block_mem_bytes * num_k_or_v * layer_group_granularity)
++        blocks_per_physical_page = physical_block_size // block_mem_bytes
++        layer_group_layout = (
++            "block_aligned" if blocks_per_physical_page == 1
++            else "slice_packed")
++        packed_block_stride_bytes = group_block_bytes
++        contiguous_page_size = (
++            blocks_per_physical_page * packed_block_stride_bytes)
++        num_layer_groups = num_layers // layer_group_granularity
++        num_blocks_per_layer = _align_up(
++            requested_num_blocks, blocks_per_physical_page)
++        num_physical_pages_per_group = (
++            num_blocks_per_layer // blocks_per_physical_page)
++        contiguous_total_size = (
++            num_layer_groups * num_physical_pages_per_group *
++            contiguous_page_size)
++        gpu_mem_bytes_per_layer_k_or_v = requested_bytes_per_layer_k_or_v
++        logger.info(
++            "KVCacheD layer-group layout enabled: "
++            "derived_layout=%s, physical_block_size=%d, "
++            "granularity=%d, num_layer_groups=%d, "
++            "logical_group_block=%d, packed_block_stride=%d, "
++            "blocks_per_physical_page=%d, packed_page_size=%d, "
++            "total_virtual_bytes=%d",
++            layer_group_layout, physical_block_size,
++            layer_group_granularity, num_layer_groups, group_block_bytes,
++            packed_block_stride_bytes,
++            blocks_per_physical_page, contiguous_page_size,
++            contiguous_total_size)
++    else:
++        # Allocate the virtual tensor to that capacity, rounded up to the VMM
++        # page boundary, so Python tensor strides and PageAllocator map offsets
++        # agree.
++        alignment = 2 * PAGE_SIZE if is_mla else PAGE_SIZE
++        gpu_mem_bytes_per_layer_k_or_v = _align_up(
++            requested_bytes_per_layer_k_or_v, alignment)
++        num_blocks_per_layer = gpu_mem_bytes_per_layer_k_or_v // block_mem_bytes
++
++    gpu_capacity_bytes = torch.cuda.get_device_properties(device).total_memory
++    if block_level_layer_groups:
++        rough_required_bytes = contiguous_total_size
++    else:
++        rough_required_bytes = (
++            gpu_mem_bytes_per_layer_k_or_v * num_layers * num_k_or_v)
++    if rough_required_bytes > gpu_capacity_bytes:
+         logger.warning(
+-            f"Requested {requested_num_blocks} blocks, but only {num_blocks_per_layer} blocks are available."
++            f"Requested {requested_num_blocks} blocks requires roughly "
++            f"{rough_required_bytes} virtual bytes, above device capacity "
++            f"estimate {gpu_capacity_bytes}."
+         )
+ 
+     ftensor_bytes_per_layer = gpu_mem_bytes_per_layer_k_or_v * num_k_or_v
+@@ -220,6 +325,9 @@ def alloc_kv_cache(
+         ftensor_bytes_per_layer, dtype.itemsize, device, num_layers,
+         num_kv_buffers=num_k_or_v, group_id=group_id,
+         unified_pool=unified_pool,
++        layer_group_granularity=layer_group_granularity,
++        contiguous_page_size=contiguous_page_size,
++        contiguous_total_size=contiguous_total_size,
+     )
+ 
+     actual_kvcache_shape: List[int] = list(kvcache_shape)
+@@ -287,13 +395,76 @@ def alloc_kv_cache(
+                 kv_tensors.append(
+                     torch.as_strided(t.view(dtype=dtype), shape, strides))
+     else:
+-        layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
+-        contiguous_shape = [num_blocks_per_layer, num_layers] + layer_elem_shape
+-        num_eles = math.prod(contiguous_shape)
+-        contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
+-        kv_tensors = [
+-            contiguous_tensor[:, i].permute(*permute_order) for i in range(num_layers)
+-        ]
++        if block_level_layer_groups:
++            packed_block_elems = packed_block_stride_bytes // dtype.itemsize
++            one_kv_block_elems = block_mem_bytes // dtype.itemsize
++            num_layer_groups = num_layers // layer_group_granularity
++            group_stride = (
++                (num_blocks_per_layer // blocks_per_physical_page) *
++                (contiguous_page_size // dtype.itemsize))
++            flat = raw_kv_tensors[0].view(dtype=dtype)[
++                :contiguous_total_size // dtype.itemsize]
++            kv_tensors = []
++            if is_mla:
++                shape = list(actual_kvcache_shape)
++                strides = [packed_block_elems]
++                inner = 1
++                for dim in reversed(shape[1:]):
++                    strides.insert(1, inner)
++                    inner *= dim
++                for i in range(num_layers):
++                    group_idx = i // layer_group_granularity
++                    layer_in_group = i % layer_group_granularity
++                    offset = (
++                        group_idx * group_stride +
++                        layer_in_group * one_kv_block_elems)
++                    kv_tensors.append(torch.as_strided(
++                        flat, shape, strides, storage_offset=offset))
++            else:
++                shape = list(actual_kvcache_shape)
++                token_dim_idx = 2
++                token_block_elems = math.prod(shape[token_dim_idx:])
++                if blocks_dim_idx == 1:
++                    strides = [
++                        one_kv_block_elems,
++                        packed_block_elems,
++                        token_block_elems // shape[token_dim_idx],
++                    ]
++                    for dim in shape[token_dim_idx + 1:]:
++                        strides.append(strides[-1] // dim)
++                else:
++                    strides = [
++                        packed_block_elems,
++                        one_kv_block_elems,
++                        token_block_elems // shape[token_dim_idx],
++                    ]
++                    for dim in shape[token_dim_idx + 1:]:
++                        strides.append(strides[-1] // dim)
++                for i in range(num_layers):
++                    group_idx = i // layer_group_granularity
++                    layer_in_group = i % layer_group_granularity
++                    offset = (
++                        group_idx * group_stride +
++                        layer_in_group * num_k_or_v * one_kv_block_elems)
++                    kv_tensors.append(torch.as_strided(
++                        flat, shape, strides, storage_offset=offset))
++        else:
++            layer_elem_shape = actual_kvcache_shape[:blocks_dim_idx] + actual_kvcache_shape[blocks_dim_idx + 1:]
++            num_layer_groups = num_layers // layer_group_granularity
++            contiguous_shape = [
++                num_layer_groups,
++                num_blocks_per_layer,
++                layer_group_granularity,
++            ] + layer_elem_shape
++            num_eles = math.prod(contiguous_shape)
++            contiguous_tensor = raw_kv_tensors[0].view(dtype=dtype)[:num_eles].view(contiguous_shape)
++            kv_tensors = [
++                contiguous_tensor[
++                    i // layer_group_granularity,
++                    :,
++                    i % layer_group_granularity,
++                ].permute(*permute_order) for i in range(num_layers)
++            ]
+ 
+     if not unified_pool:
+         return kv_tensors
+@@ -319,6 +490,7 @@ def get_kv_cache_manager(
+     num_layers: int,
+     num_kv_buffers: int = 2,
+     group_id: int = 0,
++    physical_block_size: Optional[int] = None,
+ ) -> KVCacheManager:
+     if not _kvcached_initialized:
+         raise RuntimeError("kvcached is not initialized. Please call init_kvcached() first.")
+@@ -333,4 +505,5 @@ def get_kv_cache_manager(
+         async_sched=_async_sched,
+         num_kv_buffers=num_kv_buffers,
+         group_id=group_id,
++        physical_block_size=physical_block_size,
+     )
+diff --git a/kvcached/kv_cache_manager.py b/kvcached/kv_cache_manager.py
+index ed96e51..22d711f 100644
+--- a/kvcached/kv_cache_manager.py
++++ b/kvcached/kv_cache_manager.py
+@@ -12,6 +12,7 @@ This module implements a hierarchical memory management system for KV cache:
+ from __future__ import annotations
+ 
+ import functools
++import os
+ import threading
+ import time
+ from typing import Any, Dict, List, Optional
+@@ -21,9 +22,11 @@ from kvcached.tp_ipc_util import broadcast_kv_tensors_created
+ from kvcached.utils import (
+     CONTIGUOUS_LAYOUT,
+     DEFAULT_IPC_NAME,
++    LAYER_STACKING,
+     PAGE_PREALLOC_ENABLED,
+     PAGE_SIZE,
+     SANITY_CHECK,
++    get_physical_block_size,
+     get_kvcached_logger,
+ )
+ from kvcached.vmm_ops import kv_tensors_created
+@@ -68,6 +71,7 @@ class KVCacheManager:
+         reserve_null_block: bool = False,
+         num_kv_buffers: int = 2,
+         group_id: int = 0,
++        physical_block_size: Optional[int] = None,
+     ):
+         """
+         Args:
+@@ -84,17 +88,95 @@ class KVCacheManager:
+                 1 for MLA combined KV).
+             group_id: KV cache group identifier for hybrid attention models.
+                 Different groups have independent FTensors and page spaces.
++            physical_block_size: Per-layer physical block/slice size in bytes.
++                The stacking factor is PAGE_SIZE // physical_block_size.
+         """
+         self.num_blocks = num_blocks
+-        self.block_mem_size = block_size * cell_size
++        self.page_attention_block_mem_size = block_size * cell_size
+         self.num_layers = num_layers
+         self.num_kv_buffers = num_kv_buffers
++        env_physical_block_size = get_physical_block_size()
++        if physical_block_size is None:
++            physical_block_size = env_physical_block_size
++        if physical_block_size is None:
++            physical_block_size = PAGE_SIZE
++        physical_block_size = int(physical_block_size)
++        if physical_block_size <= 0:
++            raise ValueError(
++                "physical_block_size must be positive, got "
++                f"{physical_block_size}")
++        if physical_block_size > PAGE_SIZE:
++            raise ValueError(
++                "physical_block_size must be no larger than PAGE_SIZE "
++                f"({PAGE_SIZE}), got {physical_block_size}")
++        if PAGE_SIZE % physical_block_size != 0:
++            raise ValueError(
++                "PAGE_SIZE must be divisible by physical_block_size: "
++                f"PAGE_SIZE={PAGE_SIZE}, "
++                f"physical_block_size={physical_block_size}")
++        self.physical_block_size = physical_block_size
++        self.layer_group_granularity = PAGE_SIZE // physical_block_size
++        if self.num_layers % self.layer_group_granularity != 0:
++            raise ValueError(
++                f"num_layers ({self.num_layers}) must be divisible by "
++                f"layer_group_granularity ({self.layer_group_granularity})")
++        self.num_layer_groups = self.num_layers // self.layer_group_granularity
++        self.block_level_layer_groups = (
++            CONTIGUOUS_LAYOUT and (LAYER_STACKING or self.layer_group_granularity > 1))
++        if self.layer_group_granularity > 1 and not CONTIGUOUS_LAYOUT:
++            raise ValueError(
++                "physical layer stacking requires "
++                "KVCACHED_CONTIGUOUS_LAYOUT=true")
++        if self.block_level_layer_groups:
++            if self.physical_block_size < self.page_attention_block_mem_size:
++                raise ValueError(
++                    "physical_block_size "
++                    f"({self.physical_block_size}) is smaller than "
++                    "one PageAttention block "
++                    f"({self.page_attention_block_mem_size})")
++            if (self.physical_block_size %
++                    self.page_attention_block_mem_size != 0):
++                raise ValueError(
++                    "physical_block_size "
++                    f"({self.physical_block_size}) must be divisible by "
++                    "PageAttention block size "
++                    f"({self.page_attention_block_mem_size})")
+         self.reserve_null_block = reserve_null_block
+         self.group_id = group_id
+ 
+-        # The physical page size used by kvcached page allocator.
+-        self.page_size = PAGE_SIZE
+-        # NOTE: this is the memory size of the K or V tensor in one layer
++        if self.block_level_layer_groups:
++            self.block_mem_size = self.page_attention_block_mem_size
++            self.page_size = self.physical_block_size
++            self.physical_layer_slice_size = self.physical_block_size
++            self.blocks_per_physical_page = (
++                self.physical_block_size // self.block_mem_size)
++            self.layer_group_layout = (
++                "block_aligned" if self.blocks_per_physical_page == 1
++                else "slice_packed")
++            self.physical_group_page_size = (
++                self.physical_block_size * self.layer_group_granularity *
++                self.num_kv_buffers)
++            self.packed_block_stride_bytes = (
++                self.page_attention_block_mem_size * self.num_kv_buffers *
++                self.layer_group_granularity)
++        else:
++            self.block_mem_size = self.page_attention_block_mem_size
++            # The physical page size used by kvcached page allocator.
++            self.page_size = PAGE_SIZE
++            self.physical_group_page_size = (
++                PAGE_SIZE * self.layer_group_granularity *
++                self.num_kv_buffers if CONTIGUOUS_LAYOUT else PAGE_SIZE)
++            self.packed_block_stride_bytes = (
++                self.block_mem_size * self.layer_group_granularity *
++                self.num_kv_buffers)
++            self.blocks_per_physical_page = (
++                self.page_size // self.block_mem_size)
++            self.physical_layer_slice_size = self.page_size
++            self.layer_group_layout = "unstacked"
++
++        # This is the logical allocator size. For slice_packed it remains the
++        # original per-layer K/V-buffer size; for block_aligned each public
++        # block is itself one packed physical page.
+         self.mem_size = self.num_blocks * self.block_mem_size
+         self.world_size = world_size
+         self.pp_rank = pp_rank
+@@ -110,6 +192,8 @@ class KVCacheManager:
+             num_kv_buffers=self.num_kv_buffers,
+             group_id=self.group_id,
+             ipc_name=DEFAULT_IPC_NAME,
++            layer_group_granularity=self.layer_group_granularity,
++            map_page_size=self.physical_group_page_size,
+         )
+         # Register should_use_worker_ipc callback so C++ PageAllocator
+         # knows when to use broadcast IPC even with world_size == 1
+@@ -133,7 +217,7 @@ class KVCacheManager:
+                     """Wrapper for Python broadcast function"""
+                     broadcast_map_to_kv_tensors(world_size, offsets, pp_rank, group_id)
+ 
+-                def unmap_callback(world_size: int, offsets: List[int]) -> None:
++                def unmap_callback(world_size: int, offsets: List[int], pp_rank: int = 0, group_id: int = 0) -> None:
+                     """Wrapper for Python broadcast function"""
+                     broadcast_unmap_from_kv_tensors(world_size, offsets, pp_rank, group_id)
+ 
+@@ -157,6 +241,7 @@ class KVCacheManager:
+ 
+         self.in_shrink: bool = False
+         self.target_num_blocks: Optional[int] = None
++        self._closed: bool = False
+         # NOTE: we use a no-op lock for sync scheduling to avoid overhead
+         self._lock = threading.RLock() if async_sched else NoOpLock()
+ 
+@@ -197,7 +282,9 @@ class KVCacheManager:
+             # Possibly reserve the first block as null block for padding tokens
+             self._reserve_null_block()
+ 
+-            self.page_allocator.start_prealloc_thread()
++            if not self._closed:
++                self.page_allocator.start_prealloc_thread()
++                self._maybe_wait_for_sync_prealloc()
+         except Exception as e:
+             logger.error(
+                 f"Error during KVCacheManager post-initialization: {e}")
+@@ -210,6 +297,78 @@ class KVCacheManager:
+         if not self._post_init_done.is_set():
+             self._post_init_done.wait()
+ 
++    def get_layer_group_total_span(self) -> int:
++        if not self.block_level_layer_groups:
++            raise RuntimeError("KV manager does not use independent layer groups")
++        pages = (self.num_blocks + self.blocks_per_physical_page - 1) // self.blocks_per_physical_page
++        return pages * self.physical_group_page_size
++
++    def snapshot_inuse_page_ids(self) -> list[int]:
++        # Do not wait under _lock: the initializer needs it to reserve slot 0.
++        self._wait_post_init()
++        with self._lock:
++            return sorted(set(self.avail_pages) | set(self.full_pages))
++
++    def _log_allocator_state(self, label: str) -> None:
++        reserved_pages = self.page_allocator.get_num_reserved_pages()
++        inuse_pages = self.page_allocator.get_num_inuse_pages()
++        free_pages = self.page_allocator.get_num_free_pages()
++        total_pages = self.page_allocator.get_num_total_pages()
++        avail_physical_pages = self.page_allocator.get_avail_physical_pages()
++        if self.block_level_layer_groups:
++            prealloc_bytes = (
++                reserved_pages * self.num_layer_groups *
++                self.physical_group_page_size)
++            used_bytes = (
++                inuse_pages * self.num_layer_groups *
++                self.physical_group_page_size)
++        else:
++            prealloc_bytes = (
++                reserved_pages * self.num_layers * self.page_size *
++                self.num_kv_buffers)
++            used_bytes = (
++                inuse_pages * self.num_layers * self.page_size *
++                self.num_kv_buffers)
++        logger.info(
++            "KVCacheD allocator state [%s]: reserved_pages=%d, "
++            "inuse_pages=%d, free_pages=%d, total_pages=%d, "
++            "avail_physical_pages=%d, prealloc_bytes=%.2f GB, "
++            "used_bytes=%.2f GB",
++            label, reserved_pages, inuse_pages, free_pages, total_pages,
++            avail_physical_pages, prealloc_bytes / (1024**3),
++            used_bytes / (1024**3))
++
++    def _maybe_wait_for_sync_prealloc(self) -> None:
++        target_raw = os.getenv("KVCACHED_SYNC_PREALLOC_TARGET_PAGES")
++        if not target_raw:
++            return
++
++        target_pages = int(target_raw)
++        if target_pages <= 0:
++            self._log_allocator_state("sync-prealloc-disabled")
++            return
++
++        timeout_s = float(os.getenv("KVCACHED_SYNC_PREALLOC_TIMEOUT_SEC",
++                                    "60"))
++        poll_s = float(os.getenv("KVCACHED_SYNC_PREALLOC_POLL_SEC", "0.05"))
++        deadline = time.monotonic() + timeout_s
++        self._log_allocator_state("sync-prealloc-start")
++        logger.info(
++            "Waiting for KVCacheD preallocation: target_reserved_pages=%d, "
++            "timeout=%.2fs", target_pages, timeout_s)
++
++        while time.monotonic() < deadline:
++            reserved_pages = self.page_allocator.get_num_reserved_pages()
++            if reserved_pages >= target_pages:
++                self._log_allocator_state("sync-prealloc-ready")
++                return
++            time.sleep(poll_s)
++
++        self._log_allocator_state("sync-prealloc-timeout")
++        raise TimeoutError(
++            "KVCacheD preallocation did not reach "
++            f"{target_pages} reserved pages within {timeout_s:.2f}s")
++
+     def _reserve_null_block(self) -> None:
+         """
+         Reserve the first block as null block for padding tokens.
+@@ -260,6 +419,8 @@ class KVCacheManager:
+             if not self.avail_pages:
+                 page = self.page_allocator.alloc_page()
+                 page.init(self.block_mem_size)
++                if hasattr(page, "cap_blocks"):
++                    page.cap_blocks(self.num_blocks)
+                 # A page may have zero usable blocks when block_mem_size is
+                 # large (e.g. HYBRID_LINEAR) and every aligned block would
+                 # straddle the page boundary. Park it in full_pages so it's
+@@ -388,6 +549,26 @@ class KVCacheManager:
+         self._wait_post_init()
+         self.page_allocator.trim()
+ 
++    def shutdown(self) -> None:
++        """Stop background allocator activity before KV tensors are destroyed."""
++        if self._closed:
++            return
++        self._closed = True
++        try:
++            self._post_init_done.wait(PREALLOC_THREAD_TIMEOUT)
++            self.page_allocator.stop_prealloc_thread()
++        except Exception as e:
++            logger.debug("Failed to stop KVCacheManager cleanly: %s", e)
++
++    def close(self) -> None:
++        self.shutdown()
++
++    def __del__(self) -> None:
++        try:
++            self.shutdown()
++        except Exception:
++            pass
++
+     @synchronized
+     def available_size(self) -> int:
+         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
+@@ -405,9 +586,15 @@ class KVCacheManager:
+     @synchronized
+     def get_mapped_memory_size(self, unit='bytes') -> float:
+         """Get memory usage in specified unit (bytes, kb, mb, gb)."""
+-        memory_bytes = (self.page_allocator.get_num_inuse_pages() *
+-                        self.num_layers * self.page_size *
+-                        self.num_kv_buffers)
++        if CONTIGUOUS_LAYOUT:
++            memory_bytes = (self.page_allocator.get_num_inuse_pages() *
++                            self.num_layer_groups *
++                            self.physical_group_page_size)
++        else:
++            memory_bytes = (self.page_allocator.get_num_inuse_pages() *
++                            self.num_layer_groups *
++                            self.layer_group_granularity * self.page_size *
++                            self.num_kv_buffers)
+ 
+         if unit == 'bytes':
+             return memory_bytes
+@@ -420,6 +607,33 @@ class KVCacheManager:
+         else:
+             raise ValueError(f"Unknown unit: {unit}")
+ 
++    @synchronized
++    def stats(self) -> dict[str, Any]:
++        """Return lightweight allocator statistics for debugging/tests."""
++        return {
++            "num_blocks": self.num_blocks,
++            "block_mem_size": self.block_mem_size,
++            "page_attention_block_mem_size": self.page_attention_block_mem_size,
++            "num_layers": self.num_layers,
++            "num_kv_buffers": self.num_kv_buffers,
++            "layer_group_granularity": self.layer_group_granularity,
++            "layer_group_layout": self.layer_group_layout,
++            "num_layer_groups": self.num_layer_groups,
++            "block_level_layer_groups": self.block_level_layer_groups,
++            "physical_block_size": self.physical_block_size,
++            "page_size": self.page_size,
++            "physical_group_page_size": self.physical_group_page_size,
++            "physical_layer_slice_size": self.physical_layer_slice_size,
++            "packed_block_stride_bytes": self.packed_block_stride_bytes,
++            "blocks_per_physical_page": self.blocks_per_physical_page,
++            "available_size": self.available_size(),
++            "mapped_memory_bytes": self.get_mapped_memory_size("bytes"),
++            "num_avail_blocks": self.num_avail_blocks,
++            "num_full_pages": len(self.full_pages),
++            "num_avail_pages": len(self.avail_pages),
++            "num_reserved_blocks": len(self.reserved_blocks),
++        }
++
+     @synchronized
+     def clear(self):
+         """
+@@ -431,8 +645,7 @@ class KVCacheManager:
+         # Stop the prealloc thread first — it runs on the PageAllocator's
+         # lock and can grab pages between our trim/reset/reserve steps,
+         # causing the null-block reservation to get a non-zero block.
+-        self.page_allocator._stop_prealloc_thread(
+-            timeout=PREALLOC_THREAD_TIMEOUT)
++        self.page_allocator.stop_prealloc_thread()
+ 
+         # Clear reserved blocks
+         self.free_reserved()
+@@ -466,7 +679,8 @@ class KVCacheManager:
+         self._reserve_null_block()
+ 
+         # Restart the prealloc thread now that null block is safely reserved.
+-        self.page_allocator.start_prealloc_thread()
++        if not self._closed:
++            self.page_allocator.start_prealloc_thread()
+ 
+     # Private methods
+     @synchronized
+diff --git a/kvcached/tp_ipc_util.py b/kvcached/tp_ipc_util.py
+index c779d9f..cdb62fc 100644
+--- a/kvcached/tp_ipc_util.py
++++ b/kvcached/tp_ipc_util.py
+@@ -7,12 +7,230 @@ import pickle
+ import socket
+ import threading
+ import uuid
+-from typing import Any, Dict, cast
++from collections import Counter
++from typing import Any, Callable, Dict, Iterable, cast
+ 
+ from kvcached.utils import DEFAULT_IPC_NAME
+ from kvcached.vmm_ops import kv_tensors_created, map_to_kv_tensors, unmap_from_kv_tensors
+ 
+ 
++_worker_mapping_lock = threading.RLock()
++_worker_offset_filters: dict[int, Callable] = {}
++_worker_mapped_offsets: dict[int, set[int]] = {}
++_worker_offset_pins: dict[int, Counter] = {}
++_worker_mapping_geometry: dict[int, tuple[int, int, int]] = {}
++
++
++def _normalize_offsets(offsets: Iterable[int]) -> list[int]:
++    result = sorted(set(int(offset) for offset in offsets))
++    if result and result[0] < 0:
++        raise ValueError("KV mapping offsets must be nonnegative")
++    return result
++
++
++def register_worker_offset_filter(callback: Callable, group_id: int = 0, *,
++                                  map_size: int | None = None,
++                                  layer_group_span: int | None = None,
++                                  num_layer_groups: int | None = None) -> None:
++    """Install ownership before any page in this group is allocated.
++
++    The callback is consulted on every allocator-originated map, so it can
++    follow the pool's published layer ownership without being reinstalled.
++    Migration maps bypass it, but use the same ledger and reclamation lock.
++    """
++    if not callable(callback):
++        raise TypeError("worker offset filter must be callable")
++    geometry = (map_size, layer_group_span, num_layer_groups)
++    if any(value is not None for value in geometry):
++        if any(value is None or value <= 0 for value in geometry):
++            raise ValueError("all KV mapping geometry values must be positive")
++        if layer_group_span % map_size:
++            raise ValueError("layer-group span must be aligned to mapping size")
++    with _worker_mapping_lock:
++        previous = _worker_offset_filters.get(group_id)
++        if previous is not None and previous != callback:
++            raise RuntimeError("KV group already has an ownership filter")
++        if previous is None and _worker_mapped_offsets.get(group_id):
++            raise RuntimeError("install ownership before mapping KV pages")
++        if previous is not None and _worker_mapping_geometry.get(group_id) != (
++                geometry if map_size is not None else None):
++            raise RuntimeError("cannot change live KV mapping geometry")
++        _worker_offset_filters[group_id] = callback
++        if map_size is not None:
++            _worker_mapping_geometry[group_id] = geometry
++
++
++def _validate_worker_offsets(offsets: list[int], group_id: int) -> None:
++    geometry = _worker_mapping_geometry.get(group_id)
++    if geometry is None:
++        return
++    map_size, span, groups = geometry
++    if any(offset % map_size or offset >= span * groups for offset in offsets):
++        raise ValueError("KV mapping offset is misaligned or outside reservation")
++
++
++def snapshot_worker_mapped_offsets(group_id: int = 0) -> tuple[int, ...]:
++    with _worker_mapping_lock:
++        return tuple(sorted(_worker_mapped_offsets.get(group_id, ())))
++
++
++def _map_worker_offsets(offsets: Iterable[int], group_id: int = 0,
++                        *, migration: bool = False,
++                        stream_fenced: bool = False) -> bool:
++    if stream_fenced:
++        from kvcached import vmm_ops
++        if getattr(vmm_ops, "elastic_pp_stream_mapping_abi_version", None) != 1:
++            raise RuntimeError("stream-fenced mapping requires rebuilt native ABI v1")
++    offsets = _normalize_offsets(offsets)
++    with _worker_mapping_lock:
++        _validate_worker_offsets(offsets, group_id)
++        callback = _worker_offset_filters.get(group_id)
++        if not migration and callback is not None:
++            filtered = _normalize_offsets(callback(offsets, group_id))
++            if not set(filtered).issubset(offsets):
++                raise ValueError("ownership filter introduced unrequested offsets")
++            offsets = filtered
++        ledger = _worker_mapped_offsets.setdefault(group_id, set())
++        # One offset per call preserves exact progress when a later call fails.
++        # Never re-map a live page: FTensor::map zero-initializes new backing.
++        mapped_new = False
++        try:
++            for offset in offsets:
++                if offset not in ledger:
++                    if not map_to_kv_tensors([offset], group_id=group_id):
++                        return False
++                    ledger.add(offset)
++                    mapped_new = True
++        finally:
++            # Native mapping zero-initializes new backing. The migration
++            # caller may copy on another stream immediately after return.
++            # Do not fence allocator/listener maps: an in-flight NCCL receive
++            # may be waiting for that same listener to finish.
++            if migration and mapped_new and not stream_fenced:
++                _synchronize_worker_cuda()
++        return True
++
++
++def map_worker_offsets_for_migration(offsets: Iterable[int],
++                                      group_id: int = 0, *,
++                                      stream_fenced: bool = False) -> bool:
++    """Map prepared target layers; do not change published ownership.
++
++    Call only at an engine-controlled safe boundary. New-page initialization
++    is fenced before return; this does not protect request/slot lifetimes or
++    make unrelated writes to existing pages safe to copy.
++    """
++    return _map_worker_offsets(offsets, group_id, migration=True,
++                               stream_fenced=stream_fenced)
++
++
++def unmap_worker_offsets_for_capacity(offsets: Iterable[int],
++                                      group_id: int = 0) -> bool:
++    """Reclaim unused capacity at a drained engine fence, preserving page pins."""
++    return _unmap_worker_offsets(offsets, group_id)
++
++
++def pin_worker_offsets(offsets: Iterable[int], group_id: int = 0) -> tuple[int, ...]:
++    """Prevent reclamation while a snapshot/HiCache operation owns the pages."""
++    offsets = _normalize_offsets(offsets)
++    with _worker_mapping_lock:
++        _validate_worker_offsets(offsets, group_id)
++        if not set(offsets).issubset(_worker_mapped_offsets.get(group_id, ())):
++            raise RuntimeError("cannot pin an unmapped KV page")
++        pins = _worker_offset_pins.setdefault(group_id, Counter())
++        pins.update(offsets)
++    return tuple(offsets)
++
++
++def unpin_worker_offsets(offsets: Iterable[int], group_id: int = 0) -> None:
++    offsets = _normalize_offsets(offsets)
++    with _worker_mapping_lock:
++        pins = _worker_offset_pins.setdefault(group_id, Counter())
++        if any(pins[offset] <= 0 for offset in offsets):
++            raise RuntimeError("KV page pin underflow")
++        for offset in offsets:
++            pins[offset] -= 1
++            if not pins[offset]:
++                del pins[offset]
++
++
++def _synchronize_worker_cuda() -> None:
++    # The first implementation uses the conservative device fence. A caller
++    # must also prevent new launches until unmapping has completed.
++    import torch
++    if torch.cuda.is_available():
++        torch.cuda.synchronize()
++
++
++def _unmap_worker_offsets(offsets: Iterable[int], group_id: int = 0) -> bool:
++    offsets = _normalize_offsets(offsets)
++    with _worker_mapping_lock:
++        _validate_worker_offsets(offsets, group_id)
++        ledger = _worker_mapped_offsets.setdefault(group_id, set())
++        offsets = [offset for offset in offsets if offset in ledger]
++        pins = _worker_offset_pins.get(group_id, {})
++        if any(pins.get(offset, 0) for offset in offsets):
++            raise RuntimeError("cannot reclaim pinned KV pages")
++        if offsets:
++            _synchronize_worker_cuda()
++        for offset in offsets:
++            if not unmap_from_kv_tensors([offset], group_id=group_id):
++                return False
++            ledger.remove(offset)
++        return True
++
++
++def unmap_worker_offsets_for_layer_groups(layer_groups: Iterable[int],
++                                          group_total_span: int,
++                                          group_id: int = 0) -> bool:
++    """Retire complete physical layer groups after their consumers drain."""
++    if group_total_span <= 0:
++        raise ValueError("layer-group span must be positive")
++    groups = set(int(group) for group in layer_groups)
++    if any(group < 0 for group in groups):
++        raise ValueError("layer groups must be nonnegative")
++    with _worker_mapping_lock:
++        geometry = _worker_mapping_geometry.get(group_id)
++        if geometry is not None:
++            _, expected_span, num_groups = geometry
++            if group_total_span != expected_span or any(group >= num_groups for group in groups):
++                raise ValueError("retired layer groups disagree with KV reservation")
++        offsets = [offset for offset in _worker_mapped_offsets.get(group_id, ())
++                   if offset // group_total_span in groups]
++        return _unmap_worker_offsets(offsets, group_id)
++
++
++def _apply_worker_mapping_command(command: str, offsets: Iterable[int],
++                                  group_id: int = 0) -> bool:
++    """Preserve the unfiltered API for ordinary non-elastic workers."""
++    with _worker_mapping_lock:
++        managed = group_id in _worker_offset_filters
++        if command == "map_to_kv_tensors":
++            return (_map_worker_offsets(offsets, group_id) if managed
++                    else map_to_kv_tensors(list(offsets), group_id=group_id))
++        if command == "unmap_from_kv_tensors":
++            return (_unmap_worker_offsets(offsets, group_id) if managed
++                    else unmap_from_kv_tensors(list(offsets), group_id=group_id))
++        raise ValueError(f"unknown KV mapping command: {command}")
++
++
++def _current_cuda_device_index() -> int | None:
++    try:
++        import torch
++        if torch.cuda.is_available():
++            return int(torch.cuda.current_device())
++    except Exception:
++        pass
++    return None
++
++
++def _set_cuda_device(device_index: int | None) -> None:
++    if device_index is None:
++        return
++    import torch
++    torch.cuda.set_device(device_index)
++
++
+ def _get_socket_dir_name() -> str:
+     """
+     Build a human-readable, IPC-name-based directory with a short hash suffix.
+@@ -53,6 +271,26 @@ def get_worker_socket_path(rank: int, pp_rank: int = 0) -> str:
+     return socket_path
+ 
+ 
++def _get_num_pp_stages() -> int:
++    raw = os.getenv("KVCACHED_NUM_PP_STAGES", "1")
++    try:
++        value = int(raw)
++    except ValueError:
++        value = 1
++    return max(1, value)
++
++
++def _iter_worker_targets(tp_size: int,
++                         pp_rank: int = 0) -> Iterable[tuple[int, int]]:
++    if pp_rank < 0:
++        for pp in range(_get_num_pp_stages()):
++            for rank in range(tp_size):
++                yield rank, pp
++    else:
++        for rank in range(tp_size):
++            yield rank, pp_rank
++
++
+ # NOTE: All messages exchanged through the IPC layer are dictionaries with
+ # string keys and arbitrary JSON-serialisable (picklable) values.
+ Message = Dict[str, Any]
+@@ -109,24 +347,26 @@ def start_worker_listener_thread(rank: int, pp_rank: int = 0):
+         except OSError as e:
+             print(f"Error removing existing socket file {socket_path}: {e}")
+ 
++    cuda_device_index = _current_cuda_device_index()
+     server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+     server_sock.bind(socket_path)
+     server_sock.listen()
+ 
+     def listen_loop():
+-        print(f"Worker {rank} IPC listener started at {socket_path}")
++        _set_cuda_device(cuda_device_index)
++        print(f"Worker {rank} IPC listener started at {socket_path} "
++              f"(cuda_device={cuda_device_index})")
+         while True:
+             conn, _ = server_sock.accept()
+             try:
+                 msg: Message = recv_msg(conn)
+                 # print(f"Worker {rank} received message: {msg}")
+                 group_id: int = msg.get("group_id", 0)
+-                if msg["cmd"] == "map_to_kv_tensors":
+-                    map_to_kv_tensors(msg["offsets"], group_id=group_id)
+-                    send_msg(conn, {"status": "success"})
+-                elif msg["cmd"] == "unmap_from_kv_tensors":
+-                    unmap_from_kv_tensors(msg["offsets"], group_id=group_id)
+-                    send_msg(conn, {"status": "success"})
++                if msg["cmd"] in ("map_to_kv_tensors", "unmap_from_kv_tensors"):
++                    success = _apply_worker_mapping_command(
++                        msg["cmd"], msg["offsets"], group_id)
++                    send_msg(conn, {"status": "success" if success else "error",
++                                    "message": "" if success else "VMM mapping failed"})
+                 elif msg["cmd"] == "kv_tensors_created":
+                     created: bool = kv_tensors_created(group_id=group_id)
+                     send_msg(conn, {"status": "success", "created": created})
+@@ -179,17 +419,23 @@ async def _broadcast_map_to_kv_tensors(tp_size: int,
+     """
+     map_message = {"cmd": "map_to_kv_tensors", "offsets": offsets,
+                    "group_id": group_id}
++    targets = list(_iter_worker_targets(tp_size, pp_rank))
+     tasks = [
+-        _send_and_receive_message(rank, map_message, pp_rank) for rank in range(tp_size)
++        _send_and_receive_message(rank, map_message, target_pp_rank)
++        for rank, target_pp_rank in targets
+     ]
+ 
+     responses = await asyncio.gather(*tasks, return_exceptions=True)
+-    for rank, response in enumerate(responses):
++    for (rank, target_pp_rank), response in zip(targets, responses):
+         if isinstance(response, Exception):
+-            raise RuntimeError(f"Worker {rank} failed to map: {response}")
++            raise RuntimeError(
++                f"Worker pp{target_pp_rank}/tp{rank} failed to map: "
++                f"{response}")
+         elif not isinstance(response,
+                             dict) or response.get("status") != "success":
+-            raise RuntimeError(f"Worker {rank} failed to map: {response}")
++            raise RuntimeError(
++                f"Worker pp{target_pp_rank}/tp{rank} failed to map: "
++                f"{response}")
+ 
+ 
+ async def _broadcast_unmap_from_kv_tensors(tp_size: int,
+@@ -201,18 +447,23 @@ async def _broadcast_unmap_from_kv_tensors(tp_size: int,
+     """
+     unmap_message = {"cmd": "unmap_from_kv_tensors", "offsets": offsets,
+                      "group_id": group_id}
++    targets = list(_iter_worker_targets(tp_size, pp_rank))
+     tasks = [
+-        _send_and_receive_message(rank, unmap_message, pp_rank)
+-        for rank in range(tp_size)
++        _send_and_receive_message(rank, unmap_message, target_pp_rank)
++        for rank, target_pp_rank in targets
+     ]
+ 
+     responses = await asyncio.gather(*tasks, return_exceptions=True)
+-    for rank, response in enumerate(responses):
++    for (rank, target_pp_rank), response in zip(targets, responses):
+         if isinstance(response, Exception):
+-            raise RuntimeError(f"Worker {rank} failed to unmap: {response}")
++            raise RuntimeError(
++                f"Worker pp{target_pp_rank}/tp{rank} failed to unmap: "
++                f"{response}")
+         elif not isinstance(response,
+                             dict) or response.get("status") != "success":
+-            raise RuntimeError(f"Worker {rank} failed to unmap: {response}")
++            raise RuntimeError(
++                f"Worker pp{target_pp_rank}/tp{rank} failed to unmap: "
++                f"{response}")
+ 
+ 
+ async def _broadcast_kv_tensors_created(tp_size: int,
+@@ -223,22 +474,22 @@ async def _broadcast_kv_tensors_created(tp_size: int,
+     Returns True if all workers report that KV tensors are created, False otherwise.
+     """
+     check_message = {"cmd": "kv_tensors_created", "group_id": group_id}
++    targets = list(_iter_worker_targets(tp_size, pp_rank))
+     tasks = [
+-        _send_and_receive_message(rank, check_message, pp_rank)
+-        for rank in range(tp_size)
++        _send_and_receive_message(rank, check_message, target_pp_rank)
++        for rank, target_pp_rank in targets
+     ]
+ 
+     responses = await asyncio.gather(*tasks, return_exceptions=True)
+     all_created = True
+-    for rank, response in enumerate(responses):
++    for (rank, target_pp_rank), response in zip(targets, responses):
+         if isinstance(response, Exception):
+-            raise RuntimeError(
+-                f"Worker {rank} failed to check KV tensors created: {response}"
+-            )
++            all_created = False
+         elif not isinstance(response,
+                             dict) or response.get("status") != "success":
+             raise RuntimeError(
+-                f"Worker {rank} failed to check KV tensors created: {response}"
++                f"Worker pp{target_pp_rank}/tp{rank} failed to check KV "
++                f"tensors created: {response}"
+             )
+         elif not response.get("created", False):
+             all_created = False
+diff --git a/kvcached/utils.py b/kvcached/utils.py
+index 596f017..b5d4414 100644
+--- a/kvcached/utils.py
++++ b/kvcached/utils.py
+@@ -139,8 +139,46 @@ SANITY_CHECK = os.getenv("KVCACHED_SANITY_CHECK", "false").lower() == "true"
+ # Used by both SGLang (RadixCacheLimitPatch) and vLLM (ElasticBlockPool),
+ # which converts to blocks internally via MAX_CACHED_TOKENS // block_size.
+ MAX_CACHED_TOKENS = int(os.getenv("KVCACHED_MAX_CACHED_TOKENS", "16000"))
+-CONTIGUOUS_LAYOUT = os.getenv("KVCACHED_CONTIGUOUS_LAYOUT",
+-                              "true").lower() == "true"
++LAYER_STACKING = os.getenv("KVCACHED_LAYER_STACKING", "false").lower() == "true"
++# Ownership filtering addresses independent layer groups within one reservation.
++# This also supports one layer per group; it is not the old all-layers layout.
++CONTIGUOUS_LAYOUT = LAYER_STACKING or os.getenv(
++    "KVCACHED_CONTIGUOUS_LAYOUT", "true").lower() == "true"
++
++ELASTIC_PP_LAYER_MAPPING_API_VERSION = 1
++
++
++def _parse_size_env(name: str, scale: int) -> int | None:
++    raw = os.getenv(name)
++    if raw is None or raw == "":
++        return None
++    try:
++        value = int(raw)
++    except ValueError as exc:
++        raise ValueError(f"Invalid {name}: {raw}. Must be an integer.") from exc
++    if value <= 0:
++        raise ValueError(f"{name} must be positive, got: {value}")
++    return value * scale
++
++
++def get_physical_block_size(default: int | None = None) -> int | None:
++    """Return the per-layer physical block/slice size in bytes.
++
++    This is the user-facing layer-stacking interface.  When set, the stacking
++    factor is derived as ``PAGE_SIZE // physical_block_size``.  For example,
++    with the default 2MB base page, 1MB means stacking 2 layers and 512KB means
++    stacking 4 layers.
++    """
++    for name, scale in (
++        ("KVCACHED_PHYSICAL_BLOCK_SIZE_BYTES", 1),
++        ("KVCACHED_PHYSICAL_BLOCK_SIZE_KB", 1024),
++        ("KVCACHED_PHYSICAL_BLOCK_SIZE_MB", 1024 * 1024),
++    ):
++        parsed = _parse_size_env(name, scale)
++        if parsed is not None:
++            return parsed
++    return default
++
+ 
+ DEFAULT_IPC_NAME = _obtain_default_ipc_name()
+ SHM_DIR = "/dev/shm"
+diff --git a/tests/test_layer_group_granularity.py b/tests/test_layer_group_granularity.py
+new file mode 100644
+index 0000000..82c46ae
+--- /dev/null
++++ b/tests/test_layer_group_granularity.py
+@@ -0,0 +1,266 @@
++# SPDX-FileCopyrightText: Copyright contributors to the kvcached project
++# SPDX-License-Identifier: Apache-2.0
++
++import importlib
++import sys
++import types
++
++import pytest
++import torch
++
++from kvcached.utils import PAGE_SIZE
++
++
++class _FakeInternalPage:
++
++    @staticmethod
++    def get_num_blocks(page_size, block_mem_size):
++        return page_size // block_mem_size
++
++
++class _FakePageAllocator:
++
++    init_args = None
++    init_kwargs = None
++
++    def __init__(self, *args, **kwargs):
++        type(self).init_args = args
++        type(self).init_kwargs = kwargs
++
++    def set_should_use_worker_ipc_callback(self, callback):
++        pass
++
++    def start_prealloc_thread(self):
++        pass
++
++    def stop_prealloc_thread(self):
++        pass
++
++    def get_resize_target(self):
++        return -1
++
++    def get_num_inuse_pages(self):
++        return 0
++
++    def get_num_free_pages(self):
++        return 0
++
++    def get_avail_physical_pages(self):
++        return 0
++
++    def get_num_reserved_pages(self):
++        return 0
++
++
++@pytest.fixture()
++def kv_cache_manager_module(monkeypatch):
++    fake_vmm_ops = types.ModuleType("kvcached.vmm_ops")
++    fake_vmm_ops.PageAllocator = _FakePageAllocator
++    fake_vmm_ops.InternalPage = _FakeInternalPage
++    fake_vmm_ops.kv_tensors_created = lambda group_id=0: True
++    fake_vmm_ops.map_to_kv_tensors = lambda offsets, group_id=0: True
++    fake_vmm_ops.unmap_from_kv_tensors = lambda offsets, group_id=0: True
++    monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", fake_vmm_ops)
++    module = importlib.import_module("kvcached.kv_cache_manager")
++    monkeypatch.setattr(module.KVCacheManager, "_post_init",
++                        lambda self: self._post_init_done.set())
++    return module
++
++
++def test_physical_block_size_derives_layer_group_granularity(
++        kv_cache_manager_module):
++    manager = kv_cache_manager_module.KVCacheManager(
++        num_blocks=16,
++        block_size=16,
++        cell_size=1024,
++        num_layers=8,
++        world_size=1,
++        physical_block_size=PAGE_SIZE // 4,
++    )
++
++    assert manager.layer_group_granularity == 4
++    assert manager.num_layer_groups == 2
++    assert _FakePageAllocator.init_kwargs["layer_group_granularity"] == 4
++
++
++def test_physical_block_larger_than_page_attention_block_uses_slice_packing(
++        kv_cache_manager_module):
++    physical_block_size = PAGE_SIZE // 4
++    manager = kv_cache_manager_module.KVCacheManager(
++        num_blocks=16,
++        block_size=128,
++        cell_size=1024,
++        num_layers=8,
++        world_size=1,
++        num_kv_buffers=2,
++        physical_block_size=physical_block_size,
++    )
++
++    per_kv_block = 128 * 1024
++    assert manager.block_level_layer_groups is True
++    assert manager.layer_group_granularity == 4
++    assert manager.layer_group_layout == "slice_packed"
++    assert manager.page_attention_block_mem_size == per_kv_block
++    assert manager.physical_block_size == physical_block_size
++    assert manager.block_mem_size == per_kv_block
++    assert manager.page_size == physical_block_size
++    assert manager.physical_layer_slice_size == physical_block_size
++    assert manager.physical_group_page_size == PAGE_SIZE * 2
++    assert manager.packed_block_stride_bytes == per_kv_block * 2 * 4
++    assert manager.blocks_per_physical_page == 4
++    assert _FakePageAllocator.init_args[1] == 16 * per_kv_block
++    assert _FakePageAllocator.init_args[2] == physical_block_size
++    assert _FakePageAllocator.init_kwargs["map_page_size"] == PAGE_SIZE * 2
++
++
++def test_physical_block_equal_to_page_attention_block_is_block_aligned(
++        kv_cache_manager_module):
++    physical_block_size = PAGE_SIZE // 4
++    manager = kv_cache_manager_module.KVCacheManager(
++        num_blocks=16,
++        block_size=128,
++        cell_size=4096,
++        num_layers=8,
++        world_size=1,
++        num_kv_buffers=2,
++        physical_block_size=physical_block_size,
++    )
++
++    per_kv_block = 128 * 4096
++    assert manager.block_level_layer_groups is True
++    assert manager.layer_group_granularity == 4
++    assert manager.layer_group_layout == "block_aligned"
++    assert manager.page_attention_block_mem_size == per_kv_block
++    assert manager.physical_block_size == physical_block_size
++    assert manager.block_mem_size == per_kv_block
++    assert manager.page_size == physical_block_size
++    assert manager.physical_layer_slice_size == physical_block_size
++    assert manager.physical_group_page_size == PAGE_SIZE * 2
++    assert manager.packed_block_stride_bytes == per_kv_block * 2 * 4
++    assert manager.blocks_per_physical_page == 1
++    assert _FakePageAllocator.init_args[1] == 16 * per_kv_block
++    assert _FakePageAllocator.init_args[2] == physical_block_size
++    assert _FakePageAllocator.init_kwargs["map_page_size"] == PAGE_SIZE * 2
++
++
++def test_layer_group_granularity_must_divide_layers(kv_cache_manager_module):
++    with pytest.raises(ValueError, match="must be divisible"):
++        kv_cache_manager_module.KVCacheManager(
++            num_blocks=16,
++            block_size=16,
++            cell_size=1024,
++            num_layers=10,
++            world_size=1,
++            physical_block_size=PAGE_SIZE // 4,
++        )
++
++
++def test_elastic_single_layer_groups_use_independent_physical_geometry(
++        kv_cache_manager_module, monkeypatch):
++    monkeypatch.setattr(kv_cache_manager_module, "LAYER_STACKING", True)
++    manager = kv_cache_manager_module.KVCacheManager(
++        num_blocks=4097, block_size=1, cell_size=1024,
++        num_layers=10, physical_block_size=PAGE_SIZE)
++    assert manager.layer_group_granularity == 1
++    assert manager.block_level_layer_groups is True
++    assert manager.physical_group_page_size == 2 * PAGE_SIZE
++    assert manager.get_layer_group_total_span() == 3 * 2 * PAGE_SIZE
++    manager.avail_pages = {0: object(), 2: object()}
++    manager.full_pages = {1: object()}
++    assert manager.snapshot_inuse_page_ids() == [0, 1, 2]
++
++
++class _CapturedCreateArgs(Exception):
++
++    def __init__(self, args, kwargs):
++        super().__init__("captured create_kv_tensors")
++        self.args = args
++        self.kwargs = kwargs
++
++
++def test_vllm_alloc_kv_cache_derives_slice_packing_from_physical_block(
++        monkeypatch):
++    fake_vmm_ops = types.ModuleType("kvcached.vmm_ops")
++    fake_vmm_ops.PageAllocator = _FakePageAllocator
++    fake_vmm_ops.InternalPage = _FakeInternalPage
++    fake_vmm_ops.create_kv_tensors = lambda *args, **kwargs: []
++    fake_vmm_ops.init_kvcached = lambda *args, **kwargs: None
++    fake_vmm_ops.shutdown_kvcached = lambda *args, **kwargs: None
++    fake_vmm_ops.kv_tensors_created = lambda group_id=0: True
++    monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", fake_vmm_ops)
++    monkeypatch.delitem(
++        sys.modules, "kvcached.integration.vllm.interfaces", raising=False)
++    mod = importlib.import_module("kvcached.integration.vllm.interfaces")
++    monkeypatch.setattr(mod, "_kvcached_initialized", True, raising=False)
++    monkeypatch.setattr(mod, "_contiguous_layout", True, raising=False)
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++
++    class _Props:
++        total_memory = 80 * 1024**3
++
++    monkeypatch.setattr(torch.cuda, "get_device_properties",
++                        lambda dev=None: _Props())
++
++    def _fake_create_kv_tensors(*args, **kwargs):
++        raise _CapturedCreateArgs(args, kwargs)
++
++    monkeypatch.setattr(mod, "create_kv_tensors", _fake_create_kv_tensors)
++
++    with pytest.raises(_CapturedCreateArgs) as excinfo:
++        mod.alloc_kv_cache(
++            (2, 16, 128, 4, 128),
++            128,
++            torch.float16,
++            "cuda:0",
++            16,
++            physical_block_size=PAGE_SIZE // 4,
++        )
++
++    kwargs = excinfo.value.kwargs
++    assert kwargs["layer_group_granularity"] == 4
++    assert kwargs["contiguous_page_size"] == PAGE_SIZE * 2
++    assert kwargs["contiguous_total_size"] == 4 * 4 * PAGE_SIZE * 2
++
++
++def test_vllm_alloc_kv_cache_derives_block_alignment_from_physical_block(
++        monkeypatch):
++    fake_vmm_ops = types.ModuleType("kvcached.vmm_ops")
++    fake_vmm_ops.PageAllocator = _FakePageAllocator
++    fake_vmm_ops.InternalPage = _FakeInternalPage
++    fake_vmm_ops.create_kv_tensors = lambda *args, **kwargs: []
++    fake_vmm_ops.init_kvcached = lambda *args, **kwargs: None
++    fake_vmm_ops.shutdown_kvcached = lambda *args, **kwargs: None
++    fake_vmm_ops.kv_tensors_created = lambda group_id=0: True
++    monkeypatch.setitem(sys.modules, "kvcached.vmm_ops", fake_vmm_ops)
++    monkeypatch.delitem(
++        sys.modules, "kvcached.integration.vllm.interfaces", raising=False)
++    mod = importlib.import_module("kvcached.integration.vllm.interfaces")
++    monkeypatch.setattr(mod, "_kvcached_initialized", True, raising=False)
++    monkeypatch.setattr(mod, "_contiguous_layout", True, raising=False)
++    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
++
++    class _Props:
++        total_memory = 80 * 1024**3
++
++    monkeypatch.setattr(torch.cuda, "get_device_properties",
++                        lambda dev=None: _Props())
++
++    def _fake_create_kv_tensors(*args, **kwargs):
++        raise _CapturedCreateArgs(args, kwargs)
++
++    monkeypatch.setattr(mod, "create_kv_tensors", _fake_create_kv_tensors)
++
++    with pytest.raises(_CapturedCreateArgs) as excinfo:
++        mod.alloc_kv_cache(
++            (2, 16, 128, 16, 128),
++            128,
++            torch.float16,
++            "cuda:0",
++            16,
++            physical_block_size=PAGE_SIZE // 4,
++        )
++
++    kwargs = excinfo.value.kwargs
++    assert kwargs["layer_group_granularity"] == 4
++    assert kwargs["contiguous_page_size"] == PAGE_SIZE * 2
++    assert kwargs["contiguous_total_size"] == 4 * 16 * PAGE_SIZE * 2
+diff --git a/tests/test_worker_layer_mapping.py b/tests/test_worker_layer_mapping.py
+new file mode 100644
+index 0000000..2cc5cb3
+--- /dev/null
++++ b/tests/test_worker_layer_mapping.py
+@@ -0,0 +1,181 @@
++# SPDX-FileCopyrightText: Copyright contributors to the kvcached project
++# SPDX-License-Identifier: Apache-2.0
++"""Exercise the worker protocol without allocating CUDA memory."""
++
++import importlib.util
++import sys
++from pathlib import Path
++from types import ModuleType
++from unittest.mock import Mock
++
++import pytest
++
++
++@pytest.fixture
++def mapping(monkeypatch):
++    native = ModuleType("kvcached.vmm_ops")
++    native.kv_tensors_created = lambda group_id=0: True
++    native.map_to_kv_tensors = Mock(return_value=True)
++    native.unmap_from_kv_tensors = Mock(return_value=True)
++    monkeypatch.setitem(sys.modules, native.__name__, native)
++    path = Path(__file__).parents[1] / "kvcached/tp_ipc_util.py"
++    spec = importlib.util.spec_from_file_location("_worker_mapping_test", path)
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    module._synchronize_worker_cuda = Mock()
++    module.register_worker_offset_filter(
++        lambda offsets, group: [offset for offset in offsets if offset < 512],
++        map_size=128,
++        layer_group_span=512,
++        num_layer_groups=3,
++    )
++    return module, native
++
++
++def test_allocator_maps_only_owned_groups_and_migration_bypasses_filter(mapping):
++    mod, native = mapping
++    assert mod._apply_worker_mapping_command("map_to_kv_tensors", [0, 128, 512])
++    assert mod.snapshot_worker_mapped_offsets() == (0, 128)
++    mod._synchronize_worker_cuda.assert_not_called()
++    assert mod.map_worker_offsets_for_migration([512, 640])
++    assert mod.snapshot_worker_mapped_offsets() == (0, 128, 512, 640)
++    assert native.map_to_kv_tensors.call_count == 4
++    mod._synchronize_worker_cuda.assert_called_once()
++
++
++def test_duplicate_maps_preserve_live_data(mapping):
++    mod, native = mapping
++    assert mod.map_worker_offsets_for_migration([512, 512, 640])
++    native.map_to_kv_tensors.reset_mock()
++    mod._synchronize_worker_cuda.reset_mock()
++    assert mod.map_worker_offsets_for_migration([640, 512])
++    native.map_to_kv_tensors.assert_not_called()
++    mod._synchronize_worker_cuda.assert_not_called()
++
++
++def test_map_failure_records_exact_progress_and_retry_skips_live_pages(mapping):
++    mod, native = mapping
++    native.map_to_kv_tensors.side_effect = [True, False, True]
++    assert not mod.map_worker_offsets_for_migration([512, 640])
++    assert mod.snapshot_worker_mapped_offsets() == (512,)
++    mod._synchronize_worker_cuda.assert_called_once()
++    assert mod.map_worker_offsets_for_migration([512, 640])
++    assert [call.args[0] for call in native.map_to_kv_tensors.call_args_list] == [
++        [512],
++        [640],
++        [640],
++    ]
++
++
++def test_map_exception_keeps_successful_prefix_for_abort(mapping):
++    mod, native = mapping
++    native.map_to_kv_tensors.side_effect = [True, RuntimeError("map failed")]
++    with pytest.raises(RuntimeError, match="map failed"):
++        mod.map_worker_offsets_for_migration([512, 640])
++    assert mod.snapshot_worker_mapped_offsets() == (512,)
++    mod._synchronize_worker_cuda.assert_called_once()
++    assert mod.unmap_worker_offsets_for_layer_groups([1], 512)
++    assert mod.snapshot_worker_mapped_offsets() == ()
++
++
++def test_unmap_only_retired_groups_and_retry_after_partial_failure(mapping):
++    mod, native = mapping
++    mod.map_worker_offsets_for_migration([0, 512, 640])
++    native.unmap_from_kv_tensors.side_effect = [True, False, True]
++    assert not mod.unmap_worker_offsets_for_layer_groups([1], 512)
++    assert mod.snapshot_worker_mapped_offsets() == (0, 640)
++    assert mod.unmap_worker_offsets_for_layer_groups([1], 512)
++    assert mod.snapshot_worker_mapped_offsets() == (0,)
++    assert mod.unmap_worker_offsets_for_layer_groups([1], 512)
++    assert native.unmap_from_kv_tensors.call_count == 3
++
++
++def test_nested_pins_block_reclamation_until_final_release(mapping):
++    mod, native = mapping
++    mod.map_worker_offsets_for_migration([512, 640])
++    lease = mod.pin_worker_offsets([512, 640])
++    mod.pin_worker_offsets([640])
++    with pytest.raises(RuntimeError, match="pinned"):
++        mod.unmap_worker_offsets_for_layer_groups([1], 512)
++    native.unmap_from_kv_tensors.assert_not_called()
++    mod.unpin_worker_offsets(lease)
++    with pytest.raises(RuntimeError, match="pinned"):
++        mod.unmap_worker_offsets_for_layer_groups([1], 512)
++    assert mod.snapshot_worker_mapped_offsets() == (512, 640)
++    mod.unpin_worker_offsets([640])
++    assert mod.unmap_worker_offsets_for_layer_groups([1], 512)
++    assert mod.snapshot_worker_mapped_offsets() == ()
++
++
++def test_pin_underflow_and_unmapped_pin_leave_existing_pins_unchanged(mapping):
++    mod, _ = mapping
++    mod.map_worker_offsets_for_migration([512])
++    mod.pin_worker_offsets([512])
++    with pytest.raises(RuntimeError, match="unmapped"):
++        mod.pin_worker_offsets([512, 640])
++    with pytest.raises(RuntimeError, match="underflow"):
++        mod.unpin_worker_offsets([512, 640])
++    assert mod._worker_offset_pins[0][512] == 1
++
++
++def test_groups_have_independent_ledgers(mapping):
++    mod, _ = mapping
++    mod.map_worker_offsets_for_migration([0], group_id=0)
++    mod.map_worker_offsets_for_migration([0], group_id=2)
++    mod.unmap_worker_offsets_for_layer_groups([0], 512, group_id=0)
++    assert mod.snapshot_worker_mapped_offsets(0) == ()
++    assert mod.snapshot_worker_mapped_offsets(2) == (0,)
++
++
++def test_normal_free_unmaps_prepared_pages_outside_active_filter(mapping):
++    mod, native = mapping
++    mod.map_worker_offsets_for_migration([0, 512])
++    mod._synchronize_worker_cuda.reset_mock()
++    assert mod._apply_worker_mapping_command("unmap_from_kv_tensors", [0, 512, 1024])
++    assert mod.snapshot_worker_mapped_offsets() == ()
++    assert native.unmap_from_kv_tensors.call_count == 2
++    mod._synchronize_worker_cuda.assert_called_once()
++
++
++def test_nonelastic_worker_keeps_native_dispatch(mapping):
++    mod, native = mapping
++    assert mod._apply_worker_mapping_command("map_to_kv_tensors", [128], group_id=8)
++    native.map_to_kv_tensors.assert_called_once_with([128], group_id=8)
++    assert mod.snapshot_worker_mapped_offsets(8) == ()
++
++
++@pytest.mark.parametrize("offsets", [[-128], [1], [1536]])
++def test_bad_offsets_rejected_before_native_call(mapping, offsets):
++    mod, native = mapping
++    with pytest.raises(ValueError):
++        mod.map_worker_offsets_for_migration(offsets)
++    native.map_to_kv_tensors.assert_not_called()
++
++
++@pytest.mark.parametrize("groups,span", [([3], 512), ([-1], 512), ([0], 0), ([1], 128)])
++def test_bad_retirement_geometry_rejected(mapping, groups, span):
++    mod, native = mapping
++    with pytest.raises(ValueError):
++        mod.unmap_worker_offsets_for_layer_groups(groups, span)
++    native.unmap_from_kv_tensors.assert_not_called()
++
++
++def test_filter_cannot_map_unrequested_offsets(mapping):
++    mod, native = mapping
++    mod._worker_offset_filters[0] = lambda offsets, group: [128]
++    with pytest.raises(ValueError, match="unrequested"):
++        mod._apply_worker_mapping_command("map_to_kv_tensors", [0])
++    native.map_to_kv_tensors.assert_not_called()
++
++
++def test_live_ownership_filter_cannot_be_replaced(mapping):
++    mod, _ = mapping
++    with pytest.raises(RuntimeError, match="already has"):
++        mod.register_worker_offset_filter(lambda offsets, group: offsets)
++
++
++def test_mapping_false_reaches_ipc_dispatch(mapping):
++    mod, native = mapping
++    native.map_to_kv_tensors.return_value = False
++    assert not mod._apply_worker_mapping_command("map_to_kv_tensors", [0])
++    assert mod.snapshot_worker_mapped_offsets() == ()

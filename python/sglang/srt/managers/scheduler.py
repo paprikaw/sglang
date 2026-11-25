@@ -1808,6 +1808,11 @@ class Scheduler(
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.destroy()
         self.tree_cache.release_host_resources()
+        shared_bank = getattr(self.tree_cache, "_elastic_pp_shared_host_bank", None)
+        if shared_bank is not None:
+            # Shutdown is distinct from retiring a PP generation: the latter
+            # must keep CPU backing available to the next layout.
+            shared_bank.close()
         if self.decode_offload_manager is not None:
             self.decode_offload_manager.release_host_resources()
 

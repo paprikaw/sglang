@@ -328,6 +328,7 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
+    bool canonical_k,      // keep full-K accumulation independent of active experts
     int max_shared_mem) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
@@ -403,6 +404,15 @@ __global__ void Marlin(
       // in the middle of group.
       iters = (group_blocks / thread_k_blocks) * div_ceil(iters, (group_blocks / thread_k_blocks));
     }
+  }
+
+  // A companion token can add experts and change `parallel`. Balanced stripes
+  // then split an unchanged expert's K reduction at different boundaries, even
+  // when token sorting is deterministic. Whole-K stripes keep each output tile
+  // in one CTA with the same accumulation order. Rounding upward preserves full
+  // work coverage when a CTA must visit several output/expert tiles.
+  if (canonical_k) {
+    iters = k_tiles * div_ceil(iters, k_tiles);
   }
 
   int slice_row = (iters * blockIdx.x) % k_tiles;

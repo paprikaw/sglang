@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -16,6 +17,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
+_BATCH_PROBE_DIR = os.environ.get("ELASTIC_PD_MARLIN_BATCH_PROBE_DIR")
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         StandardCombineInput,
@@ -121,6 +123,7 @@ def fused_experts_none_to_marlin(
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+    from sglang.srt.runtime_context import get_exec
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
@@ -171,7 +174,7 @@ def fused_experts_none_to_marlin(
         marlin_hidden_states = hidden_states.to(torch.bfloat16)
         marlin_inplace = False
 
-    output = fused_marlin_moe(
+    marlin_kwargs = dict(
         hidden_states=marlin_hidden_states,
         w1=quant_info.w13_qweight,
         w2=quant_info.w2_qweight,
@@ -205,7 +208,13 @@ def fused_experts_none_to_marlin(
         gemm1_alpha=runner_config.gemm1_alpha,
         activation=runner_config.activation,
         is_gated=runner_config.is_gated,
-    ).to(hidden_states.dtype)
+        deterministic=get_exec().deterministic.enable_deterministic_inference,
+    )
+    output = fused_marlin_moe(**marlin_kwargs).to(hidden_states.dtype)
+    if _BATCH_PROBE_DIR:
+        from sglang.srt.elastic_pp.marlin_batch_probe import maybe_probe
+
+        maybe_probe(marlin_kwargs, fused_marlin_moe, _BATCH_PROBE_DIR)
 
     return StandardCombineInput(
         hidden_states=output,

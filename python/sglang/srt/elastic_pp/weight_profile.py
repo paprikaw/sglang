@@ -179,6 +179,15 @@ class FirstLoadWeightProfiler:
     def recording_complete(self) -> bool:
         return self._recording_complete
 
+    def record_checkpoint_metadata(self, metadata: WeightTensorMetadata) -> None:
+        """Account for a checkpoint tensor without materializing its values."""
+        previous = self._checkpoint_tensors_by_name.setdefault(metadata.name, metadata)
+        if previous != metadata:
+            raise ValueError(
+                "weight metadata changed in the initial checkpoint stream: "
+                f"{metadata.name} was {previous}, now {metadata}"
+            )
+
     def record_initial_stream(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
@@ -192,12 +201,7 @@ class FirstLoadWeightProfiler:
         self._recording_started = True
         for name, weight in weights:
             metadata = WeightTensorMetadata.from_tensor(name, weight, kind="checkpoint")
-            previous = self._checkpoint_tensors_by_name.setdefault(name, metadata)
-            if previous != metadata:
-                raise ValueError(
-                    "weight metadata changed in the initial checkpoint stream: "
-                    f"{name} was {previous}, now {metadata}"
-                )
+            self.record_checkpoint_metadata(metadata)
             yield name, weight
         self._recording_complete = True
 

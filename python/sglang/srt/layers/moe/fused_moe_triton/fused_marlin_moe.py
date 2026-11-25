@@ -1,3 +1,4 @@
+import os
 from typing import Optional
 
 import torch
@@ -10,6 +11,7 @@ from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
+_CANONICAL_K = os.environ.get("SGLANG_MARLIN_MOE_CANONICAL_K") == "1"
 
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
@@ -162,6 +164,7 @@ def fused_marlin_moe(
     gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -243,7 +246,17 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
-    if (
+    if deterministic and M > 1:
+        from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
+            moe_align_block_size_deterministic,
+        )
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = (
+            moe_align_block_size_deterministic(
+                topk_ids, block_size_m, global_num_experts
+            )
+        )
+    elif (
         M == 1
         and topk <= 32
         and expert_map is None
@@ -297,10 +310,16 @@ def fused_marlin_moe(
     intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
+    if _CANONICAL_K and not deterministic:
+        raise ValueError("canonical Marlin K requires deterministic token alignment")
     use_atomic_add = (
-        hidden_states.dtype == torch.half
-        or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
-    ) and (not is_mxfp4_marlin)
+        not _CANONICAL_K
+        and (
+            hidden_states.dtype == torch.half
+            or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+        )
+        and not is_mxfp4_marlin
+    )
 
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
@@ -329,6 +348,7 @@ def fused_marlin_moe(
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
+        canonical_k=_CANONICAL_K,
     )
 
     if activation == "silu" and is_gated and gemm1_alpha is not None:
@@ -392,6 +412,7 @@ def fused_marlin_moe(
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
         is_zp_float=False,
+        canonical_k=_CANONICAL_K,
     ).view(-1, topk, K)
 
     output = zero_copy_context.get_moe_output(hidden_states)

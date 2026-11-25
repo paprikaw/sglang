@@ -8,6 +8,7 @@ from torch import nn
 
 from sglang.srt import cuda_vmm_utils as vmm
 from sglang.srt.elastic_pp.layer_transport import _transport_tensor_view
+from sglang.srt.elastic_pp.model import ElasticPPModelMixin
 from sglang.srt.elastic_pp.weight_backing import (
     EvictableWeightBank,
     copy_and_rebind_weight_storages,
@@ -16,6 +17,47 @@ from sglang.srt.elastic_pp.weight_backing import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+
+
+def test_startup_conversion_reclaims_old_allocator_blocks_between_layers(monkeypatch):
+    # Three 3-byte layers plus two cached loader bytes nearly fill a 12-byte
+    # driver budget. VMM cannot reuse PyTorch's cached free blocks. Delaying
+    # empty_cache until the end fails on layer 0 or 1, despite enough space for
+    # the final model and one transient layer copy.
+    memory = NS(allocated=9, cached=2, mapped=0, peak=0)
+    converted = []
+
+    def empty_cache():
+        memory.cached = 0
+
+    class Bank:
+        def prepare(self, layer_id, layer):
+            used = memory.allocated + memory.cached + memory.mapped + 3
+            assert used <= 12, "VMM allocation cannot reuse cached allocator blocks"
+            memory.peak = max(memory.peak, used)
+            memory.mapped += 3
+            memory.allocated -= 3
+            memory.cached += 3
+            converted.append(layer_id)
+
+    class Model(ElasticPPModelMixin):
+        quant_config = None
+        layers = [nn.Linear(1, 1) for _ in range(3)]
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(
+        "sglang.srt.elastic_pp.weight_backing.EvictableWeightBank", Bank
+    )
+    model = Model()
+    bank = model.enable_elastic_pp_evictable_weights()
+    assert bank is model._elastic_pp_weight_backing
+    assert converted == [0, 1, 2]
+    assert (memory.allocated, memory.cached, memory.mapped, memory.peak) == (
+        0,
+        0,
+        9,
+        12,
+    )
 
 
 def test_packed_weights_rebind_unregistered_strided_views_and_keep_parameters():

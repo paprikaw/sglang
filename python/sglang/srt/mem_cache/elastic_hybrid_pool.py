@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from bisect import bisect_left
+from copy import copy
 from threading import RLock
 
 import torch
@@ -178,6 +179,26 @@ class ElasticHybridLinearKVPool(HybridLinearKVPool):
         if pending is None or pending.generation != generation:
             raise RuntimeError(f"no hybrid KV preparation for generation {generation}")
         return pending
+
+    def prepared_pd_state_registration_regions(self, generation):
+        """Describe pending GDN storage without publishing it to serving.
+
+        The pool transaction owns these tensors until commit/abort. RDMA
+        registration does not read their contents; live retained state is still
+        copied only at the drained fence. Use the production per-layer region
+        geometry, including models with multiple conv tensors or no temporal
+        state, instead of guessing allocation boundaries.
+        """
+        with self._elastic_lock:
+            self._pending(generation)
+            if self._pending_state is None:
+                raise RuntimeError("hybrid target state has not been allocated")
+            target = copy(self.mamba_pool)
+            target.mamba_cache = self._pending_state
+            target.mamba_layer_ids = list(self._pending_mamba_ids)
+            target.num_mamba_layers = len(self._pending_mamba_ids)
+            pointers, lengths, _ = target.get_contiguous_buf_infos()
+            return tuple(zip(pointers, lengths))
 
     def prepare_elastic_pp_kv_layers(self, *, target, generation, total_num_layers):
         if total_num_layers != self._total_num_layers:

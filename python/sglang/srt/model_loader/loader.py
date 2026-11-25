@@ -1080,6 +1080,41 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_method.process_weights_after_loading(module)
 
 
+class SllmStoreStageLoader(DefaultModelLoader):
+    def load_model(self, *, model_config, device_config):
+        if not os.environ.get("SGLANG_REPLICA_PREPARED_DIR"):
+            return super().load_model(model_config=model_config, device_config=device_config)
+        from pathlib import Path
+        from sglang.srt.weight_cache.replica_preparation import (
+            _active_prepared_weights, preparation_key, read_packet,
+        )
+        prep = Path(os.environ["SGLANG_REPLICA_PREPARED_DIR"])
+        root = Path(os.environ["SGLANG_SLLMSTORE_STAGE_ROOT"])
+        key = preparation_key(prep, self.load_config._canonical_weight_cache_key)
+        packet = read_packet(root, "packed.json", key)
+        token = _active_prepared_weights.set(packet)
+        try:
+            model = super().load_model(model_config=model_config, device_config=device_config)
+            rank = get_parallel().pp_rank
+            start, end = key["pp_layers"][rank]
+            loaded = packet.get("loaded_experts", {})
+            if set(loaded) != set(range(start, end)):
+                raise ValueError("Incomplete prepared Marlin stage restore")
+            logger.info("SllmStore prepared Marlin stage %s", json.dumps({
+                "pp": rank, "restored_layers": len(loaded),
+                "bytes": sum(size for size, _ in loaded.values()),
+                "load_s": sum(duration for _, duration in loaded.values()),
+            }))
+            return model
+        finally:
+            _active_prepared_weights.reset(token)
+
+    def _get_all_weights(self, model_config, model):
+        from sglang.srt.weight_cache.sllmstore_stage import iter_stage_weights
+
+        return iter_stage_weights(model_config, model, self.load_config, get_parallel())
+
+
 class LayeredModelLoader(DefaultModelLoader):
     """Model loader that loads weights layer by layer so that one can quantize a
     layer before loading another to make the peak memory envelope smaller."""
@@ -4311,6 +4346,8 @@ def get_model_loader(
 
         if os.environ.get("SGLANG_CPU_WEIGHT_CACHE_SOCKET"):
             raise ValueError("canonical and prepared CPU weight caches cannot be mixed")
+        if load_config.load_format == LoadFormat.SERVERLESS_LLM:
+            return CanonicalCpuModelLoader(load_config, SllmStoreStageLoader(load_config))
         if load_config.load_format not in (LoadFormat.AUTO, LoadFormat.SAFETENSORS):
             raise ValueError("canonical RAM bank requires normal safetensors loading")
         return CanonicalCpuModelLoader(load_config, DefaultModelLoader(load_config))
@@ -4328,6 +4365,9 @@ def get_model_loader(
                 "CPU daemon snapshots require the default checkpoint loader"
             )
         return CpuDaemonModelLoader(load_config, DefaultModelLoader(load_config))
+
+    if load_config.load_format == LoadFormat.SERVERLESS_LLM:
+        raise ValueError("The stage-local SllmStore loader requires an admitted canonical CPU bank")
 
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
