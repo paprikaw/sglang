@@ -312,7 +312,7 @@ def prepare_history(run, servers, key, tokens, anchor, wait_for_packed):
             {"server_args": {"agentx_cache_cmd": 4}},
             420,
         )
-        if isinstance(ok, list) and len(ok) == 2 and all(value is True for value in ok):
+        if donor_published(ok, root, "weights"):
             break
         time.sleep(0.25)
     else:
@@ -331,7 +331,7 @@ def prepare_history(run, servers, key, tokens, anchor, wait_for_packed):
             {"server_args": {"agentx_cache_cmd": 3}},
             45,
         )
-        if isinstance(ok, list) and len(ok) == 2 and all(value is True for value in ok):
+        if donor_published(ok, root, "history"):
             break
         time.sleep(0.2)
     else:
@@ -344,6 +344,12 @@ def prepare_history(run, servers, key, tokens, anchor, wait_for_packed):
         raise ValueError("Donor ranks disagree on the historical prefix")
     weights = [json.loads((root / f"weights-{r}.json").read_text()) for r in (0, 1)]
     spare = json.loads((root / "spare.json").read_text())
+    snapshot_wall_s = time.perf_counter() - start
+    release_start = time.perf_counter()
+    while not all((root / f"weights-released-{r}.json").is_file() for r in (0, 1)):
+        if time.perf_counter() - release_start > 90:
+            raise TimeoutError("Donor stage weight backing was not released")
+        time.sleep(0.2)
     for rank in (0, 1):
         released = json.loads((root / f"weights-released-{rank}.json").read_text())
         if released["key"] != spare["key"]:
@@ -353,7 +359,8 @@ def prepare_history(run, servers, key, tokens, anchor, wait_for_packed):
         dict(
             donor_weight_export_wall_s=export_wall_s,
             store_conversion_and_prewarm_s=packed["preparation_s"],
-            prefix_snapshot_wall_s=time.perf_counter() - start,
+            prefix_snapshot_wall_s=snapshot_wall_s,
+            remaining_weight_release_wait_s=time.perf_counter() - release_start,
             prefix_payload_bytes=sum(x["bytes"] for x in history),
             historical_rows=history[0]["rows"],
             prefix_copy_rank_s=[x["seconds"] for x in history],
@@ -368,15 +375,26 @@ def prepare_history(run, servers, key, tokens, anchor, wait_for_packed):
     )
 
 
-def qualify_history(run, servers, key, tokens, anchor, row):
-    import agentx_replay as replay
+def donor_published(reply, root, kind):
+    # The fixed PP2 endpoint exposes one public control reply. Both stage
+    # writers publish their receipts only after all their copies are complete.
+    return (
+        isinstance(reply, list)
+        and True in reply
+        and all((root / f"{kind}-{rank}.json").is_file() for rank in (0, 1))
+    )
 
+
+def qualify_history(run, servers, key, tokens, anchor, row):
     target = servers["d_store"]
-    info = replay.http(target["node"], target["port"], "/get_server_info", key)
-    events_by_rank = [
-        [e for e in state.get("agentx_restores", []) if e.get("room") == row["room"]]
-        for state in info["internal_states"]
-    ]
+    log = Path(target["layouts"][0]["usage_logs"][0]["path"])
+    deadline = time.monotonic() + 8
+    while True:
+        hits = events(log, "PP2_HISTORICAL_RESTORE", row["room"])
+        events_by_rank = [[e for e in hits if e["rank"] == r] for r in (0, 1)]
+        if all(events_by_rank) or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
     row["first_request_historical_restore"] = events_by_rank
     h.save(
         run / "first_request_history.json", dict(room=row["room"], ranks=events_by_rank)

@@ -6,7 +6,7 @@
 
 - A100 preparation reached both resident endpoints and a warm 136-GiB Store in the first admitted attempt. The worker CLI rejected the new raw-control name before either new replica was timed. The rejected run is retained; both control names have been checked through the normal CLI.
 
-- [x] Prepared replica CPU verification, 96 tests passed, including responsive Store retirement on its RPC event loop. This includes native host tree insertion, separate writable KV/GDN slots, compact dense weight indices and sealed Marlin storage. The two-node A100 handoff has its own acceptance above.
+- [x] Prepared replica CPU verification, 97 tests passed. The fixed PP2 HTTP control endpoint publishes one reply. Each rank must independently confirm completed weight/cache publication, and each first-request CPU load is linked to its rank and transfer room. In the r4 pilot, the raw control took 101.40 s and both actual GPU stages exported 54.84 GiB each. No prepared replica timing was obtained from that pilot.
 
 - [x] One paired startup at the immutable r2 tag, `d83b53624e`. On two A100 nodes, the CPU loader took 110.99 s from replica trigger to the first Decode-generated token. Official SllmStore took 100.67 s with a prewarmed 119.56 GiB host pool. Both new replicas completed real transfers and CUDA Graph replays on both PP stages. The eight greedy outputs matched the resident replica, warm Prefill hit 4,544 tokens in both arms, and Guard verified cleanup and release. Evidence is archived under `sllmstore_pp2_startup_20261125_r2`. This is a fixed-PP2 startup measurement with one observation per method.
 

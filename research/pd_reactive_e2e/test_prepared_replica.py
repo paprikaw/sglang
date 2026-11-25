@@ -344,3 +344,14 @@ def test_raw_weight_retirement_keeps_store_event_loop_responsive():
         assert retired == ["stage0", "stage1", "missing"]
 
     asyncio.run(probe())
+
+
+def test_one_http_response_needs_both_stage_receipts(tmp_path):
+    from replica_startup import donor_published
+
+    for kind in ("weights", "history"):
+        (tmp_path / f"{kind}-0.json").touch()
+        assert not donor_published([True], tmp_path, kind)
+        (tmp_path / f"{kind}-1.json").touch()
+        assert not donor_published([False], tmp_path, kind)
+        assert donor_published([True], tmp_path, kind)

@@ -61,15 +61,23 @@ def install():
         if inspect_history:
             from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
             node = self.tree_core.node_by_id(params.best_match_node)
-            recurrent = node.component_data[ComponentType.MAMBA]
-            host_only_gdn = recurrent.host_value is not None and recurrent.value is None
+            host_only_gdn = []
+            while node is not None:
+                recurrent = node.component_data[ComponentType.MAMBA]
+                if recurrent.host_value is not None and recurrent.value is None:
+                    host_only_gdn.append(recurrent)
+                node = node.parent
         result = old_load(self, params)
         events = getattr(self, '_agentx_restores', [])
         events.append({'time': time.time(), 'copy_mamba_to_request': params.copy_mamba_to_request,
                        'loaded_tokens': len(result[0]) if result is not None else 0})
         if inspect_history:
+            import json
+            from sglang.srt.runtime_context import get_parallel
             events[-1].update(room=getattr(params.req, 'bootstrap_room', None),
-                              host_gdn_to_device_cache=host_only_gdn and recurrent.value is not None)
+                              rank=get_parallel().pp_rank,
+                              host_gdn_to_device_cache=any(x.value is not None for x in host_only_gdn))
+            print("PP2_HISTORICAL_RESTORE " + json.dumps(events[-1]), flush=True)
         self._agentx_restores = events[-128:]
         return result
 
