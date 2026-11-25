@@ -671,7 +671,7 @@ if __name__=='__main__':
     p.add_argument('--probe-batch-numerics',action='store_true')
     p.add_argument('--marlin-canonical-k',action='store_true')
     p.add_argument('--worker',action='store_true');p.add_argument('--engine',action='store_true');p.add_argument('--client',action='store_true');p.add_argument('--reuse-probe',action='store_true')
-    p.add_argument('--server',choices=['p','d0','d1','d_cpu','d_store']);a=p.parse_args()
+    p.add_argument('--server',choices=['p','d0','d1','d_cpu','d_raw','d_store']);a=p.parse_args()
     if a.reuse_probe:
         packet=json.loads(sys.stdin.readline());os.environ.update(packet['environment'])
         os.environ['CUDA_VISIBLE_DEVICES']='1'
