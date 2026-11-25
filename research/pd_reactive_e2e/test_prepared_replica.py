@@ -355,3 +355,23 @@ def test_one_http_response_needs_both_stage_receipts(tmp_path):
         (tmp_path / f"{kind}-1.json").touch()
         assert not donor_published([False], tmp_path, kind)
         assert donor_published([True], tmp_path, kind)
+
+
+def test_spare_allocation_requires_released_weight_backing_from_both_stages(tmp_path):
+    import asyncio
+    import json
+    from replica_startup import wait_for_weight_release
+    from prepare_replica_startup import prepared_host_reservation
+
+    key = {"run": "current"}
+    (tmp_path / "weights-released-0.json").write_text(json.dumps({"key": key}))
+    with pytest.raises(TimeoutError):
+        asyncio.run(wait_for_weight_release(tmp_path, key, timeout=0))
+    peer = tmp_path / "weights-released-1.json"
+    peer.write_text(json.dumps({"key": {"run": "stale"}}))
+    with pytest.raises(ValueError):
+        asyncio.run(wait_for_weight_release(tmp_path, key))
+    peer.write_text(json.dumps({"key": key}))
+    assert asyncio.run(wait_for_weight_release(tmp_path, key)) >= 0
+    budget = prepared_host_reservation()
+    assert budget["total_gib"] == 400

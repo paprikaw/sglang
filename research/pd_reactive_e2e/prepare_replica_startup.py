@@ -17,6 +17,24 @@ q, h = harness.q, harness.h
 GIB = 1024**3
 
 
+def prepared_host_reservation():
+    # All figures are GiB. The Store keeps one physical pinned region. The
+    # donor and raw replica may overlap the raw replica's initial pool and its
+    # shared replacement during bootstrap. In preparation, the raw process has
+    # exited and both sealed stage exports must close before creating the spare.
+    phases = {
+        "raw_replica_bootstrap": 3 * 64,
+        "donor_plus_two_stage_exports_and_dense_staging": 64 + 2 * 64 + 16,
+        "serving_banks_after_stage_release": 2 * 64,
+    }
+    return dict(
+        store_gib=136,
+        phase_gib=phases,
+        worker_and_copy_margin_gib=56,
+        total_gib=136 + max(phases.values()) + 56,
+    )
+
+
 def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
     nodes = list(nodes)
     if len(set(nodes)) != 2:
@@ -69,17 +87,14 @@ def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
     # Two PP2 replicas each allocate two 32-GiB rank caches, including
     # transient old/new pools; allow 128 GiB for CPU weight offload. The
     # 122B official host pool, rounded to 32-MiB chunks, is <120 GiB.
-    # The prepared comparison has one 136-GiB Store used sequentially. Its
-    # peak preparation includes two independent <=64-GiB HiCache banks, two
-    # <=64-GiB sealed stage exports, <=16 GiB of dense staging and 8 GiB for
-    # transient copies. The raw control retires before export. Guard adds its
-    # separate headroom and canonical-weight reservation in both modes.
+    # Guard adds its own headroom and the canonical weight reservation.
+    prepared_budget = prepared_host_reservation()
     cache.update(
         usage_logs={n: [] for n in nodes},
         node_specs={},
         hicache_reserve_bytes_per_node={
             nodes[0]: 160 * GIB,
-            nodes[1]: (416 if prepared_replica else 512) * GIB,
+            nodes[1]: (prepared_budget["total_gib"] if prepared_replica else 512) * GIB,
         },
         cpu_memory_budget=dict(
             schema_version=1, kv_banks_per_node={n: [] for n in nodes}
@@ -168,6 +183,7 @@ def prepare(run, prior, nodes, overlay, port, prepared_replica=False):
         engine_root=str(ENGINE),
         engine_commit=rev,
         prepared_replica=prepared_replica,
+        prepared_cpu_budget=prepared_budget if prepared_replica else None,
         store_reserve_bytes=(136 if prepared_replica else 128) * GIB,
         spare_hicache_reserve_bytes=64 * GIB if prepared_replica else 0,
         scope="two fresh fixed PP2 starts, one measured request each",

@@ -33,6 +33,21 @@ async def unload_store_weights(client, names):
             raise RuntimeError(f"Could not retire raw Store weights: {name}")
 
 
+async def wait_for_weight_release(root, key, timeout=90):
+    import asyncio
+    from sglang.srt.weight_cache.replica_preparation import read_packet
+
+    started = time.monotonic()
+    names = [f"weights-released-{rank}.json" for rank in (0, 1)]
+    while not all((root / name).is_file() for name in names):
+        if time.monotonic() - started >= timeout:
+            raise TimeoutError("Donor stage weight backing was not released")
+        await asyncio.sleep(0.15)
+    for name in names:
+        read_packet(root, name, key)
+    return time.monotonic() - started
+
+
 def store_service(run, config):
     import asyncio
     import grpc
@@ -138,6 +153,7 @@ def store_service(run, config):
                             os.close(fd)
                         fds.clear()
                         publish(preparation / "weights-consumed.json", dict(key=key))
+                        release_s = await wait_for_weight_release(preparation, key)
                         spare = prepare_spare(
                             preparation, key, config["spare_hicache_reserve_bytes"]
                         )
@@ -147,6 +163,7 @@ def store_service(run, config):
                                 passed=True,
                                 host_pool_bytes=pool_bytes,
                                 rounded_payload_bytes=used,
+                                release_before_spare_s=release_s,
                                 preparation_s=time.monotonic() - started,
                             ),
                         )
@@ -345,11 +362,6 @@ def prepare_history(run, servers, key, tokens, anchor, wait_for_packed):
     weights = [json.loads((root / f"weights-{r}.json").read_text()) for r in (0, 1)]
     spare = json.loads((root / "spare.json").read_text())
     snapshot_wall_s = time.perf_counter() - start
-    release_start = time.perf_counter()
-    while not all((root / f"weights-released-{r}.json").is_file() for r in (0, 1)):
-        if time.perf_counter() - release_start > 90:
-            raise TimeoutError("Donor stage weight backing was not released")
-        time.sleep(0.2)
     for rank in (0, 1):
         released = json.loads((root / f"weights-released-{rank}.json").read_text())
         if released["key"] != spare["key"]:
@@ -360,7 +372,7 @@ def prepare_history(run, servers, key, tokens, anchor, wait_for_packed):
             donor_weight_export_wall_s=export_wall_s,
             store_conversion_and_prewarm_s=packed["preparation_s"],
             prefix_snapshot_wall_s=snapshot_wall_s,
-            remaining_weight_release_wait_s=time.perf_counter() - release_start,
+            weight_release_before_spare_s=packed["release_before_spare_s"],
             prefix_payload_bytes=sum(x["bytes"] for x in history),
             historical_rows=history[0]["rows"],
             prefix_copy_rank_s=[x["seconds"] for x in history],
