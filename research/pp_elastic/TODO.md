@@ -2,7 +2,7 @@
 
 ## 122B PP2 Decode replica startup with official SllmStore
 
-- [ ] Prepared PP2 replica on one Decode node. Both ranks bind the preallocated CPU bank, import the donor's KV/GDN prefix snapshot with independent writable slots, and load the sealed stage-local Marlin tensors through the official Store. Validate first-request CPU hits on both ranks, donor/receiver branch outputs, real handoff, Graph replay, preparation costs and GPU cleanup. Cross-node CPU synchronization is a separate scope.
+- [x] Prepared fixed PP2 replica, two A100 nodes, r6. Plain and prepared official SllmStore took 101.23 s and 59.39 s to the first Decode token. Both ranks restored 4,608 KV tokens and one GDN checkpoint on the first handoff, replayed the graph and matched the donor output. Divergent suffix and donor revisit passed. Pretrigger phases totaled 220.45 s. Guard passed and released both nodes. [Paired startup and phase costs](/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/runs/sllmstore_pp2_shared_history_20261125_r6_111_069/REPORT.md). Cross-node CPU synchronization remains open.
 
 - A100 preparation reached both resident endpoints and a warm 136-GiB Store in the first admitted attempt. The worker CLI rejected the new raw-control name before either new replica was timed. The rejected run is retained; both control names have been checked through the normal CLI.
 
