@@ -1246,7 +1246,17 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                if elastic_pp_draining:
+                # process_prefill_chunk reads the previous chunk's page IDs
+                # back to the host. On a sparse pipeline that read can wait for
+                # a proxy send whose peer still needs this turn's control
+                # messages. Retire the producing microbatch first, while all
+                # ranks keep advancing the bootstrap and output rings.
+                chunk_in_flight = (
+                    getattr(self.server_args, "elastic_pp_disagg_prefill", False)
+                    and self.chunked_req is not None
+                    and self.chunked_req.inflight_middle_chunks > 0
+                )
+                if elastic_pp_draining or chunk_in_flight:
                     batch = None
                     server_is_idle = False
                 else:
