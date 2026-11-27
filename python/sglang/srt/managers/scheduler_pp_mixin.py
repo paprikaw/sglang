@@ -1193,6 +1193,8 @@ class SchedulerPPMixin:
         # before retiring the old layout.
         elastic_sender = getattr(self.server_args, "elastic_pp_disagg_prefill", False)
         proxy_by_slot = [[] for _ in range(self.pp_loop_size)] if elastic_sender else None
+        proxy_stream = self.device_module.Stream() if elastic_sender else None
+        proxy_complete = [None] * self.pp_loop_size
 
         while True:
             server_is_idle = True
@@ -1363,14 +1365,19 @@ class SchedulerPPMixin:
                         and self._pp_rank_is_active()
                         and not self._pp_is_last_rank()
                     ):
-                        self.device_module.current_stream().wait_event(
-                            self.launch_event
-                        )
-                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
-                            async_send=True,
-                            msg_type="proxy",
-                        )
+                        # PyNCCL enqueues on the current stream; a later host
+                        # read during admission must not wait for the remote
+                        # peer to make progress on its control ring.
+                        stream = proxy_stream or self.device_module.current_stream()
+                        with self.device_module.stream(stream):
+                            stream.wait_event(self.launch_event)
+                            self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                                result.pp_hidden_states_proxy_tensors.tensors,
+                                async_send=True,
+                                msg_type="proxy",
+                            )
+                            if elastic_sender:
+                                proxy_complete[mb_id] = stream.record_event()
 
                 if proxy_by_slot is not None:
                     proxy_by_slot[mb_id] = self.send_proxy_work
@@ -1388,6 +1395,7 @@ class SchedulerPPMixin:
                         and all(row is None for ring in (bmbs, tmbs) for row in ring)
                         and release_rids is None and consensus_bootstrapped_rids is None
                         and not any(proxy_by_slot or ())
+                        and all(ev is None or ev.query() for ev in proxy_complete)
                         and manager.prefill_transfer_fence.pending() == 0
                     )
                 if self._elastic_pp_finalize_if_drained():

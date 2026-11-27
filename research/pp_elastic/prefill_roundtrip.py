@@ -57,10 +57,14 @@ def measure(run, p, d, key, wait_file, replay, save):
             for history in fixture["histories"]:
                 replay.request_one(p, d, key, history, 1, 0, True, request_timeout_s=90)
             room_base = 1827000000 + 10000 * generation + (1000 if migrate else 0)
+            samples = run / "samples" / name
+            samples.mkdir(parents=True, exist_ok=True)
             def send(row, room):
                 prefix = [] if row["history"] is None else fixture["histories"][row["history"]]
-                return replay.request_one(p, d, key, prefix + row["suffix_ids"], row["max_new_tokens"],
+                result = replay.request_one(p, d, key, prefix + row["suffix_ids"], row["max_new_tokens"],
                                           0, True, request_timeout_s=60, bootstrap_room=room)
+                save(samples / f"{room}.json", result)
+                return result
 
             with cf.ThreadPoolExecutor(max_workers=90) as pool:
                 started = time.monotonic()
