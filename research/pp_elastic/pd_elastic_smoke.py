@@ -124,7 +124,8 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
                        nixl_root=str(NIXL_ROOT) if role_is_p else None,
                        kvcached_root=str(KVCACHED_ROOT) if role_is_p else None)
             cfg["launch_env"].update(CUDA_MODULE_LOADING="EAGER", CUDA_MODULE_DATA_LOADING="EAGER",
-                                     ELASTIC_PD_STATIC_DECODE="1", PREFILL_ROUNDTRIP_PROBE="1")
+                                     ELASTIC_PD_STATIC_DECODE="1", PREFILL_ROUNDTRIP_PROBE="1",
+                                     SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE="512")
             if role_is_p:
                 cfg["launch_env"].update(KVCACHED_LAYER_STACKING="true",
                     KVCACHED_PAGE_PREALLOC_ENABLED="false", KVCACHED_CONTIGUOUS_LAYOUT="true",
@@ -777,8 +778,14 @@ def controller(run, root):
         cleanups = []
         for cfg in cfgs:
             path = run / "nodes" / cfg["node"] / "cleanup.json"
-            if path.exists():
-                wait_file(path, 20)
+            # Workers have exited. Poll the shared directory without checking
+            # worker liveness while its final receipt becomes visible here.
+            visibility = subprocess.run(
+                [PYTHON, str(GUARD / "artifact_visibility.py"), str(path), "--timeout-s", "45",
+                 "--receipt", str(path.with_name("cleanup.visibility.json"))],
+                timeout=55, stdout=subprocess.DEVNULL,
+            )
+            if visibility.returncode == 0:
                 cleanups.append(json.loads(path.read_text()))
         cleanup_passed = len(cleanups) == len(cfgs) and all(
             c.get("cleanup_verified") for c in cleanups)

@@ -55,7 +55,7 @@ def measure(run, p, d, key, wait_file, replay, save):
             for endpoint in (p, d):
                 replay.http(endpoint["host"], endpoint["port"], "/flush_cache?timeout=60", key)
             for history in fixture["histories"]:
-                replay.request_one(p, d, key, history, 1, 0, True)
+                replay.request_one(p, d, key, history, 1, 0, True, request_timeout_s=90)
             room_base = 1827000000 + 10000 * generation + (1000 if migrate else 0)
             def send(row, room):
                 prefix = [] if row["history"] is None else fixture["histories"][row["history"]]
