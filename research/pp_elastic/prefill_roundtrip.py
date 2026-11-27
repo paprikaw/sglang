@@ -37,6 +37,19 @@ def install_trigger_probe():
     Scheduler.process_input_requests = dispatch
 
 
+def read_worker_log(path, complete, timeout=65):
+    # GPFS on the controller can show a shorter file after the request has
+    # returned and the writer has flushed on the remote worker.
+    deadline = time.monotonic() + timeout
+    while True:
+        text = path.read_text(errors="replace")
+        if complete(text):
+            return text
+        if time.monotonic() >= deadline:
+            raise ValueError(f"Worker log has no complete terminal markers: {path}")
+        time.sleep(0.5)
+
+
 def measure(run, p, d, key, wait_file, replay, save):
     spec = importlib.util.spec_from_file_location("frozen_migration_workload", BENCH / "workload.py")
     workload = importlib.util.module_from_spec(spec)
@@ -98,7 +111,11 @@ def measure(run, p, d, key, wait_file, replay, save):
                     raise ValueError("Migration changed a generated token")
                 if rows["crossing"]["prefill_meta"].get("cached_tokens", 0) < 2048:
                     raise ValueError("Crossing request lost its warm history")
-                text = (run / "cache/prefill.log").read_text(errors="replace")
+                text = read_worker_log(
+                    run / "cache/prefill.log",
+                    lambda raw: f"Elastic Prefill trigger rank=0 generation={generation} " in raw
+                    and f"Elastic Prefill KV transport rank=0 room={crossing_room} " in raw,
+                )
                 trigger = re.search(rf"Elastic Prefill trigger rank=0 generation={generation} at_ns=(\d+)",text)
                 transfers = re.findall(rf"Elastic Prefill KV transport rank=0 room={crossing_room} start_ns=(\d+) end_ns=(\d+) bytes=(\d+) rc=0", text)
                 overlap = [(int(a),int(b),int(n)) for a,b,n in transfers if trigger and
@@ -109,7 +126,12 @@ def measure(run, p, d, key, wait_file, replay, save):
                 observations[name] = dict(verified_output_requests=len(rows), overlap=overlap)
             # All D workers are on the same host. Measure from first destination
             # publication to the last required receiver's transfer completion.
-            text = (run / "cache/decode.log").read_text(errors="replace")
+            last_room = room_base + 61
+            text = read_worker_log(
+                run / "cache/decode.log",
+                lambda raw: all(f"Migration probe D ready rank={rank} room={last_room} " in raw
+                                for rank in (0, 1)),
+            )
             waits = {}
             for second in range(0,31):
                 room = room_base + second + 31
