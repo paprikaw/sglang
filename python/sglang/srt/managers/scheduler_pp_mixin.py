@@ -1187,6 +1187,12 @@ class SchedulerPPMixin:
         send_transfer_work = []
         send_consensus_bootstrapped_work = []
         send_release_work = []
+        # The activation can jump over a dormant stage. Its peer learns the
+        # batch through the physical control ring, up to pp_size turns later.
+        # Keep sends alive until the same slot returns, and count every slot
+        # before retiring the old layout.
+        elastic_sender = getattr(self.server_args, "elastic_pp_disagg_prefill", False)
+        proxy_by_slot = [[] for _ in range(self.pp_loop_size)] if elastic_sender else None
 
         while True:
             server_is_idle = True
@@ -1283,6 +1289,8 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+                if proxy_by_slot is not None:
+                    self.send_proxy_work = proxy_by_slot[mb_id]
                 self._pp_commit_comm_work(self.send_proxy_work)
                 self._pp_commit_comm_work(self.send_output_handoff_work)
                 if cur_batch:
@@ -1364,6 +1372,8 @@ class SchedulerPPMixin:
                             msg_type="proxy",
                         )
 
+                if proxy_by_slot is not None:
+                    proxy_by_slot[mb_id] = self.send_proxy_work
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
@@ -1377,6 +1387,7 @@ class SchedulerPPMixin:
                                  send_consensus_bootstrapped_work, send_release_work))
                         and all(row is None for ring in (bmbs, tmbs) for row in ring)
                         and release_rids is None and consensus_bootstrapped_rids is None
+                        and not any(proxy_by_slot or ())
                         and manager.prefill_transfer_fence.pending() == 0
                     )
                 if self._elastic_pp_finalize_if_drained():
