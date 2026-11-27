@@ -33,8 +33,11 @@ def capacity_frontier(args):
         raise ValueError("max-total-tokens must equal the maximum virtual KV capacity")
     if getattr(args, "page_size", None) != 1:
         raise ValueError("capacity-managed KVCacheD currently requires page-size 1")
-    if getattr(args, "disaggregation_mode", None) != "decode":
-        raise ValueError("capacity-managed P/D qualification currently scales Decode")
+    role = getattr(args, "disaggregation_mode", None)
+    if role != "decode" and not (
+        role == "prefill" and getattr(args, "elastic_pp_disagg_prefill", False)
+    ):
+        raise ValueError("capacity-managed P/D requires Decode or the elastic Prefill sender")
     return dict(zip(parts, caps))
 
 

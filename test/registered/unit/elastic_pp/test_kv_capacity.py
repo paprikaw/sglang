@@ -214,3 +214,7 @@ def test_prepared_pd_regions_use_target_layers_and_capacity_without_publishing()
     assert pool.serving_capacity == 4 and pool.k_buffer == buffers[:1]
     with pytest.raises(RuntimeError, match='no matching prepared'):
         KVCacheDMHATokenToKVPool.prepared_pd_registration_regions(pool, 8)
+
+def test_capacity_frontier_accepts_prefill_only_with_sender_fence():
+    cfg = args(disaggregation_mode="prefill", elastic_pp_disagg_prefill=True)
+    assert capacity_frontier(cfg) == {(24, 0, 24): 4, (16, 16, 16): 8}
