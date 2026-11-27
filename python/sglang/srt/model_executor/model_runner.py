@@ -1575,9 +1575,13 @@ class ModelRunner:
 
         full = full_pool(self)
         if getattr(full, "capacity_managed", False):
-            full._logical_allocator.check_serving_capacity(
-                topology_capacity(self.server_args, transition.target)
-            )
+            capacity = topology_capacity(self.server_args, transition.target)
+            allocator = full._logical_allocator
+            registration = getattr(self, "_elastic_pp_pd_registration", None)
+            demote = getattr(registration, "demote_cached_rows_for_shrink", None)
+            if demote is not None:
+                demote(allocator, capacity)
+            allocator.check_serving_capacity(capacity)
 
     def invalidate_elastic_pp_attention_state_views(self):
         """Drop lazy GDN tracking views at a drained backing change.

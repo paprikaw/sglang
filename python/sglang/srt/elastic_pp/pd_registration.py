@@ -279,6 +279,60 @@ class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
     def pending_work(self):
         return self._queue().kv_manager.prefill_transfer_fence.pending()
 
+    def demote_cached_rows_for_shrink(self, allocator, capacity):
+        """Keep host-backed prefixes while retiring high-numbered device rows."""
+        if capacity >= allocator.serving_capacity:
+            return
+        high = {row for row in allocator._live_page_ids if row > capacity}
+        if not high:
+            return
+        if self.pending_work():
+            raise RuntimeError("Cannot demote Prefill KV referenced by an active transfer")
+        from collections import defaultdict
+        import logging
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+        cache = self.scheduler.tree_cache
+        tree = cache.tree_core
+        tracker = defaultdict(int)
+        before = len(high)
+        # Demoting a leaf can expose its parent. A request lock, missing host
+        # copy, or non-cache owner must continue to prevent physical reclaim.
+        while high:
+            progress = False
+            for node in sorted(tree.evictable_device_leaves, key=lambda n: n.id):
+                if not node.backuped or not tree._is_device_leaf(node):
+                    continue
+                rows = node.component_data[ComponentType.FULL].value
+                if rows is None or not high.intersection(allocator._as_int_list(rows)):
+                    continue
+                cache._demote(node.id, tracker)
+                high.intersection_update(allocator._live_page_ids)
+                progress = True
+            if not progress:
+                break
+        if high:
+            cached = set()
+            locked = set()
+            for node in getattr(tree, "_node_arena", {}).values():
+                rows = node.component_data[ComponentType.FULL].value
+                if rows is None:
+                    continue
+                affected = high.intersection(allocator._as_int_list(rows))
+                cached.update(affected)
+                if any(component.lock_ref > 0 for component in node.component_data):
+                    locked.update(affected)
+            logging.getLogger(__name__).warning(
+                "Prefill shrink kept high KV rows: cached=%d locked_cached=%d "
+                "outside_tree=%d", len(cached), len(locked), len(high - cached),
+            )
+        logging.getLogger(__name__).info(
+            "Elastic Prefill shrink rank=%d cap=%d high_before=%d high_after=%d "
+            "live=%d demoted_KV=%d",
+            self.scheduler.ps.pp_rank, capacity, before, len(high),
+            len(allocator._live_page_ids), tracker[ComponentType.FULL],
+        )
+
     def suspend(self):
         fence = self._queue().kv_manager.prefill_transfer_fence
         fence.close()
