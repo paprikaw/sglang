@@ -89,7 +89,7 @@ def stream(endpoint, key, payload, timeout=600, *, event_sink=None):
 
 
 def request_one(prefill, decode, key, tokens, output, lane, return_logprob=False,
-                *, request_timeout_s=600):
+                *, request_timeout_s=600, bootstrap_room=None):
     target = decode or prefill
     payload = dict(input_ids=tokens, stream=True, sampling_params={
         'temperature': 0, 'max_new_tokens': output, 'ignore_eos': True})
@@ -101,7 +101,7 @@ def request_one(prefill, decode, key, tokens, output, lane, return_logprob=False
     if decode is None:
         return stream(target, key, payload, timeout=request_timeout_s)
     payload.update(bootstrap_host=prefill['host'], bootstrap_port=prefill['bootstrap_port'],
-                   bootstrap_room=random.randrange(1, 2**62), disagg_prefill_dp_rank=prefill.get('rank', lane % prefill['ep']))
+                   bootstrap_room=bootstrap_room if bootstrap_room is not None else random.randrange(1, 2**62), disagg_prefill_dp_rank=prefill.get('rank', lane % prefill['ep']))
     pre = dict(payload, stream=False)
     if prefill['ep'] > 1:
         pre['routed_dp_rank'] = prefill.get('rank', lane % prefill['ep'])

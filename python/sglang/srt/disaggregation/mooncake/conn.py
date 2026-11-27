@@ -212,7 +212,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         return (
             peer is not None
             and getattr(peer, "dst_pp_size", 1) > 1
-            and peer.dst_pp_size != self.pp_size
+            and (peer.dst_pp_size != self.pp_size or getattr(self.server_args, "elastic_pp_disagg_prefill", False))
             and self.pp_size > 1
         )
 
@@ -296,6 +296,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
         self.enable_trace = server_args.enable_trace
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.prefill_transfer_fence = None
+            if getattr(server_args, "elastic_pp_disagg_prefill", False):
+                from sglang.srt.elastic_pp.prefill_transfer import PrefillTransferFence
+
+                self.prefill_transfer_fence = PrefillTransferFence()
             self.start_prefill_thread()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
@@ -723,6 +728,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         allow_destination_subset: bool = False,
         allow_partial_overlap: bool = False,
         dst_row_strides: Optional[List[int]] = None,
+        src_row_strides: Optional[List[int]] = None,
     ) -> int:
         """
         Generic KV cache transfer supporting both MHA and MLA architectures.
@@ -824,14 +830,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_ptr: int, dst_ptr: int, item_len: int
         ) -> List[Tuple[int, int, int]]:
             transfer_blocks = []
-            if dst_row_strides is not None:
-                stride = dst_row_strides[dst_data_ptrs.index(dst_ptr)]
+            if dst_row_strides is not None or src_row_strides is not None:
+                stride = dst_row_strides[dst_data_ptrs.index(dst_ptr)] if dst_row_strides is not None else item_len
+                src_stride = src_row_strides[src_data_ptrs.index(src_ptr)] if src_row_strides is not None else item_len
+                if src_stride < item_len:
+                    raise ValueError("source KV row stride overlaps payload rows")
                 if stride < item_len:
                     raise ValueError("destination KV row stride overlaps payload rows")
                 # K and V share one physical group, with independent wire
                 # pointers. Coalescing contiguous logical tokens would overwrite
                 # the other field; keep each payload row separate.
-                return [(src_ptr + int(s) * item_len, dst_ptr + int(d) * stride, item_len)
+                return [(src_ptr + int(s) * src_stride, dst_ptr + int(d) * stride, item_len)
                         for s, d in zip(prefill_data_indices, dst_data_indices)]
             if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
                 assert (
@@ -877,6 +886,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         else:
             # Combining all layers' params in one batch transfer is more efficient
             # compared to using multiple threads
+            if getattr(self, "prefill_transfer_fence", None) is not None and state_type is None and not force_flat:
+                blocks = [
+                    block for src, dst, size in layers_params
+                    for block in set_transfer_blocks(src, dst, size)
+                ]
+                if blocks:
+                    fence = self.prefill_transfer_fence
+                    room = fence.worker.room
+                    fence.begin_io(room)
+                    start = time.monotonic_ns()
+                    try:
+                        ret = self._transfer_data(mooncake_session_id, blocks)
+                        end = time.monotonic_ns()
+                    finally:
+                        fence.end_io(room)
+                    logger.info("Elastic Prefill KV transport rank=%d room=%d start_ns=%d end_ns=%d bytes=%d rc=%d",
+                                self.pp_rank, room, start, end, sum(b[2] for b in blocks), ret)
+                    return ret
+                return 0
             return process_layers(layers_params)
 
     def _validate_envelope_kv_layout(
@@ -987,6 +1015,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             allow_destination_subset=self.pp_size == 1 and dst_pp_size > 1,
             allow_partial_overlap=self._partial_layer_transfer(mooncake_session_id),
             dst_row_strides=dst_kv_row_strides,
+            src_row_strides=getattr(self.kv_args, "kv_row_strides", None),
         )
 
     def send_kvcache_dcp(
@@ -1745,6 +1774,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         while True:
             try:
                 kv_chunk: TransferKVChunk = queue.get()
+                if self.prefill_transfer_fence is not None:
+                    self.prefill_transfer_fence.worker.room = kv_chunk.room
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -1774,6 +1805,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             thread_finish_flag=True,
                         )
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                    if self.prefill_transfer_fence is not None:
+                        self.prefill_transfer_fence.finish(kv_chunk)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -2047,6 +2080,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if staging_deferred:
                     continue
 
+                if self.prefill_transfer_fence is not None:
+                    self.prefill_transfer_fence.finish(kv_chunk)
                 self._staging_outstanding[kv_chunk.room] -= 1
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
@@ -2275,6 +2310,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             self.prefill_response_tracker[bootstrap_room]
                         )
                         if arrived_response_num == expected_response_num:
+                            if os.environ.get("PREFILL_ROUNDTRIP_PROBE"):
+                                logger.info("Migration probe D ready rank=%d room=%d at_ns=%d",
+                                            self.pp_rank, bootstrap_room, time.monotonic_ns())
                             if self.enable_staging:
                                 handler = self._staging_handler
                                 if handler.is_staging_room(bootstrap_room):
@@ -2329,8 +2367,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
+        chunk = TransferKVChunk(
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
                 index_slice=index_slice,
@@ -2340,7 +2377,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
             )
-        )
+        fence = self.prefill_transfer_fence
+        if fence is not None:
+            fence.admit(chunk)
+        try:
+            self.transfer_queues[shard_idx].put(chunk)
+        except BaseException:
+            if fence is not None:
+                fence.finish(chunk)
+            raise
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -2624,6 +2669,9 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         decode_prefix_len: Optional[int] = None,
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
+        if os.environ.get("PREFILL_ROUNDTRIP_PROBE"):
+            logger.info("Migration probe D posted rank=%d room=%d at_ns=%d",
+                        self.kv_mgr.pp_rank, self.bootstrap_room, time.monotonic_ns())
         if self.bootstrap_infos is None:
             self.kv_mgr.record_failure(
                 self.bootstrap_room,

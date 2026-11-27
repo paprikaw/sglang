@@ -70,6 +70,18 @@ def validate_decode_args(args):
         raise ValueError("elastic P/D Decode qualification: " + "; ".join(mismatches))
 
 
+def validate_prefill_args(args):
+    if not (args.disaggregation_transfer_backend == "mooncake"
+            and args.tp_size == 1 and args.pp_async_batch_depth == 0
+            and args.enable_hierarchical_cache
+            and args.elastic_pp_transition_strategy == "background"
+            and args.elastic_pp_transition_backing == "overlap"
+            and args.elastic_pp_prepared_weight_policy == "offload"
+            and args.elastic_pp_hicache_shared_host
+            and args.enable_elastic_pp_kv_patch):
+        raise ValueError("elastic Prefill requires TP1 Mooncake, HiCache, overlapping CPU weight recovery and KV patch")
+
+
 def pending_pd_work(scheduler):
     """Do not confuse running decode requests with outstanding RDMA writers."""
     prealloc = scheduler.disagg_decode_prealloc_queue
@@ -132,6 +144,9 @@ class DecodeRegistrationTransaction:
         self.prepared_generation = None
         self.last_metrics = {}
 
+    def _queue(self):
+        return self.scheduler.disagg_decode_prealloc_queue
+
     def prepare_target(self, generation):
         runner = self.scheduler.tp_worker.model_runner
         if (
@@ -150,7 +165,7 @@ class DecodeRegistrationTransaction:
             regions,
         )
 
-        manager = self.scheduler.disagg_decode_prealloc_queue.kv_manager
+        manager = self._queue().kv_manager
         target = pool.prepared_pd_registration_regions(generation)
         # Metadata buffers belong to the persistent P/D queue, not to a PP
         # layer generation. Keep their registrations throughout the handoff.
@@ -197,9 +212,9 @@ class DecodeRegistrationTransaction:
     def suspend(self):
         if self.suspended:
             raise RuntimeError("P/D registration already suspended")
-        if pending_pd_work(self.scheduler):
+        if self.pending_work():
             raise RuntimeError("P/D transfers must finish before backing release")
-        manager = self.scheduler.disagg_decode_prealloc_queue.kv_manager
+        manager = self._queue().kv_manager
         self.suspended = True
         if self.prepared_regions is None:
             manager.deregister_buffer_to_engine()
@@ -210,10 +225,13 @@ class DecodeRegistrationTransaction:
                 with manager.connection_lock:
                     manager.connection_pool.clear()
 
+    def pending_work(self):
+        return pending_pd_work(self.scheduler)
+
     def refresh(self):
         if not self.suspended:
             return
-        queue = self.scheduler.disagg_decode_prealloc_queue
+        queue = self._queue()
         manager = queue.kv_manager
         from sglang.srt.elastic_pp.kv_capacity import publish_scheduler_capacity
 
@@ -236,6 +254,12 @@ class DecodeRegistrationTransaction:
         # These rooms bootstrapped before migration, but have not published any
         # token destinations. Republish pool addresses before their first send.
         # Future rooms use the same refreshed connection cache.
+        self._refresh_peers(queue)
+        self.suspended = False
+        self.last_metrics = self.metrics()
+        self.prepared_regions = self.prepared_generation = None
+
+    def _refresh_peers(self, queue):
         for entry in [*queue.queue, *getattr(queue, "pending_reqs", ())]:
             receiver = entry.kv_receiver
             if hasattr(receiver, "prefill_dp_rank"):
@@ -244,6 +268,28 @@ class DecodeRegistrationTransaction:
                     raise RuntimeError(
                         "unallocated P/D receiver re-registration failed"
                     )
-        self.suspended = False
-        self.last_metrics = self.metrics()
-        self.prepared_regions = self.prepared_generation = None
+
+
+class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
+    """Keep sender resources registered until all old chunks have retired."""
+
+    def _queue(self):
+        return self.scheduler.disagg_prefill_bootstrap_queue
+
+    def pending_work(self):
+        return self._queue().kv_manager.prefill_transfer_fence.pending()
+
+    def suspend(self):
+        fence = self._queue().kv_manager.prefill_transfer_fence
+        fence.close()
+        try:
+            super().suspend()
+        except BaseException:
+            if not self.suspended:
+                fence.reopen()
+            raise
+
+    def _refresh_peers(self, queue):
+        # The static D registered each physical P rank once. Destination
+        # addresses and room IDs are unchanged, even on zero-layer stages.
+        queue.kv_manager.prefill_transfer_fence.reopen()

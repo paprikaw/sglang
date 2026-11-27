@@ -75,7 +75,9 @@ def publish_scheduler_capacity(scheduler):
     capacity = pool.serving_capacity
     runner.max_total_num_tokens = capacity
     scheduler.max_total_num_tokens = capacity
-    queue = scheduler.disagg_decode_prealloc_queue
+    queue = (scheduler.disagg_prefill_bootstrap_queue
+             if getattr(getattr(scheduler, "server_args", None), "elastic_pp_disagg_prefill", False)
+             else scheduler.disagg_decode_prealloc_queue)
     queue.max_total_num_tokens = capacity
     observer = getattr(scheduler, "pool_stats_observer", None)
     if observer is not None:

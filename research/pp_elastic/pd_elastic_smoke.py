@@ -60,7 +60,7 @@ def memory_size_json(value):
 
 
 def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
-            lazy_cuda_modules=False, kvcached_capacity=False):
+            lazy_cuda_modules=False, kvcached_capacity=False, prefill_roundtrip=False):
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
     dirty = subprocess.check_output(["git", "-C", str(ENGINE), "status", "--porcelain"], text=True)
@@ -79,7 +79,7 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
     nodes = {}
     for index, (node, previous) in enumerate(old["node_configs"].items()):
         cfg = dict(previous)
-        pp = 2 if index == 0 else 3
+        pp = (3, 2)[index] if prefill_roundtrip else (2, 3)[index]
         role = "prefill" if index == 0 else "decode"
         use = dict(id=f"{run.name}.{role}", path=str(run / "cache" / f"{role}.log"),
                    expected_ranks=[f"PP{rank} TP0" for rank in range(pp)])
@@ -112,14 +112,39 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
             # CUDA modules while the real CPU weight restore is in flight.
             cfg["launch_env"].update(CUDA_MODULE_LOADING="EAGER",
                                      CUDA_MODULE_DATA_LOADING="EAGER")
+        if prefill_roundtrip:
+            role_is_p = role == "prefill"
+            job_ids = subprocess.check_output(["squeue", "--me", "-h", "-t", "RUNNING",
+                                              "-w", node, "-o", "%A"], text=True).split()
+            if len(job_ids) != 1:
+                raise ValueError(f"{node} needs a currently running booking")
+            cfg.update(job_id=job_ids[0], prefill_roundtrip=True,
+                       optimized_elastic_pp=role_is_p, cuda_graph=True,
+                       cpu_weight_cache_gib=64 if role_is_p else 0,
+                       nixl_root=str(NIXL_ROOT) if role_is_p else None,
+                       kvcached_root=str(KVCACHED_ROOT) if role_is_p else None)
+            cfg["launch_env"].update(CUDA_MODULE_LOADING="EAGER", CUDA_MODULE_DATA_LOADING="EAGER",
+                                     ELASTIC_PD_STATIC_DECODE="1", PREFILL_ROUNDTRIP_PROBE="1")
+            if role_is_p:
+                cfg["launch_env"].update(KVCACHED_LAYER_STACKING="true",
+                    KVCACHED_PAGE_PREALLOC_ENABLED="false", KVCACHED_CONTIGUOUS_LAYOUT="true",
+                    KVCACHED_PHYSICAL_BLOCK_SIZE_MB="2", KVCACHED_MIN_RESERVED_PAGES="0",
+                    KVCACHED_MAX_RESERVED_PAGES="0", KVCACHED_GPU_DIRECT_RDMA_REQUIRED="1",
+                    KVCACHED_IPC_NAME=run.name)
         nodes[node] = cfg
         node_spec = json.loads((PRIOR / "cache" / f"{node}.json").read_text())
         node_path = run / "cache" / f"{node}.json"
+        if prefill_roundtrip:
+            node_spec["expected_job_id"] = cfg["job_id"]
         save(node_path, node_spec)
         cache["node_specs"][node] = describe(node_path)
         cache["usage_logs"][node] = [use]
         # Host cache + CPU KV/GDN spill staging share an explicit reservation.
         cache["hicache_reserve_bytes_per_node"][node] = (240 if optimized and role == "decode" else 32) * 1024**3
+    if prefill_roundtrip:
+        for node, cfg in nodes.items():
+            cache["hicache_reserve_bytes_per_node"][node] = (240 if cfg["role"] == "prefill" else 32) * 1024**3
+        spec["implementation_note"] = "New 122B P-side transfer fence, fixed native PP2 D; existing registered inplace path is Decode-only."
     for cfg in nodes.values():
         cfg["model_cache"] = cache
     config = dict(id=run.name, python=PYTHON, node_configs=nodes,
@@ -133,6 +158,7 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
                   logical_gpu_counts=[4, 5, 4], resident_worker_gpus=5,
                   reserved_gpus=8, gpu_reuse_probe_gib=64)
     config["deterministic_inference"] = True
+    config["prefill_roundtrip"] = prefill_roundtrip
     config["temporary_prefill_diagnostics"] = False
     config["kvcached_capacity"] = kvcached_capacity
     if kvcached_capacity:
@@ -174,6 +200,9 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
              native_rdma_mapping_abi=1))
     bank = Path("/data/gpfs/projects/punim2715/vllm_workbench/sglang-memory-bank/src/sglang_memory_bank")
     paths.extend(bank / name for name in ("__init__.py", "memory_budget.py", "memory_bank.py"))
+    if prefill_roundtrip:
+        workload_root = Path("/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/benchmarks/prefill_pp_migration_v1")
+        paths.extend([workload_root / "workload.py", workload_root / "fixtures.json"])
     spec["frozen_inputs"] = [describe(p) for p in dict.fromkeys(paths)]
     save(run / "dashboard_spec.json", spec)
     save(run / "preparation.json", dict(command=[PYTHON, str(GUARD / "dashboard_guard.py"),
@@ -252,6 +281,9 @@ def install_hooks():
               data=os.environ.get("CUDA_MODULE_DATA_LOADING"))), flush=True)
         return result
     ModelRunner.load_model = load
+    if os.environ.get("PREFILL_ROUNDTRIP_PROBE") and os.environ["ELASTIC_PD_ROLE"] == "prefill":
+        from prefill_roundtrip import install_trigger_probe
+        install_trigger_probe()
     if os.environ["ELASTIC_PD_ROLE"] == "decode":
         if os.environ.get("SGLANG_PP2_STARTUP_PROBE"):
             from startup_timing_probe import install
@@ -364,7 +396,15 @@ def engine_entry(run, cfg):
         "--hicache-mem-layout", "page_first", "--disaggregation-mode", cfg["role"],
         "--disaggregation-transfer-backend", "mooncake", "--disaggregation-bootstrap-port", str(cfg["bootstrap_port"]),
         "--disaggregation-ib-device", "mlx5_bond_0"]
-    if cfg["role"] == "decode":
+    if cfg.get("prefill_roundtrip") and cfg["role"] == "prefill":
+        argv += ["--enable-elastic-pp", "--elastic-pp-disagg-prefill",
+                 "--elastic-pp-initial-partition", "24,0,24",
+                 "--elastic-pp-kv-backend", "kvcached", "--elastic-pp-kv-capacities", "8192;12288",
+                 "--cuda-graph-backend-decode", "full", "--cuda-graph-backend-prefill", "disabled"]
+    elif cfg.get("prefill_roundtrip"):
+        argv += ["--disaggregation-decode-enable-radix-cache", "--disaggregation-decode-extra-slots", "4",
+                 "--cuda-graph-bs-decode", "1", "2", "4"]
+    elif cfg["role"] == "decode":
         argv += ["--enable-elastic-pp", "--elastic-pp-disagg-decode", "--elastic-pp-initial-partition", "24,0,24",
                  "--disaggregation-decode-enable-radix-cache", "--disaggregation-decode-extra-slots", "4"]
     if cfg.get("kvcached_capacity"):
@@ -372,7 +412,7 @@ def engine_entry(run, cfg):
                               ("--page-size", "1"), ("--chunked-prefill-size", "4096"),
                               ("--max-prefill-tokens", "8192")):
             argv[argv.index(option) + 1] = value
-        if cfg["role"] == "decode":
+        if cfg["role"] == "decode" and not cfg.get("prefill_roundtrip"):
             argv += ["--elastic-pp-kv-backend", "kvcached", "--elastic-pp-kv-capacities", "8192;12288"]
     if cfg.get("optimized_elastic_pp"):
         argv += ["--elastic-pp-transition-strategy", "background", "--elastic-pp-transition-backing", "overlap",
@@ -384,10 +424,14 @@ def engine_entry(run, cfg):
                  "--elastic-pp-hicache-background", "--elastic-pp-hicache-shared-host",
                  "--enable-elastic-pp-kv-patch", "--elastic-pp-kv-patch-transport", "nixl",
                  "--elastic-pp-kv-base-precopy"]
-    else:
+    elif not cfg.get("prefill_roundtrip"):
         argv += ["--disable-cuda-graph"]
         if cfg["role"] == "decode":
             argv += ["--elastic-pp-transition-strategy", "sync", "--elastic-pp-transition-backing", "cpu_spill"]
+    if cfg.get("prefill_roundtrip"):
+        for name, value in (("--chunked-prefill-size", "512"), ("--max-running-requests", "4"),
+                            ("--max-mamba-cache-size", "48"), ("--pp-max-micro-batch-size", "1")):
+            argv[argv.index(name) + 1] = value
     save(run / "nodes" / cfg["node"] / "effective_launch.json",
          dict(engine_commit=cfg["engine_commit"], argv=argv,
               optimized_elastic_pp=cfg.get("optimized_elastic_pp", False)))
@@ -433,7 +477,8 @@ def worker(run, root):
         topology = subprocess.run(["nvidia-smi", "topo", "-m"], capture_output=True,
                                   text=True, check=True, timeout=20)
         save(directory / "topology.json", dict(stdout=topology.stdout))
-        if cfg.get("kvcached_capacity") and cfg["role"] == "decode":
+        owns_elastic = cfg["role"] == ("prefill" if cfg.get("prefill_roundtrip") else "decode")
+        if cfg.get("kvcached_capacity") and owns_elastic:
             diagnostic = subprocess.Popen([PYTHON, str(ROOT / "kvcached_rdma_probe.py"),
                 "--output", str(run / "rdma_registration_probe.json")],
                 env=environment(cfg), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -488,7 +533,7 @@ def worker(run, root):
             h.authenticate(run, cfg, os.environ, local=True)
             if proc.poll() is not None:
                 raise RuntimeError("Engine exited while serving")
-            if cfg["role"] == "decode" and (run / "probe.trigger").exists() and not any(c.get("gpu_reuse_probe") for c in children):
+            if owns_elastic and (run / "probe.trigger").exists() and not any(c.get("gpu_reuse_probe") for c in children):
                 probe_env = dict(os.environ, **cfg["launch_env"], CUDA_VISIBLE_DEVICES="1")
                 probe = subprocess.Popen([PYTHON, str(Path(__file__).resolve()), "--probe", "--run", str(run)],
                     env=probe_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -578,6 +623,10 @@ def controller(run, root):
         for cfg in cfgs:
             wait_file(run / "nodes" / cfg["node"] / "ready.json", 1200)
         progress(run, root, "reference_and_roundtrip")
+        if root.get("prefill_roundtrip"):
+            from prefill_roundtrip import measure
+            results.update(measure(run, p, d, key, wait_file, replay, save))
+            return
         tokens = [1000 + (i * 31) % 20000 for i in range(512)]
         results["warmup"] = replay.request_one(p, d, key, tokens, 1, 0, True)
         prompt = tokens + [20000 + i for i in range(64)]
@@ -753,6 +802,7 @@ def controller(run, root):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", type=Path, required=True)
+    parser.add_argument("--prefill-roundtrip", action="store_true")
     parser.add_argument("--sync-baseline", action="store_true")
     parser.add_argument("--diagnostic-prepare", action="store_true")
     parser.add_argument("--native-prepare", action="store_true")
@@ -763,7 +813,7 @@ def main():
     args = parser.parse_args()
     run = args.run.resolve()
     if args.prepare:
-        return prepare(run, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare,
+        return prepare(run, prefill_roundtrip=args.prefill_roundtrip, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare,
                        native_prepare=args.native_prepare, lazy_cuda_modules=args.lazy_cuda_modules,
                        kvcached_capacity=args.kvcached_capacity)
     root = json.loads((run / "config.json").read_text())

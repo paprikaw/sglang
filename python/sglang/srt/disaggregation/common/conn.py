@@ -103,6 +103,7 @@ class PrefillServerInfo:
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
+    elastic_pp_prefill: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -731,12 +732,13 @@ class CommonKVManager(BaseKVManager):
         self, info: PrefillServerInfo
     ) -> Tuple[List[int], int, int]:
         """Return target prefill ranks, destination fan-out, and response fan-in."""
-        if info.pp_size == self.pp_size:
+        elastic_sender = getattr(info, "elastic_pp_prefill", False)
+        if info.pp_size == self.pp_size and not elastic_sender:
             return [self.pp_rank], 1, 1
         if info.pp_size == 1 and self._supports_pp1_to_pp_decode(info):
             return [0], self.pp_size, 1
         if (
-            getattr(getattr(self, "server_args", None), "elastic_pp_disagg_decode", False)
+            (elastic_sender or getattr(getattr(self, "server_args", None), "elastic_pp_disagg_decode", False))
             and getattr(self, "supports_partial_pp_transfer", False)
         ):
             if (
@@ -819,6 +821,7 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "elastic_pp_prefill": getattr(self.server_args, "elastic_pp_disagg_prefill", False),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1651,6 +1654,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
+        self.elastic_pp_prefill: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
@@ -1747,6 +1751,11 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
 
+        elastic_sender = bool(data.get("elastic_pp_prefill", False))
+        if self.elastic_pp_prefill is None:
+            self.elastic_pp_prefill = elastic_sender
+        elif self.elastic_pp_prefill != elastic_sender:
+            raise ValueError("Inconsistent elastic Prefill capability across PP ranks")
         if self.enable_dsa_cache_layer_split is None:
             self.enable_dsa_cache_layer_split = bool(
                 data.get("enable_dsa_cache_layer_split", False)
@@ -1816,6 +1825,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     else True
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
+                elastic_pp_prefill=bool(self.elastic_pp_prefill),
                 prefill_http_port=self.prefill_http_port,
             )
             return web.json_response(dataclasses.asdict(info), status=200)

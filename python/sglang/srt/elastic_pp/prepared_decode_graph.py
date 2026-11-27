@@ -420,7 +420,12 @@ def prewarm_scheduler_graph_bank(scheduler):
         raise RuntimeError("prepared Graph warmup requires startup with no requests")
     original = scheduler._pp_topology()
     registration = None
-    if getattr(mr.server_args, "elastic_pp_disagg_decode", False):
+    if getattr(mr.server_args, "elastic_pp_disagg_prefill", False):
+        from sglang.srt.elastic_pp.pd_registration import PrefillRegistrationTransaction
+
+        registration = PrefillRegistrationTransaction(scheduler)
+        registration.suspend()
+    elif getattr(mr.server_args, "elastic_pp_disagg_decode", False):
         from sglang.srt.elastic_pp.pd_registration import DecodeRegistrationTransaction
 
         registration = DecodeRegistrationTransaction(scheduler)

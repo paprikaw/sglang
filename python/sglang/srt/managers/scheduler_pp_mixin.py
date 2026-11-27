@@ -504,6 +504,9 @@ class SchedulerPPMixin:
             for req in getattr(batch, "reqs", ())
         ]
         requests.extend(getattr(self, "waiting_queue", ()))
+        requests.extend(getattr(self, "disagg_prefill_inflight_queue", None) or ())
+        bootstrap = getattr(self, "disagg_prefill_bootstrap_queue", None)
+        requests.extend(getattr(bootstrap, "queue", ()))
         chunked = getattr(self, "chunked_req", None)
         if chunked is not None:
             requests.append(chunked)
@@ -748,7 +751,10 @@ class SchedulerPPMixin:
             requested_counts,
             generation=target_generation,
         )
-        if getattr(getattr(self, "server_args", None), "elastic_pp_disagg_decode", False) and (
+        args = getattr(self, "server_args", None)
+        elastic_prefill = getattr(args, "elastic_pp_disagg_prefill", False)
+        elastic_pd = elastic_prefill or getattr(args, "elastic_pp_disagg_decode", False)
+        if elastic_pd and (
             target.first_rank != 0 or target.last_rank != self.ps.pp_size - 1
         ):
             return make_output(
@@ -761,12 +767,13 @@ class SchedulerPPMixin:
         transition = DynamicPPTransition.build(current, target)
         self._elastic_pp_pending_req = recv_req
         try:
-            if getattr(getattr(self, "server_args", None), "elastic_pp_disagg_decode", False):
+            if elastic_pd:
                 from sglang.srt.elastic_pp.pd_registration import (
-                    DecodeRegistrationTransaction,
+                    DecodeRegistrationTransaction, PrefillRegistrationTransaction,
                 )
 
-                registration = DecodeRegistrationTransaction(self)
+                registration = (PrefillRegistrationTransaction(self) if elastic_prefill
+                                else DecodeRegistrationTransaction(self))
                 self.tp_worker.model_runner._elastic_pp_pd_registration = registration
                 coordinator.before_backing_release = registration.suspend
                 coordinator.overlap_registration_suspend = (
@@ -791,6 +798,9 @@ class SchedulerPPMixin:
                     rank=self.ps.pp_rank,
                     overlap_shared_metadata=coordinator.overlap_registration_suspend,
                 )
+            if elastic_prefill:
+                logger.info("Elastic Prefill trigger rank=%d generation=%d at_ns=%d",
+                            self.ps.pp_rank, target_generation, time.monotonic_ns())
             coordinator.begin(transition)
         except BaseException as exc:
             self._elastic_pp_pending_req = None
@@ -1192,27 +1202,61 @@ class SchedulerPPMixin:
                 d2h_event = None
                 next_batch_result = None
 
-                recv_reqs = self.request_receiver.recv_requests()
+                elastic_pp_draining = self._elastic_pp_drain_due()
+                request_ring_fence = None
+                if (
+                    self.ps.pp_rank == 0
+                    and elastic_pp_draining
+                    and not self._elastic_pp_request_ring_fence_seen
+                ):
+                    snapshot = self.elastic_pp_migration_coordinator.snapshot()
+                    request_ring_fence = _ElasticPPRequestRingFence(
+                        generation=snapshot.generation,
+                        fence_microstep=snapshot.fence_microstep,
+                    )
+                recv_reqs = (
+                    [] if elastic_pp_draining else self.request_receiver.recv_requests()
+                )
+                received_fence = self._elastic_pp_extract_request_ring_fence(recv_reqs)
+                if received_fence is not None:
+                    request_ring_fence = received_fence
+                    recv_reqs = []
+                    self._elastic_pp_draining = True
+                    elastic_pp_draining = True
+                if request_ring_fence is not None:
+                    self._elastic_pp_request_ring_fence_seen = True
                 self.process_input_requests(recv_reqs)
+
 
                 if not self._pp_is_physical_last_rank():
                     self._pp_commit_comm_work(self.send_req_work)
 
-                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids()
+                if elastic_pp_draining:
+                    self._elastic_pp_request_ring_drained = (
+                        self._elastic_pp_request_ring_fence_seen and not self.send_req_work
+                    )
+                consume_pd_round = not elastic_pp_draining or (
+                    request_ring_fence is not None and self.ps.pp_rank != 0
+                )
+                bootstrapped_rids = self._pp_pd_get_bootstrapped_ids() if consume_pd_round else None
                 bmbs[mb_id] = bootstrapped_rids
                 self._pp_commit_comm_work(send_bootstrapped_work)
 
-                transferred_rids = self._pp_pd_get_prefill_transferred_ids()
+                transferred_rids = self._pp_pd_get_prefill_transferred_ids() if consume_pd_round else None
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
-                self.process_prefill_chunk(
-                    last_batch=self.last_batch, running_batch=self.running_batch
-                )
-                prefill_plan = self.get_new_batch_prefill(self.running_batch)
-                batch = prefill_plan.batch_to_run
-                self.running_batch = prefill_plan.running_batch
-                batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
+                if elastic_pp_draining:
+                    batch = None
+                    server_is_idle = False
+                else:
+                    self.process_prefill_chunk(
+                        last_batch=self.last_batch, running_batch=self.running_batch
+                    )
+                    prefill_plan = self.get_new_batch_prefill(self.running_batch)
+                    batch = prefill_plan.batch_to_run
+                    self.running_batch = prefill_plan.running_batch
+                    batch = self.dp_attn_adapter.maybe_prepare_mlp_sync_batch(batch)
                 self.mbs[mb_id] = batch
                 self.running_mbs[mb_id] = self.running_batch
 
@@ -1284,9 +1328,11 @@ class SchedulerPPMixin:
 
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_inflight_queue(next_release_rids)
-                if not self._pp_is_physical_last_rank():
+                if not self._pp_is_physical_last_rank() and (
+                    not elastic_pp_draining or request_ring_fence is not None
+                ):
                     self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
+                        [request_ring_fence] if request_ring_fence is not None else recv_reqs, async_send=True
                     )
                     send_bootstrapped_work = self._pp_send_pyobj_to_next_stage(
                         bootstrapped_rids, async_send=True
@@ -1313,6 +1359,18 @@ class SchedulerPPMixin:
                 consensus_bootstrapped_rids = next_consensus_bootstrapped_rids
 
                 self.running_batch.batch_is_full = False
+                self._pp_microstep += 1
+                if elastic_pp_draining:
+                    manager = self.disagg_prefill_bootstrap_queue.kv_manager
+                    self._elastic_pp_pd_ring_drained = (
+                        not any((send_bootstrapped_work, send_transfer_work,
+                                 send_consensus_bootstrapped_work, send_release_work))
+                        and all(row is None for ring in (bmbs, tmbs) for row in ring)
+                        and release_rids is None and consensus_bootstrapped_rids is None
+                        and manager.prefill_transfer_fence.pending() == 0
+                    )
+                if self._elastic_pp_finalize_if_drained():
+                    break
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
@@ -2011,6 +2069,8 @@ class SchedulerPPMixin:
         else:
             # Other ranks, receive the bootstrap reqs info from the previous rank and ensure the consensus
             prev_bootstrapped_rids = self._pp_recv_pyobj_from_prev_stage()
+            if prev_bootstrapped_rids is None:
+                return None
             prev_good_bootstrapped_rids, prev_bad_bootstrapped_rids = (
                 prev_bootstrapped_rids
             )
@@ -2053,6 +2113,8 @@ class SchedulerPPMixin:
             # 2 (Release): Receive the transferred rids from the previous rank
             # 1. recv previous stage's transferred reqs info
             prev_transferred_rids = self._pp_recv_pyobj_from_prev_stage()
+            if prev_transferred_rids is None:
+                return None
             # 2. get the current stage's transferred reqs info
             curr_transferred_rids = self.get_rids(
                 self.disagg_prefill_inflight_queue,

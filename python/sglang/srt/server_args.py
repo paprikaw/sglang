@@ -1100,6 +1100,11 @@ class ServerArgs:
         "Experimental Decode PP migration with quiescent P/D transfers: single-request sync CPU-spill/Eager or bounded (up to four requests) background overlap/prepared Graphs/shared CPU HiCache/NIXL.",
         NS("parallel"),
     ] = False
+    elastic_pp_disagg_prefill: A[
+        bool,
+        "Allow TP1 Mooncake Prefill to migrate PP stages while Decode stays fixed.",
+        NS("parallel"),
+    ] = False
     elastic_pp_initial_partition: A[
         Optional[str],
         "Comma-separated initial layer counts for every resident elastic PP rank.",
@@ -8161,7 +8166,12 @@ class ServerArgs:
         if self.disaggregation_mode != "null":
             from sglang.srt.elastic_pp.pd_registration import validate_decode_args
 
-            validate_decode_args(self)
+            if self.disaggregation_mode == "prefill" and self.elastic_pp_disagg_prefill:
+                from sglang.srt.elastic_pp.pd_registration import validate_prefill_args
+
+                validate_prefill_args(self)
+            else:
+                validate_decode_args(self)
         if self.elastic_pp_kv_backend == "kvcached" and os.getenv(
             "KVCACHED_AUTOPATCH", ""
         ).lower() in {"1", "true", "yes", "on"}:
