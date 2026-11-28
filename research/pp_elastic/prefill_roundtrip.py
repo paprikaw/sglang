@@ -73,21 +73,72 @@ def install_high_kv_rows_probe():
 
 
 def install_shrink_stack_probe():
-    """Emit blocked scheduler stacks if the instrumented trim takes too long."""
+    """Trace the cache events following a test shrink without changing them."""
     import faulthandler
 
     from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-    native = ElasticPPMigrationCoordinator._prepare_prefill_shrink_at_fence
+    native_trim = ElasticPPMigrationCoordinator._prepare_prefill_shrink_at_fence
+    native_backup = UnifiedRadixCache._execute_and_commit_kv_backup
+    native_write = UnifiedRadixCache._execute_kv_backup
+    native_poll = UnifiedRadixCache.writing_check
+    scheduler = None
+    trace_until = -1
+
+    def trace(cache, event, **data):
+        if scheduler is None or scheduler._pp_microstep > trace_until:
+            return
+        controller = cache.cache_controller
+        print(
+            "PREFILL_KV_TEST_HICACHE " + json.dumps(dict(
+                rank=cache.pp_rank,
+                step=scheduler._pp_microstep,
+                event=event,
+                published=cache is scheduler.tree_cache,
+                pending=list(cache.ongoing_write_through),
+                acks=[ack.node_ids for ack in controller.ack_write_queue],
+                **data,
+            )),
+            flush=True,
+        )
 
     def trim(coordinator, transition):
+        nonlocal scheduler, trace_until
         faulthandler.dump_traceback_later(25, repeat=True)
         try:
-            return native(coordinator, transition)
+            result = native_trim(coordinator, transition)
+            scheduler = coordinator.model_runner._elastic_pp_pd_registration.scheduler
+            trace_until = scheduler._pp_microstep + 120
+            return result
         finally:
             faulthandler.cancel_dump_traceback_later()
 
+    def backup(cache, action, write_back=False):
+        num_written = native_backup(cache, action, write_back)
+        trace(cache, "backup", nodes=action.node_ids, written=num_written)
+        return num_written
+
+    def write(cache, node_id, device_value, comp_xfers, sidecar_xfers):
+        result = native_write(cache, node_id, device_value, comp_xfers, sidecar_xfers)
+        if scheduler is not None and scheduler._pp_microstep <= trace_until:
+            host = cache.host_pool_group
+            trace(
+                cache, "write", node=node_id, accepted=result is not None,
+                full_free=host.available_size(),
+                gdn_free=host.get_pool(PoolName.MAMBA).available_size(),
+            )
+        return result
+
+    def poll(cache, write_back=False, finish_count=None):
+        trace(cache, "poll", received=finish_count, write_back=write_back)
+        return native_poll(cache, write_back, finish_count)
+
     ElasticPPMigrationCoordinator._prepare_prefill_shrink_at_fence = trim
+    UnifiedRadixCache._execute_and_commit_kv_backup = backup
+    UnifiedRadixCache._execute_kv_backup = write
+    UnifiedRadixCache.writing_check = poll
 
 
 def read_worker_log(path, complete, timeout=65):
