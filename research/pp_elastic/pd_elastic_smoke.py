@@ -60,6 +60,14 @@ def memory_size_json(value):
     return int(value)
 
 
+def ordered_node_configs(root):
+    configs = root["node_configs"]
+    by_role = {cfg["role"]: cfg for cfg in configs.values()}
+    if len(configs) != 2 or by_role.keys() != {"prefill", "decode"}:
+        raise ValueError("P/D qualification requires exactly one Prefill and one Decode node")
+    return [by_role["prefill"], by_role["decode"]]
+
+
 def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
             lazy_cuda_modules=False, kvcached_capacity=False, prefill_roundtrip=False,
             agentx_length_gate=False, burst_gate=None, auto_prefill_kv_capacity=False,
@@ -86,7 +94,8 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
     cache["node_specs"] = {}
     cache["hicache_reserve_bytes_per_node"] = {}
     nodes = {}
-    for index, (previous_node, previous) in enumerate(old["node_configs"].items()):
+    for index, previous in enumerate(ordered_node_configs(old)):
+        previous_node = previous["node"]
         node = os.environ.get(("BURST_PREFILL_NODE", "BURST_DECODE_NODE")[index], previous_node) if long_context else previous_node
         cfg = dict(previous, node=node)
         pp = (3, 2)[index] if prefill_roundtrip else (2, 3)[index]
@@ -621,7 +630,7 @@ def worker(run, root):
 def controller(run, root):
     import agentx_replay as replay
     import hicache_transition_smoke as probe
-    cfgs = list(root["node_configs"].values())
+    cfgs = ordered_node_configs(root)
     def stop(*_):
         raise KeyboardInterrupt("Guard requested owned cleanup")
     signal.signal(signal.SIGTERM, stop)

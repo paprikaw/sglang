@@ -62,6 +62,23 @@ def test_prepare_abort_leaves_original_registrations_untouched():
     assert engine.calls[-1] == ("deregister", {400})
 
 
+def test_large_retirement_submits_only_bounded_batches():
+    engine = Engine()
+    source = {(100 + i * 10, 10) for i in range(8)}
+    engine.live = set(source)
+    target = {(100, 10)}
+    lease = PreparedDecodeRegions(engine, source, target, deregister_batch_limit=3)
+    lease.prepare()
+    lease.suspend()
+    assert engine.calls == [
+        ("deregister", {110, 120, 130}),
+        ("deregister", {140, 150, 160}),
+        ("deregister", {170}),
+    ]
+    assert engine.live == target
+    assert lease.metrics["suspend_regions"] == 7
+
+
 def test_prepared_state_and_persistent_metadata_avoid_fence_reregistration():
     engine = Engine()
     auxiliary = {(200, 10), (500, 10)}

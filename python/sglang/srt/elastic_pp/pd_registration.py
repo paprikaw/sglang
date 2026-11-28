@@ -414,6 +414,9 @@ class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
         lease = PreparedDecodeRegions(
             manager.engine, old, pool.pd_registration_regions(capacity),
             target_aux=old - old_kv,
+            # Mooncake can spawn one native task per MR. Bound simultaneous
+            # releases when a Prefill rank retires thousands of physical pages.
+            deregister_batch_limit=256,
         )
         self.prepared_regions, self.prepared_generation = lease, generation
         lease.prepare()

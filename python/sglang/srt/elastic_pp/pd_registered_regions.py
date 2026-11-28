@@ -24,8 +24,11 @@ def regions(values):
 
 
 class PreparedDecodeRegions:
-    def __init__(self, engine, source, target_kv, *, target_aux=()):
+    def __init__(
+        self, engine, source, target_kv, *, target_aux=(), deregister_batch_limit=None
+    ):
         self.engine = engine
+        self.deregister_batch_limit = deregister_batch_limit
         self.source, self.target_kv = regions(source), regions(target_kv)
         self.target_prepared = self.target_kv | regions(target_aux)
         # Sweep once. Source-only registrations need no revalidation, and
@@ -72,9 +75,12 @@ class PreparedDecodeRegions:
         values = sorted(values)
         started = time.monotonic()
         if values:
-            status = self.engine.batch_deregister([p for p, _ in values])
-            if status != 0:
-                raise RuntimeError(f"P/D {phase} RDMA deregistration failed: {status}")
+            batch_size = self.deregister_batch_limit or len(values)
+            for start in range(0, len(values), batch_size):
+                batch = values[start : start + batch_size]
+                status = self.engine.batch_deregister([ptr for ptr, _ in batch])
+                if status != 0:
+                    raise RuntimeError(f"P/D {phase} RDMA deregistration failed: {status}")
         self.metrics[phase + "_seconds"] = time.monotonic() - started
         self.metrics[phase + "_regions"] = len(values)
         self.metrics[phase + "_bytes"] = sum(n for _, n in values)
