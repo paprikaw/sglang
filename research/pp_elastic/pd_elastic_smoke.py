@@ -60,7 +60,7 @@ def memory_size_json(value):
 
 
 def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
-            lazy_cuda_modules=False, kvcached_capacity=False, prefill_roundtrip=False):
+            lazy_cuda_modules=False, kvcached_capacity=False, prefill_roundtrip=False, agentx_length_gate=False):
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
     dirty = subprocess.check_output(["git", "-C", str(ENGINE), "status", "--porcelain"], text=True)
@@ -132,6 +132,9 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
                     KVCACHED_PHYSICAL_BLOCK_SIZE_MB="2", KVCACHED_MIN_RESERVED_PAGES="0",
                     KVCACHED_MAX_RESERVED_PAGES="0", KVCACHED_GPU_DIRECT_RDMA_REQUIRED="1",
                     KVCACHED_IPC_NAME=run.name)
+        if agentx_length_gate:
+            cfg.update(agentx_length_gate=True, hicache_size_gib=16)
+            cfg["launch_env"].pop("PREFILL_ROUNDTRIP_PROBE", None)
         nodes[node] = cfg
         node_spec = json.loads((PRIOR / "cache" / f"{node}.json").read_text())
         node_path = run / "cache" / f"{node}.json"
@@ -165,6 +168,10 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
     if kvcached_capacity:
         config["capacity_frontier"] = [8192, 12288, 8192]
         config["capacity_probe_input_tokens"] = 9216
+    if agentx_length_gate:
+        config.update(agentx_length_gate=True, capacity_frontier=[65536, 98304, 65536], context_length=65536)
+        spec.update(port=29870, title="122B AgentX longest request size, P2+D2 handoff",
+                    implementation_note="Candidate long-context capacity on the r11 P-side migration engine (6de1b3e), same fixed D, HiCache. Length qualification only; no workload-specific small-probe trigger.")
     save(run / "config.json", config)
     spec["tasks"] = [dict(id="qualification", label="Request/cache/reuse acceptance",
         root=str(run / "task"), expected=1, nodes=list(nodes), controller_script=str(Path(__file__).resolve()))]
@@ -173,6 +180,8 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
     paths = [run / "config.json", *(run / "cache").glob("*.json")]
     tracked = subprocess.check_output(["git", "-C", str(ENGINE), "ls-files", "python/sglang", "research/pp_elastic"], text=True).splitlines()
     paths.extend(ENGINE / p for p in tracked if p.endswith((".py", ".json")))
+    if agentx_length_gate:
+        paths.extend([PRIOR / "replay/routing.jsonl", PRIOR / "data/traces.jsonl"])
     paths.extend(GUARD.glob("*.py"))
     if optimized:
         for pattern in ("nixl/_api.py", "nixl/__init__.py", "nixl_cu12/_api.py",
@@ -433,6 +442,13 @@ def engine_entry(run, cfg):
         for name, value in (("--chunked-prefill-size", "512"), ("--max-running-requests", "4"),
                             ("--max-mamba-cache-size", "48"), ("--pp-max-micro-batch-size", "1")):
             argv[argv.index(name) + 1] = value
+    if cfg.get("agentx_length_gate"):
+        options = {"--context-length": "65536", "--max-total-tokens": "98304",
+                   "--hicache-size": str(cfg["hicache_size_gib"])}
+        if cfg["role"] == "prefill":
+            options["--elastic-pp-kv-capacities"] = "65536;98304"
+        for option, value in options.items():
+            argv[argv.index(option) + 1] = value
     save(run / "nodes" / cfg["node"] / "effective_launch.json",
          dict(engine_commit=cfg["engine_commit"], argv=argv,
               optimized_elastic_pp=cfg.get("optimized_elastic_pp", False)))
@@ -624,7 +640,11 @@ def controller(run, root):
         for cfg in cfgs:
             wait_file(run / "nodes" / cfg["node"] / "ready.json", 1200)
         progress(run, root, "reference_and_roundtrip")
-        if root.get("prefill_roundtrip"):
+        if root.get("agentx_length_gate"):
+            from burst_length_gate import measure
+            results.update(measure(run, p, d, key, replay, PRIOR))
+            return
+        elif root.get("prefill_roundtrip"):
             from prefill_roundtrip import measure
             results.update(measure(run, p, d, key, wait_file, replay, save))
             return
@@ -809,6 +829,7 @@ def controller(run, root):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", type=Path, required=True)
+    parser.add_argument("--agentx-length-gate", action="store_true")
     parser.add_argument("--prefill-roundtrip", action="store_true")
     parser.add_argument("--sync-baseline", action="store_true")
     parser.add_argument("--diagnostic-prepare", action="store_true")
@@ -820,7 +841,7 @@ def main():
     args = parser.parse_args()
     run = args.run.resolve()
     if args.prepare:
-        return prepare(run, prefill_roundtrip=args.prefill_roundtrip, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare,
+        return prepare(run, agentx_length_gate=args.agentx_length_gate, prefill_roundtrip=args.prefill_roundtrip, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare,
                        native_prepare=args.native_prepare, lazy_cuda_modules=args.lazy_cuda_modules,
                        kvcached_capacity=args.kvcached_capacity)
     root = json.loads((run / "config.json").read_text())
@@ -830,7 +851,9 @@ def main():
         return engine_entry(run, node_config(root))
     if args.probe:
         return reuse_probe(run, node_config(root))
-    return controller(run, root)
+    controller(run, root)
+    if not json.loads((run / "results.json").read_text())["passed"]:
+        raise RuntimeError("Worker or final usage audit failed")
 
 
 if __name__ == "__main__":
