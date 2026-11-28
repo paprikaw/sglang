@@ -27,7 +27,10 @@ def test_prefill_cpu_roundtrip_keeps_request_and_tree_aliases(monkeypatch):
     prefix = torch.tensor([1, 6])
     request_rows = torch.tensor([[1, 6, 7, 0]], dtype=torch.int32)
     req = NS(prefix_indices=prefix.clone(), req_pool_idx=0, kv=NS(kv_allocated_len=3))
-    tree = NS(_node_arena={0: NS(component_data={ComponentType.FULL: NS(value=prefix)})})
+    tree = NS(_node_arena={
+        0: NS(component_data={ComponentType.FULL: NS(value=[])}),
+        1: NS(component_data={ComponentType.FULL: NS(value=prefix)}),
+    })
     scheduler = NS(
         req_to_token_pool=NS(req_to_token=request_rows), tree_cache=NS(tree_core=tree),
         _elastic_pp_live_requests=lambda: [req],

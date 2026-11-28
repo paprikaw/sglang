@@ -1022,6 +1022,7 @@ class ElasticPPMigrationCoordinator:
             try:
                 details = self._timed(name, action)
             except BaseException as exc:
+                logger.exception("Elastic Prefill shrink rank=%d phase=%s", self.rank, name)
                 error = f"{type(exc).__name__}: {exc}"
             reports = self._consensus(name, success=error is None, error=error, details=details)
             self._raise_peer_failures(name, reports)

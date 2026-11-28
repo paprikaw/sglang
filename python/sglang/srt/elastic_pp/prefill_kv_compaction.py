@@ -63,7 +63,8 @@ class PrefillKVCompaction:
         active = set()
 
         def rebind(view, owner_set):
-            if view is None or not view.numel():
+            # The unified radix root uses an empty list as its slot sentinel.
+            if view is None or not len(view):
                 return
             ids = view.to(device=allocator.device, dtype=torch.int64)
             pos = torch.searchsorted(self.source, ids).clamp(max=len(high) - 1)
