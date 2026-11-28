@@ -195,7 +195,11 @@ class EvictableWeightBank:
         )
 
     def evict(self, layer_ids):
-        owners = [(i, self.layers[i]) for i in layer_ids if i in self.layers]
+        owners = [
+            (i, self.layers[i])
+            for i in layer_ids
+            if i in self.layers and self.layers[i].mapped
+        ]
         if owners:
             torch.cuda.synchronize(owners[0][1].device_id)
         for layer_id, owner in owners:

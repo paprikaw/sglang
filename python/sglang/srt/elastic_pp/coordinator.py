@@ -1032,9 +1032,11 @@ class ElasticPPMigrationCoordinator:
 
         # Demote only leaves acknowledged by every source rank. A CPU backup
         # may be prepared independently, but live row ownership must agree.
+        self._prefill_resize_unsafe = True
         reports = agree("prefill_trim_hicache", lambda: registration.demote_cached_rows_for_shrink(
             full._logical_allocator, capacity, write_missing=True, group=self.group
         ))
+        self._prefill_resize_unsafe = False
         demoted = next(row["details"] for row in reports if row["rank"] == self.rank)
 
         plan = None

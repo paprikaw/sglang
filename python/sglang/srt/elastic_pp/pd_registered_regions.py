@@ -28,11 +28,21 @@ class PreparedDecodeRegions:
         self.engine = engine
         self.source, self.target_kv = regions(source), regions(target_kv)
         self.target_prepared = self.target_kv | regions(target_aux)
-        # Source buffers have already passed the engine's registration check.
-        # A sorted sweep keeps the validation cheap for thousands of VMM pages.
-        combined = sorted(self.source | self.target_prepared)
-        if any(p + n > q for (p, n), (q, _) in zip(combined, combined[1:])):
-            raise ValueError("P/D prepared regions overlap a different registration")
+        # Sweep once. Source-only registrations need no revalidation, and
+        # exact aliases appearing in both sets are tested only once.
+        source_end = target_end = 0
+        for region in sorted(self.source | self.target_prepared):
+            ptr, size = region
+            in_source = region in self.source
+            in_target = region in self.target_prepared
+            if (in_target and ptr < max(source_end, target_end)) or (
+                in_source and ptr < target_end
+            ):
+                raise ValueError("P/D prepared regions overlap a different registration")
+            if in_source:
+                source_end = max(source_end, ptr + size)
+            if in_target:
+                target_end = max(target_end, ptr + size)
         self.registered = set(self.source)
         self.attempted_added = set()
         self.phase = "new"

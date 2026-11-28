@@ -288,8 +288,6 @@ class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
         high = {row for row in allocator._live_page_ids if row > capacity}
         if not high and group is None:
             return 0
-        if self.pending_work():
-            raise RuntimeError("Cannot demote Prefill KV referenced by an active transfer")
         from collections import defaultdict
         import logging
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
@@ -298,38 +296,76 @@ class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
         tree = cache.tree_core
         tracker = defaultdict(int)
         before = len(high)
+        consider_low = False
+
+        def host_backed(node):
+            if not node.backuped:
+                return False
+            if not write_missing:
+                return True
+            state = node.component_data[ComponentType.MAMBA]
+            return state.value is None or state.host_value is not None
+
         # Demoting a leaf can expose its parent. No row is freed until the
         # existing host copy is valid or an explicit write-back completes.
         while True:
-            ready = set()
+            candidates = []
+            ready = {}
             error = None
+            needed = max(0, len(allocator._live_page_ids) - capacity)
             try:
-                for node in sorted(tree.evictable_device_leaves, key=lambda n: n.id):
+                if self.pending_work():
+                    raise RuntimeError("Cannot demote Prefill KV referenced by an active transfer")
+                selecting = needed > 0 if consider_low else bool(high)
+                leaves = tree.evictable_device_leaves if selecting else ()
+                for node in sorted(leaves, key=lambda n: n.id):
                     if not tree._is_device_leaf(node):
                         continue
                     rows = node.component_data[ComponentType.FULL].value
-                    if rows is None or not high.intersection(allocator._as_int_list(rows)):
+                    if rows is None:
                         continue
-                    if write_missing and not node.backuped:
+                    if not consider_low and not high.intersection(allocator._as_int_list(rows)):
+                        continue
+                    if write_missing and not host_backed(node):
                         action = tree._build_backup_kv_action(node)
                         cache._execute_and_commit_kv_backup(action, write_back=True)
                         cache.writing_check(write_back=True)
-                    if node.backuped:
-                        ready.add(node.id)
+                    candidates.append((node, len(rows)))
+                ready = {
+                    node.id: count for node, count in candidates if host_backed(node)
+                }
             except BaseException as exc:
                 error = f"{type(exc).__name__}: {exc}"
             reports = (
-                group.all_gather_object((ready, error))
+                group.all_gather_object((ready, error, needed))
                 if group is not None
-                else [(ready, error)]
+                else [(ready, error, needed)]
             )
-            if any(failure for _, failure in reports):
+            if any(failure for _, failure, _ in reports):
                 raise RuntimeError(f"Prefill HiCache backup failed: {reports}")
-            ready.intersection_update(*(ids for ids, _ in reports))
-            if not ready:
+            if any(count != needed for _, _, count in reports):
+                raise RuntimeError("Prefill shrink live row counts differ across ranks")
+            common = set.intersection(*(set(ids) for ids, _, _ in reports))
+            if not common and needed and write_missing and not consider_low:
+                # Locked high rows may still fit after releasing a few
+                # unlocked low rows with durable CPU copies.
+                consider_low = True
+                continue
+            if not common:
                 break
-            for node_id in sorted(ready):
-                cache._demote(node_id, tracker)
+            failure = None
+            try:
+                rows_to_free = needed
+                for node_id in sorted(common):
+                    if consider_low and rows_to_free <= 0:
+                        break
+                    cache._demote(node_id, tracker)
+                    rows_to_free -= min(ids[node_id] for ids, _, _ in reports)
+            except BaseException as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+            failures = group.all_gather_object(failure) if group is not None else [failure]
+            if any(failures):
+                raise RuntimeError(f"Prefill HiCache demotion failed: {failures}")
             high.intersection_update(allocator._live_page_ids)
         if high:
             cached = set()
@@ -380,8 +416,8 @@ class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
         self.suspend()
         if shrinking:
             pool.resize_serving_capacity_at_fence(capacity)
-        self.refresh()
         pool.reclaim_capacity_at_fence()
+        self.refresh()
 
     def suspend(self):
         fence = self._queue().kv_manager.prefill_transfer_fence
