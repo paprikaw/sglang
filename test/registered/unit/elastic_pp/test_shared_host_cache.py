@@ -684,6 +684,7 @@ def test_dormant_shared_view_uses_bank_capacity_without_a_collective(bank, monke
     )
     from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
+    evictions = []
     source = NS(
         host_pool_group=NS(
             entries=[
@@ -691,6 +692,8 @@ def test_dormant_shared_view_uses_bank_capacity_without_a_collective(bank, monke
                     name=name,
                     host_pool=NS(page_size=1, layout="page_first"),
                     is_primary_index_anchor=name == PoolName.KV,
+                    host_evict_fn=lambda _: pytest.fail("called the retired cache"),
+                    device_evict_fn=lambda _: pytest.fail("called the retired cache"),
                 )
                 for name in (PoolName.KV, PoolName.MAMBA)
             ]
@@ -701,7 +704,9 @@ def test_dormant_shared_view_uses_bank_capacity_without_a_collective(bank, monke
         host_memory_mode="cache",
     )
     clone = NS(
-        components={ct: NS() for ct in (ComponentType.FULL, ComponentType.MAMBA)}
+        components={ct: NS() for ct in (ComponentType.FULL, ComponentType.MAMBA)},
+        evict_host=lambda n, component: evictions.append((component, n)),
+        evict=lambda params: evictions.append(("device", params.mamba_num)),
     )
     params = NS(
         token_to_kv_pool_allocator=NS(),
@@ -730,3 +735,7 @@ def test_dormant_shared_view_uses_bank_capacity_without_a_collective(bank, monke
     assert clone.host_pool_group.get_pool(PoolName.KV).size == 32
     assert clone.host_pool_group.get_pool(PoolName.MAMBA).size == 8
     assert bank.leases == 0
+    mamba_entry = clone.host_pool_group.entry_map[PoolName.MAMBA]
+    mamba_entry.host_evict_fn(2)
+    mamba_entry.device_evict_fn(3)
+    assert evictions == [(ComponentType.MAMBA, 2), ("device", 3)]

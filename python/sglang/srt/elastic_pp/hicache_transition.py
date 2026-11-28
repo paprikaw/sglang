@@ -1725,6 +1725,7 @@ def build_dormant_host_stack(clone, *, source, projected, params):
     import threading
 
     from sglang.srt.elastic_pp.shared_host_cache import shared_pool_capacity
+    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
     from sglang.srt.mem_cache.hicache_storage import PoolName
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
         HybridCacheController,
@@ -1744,6 +1745,10 @@ def build_dormant_host_stack(clone, *, source, projected, params):
             entry.device_pool = getattr(projected, "full_kv_pool", projected)
         elif entry.name == PoolName.MAMBA:
             entry.device_pool = projected.mamba_pool
+            # The copied entry's eviction callbacks capture the source cache.
+            # After publication only the target owns the live free lists.
+            entry.host_evict_fn = lambda n: clone.evict_host(n, ComponentType.MAMBA)
+            entry.device_evict_fn = lambda n: clone.evict(EvictParams(mamba_num=n))
         else:
             raise NotImplementedError("dormant HiCache supports FULL and MAMBA only")
         # Physical target constructors enter one PP MIN per component when
