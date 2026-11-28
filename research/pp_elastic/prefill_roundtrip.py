@@ -50,7 +50,7 @@ def read_worker_log(path, complete, timeout=65):
         time.sleep(0.5)
 
 
-def measure(run, p, d, key, wait_file, replay, save):
+def measure(run, p, d, key, wait_file, replay, save, *, verify_auto_capacity=False):
     spec = importlib.util.spec_from_file_location("frozen_migration_workload", BENCH / "workload.py")
     workload = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(workload)
@@ -58,6 +58,23 @@ def measure(run, p, d, key, wait_file, replay, save):
     previous = {}
     observations = {}
     transition_waits = {}
+    published_capacities = []
+    if verify_auto_capacity:
+        marker = "ELASTIC_PP_AUTO_KV_CAPACITY "
+        text = read_worker_log(run / "cache/prefill.log", lambda raw: marker in raw)
+        capacity_plan = json.loads(text.split(marker, 1)[1].splitlines()[0])
+
+        def verify_capacity(expected):
+            info = replay.http(p["host"], p["port"], "/server_info", key)
+            observed = sorted({row["memory_usage"]["token_capacity"]
+                               for row in info["internal_states"]})
+            if observed != [expected]:
+                raise ValueError(f"Prefill published {observed} KV slots, expected {expected}")
+            published_capacities.append(expected)
+            save(run / "prefill_kv_capacity.json", dict(
+                plan=capacity_plan, published_capacities=published_capacities))
+
+        verify_capacity(capacity_plan["serving_tokens"][0])
     for generation, direction in enumerate(("up", "down"), 1):
         fixture = workload.case("small", direction)
         frozen = next(row for row in fingerprints if row["direction"] == direction and row["size"] == "small")
@@ -102,6 +119,8 @@ def measure(run, p, d, key, wait_file, replay, save):
                         raise RuntimeError("Prefill transition failed or wrong target layout")
                 rows = {i: f.result(timeout=65) for i, f in requests.items()}
             save(run / f"{name}.requests.json", rows)
+            if verify_auto_capacity and migrate:
+                verify_capacity(capacity_plan["serving_tokens"][generation % 2])
             if any(len(row.get("output_ids") or []) != 32 for row in rows.values()):
                 raise ValueError("Missing generated tokens")
             if not migrate:

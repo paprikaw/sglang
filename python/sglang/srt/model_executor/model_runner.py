@@ -831,8 +831,21 @@ class ModelRunner:
             self.memory_pool_config = memory_pool_config
 
         self.init_kv_cache_configurator()
+        from sglang.srt.elastic_pp.kv_capacity import (
+            automatic_prefill_capacity,
+            configure_capacity,
+        )
+
+        virtual_capacity = None
+        if automatic_prefill_capacity(self.server_args):
+            from sglang.srt.elastic_pp.prefill_kv_capacity import (
+                prefill_virtual_capacity,
+            )
+
+            virtual_capacity = prefill_virtual_capacity(self)
         result = self.kv_cache_configurator.configure(
-            pre_model_load_memory=self.pre_model_load_memory
+            pre_model_load_memory=self.pre_model_load_memory,
+            virtual_capacity=virtual_capacity,
         )
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests
@@ -840,8 +853,6 @@ class ModelRunner:
         self.token_to_kv_pool = result.token_to_kv_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.memory_pool_config = result.memory_pool_config
-        from sglang.srt.elastic_pp.kv_capacity import configure_capacity
-
         configure_capacity(self)
         if self.is_hybrid_swa:
             self.full_max_total_num_tokens = result.full_max_total_num_tokens
@@ -1508,12 +1519,14 @@ class ModelRunner:
             from sglang.srt.elastic_pp.kv_capacity import topology_capacity
 
             attention_range = pool._attention_range(target) if hasattr(pool, "_attention_range") else target
-            capacity = topology_capacity(self.server_args, transition.target)
+            capacity = topology_capacity(self.server_args, transition.target, pool=full)
             desired = full._capacity_offsets(attention_range, max(capacity, full.serving_capacity))
             mapped = set(snapshot_worker_mapped_offsets(full._group_id))
             kv_bytes = len(desired - mapped) * int(full.kvcached_allocator.physical_group_page_size)
         required = weights + kv_bytes + recurrent_bytes
-        reserve = max(256 * 2**20, math.ceil(required * 0.05))
+        from sglang.srt.elastic_pp.prefill_kv_capacity import transition_reserve_bytes
+
+        reserve = transition_reserve_bytes(required)
         device = torch.device(self.device)
         free = torch.cuda.mem_get_info(device)[0] if device.type == "cuda" else None
         report = {
@@ -1555,13 +1568,14 @@ class ModelRunner:
     def prepare_elastic_pp_kv_capacity(self, transition):
         from sglang.srt.elastic_pp.kv_capacity import full_pool, topology_capacity
 
-        capacity = topology_capacity(self.server_args, transition.target)
+        full = full_pool(self)
+        capacity = topology_capacity(self.server_args, transition.target, pool=full)
         if capacity is not None:
             pool = self.token_to_kv_pool
             target = transition.target.layer_range(self.ps.pp_rank)
             if hasattr(pool, "_attention_range"):
                 target = pool._attention_range(target)
-            full_pool(self).prepare_serving_capacity(target, capacity, transition.target.generation)
+            full.prepare_serving_capacity(target, capacity, transition.target.generation)
 
     def reclaim_elastic_pp_kv_capacity_at_fence(self):
         from sglang.srt.elastic_pp.kv_capacity import full_pool
@@ -1575,7 +1589,7 @@ class ModelRunner:
 
         full = full_pool(self)
         if getattr(full, "capacity_managed", False):
-            capacity = topology_capacity(self.server_args, transition.target)
+            capacity = topology_capacity(self.server_args, transition.target, pool=full)
             allocator = full._logical_allocator
             registration = getattr(self, "_elastic_pp_pd_registration", None)
             demote = getattr(registration, "demote_cached_rows_for_shrink", None)

@@ -274,7 +274,9 @@ class KVCacheConfigurator:
         quant_method.load_scales_from_model(self.model)
         return quant_method
 
-    def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
+    def configure(
+        self, *, pre_model_load_memory: int, virtual_capacity: Optional[int] = None
+    ) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert (
@@ -283,6 +285,10 @@ class KVCacheConfigurator:
             config = self.memory_pool_config
         else:
             config = self._resolve_memory_pool_config(pre_model_load_memory)
+        if virtual_capacity is not None:
+            # KVCacheD will attach physical pages using the measured serving
+            # capacities. The tensor shapes only reserve stable addresses here.
+            config.max_total_num_tokens = virtual_capacity
 
         sizes = self._derive_pool_sizes(config=config)
 

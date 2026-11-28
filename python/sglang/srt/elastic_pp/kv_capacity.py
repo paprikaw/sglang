@@ -21,28 +21,50 @@ def capacity_frontier(args):
     parts = parse_elastic_pp_partitions(
         args.elastic_pp_graph_partitions, allow_single=True
     )
+    if len(set(parts)) != len(parts):
+        raise ValueError("capacity frontier cannot contain duplicate PP partitions")
+    if getattr(args, "page_size", None) != 1:
+        raise ValueError("capacity-managed KVCacheD currently requires page-size 1")
+    role = getattr(args, "disaggregation_mode", None)
+    prefill = role == "prefill" and getattr(args, "elastic_pp_disagg_prefill", False)
+    if raw == "auto":
+        if (
+            not prefill
+            or len(parts) != 2
+            or getattr(args, "max_total_tokens", None) is not None
+            or (args.tp_size, args.ep_size, args.dp_size) != (1, 1, 1)
+        ):
+            raise ValueError(
+                "automatic KV capacity requires two TP1/EP1/DP1 elastic Prefill layouts and "
+                "no --max-total-tokens"
+            )
+        from sglang.srt.elastic_pp.prefill_kv_capacity import prefill_capacity_layouts
+
+        prefill_capacity_layouts(args)
+        return {}
+    if role != "decode" and not prefill:
+        raise ValueError("capacity-managed P/D requires Decode or the elastic Prefill sender")
     try:
         caps = tuple(int(x.strip()) for x in raw.split(";"))
     except (TypeError, ValueError) as exc:
         raise ValueError("KV capacities must be semicolon-separated integers") from exc
     if len(caps) != len(parts) or any(c <= 0 for c in caps):
         raise ValueError("one positive KV capacity is required per PP partition")
-    if len(set(parts)) != len(parts):
-        raise ValueError("capacity frontier cannot contain duplicate PP partitions")
     if max(caps) != getattr(args, "max_total_tokens", None):
         raise ValueError("max-total-tokens must equal the maximum virtual KV capacity")
-    if getattr(args, "page_size", None) != 1:
-        raise ValueError("capacity-managed KVCacheD currently requires page-size 1")
-    role = getattr(args, "disaggregation_mode", None)
-    if role != "decode" and not (
-        role == "prefill" and getattr(args, "elastic_pp_disagg_prefill", False)
-    ):
-        raise ValueError("capacity-managed P/D requires Decode or the elastic Prefill sender")
     return dict(zip(parts, caps))
 
 
-def topology_capacity(args, topology):
-    frontier = capacity_frontier(args)
+def automatic_prefill_capacity(args):
+    return getattr(args, "elastic_pp_kv_capacities", None) == "auto"
+
+
+def topology_capacity(args, topology, *, pool=None):
+    frontier = (
+        pool.auto_capacity_by_layout
+        if automatic_prefill_capacity(args)
+        else capacity_frontier(args)
+    )
     if not frontier:
         return None
     counts = tuple(r.size for r in topology.layer_ranges)
@@ -57,6 +79,21 @@ def full_pool(runner):
 
 
 def configure_capacity(runner):
+    if automatic_prefill_capacity(runner.server_args):
+        from sglang.srt.elastic_pp.prefill_kv_capacity import (
+            prefill_capacity_layouts,
+        )
+
+        pool = full_pool(runner)
+        # The private Graph walk is request-free. Give it just the physical page
+        # containing the null slot. Profile serving capacity after that walk.
+        capture_capacity = pool.kvcached_allocator.blocks_per_physical_page - 1
+        pool.configure_serving_capacity(capture_capacity)
+        pool.auto_capacity_by_layout = dict.fromkeys(
+            prefill_capacity_layouts(runner.server_args), capture_capacity
+        )
+        runner.max_total_num_tokens = capture_capacity
+        return
     frontier = capacity_frontier(runner.server_args)
     if not frontier:
         return

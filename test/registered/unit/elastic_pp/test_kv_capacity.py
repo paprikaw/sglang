@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from sglang.srt.elastic_pp.kv_capacity import capacity_frontier, topology_capacity
+from sglang.srt.elastic_pp.prefill_kv_capacity import RankMemory, resolve_prefill_pages
 from sglang.srt.elastic_pp.topology import PPTopology
 from sglang.srt.mem_cache.kvcached_pool import KVCacheDTokenToKVPoolAllocator
 
@@ -218,3 +219,46 @@ def test_prepared_pd_regions_use_target_layers_and_capacity_without_publishing()
 def test_capacity_frontier_accepts_prefill_only_with_sender_fence():
     cfg = args(disaggregation_mode="prefill", elastic_pp_disagg_prefill=True)
     assert capacity_frontier(cfg) == {(24, 0, 24): 4, (16, 16, 16): 8}
+
+
+def auto_args(**changes):
+    settings = dict(disaggregation_mode="prefill", elastic_pp_disagg_prefill=True,
+                    elastic_pp_kv_capacities="auto", max_total_tokens=None,
+                    elastic_pp_initial_partition="24,0,24", tp_size=1, ep_size=1, dp_size=1)
+    return args(**(settings | changes))
+
+
+def test_auto_uses_the_profiled_capacity_instead_of_a_token_flag():
+    cfg = auto_args()
+    assert capacity_frontier(cfg) == {}
+    pool = NS(auto_capacity_by_layout={(24, 0, 24): 341, (16, 16, 16): 512})
+    assert topology_capacity(cfg, PPTopology.from_layer_counts((16, 16, 16)), pool=pool) == 512
+
+
+@pytest.mark.parametrize("changes", [
+    dict(max_total_tokens=98304),
+    dict(disaggregation_mode="decode"),
+    dict(ep_size=2),
+    dict(elastic_pp_initial_partition="16,16,16"),
+    dict(elastic_pp_graph_partitions="24,0,24"),
+])
+def test_auto_rejects_incompatible_modes(changes):
+    with pytest.raises(ValueError):
+        capacity_frontier(auto_args(**changes))
+
+
+def test_auto_accounts_for_the_growth_and_shrink_peak():
+    gib = 2**30
+    end = RankMemory((16 * gib, 36 * gib), (6, 4), (2, 0), (0, 20 * gib), 8 * gib, 4 * gib)
+    middle = RankMemory((76 * gib, 36 * gib), (0, 4), (0, 4), (40 * gib, 0), 8 * gib, 4 * gib)
+    selected, steady = resolve_prefill_pages((end, middle, end), page_bytes=4 * 2**20, max_pages=4096)
+    assert selected == (341, 512)
+    assert steady == (341, 1792)
+
+
+def test_auto_fails_when_weight_restore_does_not_fit():
+    gib = 2**30
+    end = RankMemory((16 * gib, 36 * gib), (6, 4), (2, 0), (0, 20 * gib), 8 * gib, 4 * gib)
+    middle = RankMemory((40 * gib, 36 * gib), (0, 4), (0, 4), (40 * gib, 0), 8 * gib, 4 * gib)
+    with pytest.raises(RuntimeError, match="no transition-safe Prefill KV pages"):
+        resolve_prefill_pages((end, middle, end), page_bytes=4 * 2**20, max_pages=4096)

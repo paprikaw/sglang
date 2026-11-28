@@ -491,6 +491,16 @@ def prewarm_scheduler_graph_bank(scheduler):
     from sglang.srt.elastic_pp.shared_host_cache import initialize_scheduler_shared_host
 
     initialize_scheduler_shared_host(scheduler)
+    from sglang.srt.elastic_pp.kv_capacity import automatic_prefill_capacity
+
+    if automatic_prefill_capacity(mr.server_args):
+        from sglang.srt.elastic_pp.prefill_kv_capacity import (
+            initialize_prefill_capacity,
+        )
+
+        # The sender's old regions are already unregistered. Publish the
+        # measured slot limit before refreshing the addresses on all ranks.
+        initialize_prefill_capacity(scheduler)
     if registration is not None:
         registration.refresh()
     scheduler.init_elastic_pp_migration_coordinator()

@@ -30,6 +30,7 @@ sys.path.insert(0, str(PROFILE))
 import process_helpers as h
 
 GUARD = Path("/home/bxb1/.codex/skills/llm-experiment-guard/scripts")
+VERSIONS = Path("/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/implementations/versions.py")
 PRIOR = Path("/data/gpfs/projects/punim2715/vllm_workbench/engines/sglang/autoscaling/experiments/agentx_pd_reactive_burst_20261113/runs/p2d2_start_r1")
 PYTHON = "/data/gpfs/projects/punim2715/vllm_workbench/sglang_overlap_compare/venv-dd15fb57-cu12/bin/python"
 NIXL_ROOT = Path("/data/gpfs/projects/punim2715/vllm_workbench/.dependency-runtimes/sglang-nixl-cu12-1.5.2")
@@ -60,8 +61,12 @@ def memory_size_json(value):
 
 
 def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
-            lazy_cuda_modules=False, kvcached_capacity=False, prefill_roundtrip=False, agentx_length_gate=False, burst_gate=None):
+            lazy_cuda_modules=False, kvcached_capacity=False, prefill_roundtrip=False,
+            agentx_length_gate=False, burst_gate=None, auto_prefill_kv_capacity=False):
     agentx_length_gate = agentx_length_gate or bool(burst_gate)
+    if auto_prefill_kv_capacity and not (optimized and kvcached_capacity and prefill_roundtrip):
+        raise ValueError("automatic Prefill KV sizing requires the optimized Prefill KVCacheD path")
+    long_context = agentx_length_gate or auto_prefill_kv_capacity
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
     dirty = subprocess.check_output(["git", "-C", str(ENGINE), "status", "--porcelain"], text=True)
@@ -79,7 +84,7 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
     cache["hicache_reserve_bytes_per_node"] = {}
     nodes = {}
     for index, (previous_node, previous) in enumerate(old["node_configs"].items()):
-        node = os.environ.get(("BURST_PREFILL_NODE", "BURST_DECODE_NODE")[index], previous_node) if agentx_length_gate else previous_node
+        node = os.environ.get(("BURST_PREFILL_NODE", "BURST_DECODE_NODE")[index], previous_node) if long_context else previous_node
         cfg = dict(previous, node=node)
         pp = (3, 2)[index] if prefill_roundtrip else (2, 3)[index]
         role = "prefill" if index == 0 else "decode"
@@ -134,9 +139,12 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
                     KVCACHED_PHYSICAL_BLOCK_SIZE_MB="2", KVCACHED_MIN_RESERVED_PAGES="0",
                     KVCACHED_MAX_RESERVED_PAGES="0", KVCACHED_GPU_DIRECT_RDMA_REQUIRED="1",
                     KVCACHED_IPC_NAME=run.name)
-        if agentx_length_gate:
+        if long_context:
             cfg.update(agentx_length_gate=True, hicache_size_gib=16)
+        if agentx_length_gate:
             cfg["launch_env"].pop("PREFILL_ROUNDTRIP_PROBE", None)
+        if auto_prefill_kv_capacity and role == "prefill":
+            cfg["auto_prefill_kv_capacity"] = True
         cfg["burst_replay"] = bool(burst_gate)
         nodes[node] = cfg
         node_spec = json.loads((PRIOR / "cache" / f"{previous_node}.json").read_text())
@@ -176,6 +184,10 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
         config.update(agentx_length_gate=True, capacity_frontier=[65536, 98304, 65536], context_length=65536)
         spec.update(port=29870, title="122B AgentX longest request size, P2+D2 handoff",
                     implementation_note="Candidate long-context capacity on the r11 P-side migration engine (6de1b3e), same fixed D, HiCache. Length qualification only; no workload-specific small-probe trigger.")
+    if auto_prefill_kv_capacity:
+        config.update(auto_prefill_kv_capacity=True, capacity_frontier="auto", context_length=65536)
+        spec.update(port=29870, title="122B A100 elastic Prefill with memory-sized KV capacity",
+                    implementation_note="Candidate replaces fixed Prefill KV caps with startup memory sizing. Fixed PP2 Decode, HiCache, and the existing migration path.")
     config.update(burst_replay=bool(burst_gate), expected_profile_requests=97 if burst_gate else None)
     save(run / "config.json", config)
     spec["tasks"] = [dict(id="qualification", label="Request/cache/reuse acceptance",
@@ -223,7 +235,7 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
         prepare_files(run, nodes, burst_gate, spec, paths)
     spec["frozen_inputs"] = [describe(p) for p in dict.fromkeys(paths)]
     save(run / "dashboard_spec.json", spec)
-    save(run / "preparation.json", dict(command=[PYTHON, str(GUARD / "dashboard_guard.py"),
+    save(run / "preparation.json", dict(command=[PYTHON, str(VERSIONS),
         "run", "--spec", str(run / "dashboard_spec.json"), "--resource-choice", "auto",
         "--exit-after-run", "--", PYTHON, str(Path(__file__).resolve()), "--run", str(run)]))
     print(json.dumps({"run": str(run), "source": revision, "frozen_files": len(paths)}))
@@ -457,6 +469,10 @@ def engine_entry(run, cfg):
             options["--elastic-pp-kv-capacities"] = "65536;98304"
         for option, value in options.items():
             argv[argv.index(option) + 1] = value
+    if cfg.get("auto_prefill_kv_capacity"):
+        max_total = argv.index("--max-total-tokens")
+        del argv[max_total:max_total + 2]
+        argv[argv.index("--elastic-pp-kv-capacities") + 1] = "auto"
     save(run / "nodes" / cfg["node"] / "effective_launch.json",
          dict(engine_commit=cfg["engine_commit"], argv=argv,
               optimized_elastic_pp=cfg.get("optimized_elastic_pp", False)))
@@ -670,7 +686,8 @@ def controller(run, root):
             return
         elif root.get("prefill_roundtrip"):
             from prefill_roundtrip import measure
-            results.update(measure(run, p, d, key, wait_file, replay, save))
+            results.update(measure(run, p, d, key, wait_file, replay, save,
+                                   verify_auto_capacity=root.get("auto_prefill_kv_capacity", False)))
             return
         tokens = [1000 + (i * 31) % 20000 for i in range(512)]
         results["warmup"] = replay.request_one(p, d, key, tokens, 1, 0, True)
@@ -862,6 +879,7 @@ def main():
     parser.add_argument("--native-prepare", action="store_true")
     parser.add_argument("--lazy-cuda-modules", action="store_true")
     parser.add_argument("--kvcached-capacity", action="store_true")
+    parser.add_argument("--auto-prefill-kv-capacity", action="store_true")
     for option in ("prepare", "worker", "engine", "probe"):
         parser.add_argument("--" + option, action="store_true")
     args = parser.parse_args()
@@ -869,7 +887,8 @@ def main():
     if args.prepare:
         return prepare(run, burst_gate=args.burst_gate, agentx_length_gate=args.agentx_length_gate, prefill_roundtrip=args.prefill_roundtrip, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare,
                        native_prepare=args.native_prepare, lazy_cuda_modules=args.lazy_cuda_modules,
-                       kvcached_capacity=args.kvcached_capacity)
+                       kvcached_capacity=args.kvcached_capacity,
+                       auto_prefill_kv_capacity=args.auto_prefill_kv_capacity)
     root = json.loads((run / "config.json").read_text())
     if args.client:
         from prefill_burst import run_client

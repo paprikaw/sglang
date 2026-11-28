@@ -1188,7 +1188,11 @@ class ServerArgs:
     ] = "native"
     elastic_pp_kv_capacities: A[
         Optional[str],
-        Arg(help="Serving KV token capacities, semicolon-separated in prepared PP partition order; max-total-tokens reserves the stable virtual maximum."),
+        Arg(help=(
+            "Serving KV token capacities in prepared PP partition order. 'auto' "
+            "profiles elastic Prefill GPU memory and includes transition peaks; "
+            "explicit semicolon-separated capacities require max-total-tokens."
+        )),
         NS("parallel"),
     ] = None
     elastic_pp_hicache_shared_host: A[
