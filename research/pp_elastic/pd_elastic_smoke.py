@@ -60,7 +60,8 @@ def memory_size_json(value):
 
 
 def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
-            lazy_cuda_modules=False, kvcached_capacity=False, prefill_roundtrip=False, agentx_length_gate=False):
+            lazy_cuda_modules=False, kvcached_capacity=False, prefill_roundtrip=False, agentx_length_gate=False, burst_gate=None):
+    agentx_length_gate = agentx_length_gate or bool(burst_gate)
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
     dirty = subprocess.check_output(["git", "-C", str(ENGINE), "status", "--porcelain"], text=True)
@@ -136,6 +137,7 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
         if agentx_length_gate:
             cfg.update(agentx_length_gate=True, hicache_size_gib=16)
             cfg["launch_env"].pop("PREFILL_ROUNDTRIP_PROBE", None)
+        cfg["burst_replay"] = bool(burst_gate)
         nodes[node] = cfg
         node_spec = json.loads((PRIOR / "cache" / f"{previous_node}.json").read_text())
         node_path = run / "cache" / f"{node}.json"
@@ -174,6 +176,7 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
         config.update(agentx_length_gate=True, capacity_frontier=[65536, 98304, 65536], context_length=65536)
         spec.update(port=29870, title="122B AgentX longest request size, P2+D2 handoff",
                     implementation_note="Candidate long-context capacity on the r11 P-side migration engine (6de1b3e), same fixed D, HiCache. Length qualification only; no workload-specific small-probe trigger.")
+    config.update(burst_replay=bool(burst_gate), expected_profile_requests=97 if burst_gate else None)
     save(run / "config.json", config)
     spec["tasks"] = [dict(id="qualification", label="Request/cache/reuse acceptance",
         root=str(run / "task"), expected=1, nodes=list(nodes), controller_script=str(Path(__file__).resolve()))]
@@ -215,6 +218,9 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
     if prefill_roundtrip:
         workload_root = Path("/data/gpfs/projects/punim2715/vllm_workbench/experiment_manager/benchmarks/prefill_pp_migration_v1")
         paths.extend([workload_root / "workload.py", workload_root / "fixtures.json"])
+    if burst_gate:
+        from prefill_burst import prepare_files
+        prepare_files(run, nodes, burst_gate, spec, paths)
     spec["frozen_inputs"] = [describe(p) for p in dict.fromkeys(paths)]
     save(run / "dashboard_spec.json", spec)
     save(run / "preparation.json", dict(command=[PYTHON, str(GUARD / "dashboard_guard.py"),
@@ -548,10 +554,22 @@ def worker(run, root):
                     raise TimeoutError("Engine startup deadline")
                 stop.wait(1)
         save(directory / "ready.json", dict(passed=True, timestamp=time.time()))
+        client = None
+        client_done = False
         while not stop.wait(.5):
             h.authenticate(run, cfg, os.environ, local=True)
             if proc.poll() is not None:
                 raise RuntimeError("Engine exited while serving")
+            if cfg.get("burst_replay") and cfg["role"]=="decode" and (run/"start-client.json").exists():
+                if client is None:
+                    client = subprocess.Popen([PYTHON, str(Path(__file__).resolve()), "--client", "--run", str(run)],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+                    log = threading.Thread(target=h.stream_log, args=(client.stdout, str(run/"client.log"), key), daemon=True)
+                    log.start()
+                    children.append(dict(process=client, identity=h.process_record(client.pid), log_thread=log))
+                if not client_done and client.poll() is not None:
+                    save(run/"client_exit.json",dict(returncode=client.returncode,unix=time.time()))
+                    client_done = True
             if owns_elastic and (run / "probe.trigger").exists() and not any(c.get("gpu_reuse_probe") for c in children):
                 probe_env = dict(os.environ, **cfg["launch_env"], CUDA_VISIBLE_DEVICES="1")
                 probe = subprocess.Popen([PYTHON, str(Path(__file__).resolve()), "--probe", "--run", str(run)],
@@ -642,6 +660,10 @@ def controller(run, root):
         for cfg in cfgs:
             wait_file(run / "nodes" / cfg["node"] / "ready.json", 1200)
         progress(run, root, "reference_and_roundtrip")
+        if root.get("burst_replay"):
+            from prefill_burst import measure
+            results.update(measure(run, p, d, key, replay, health))
+            return
         if root.get("agentx_length_gate"):
             from burst_length_gate import measure
             results.update(measure(run, p, d, key, replay, PRIOR))
@@ -831,6 +853,8 @@ def controller(run, root):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", type=Path, required=True)
+    parser.add_argument("--burst-gate", type=Path)
+    parser.add_argument("--client", action="store_true")
     parser.add_argument("--agentx-length-gate", action="store_true")
     parser.add_argument("--prefill-roundtrip", action="store_true")
     parser.add_argument("--sync-baseline", action="store_true")
@@ -843,10 +867,13 @@ def main():
     args = parser.parse_args()
     run = args.run.resolve()
     if args.prepare:
-        return prepare(run, agentx_length_gate=args.agentx_length_gate, prefill_roundtrip=args.prefill_roundtrip, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare,
+        return prepare(run, burst_gate=args.burst_gate, agentx_length_gate=args.agentx_length_gate, prefill_roundtrip=args.prefill_roundtrip, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare,
                        native_prepare=args.native_prepare, lazy_cuda_modules=args.lazy_cuda_modules,
                        kvcached_capacity=args.kvcached_capacity)
     root = json.loads((run / "config.json").read_text())
+    if args.client:
+        from prefill_burst import run_client
+        return run_client(run)
     if args.worker:
         return worker(run, root)
     if args.engine:
