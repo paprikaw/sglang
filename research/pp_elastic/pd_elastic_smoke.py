@@ -77,8 +77,9 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
     cache["node_specs"] = {}
     cache["hicache_reserve_bytes_per_node"] = {}
     nodes = {}
-    for index, (node, previous) in enumerate(old["node_configs"].items()):
-        cfg = dict(previous)
+    for index, (previous_node, previous) in enumerate(old["node_configs"].items()):
+        node = os.environ.get(("BURST_PREFILL_NODE", "BURST_DECODE_NODE")[index], previous_node) if agentx_length_gate else previous_node
+        cfg = dict(previous, node=node)
         pp = (3, 2)[index] if prefill_roundtrip else (2, 3)[index]
         role = "prefill" if index == 0 else "decode"
         use = dict(id=f"{run.name}.{role}", path=str(run / "cache" / f"{role}.log"),
@@ -136,16 +137,17 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
             cfg.update(agentx_length_gate=True, hicache_size_gib=16)
             cfg["launch_env"].pop("PREFILL_ROUNDTRIP_PROBE", None)
         nodes[node] = cfg
-        node_spec = json.loads((PRIOR / "cache" / f"{node}.json").read_text())
+        node_spec = json.loads((PRIOR / "cache" / f"{previous_node}.json").read_text())
         node_path = run / "cache" / f"{node}.json"
         if prefill_roundtrip:
-            node_spec["expected_job_id"] = cfg["job_id"]
+            node_spec.update(expected_job_id=cfg["job_id"], node=node)
         save(node_path, node_spec)
         cache["node_specs"][node] = describe(node_path)
         cache["usage_logs"][node] = [use]
         # Host cache + CPU KV/GDN spill staging share an explicit reservation.
         cache["hicache_reserve_bytes_per_node"][node] = (240 if optimized and role == "decode" else 32) * 1024**3
     if prefill_roundtrip:
+        cache["cpu_memory_budget"]["kv_banks_per_node"] = {node: [] for node in nodes}
         for node, cfg in nodes.items():
             cache["hicache_reserve_bytes_per_node"][node] = (240 if cfg["role"] == "prefill" else 32) * 1024**3
         spec["implementation_note"] = "New 122B P-side transfer fence, fixed native PP2 D; existing registered inplace path is Decode-only."
