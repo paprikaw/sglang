@@ -37,6 +37,30 @@ def install_trigger_probe():
     Scheduler.process_input_requests = dispatch
 
 
+def install_high_kv_rows_probe():
+    """Exercise occupied PP3 rows beyond the PP2 ceiling with short requests."""
+    from sglang.srt.mem_cache.kvcached_pool import KVCacheDTokenToKVPoolAllocator
+
+    native = KVCacheDTokenToKVPoolAllocator.alloc
+
+    def allocate(allocator, need_size):
+        staging = getattr(allocator._kvcache, "prefill_staging_capacity", None)
+        if (
+            staging is None
+            or allocator.serving_capacity <= staging
+            or not 0 < need_size <= allocator.available_size()
+        ):
+            return native(allocator, need_size)
+        allocator.merge_and_sort_free()
+        pages = allocator.free_pages[-need_size:]
+        if int(pages[0]) <= staging:
+            raise RuntimeError("fixture did not allocate beyond the PP2 ceiling")
+        allocator.free_pages = allocator.free_pages[:-need_size]
+        return allocator._record_allocated_pages(allocator._as_int_list(pages))
+
+    KVCacheDTokenToKVPoolAllocator.alloc = allocate
+
+
 def read_worker_log(path, complete, timeout=65):
     # GPFS on the controller can show a shorter file after the request has
     # returned and the writer has flushed on the remote worker.
@@ -50,7 +74,10 @@ def read_worker_log(path, complete, timeout=65):
         time.sleep(0.5)
 
 
-def measure(run, p, d, key, wait_file, replay, save, *, verify_auto_capacity=False):
+def measure(
+    run, p, d, key, wait_file, replay, save, *,
+    verify_auto_capacity=False, verify_prefill_kv_spill=False,
+):
     spec = importlib.util.spec_from_file_location("frozen_migration_workload", BENCH / "workload.py")
     workload = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(workload)
@@ -143,6 +170,33 @@ def measure(run, p, d, key, wait_file, replay, save, *, verify_auto_capacity=Fal
                 if not overlap:
                     raise ValueError("No positive-byte KV transport spanned the actual migration trigger")
                 observations[name] = dict(verified_output_requests=len(rows), overlap=overlap)
+                if direction == "down" and verify_prefill_kv_spill:
+                    def trim_metrics(raw):
+                        metrics = [
+                            json.loads(line.split("ELASTIC_PP_TRANSITION_METRICS ", 1)[1])
+                            for line in raw.splitlines()
+                            if "ELASTIC_PP_TRANSITION_METRICS " in line
+                            and '"prefill_kv_trim"' in line
+                        ]
+                        return {
+                            row["rank"]: row["source_backing"]["prefill_kv_trim"]
+                            for row in metrics if row["generation"] == generation
+                        }
+
+                    text = read_worker_log(
+                        run / "cache/prefill.log",
+                        lambda raw: set(trim_metrics(raw)) == {0, 1, 2},
+                    )
+                    trim = trim_metrics(text)
+                    save(run / "prefill_kv_trim.json", trim)
+                    if any(
+                        row["released_gpu_kv_bytes"] <= 0
+                        or row["cpu_bytes"] <= 0
+                        or row["staged_request_rows"] <= 0
+                        for row in trim.values()
+                    ):
+                        raise ValueError("PP3 shrink did not exercise active high KV rows")
+                    observations[name]["kv_trim"] = trim
             # All D workers are on the same host. Measure from first destination
             # publication to the last required receiver's transfer completion.
             last_room = room_base + 61

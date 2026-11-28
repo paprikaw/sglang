@@ -57,7 +57,7 @@ def transition_reserve_bytes(required_bytes):
 
 
 def resolve_prefill_pages(ranks, *, page_bytes, max_pages):
-    """Find the largest PP2 pool, then the largest PP3 pool compatible with it."""
+    """Size both serving pools independently and the temporary overlap pool."""
     steady = tuple(
         min(
             max_pages,
@@ -73,35 +73,25 @@ def resolve_prefill_pages(ranks, *, page_bytes, max_pages):
     def fits(pages):
         for rank in ranks:
             for src, dst in ((0, 1), (1, 0)):
-                # Source-only groups stay mapped until retirement. The target
-                # groups must cover the old IDs until the drained fence, even
-                # during shrink. Retained groups are counted once.
-                old_bytes = rank.groups[src] * pages[src] * page_bytes
-                peak_pages = (
-                    rank.departing_groups[src] * pages[src]
-                    + rank.groups[dst] * max(pages[src], pages[dst])
-                )
-                additional = peak_pages * page_bytes - old_bytes + rank.incoming_weights[src]
+                old_bytes = rank.groups[src] * pages * page_bytes
+                peak_pages = (rank.departing_groups[src] + rank.groups[dst]) * pages
+                required = peak_pages * page_bytes + rank.incoming_weights[src]
+                additional = required - old_bytes
                 reserve = max(rank.prefill_workspace, transition_reserve_bytes(additional))
-                if old_bytes + additional + reserve > rank.free_without_kv[src]:
+                if required + reserve > rank.free_without_kv[src]:
                     return False
         return True
 
-    def largest(upper, accepts):
-        lo, hi = 0, max(upper, 0)
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if accepts(mid):
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo
-
-    initial = largest(min(steady), lambda pages: fits((pages, pages)))
-    if not initial:
+    lo, hi = 0, max(min(steady), 0)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    if not lo:
         raise RuntimeError(f"no transition-safe Prefill KV pages: steady={steady}, ranks={ranks}")
-    expanded = largest(steady[1], lambda pages: fits((initial, pages)))
-    return (initial, expanded), steady
+    return steady, lo
 
 
 def initialize_prefill_capacity(scheduler):
@@ -157,12 +147,14 @@ def initialize_prefill_capacity(scheduler):
         prefill_workspace=workspace,
     )
     rows = runner.elastic_pp_migration_group.all_gather_object(local)
-    selected_pages, steady_pages = resolve_prefill_pages(
+    steady_pages, staging_pages = resolve_prefill_pages(
         rows, page_bytes=page_bytes, max_pages=(full.size + 1) // slots_per_page
     )
-    serving = tuple(n * slots_per_page - 1 for n in selected_pages)
+    serving = tuple(n * slots_per_page - 1 for n in steady_pages)
+    staging = staging_pages * slots_per_page - 1
     full.configure_serving_capacity(serving[0])
     full.auto_capacity_by_layout = dict(zip(layouts, serving))
+    full.prefill_staging_capacity = staging
     if rank == 0:
         logger.info(
             "ELASTIC_PP_AUTO_KV_CAPACITY %s",
@@ -170,9 +162,7 @@ def initialize_prefill_capacity(scheduler):
                 dict(
                     partitions=layouts,
                     serving_tokens=serving,
-                    steady_tokens_before_transition_reserve=[
-                        n * slots_per_page - 1 for n in steady_pages
-                    ],
+                    transition_tokens=staging,
                     virtual_tokens=full.size,
                     physical_page_bytes=page_bytes,
                     tokens_per_page=slots_per_page,

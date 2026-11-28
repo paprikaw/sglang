@@ -247,13 +247,13 @@ def test_auto_rejects_incompatible_modes(changes):
         capacity_frontier(auto_args(**changes))
 
 
-def test_auto_accounts_for_the_growth_and_shrink_peak():
+def test_auto_keeps_the_steady_pool_independent_of_the_transition_peak():
     gib = 2**30
     end = RankMemory((16 * gib, 36 * gib), (6, 4), (2, 0), (0, 20 * gib), 8 * gib, 4 * gib)
     middle = RankMemory((76 * gib, 36 * gib), (0, 4), (0, 4), (40 * gib, 0), 8 * gib, 4 * gib)
-    selected, steady = resolve_prefill_pages((end, middle, end), page_bytes=4 * 2**20, max_pages=4096)
-    assert selected == (341, 512)
+    steady, staging = resolve_prefill_pages((end, middle, end), page_bytes=4 * 2**20, max_pages=4096)
     assert steady == (341, 1792)
+    assert staging == 341
 
 
 def test_auto_fails_when_weight_restore_does_not_fit():

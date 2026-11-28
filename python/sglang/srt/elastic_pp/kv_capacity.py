@@ -73,6 +73,13 @@ def topology_capacity(args, topology, *, pool=None):
     return frontier[counts]
 
 
+def prepared_topology_capacity(args, topology, *, pool):
+    """Temporary capacity used while both PP weight layouts are resident."""
+    capacity = topology_capacity(args, topology, pool=pool)
+    staging = getattr(pool, "prefill_staging_capacity", None)
+    return capacity if staging is None else min(capacity, staging)
+
+
 def full_pool(runner):
     pool = runner.token_to_kv_pool
     return getattr(pool, "full_kv_pool", pool)

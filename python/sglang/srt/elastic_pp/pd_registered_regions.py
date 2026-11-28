@@ -28,12 +28,10 @@ class PreparedDecodeRegions:
         self.engine = engine
         self.source, self.target_kv = regions(source), regions(target_kv)
         self.target_prepared = self.target_kv | regions(target_aux)
-        target = sorted(self.target_prepared)
-        if any(p + n > q for (p, n), (q, _) in zip(target, target[1:])) or any(
-            p < q + m and q < p + n and (p, n) != (q, m)
-            for p, n in target
-            for q, m in self.source
-        ):
+        # Source buffers have already passed the engine's registration check.
+        # A sorted sweep keeps the validation cheap for thousands of VMM pages.
+        combined = sorted(self.source | self.target_prepared)
+        if any(p + n > q for (p, n), (q, _) in zip(combined, combined[1:])):
             raise ValueError("P/D prepared regions overlap a different registration")
         self.registered = set(self.source)
         self.attempted_added = set()

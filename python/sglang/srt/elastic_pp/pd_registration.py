@@ -279,13 +279,15 @@ class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
     def pending_work(self):
         return self._queue().kv_manager.prefill_transfer_fence.pending()
 
-    def demote_cached_rows_for_shrink(self, allocator, capacity):
+    def demote_cached_rows_for_shrink(
+        self, allocator, capacity, *, write_missing=False, group=None
+    ):
         """Keep host-backed prefixes while retiring high-numbered device rows."""
         if capacity >= allocator.serving_capacity:
-            return
+            return 0
         high = {row for row in allocator._live_page_ids if row > capacity}
-        if not high:
-            return
+        if not high and group is None:
+            return 0
         if self.pending_work():
             raise RuntimeError("Cannot demote Prefill KV referenced by an active transfer")
         from collections import defaultdict
@@ -296,21 +298,39 @@ class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
         tree = cache.tree_core
         tracker = defaultdict(int)
         before = len(high)
-        # Demoting a leaf can expose its parent. A request lock, missing host
-        # copy, or non-cache owner must continue to prevent physical reclaim.
-        while high:
-            progress = False
-            for node in sorted(tree.evictable_device_leaves, key=lambda n: n.id):
-                if not node.backuped or not tree._is_device_leaf(node):
-                    continue
-                rows = node.component_data[ComponentType.FULL].value
-                if rows is None or not high.intersection(allocator._as_int_list(rows)):
-                    continue
-                cache._demote(node.id, tracker)
-                high.intersection_update(allocator._live_page_ids)
-                progress = True
-            if not progress:
+        # Demoting a leaf can expose its parent. No row is freed until the
+        # existing host copy is valid or an explicit write-back completes.
+        while True:
+            ready = set()
+            error = None
+            try:
+                for node in sorted(tree.evictable_device_leaves, key=lambda n: n.id):
+                    if not tree._is_device_leaf(node):
+                        continue
+                    rows = node.component_data[ComponentType.FULL].value
+                    if rows is None or not high.intersection(allocator._as_int_list(rows)):
+                        continue
+                    if write_missing and not node.backuped:
+                        action = tree._build_backup_kv_action(node)
+                        cache._execute_and_commit_kv_backup(action, write_back=True)
+                        cache.writing_check(write_back=True)
+                    if node.backuped:
+                        ready.add(node.id)
+            except BaseException as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            reports = (
+                group.all_gather_object((ready, error))
+                if group is not None
+                else [(ready, error)]
+            )
+            if any(failure for _, failure in reports):
+                raise RuntimeError(f"Prefill HiCache backup failed: {reports}")
+            ready.intersection_update(*(ids for ids, _ in reports))
+            if not ready:
                 break
+            for node_id in sorted(ready):
+                cache._demote(node_id, tracker)
+            high.intersection_update(allocator._live_page_ids)
         if high:
             cached = set()
             locked = set()
@@ -332,6 +352,36 @@ class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
             self.scheduler.ps.pp_rank, capacity, before, len(high),
             len(allocator._live_page_ids), tracker[ComponentType.FULL],
         )
+        return tracker[ComponentType.FULL]
+
+    def resize_source_capacity_at_fence(self, pool, capacity, generation):
+        """Update the current layout's MR set before relinquishing its pages."""
+        from sglang.srt.elastic_pp.pd_registered_regions import (
+            PreparedDecodeRegions,
+            regions,
+        )
+
+        if self.suspended or self.prepared_regions is not None:
+            raise RuntimeError("source resize requires active source registrations")
+        manager = self._queue().kv_manager
+        old = regions(manager._registerable_regions())
+        old_kv = regions(pool.pd_registration_regions())
+        shrinking = capacity < pool.serving_capacity
+        if not shrinking:
+            # Registration additions need mapped addresses. The scheduler is
+            # fenced throughout, so no sender can observe the new capacity.
+            pool.resize_serving_capacity_at_fence(capacity)
+        lease = PreparedDecodeRegions(
+            manager.engine, old, pool.pd_registration_regions(capacity),
+            target_aux=old - old_kv,
+        )
+        self.prepared_regions, self.prepared_generation = lease, generation
+        lease.prepare()
+        self.suspend()
+        if shrinking:
+            pool.resize_serving_capacity_at_fence(capacity)
+        self.refresh()
+        pool.reclaim_capacity_at_fence()
 
     def suspend(self):
         fence = self._queue().kv_manager.prefill_transfer_fence

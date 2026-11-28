@@ -1516,10 +1516,10 @@ class ModelRunner:
             kv_bytes = recurrent_bytes = 0
         if getattr(full, "capacity_managed", False):
             from kvcached.tp_ipc_util import snapshot_worker_mapped_offsets
-            from sglang.srt.elastic_pp.kv_capacity import topology_capacity
+            from sglang.srt.elastic_pp.kv_capacity import prepared_topology_capacity
 
             attention_range = pool._attention_range(target) if hasattr(pool, "_attention_range") else target
-            capacity = topology_capacity(self.server_args, transition.target, pool=full)
+            capacity = prepared_topology_capacity(self.server_args, transition.target, pool=full)
             desired = full._capacity_offsets(attention_range, max(capacity, full.serving_capacity))
             mapped = set(snapshot_worker_mapped_offsets(full._group_id))
             kv_bytes = len(desired - mapped) * int(full.kvcached_allocator.physical_group_page_size)
@@ -1566,10 +1566,10 @@ class ModelRunner:
         return result
 
     def prepare_elastic_pp_kv_capacity(self, transition):
-        from sglang.srt.elastic_pp.kv_capacity import full_pool, topology_capacity
+        from sglang.srt.elastic_pp.kv_capacity import full_pool, prepared_topology_capacity
 
         full = full_pool(self)
-        capacity = topology_capacity(self.server_args, transition.target, pool=full)
+        capacity = prepared_topology_capacity(self.server_args, transition.target, pool=full)
         if capacity is not None:
             pool = self.token_to_kv_pool
             target = transition.target.layer_range(self.ps.pp_rank)
@@ -1585,17 +1585,42 @@ class ModelRunner:
             full.reclaim_capacity_at_fence()
 
     def validate_elastic_pp_kv_capacity_at_fence(self, transition):
-        from sglang.srt.elastic_pp.kv_capacity import full_pool, topology_capacity
+        from sglang.srt.elastic_pp.kv_capacity import full_pool, prepared_topology_capacity
 
         full = full_pool(self)
         if getattr(full, "capacity_managed", False):
-            capacity = topology_capacity(self.server_args, transition.target, pool=full)
+            capacity = prepared_topology_capacity(self.server_args, transition.target, pool=full)
             allocator = full._logical_allocator
             registration = getattr(self, "_elastic_pp_pd_registration", None)
             demote = getattr(registration, "demote_cached_rows_for_shrink", None)
             if demote is not None:
                 demote(allocator, capacity)
             allocator.check_serving_capacity(capacity)
+
+    def prefill_trim_capacity(self):
+        from sglang.srt.elastic_pp.kv_capacity import full_pool
+
+        full = full_pool(self)
+        staging = getattr(full, "prefill_staging_capacity", None)
+        return staging if staging is not None and staging < full.serving_capacity else None
+
+    def finish_prefill_capacity_at_fence(self, transition):
+        from sglang.srt.elastic_pp.kv_capacity import full_pool, topology_capacity
+
+        full = full_pool(self)
+        if getattr(full, "prefill_staging_capacity", None) is None:
+            return
+        capacity = topology_capacity(self.server_args, transition.target, pool=full)
+        if capacity == full.serving_capacity:
+            return
+        rank = self.ps.pp_rank
+        old = transition.source.layer_range(rank)
+        new = transition.target.layer_range(rank)
+        departed = sorted(set(range(old.start, old.end)) - set(range(new.start, new.end)))
+        self._elastic_pp_prepared_graphs.weight_backing.evict(departed)
+        full.reclaim_capacity_at_fence()
+        torch.cuda.empty_cache()
+        full.resize_serving_capacity_at_fence(capacity)
 
     def invalidate_elastic_pp_attention_state_views(self):
         """Drop lazy GDN tracking views at a drained backing change.

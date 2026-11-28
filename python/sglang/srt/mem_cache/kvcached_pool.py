@@ -515,6 +515,14 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
         self._back_capacity(target, max(capacity, self.serving_capacity))
         self._pending_serving_capacity = (int(generation), int(capacity))
 
+    def resize_serving_capacity_at_fence(self, capacity):
+        """Resize the committed layer range without discarding allocator state."""
+        self._logical_allocator.check_serving_capacity(capacity)
+        if capacity > self.serving_capacity:
+            self._back_capacity(LayerRange(self.start_layer, self.end_layer), capacity)
+        self._logical_allocator.set_serving_capacity(capacity)
+        self.serving_capacity = capacity
+
     def commit_elastic_pp_kv_layers(self, *, generation):
         if self.capacity_managed:
             pending = self._pending_serving_capacity
@@ -552,11 +560,12 @@ class KVCacheDMHATokenToKVPool(MHATokenToKVPool):
                  + t[0].numel() * t.element_size() for t in tensors],
                 [t[0].numel() * t.element_size() for t in tensors])
 
-    def pd_registration_regions(self):
+    def pd_registration_regions(self, capacity=None):
         """Register each mapped physical allocation without overlapping K/V."""
         manager = self.kvcached_allocator
         step = int(manager.physical_group_page_size)
-        pages = math.ceil((self.serving_capacity + 1) / manager.blocks_per_physical_page)
+        capacity = self.serving_capacity if capacity is None else capacity
+        pages = math.ceil((capacity + 1) / manager.blocks_per_physical_page)
         return [(k.data_ptr() + page * step, step)
                 for k in self.k_buffer for page in range(pages)]
 

@@ -119,6 +119,9 @@ class ElasticPPMigrationCoordinator:
             raise ValueError("online KV patch requires background/overlap transition")
         self._source_backing_attempted = False
         self._registration_suspended = False
+        self._prefill_trim_capacity = None
+        self._prefill_trimmed_from = None
+        self._prefill_resize_unsafe = False
         self._source_backing_metrics: dict[str, Any] = {}
         self._layers_precopied = False
         self._background_weight_bytes_sent = 0
@@ -287,6 +290,10 @@ class ElasticPPMigrationCoordinator:
             self._observed_cuda_allocated_peak = 0
             self._source_backing_attempted = False
             self._registration_suspended = False
+            self._prefill_trimmed_from = None
+            self._prefill_resize_unsafe = False
+            trim_capacity = getattr(self.model_runner, "prefill_trim_capacity", None)
+            self._prefill_trim_capacity = trim_capacity() if trim_capacity else None
             self._source_backing_metrics = {}
             self._stage_seconds = {}
             self._stage_intervals = []
@@ -298,7 +305,7 @@ class ElasticPPMigrationCoordinator:
                 capture = getattr(self.cache_transition, "begin_background", None)
                 if capture is not None:
                     self._timed("host_background_capture", capture, transition)
-            if self.enable_kv_patch:
+            if self.enable_kv_patch and self._prefill_trim_capacity is None:
                 # This caller is the scheduler; allocator snapshots must never
                 # be taken from the preparation worker.
                 self._timed(
@@ -845,9 +852,12 @@ class ElasticPPMigrationCoordinator:
             local_error = None
             try:
                 self._set_worker_device()
-                if self.enable_kv_patch:
+                if self.enable_kv_patch and self._prefill_trim_capacity is None:
                     self.kv_transport.check_live_patch()
-                if self.strategy in {"background", "legacy"}:
+                if (
+                    self.strategy in {"background", "legacy"}
+                    and self._prefill_trim_capacity is None
+                ):
                     if self.strategy == "background":
                         self._timed("capacity", self._preflight_capacity, transition)
                     self._prepare_backing(transition)
@@ -879,7 +889,7 @@ class ElasticPPMigrationCoordinator:
                 raise RuntimeError("prepared weight policy differs across ranks")
             # Never enter P2P pre-copy before all peers have allocated backing:
             # a peer allocation failure must not strand a sender/receiver.
-            if self.strategy == "background":
+            if self.strategy == "background" and self._prefill_trim_capacity is None:
                 local_error = None
                 try:
                     if not self._weights_reused:
@@ -935,7 +945,7 @@ class ElasticPPMigrationCoordinator:
                     error=local_error,
                 )
                 self._raise_peer_failures("background host copy", reports)
-            if self.enable_kv_patch:
+            if self.enable_kv_patch and self._prefill_trim_capacity is None:
                 wait_base = getattr(self.kv_transport, "wait_initial_live_base", None)
                 if wait_base is not None:
                     local_error = None
@@ -997,6 +1007,87 @@ class ElasticPPMigrationCoordinator:
         except BaseException as exc:
             self._fail_before_publication(exc)
 
+    def _prepare_prefill_shrink_at_fence(self, transition):
+        from sglang.srt.elastic_pp.hicache_transition import drain_host_io_at_fence
+        from sglang.srt.elastic_pp.kv_capacity import full_pool
+        from sglang.srt.elastic_pp.prefill_kv_compaction import PrefillKVCompaction
+
+        registration = self.model_runner._elastic_pp_pd_registration
+        scheduler = registration.scheduler
+        full = full_pool(self.model_runner)
+        capacity = self._prefill_trim_capacity
+
+        def agree(name, action):
+            error, details = None, None
+            try:
+                details = self._timed(name, action)
+            except BaseException as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            reports = self._consensus(name, success=error is None, error=error, details=details)
+            self._raise_peer_failures(name, reports)
+            return reports
+
+        agree("prefill_trim_retire_host_io",
+              lambda: drain_host_io_at_fence(scheduler.tree_cache, self.group))
+
+        # Demote only leaves acknowledged by every source rank. A CPU backup
+        # may be prepared independently, but live row ownership must agree.
+        reports = agree("prefill_trim_hicache", lambda: registration.demote_cached_rows_for_shrink(
+            full._logical_allocator, capacity, write_missing=True, group=self.group
+        ))
+        demoted = next(row["details"] for row in reports if row["rank"] == self.rank)
+
+        plan = None
+
+        def stage():
+            nonlocal plan
+            plan = PrefillKVCompaction(scheduler, full, capacity)
+            plan.stage_on_free_rows()
+            return plan.signature
+
+        reports = agree("prefill_trim_cpu_spill", stage)
+        if any(report["details"] != plan.signature for report in reports):
+            raise RuntimeError("Prefill shrink row ownership differs across ranks")
+
+        # A partial index update or deregistration cannot be retried safely.
+        # Once all peers verify the trim, later failures can regrow the source.
+        self._prefill_resize_unsafe = True
+        agree("prefill_trim_rebind", plan.commit)
+        previous = full.serving_capacity
+
+        from kvcached.tp_ipc_util import snapshot_worker_mapped_offsets
+
+        def trim():
+            before = len(snapshot_worker_mapped_offsets(full._group_id))
+            registration.resize_source_capacity_at_fence(
+                full, capacity, transition.target.generation
+            )
+            after = len(snapshot_worker_mapped_offsets(full._group_id))
+            return (before - after) * int(full.kvcached_allocator.physical_group_page_size)
+
+        reports = agree("prefill_trim_unmap", trim)
+        released = next(row["details"] for row in reports if row["rank"] == self.rank)
+        self._prefill_trimmed_from = previous
+        self._prefill_resize_unsafe = False
+        self._source_backing_metrics["prefill_kv_trim"] = dict(
+            previous_capacity=previous,
+            staging_capacity=capacity,
+            hicache_demoted_rows=demoted,
+            staged_rows=len(plan.rows),
+            staged_request_rows=plan.request_rows,
+            cpu_bytes=plan.cpu_bytes,
+            released_gpu_kv_bytes=released,
+        )
+
+        def prepare():
+            if self.enable_kv_patch:
+                self.kv_transport.begin_live_patch(transition)
+                self.kv_transport.check_live_patch()
+            self._prepare_backing(transition)
+
+        self._preflight_capacity(transition)
+        agree("prefill_trim_target_prepare", prepare)
+
     def finalize_at_fence(
         self, commit_topology: Callable[[PPTopology], None]
     ) -> PPTopology:
@@ -1021,6 +1112,8 @@ class ElasticPPMigrationCoordinator:
 
         commit_started = False
         try:
+            if self._prefill_trim_capacity is not None:
+                self._prepare_prefill_shrink_at_fence(transition)
             # Host I/O and live allocator reads occur only at the drained fence.
             # Keep the source generation intact until all ranks can publish.
             local_error = None
@@ -1370,6 +1463,11 @@ class ElasticPPMigrationCoordinator:
                     self._timed(
                         "fence_host_commit", self.cache_transition.commit, transition
                     )
+                finish_capacity = getattr(
+                    self.model_runner, "finish_prefill_capacity_at_fence", None
+                )
+                if finish_capacity is not None:
+                    self._timed("fence_steady_kv_capacity", finish_capacity, transition)
                 # From this point onward the local source generation cannot be
                 # restored, even if route publication or peer commit fails.
                 self._timed("fence_route_publish", commit_topology, transition.target)
@@ -1438,7 +1536,7 @@ class ElasticPPMigrationCoordinator:
             )
             return transition.target
         except BaseException as exc:
-            if not commit_started:
+            if not commit_started and not self._prefill_resize_unsafe:
                 self._fail_before_publication(exc)
             else:
                 self._fail(exc, source_usable=False)
@@ -1576,6 +1674,16 @@ class ElasticPPMigrationCoordinator:
             attempt("source P/D registration restore", self.after_backing_restore)
             if not errors:
                 self._registration_suspended = False
+        if self._prefill_trimmed_from is not None and not errors:
+            from sglang.srt.elastic_pp.kv_capacity import full_pool
+
+            registration = self.model_runner._elastic_pp_pd_registration
+            attempt(
+                "restore source Prefill capacity",
+                lambda: registration.resize_source_capacity_at_fence(
+                    full_pool(self.model_runner), self._prefill_trimmed_from, generation
+                ),
+            )
         if errors:
             raise RuntimeError("; ".join(errors))
 

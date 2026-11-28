@@ -62,10 +62,13 @@ def memory_size_json(value):
 
 def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
             lazy_cuda_modules=False, kvcached_capacity=False, prefill_roundtrip=False,
-            agentx_length_gate=False, burst_gate=None, auto_prefill_kv_capacity=False):
+            agentx_length_gate=False, burst_gate=None, auto_prefill_kv_capacity=False,
+            verify_prefill_kv_spill=False):
     agentx_length_gate = agentx_length_gate or bool(burst_gate)
     if auto_prefill_kv_capacity and not (optimized and kvcached_capacity and prefill_roundtrip):
         raise ValueError("automatic Prefill KV sizing requires the optimized Prefill KVCacheD path")
+    if verify_prefill_kv_spill and (not auto_prefill_kv_capacity or agentx_length_gate):
+        raise ValueError("KV spill assertion requires the small automatic Prefill roundtrip")
     long_context = agentx_length_gate or auto_prefill_kv_capacity
     run.mkdir(parents=True, exist_ok=False)
     revision = subprocess.check_output(["git", "-C", str(ENGINE), "rev-parse", "HEAD"], text=True).strip()
@@ -145,6 +148,8 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
             cfg["launch_env"].pop("PREFILL_ROUNDTRIP_PROBE", None)
         if auto_prefill_kv_capacity and role == "prefill":
             cfg["auto_prefill_kv_capacity"] = True
+            if verify_prefill_kv_spill:
+                cfg["launch_env"]["PREFILL_HIGH_KV_ROWS_PROBE"] = "1"
         cfg["burst_replay"] = bool(burst_gate)
         nodes[node] = cfg
         node_spec = json.loads((PRIOR / "cache" / f"{previous_node}.json").read_text())
@@ -187,7 +192,8 @@ def prepare(run, optimized=True, diagnostic_prepare=False, native_prepare=False,
     if auto_prefill_kv_capacity:
         config.update(auto_prefill_kv_capacity=True, capacity_frontier="auto", context_length=65536)
         spec.update(port=29870, title="122B A100 elastic Prefill with memory-sized KV capacity",
-                    implementation_note="Candidate replaces fixed Prefill KV caps with startup memory sizing. Fixed PP2 Decode, HiCache, and the existing migration path.")
+                    implementation_note="Candidate based on the registered r11 small-migration and the 20261128 64K AgentX Prefill implementations. Steady KV sizing and CPU-backed trim are under test; fixed PP2 Decode, HiCache and the existing NIXL transport.")
+    config["verify_prefill_kv_spill"] = verify_prefill_kv_spill
     config.update(burst_replay=bool(burst_gate), expected_profile_requests=97 if burst_gate else None)
     save(run / "config.json", config)
     spec["tasks"] = [dict(id="qualification", label="Request/cache/reuse acceptance",
@@ -314,6 +320,9 @@ def install_hooks():
     if os.environ.get("PREFILL_ROUNDTRIP_PROBE") and os.environ["ELASTIC_PD_ROLE"] == "prefill":
         from prefill_roundtrip import install_trigger_probe
         install_trigger_probe()
+        if os.environ.get("PREFILL_HIGH_KV_ROWS_PROBE") == "1":
+            from prefill_roundtrip import install_high_kv_rows_probe
+            install_high_kv_rows_probe()
     if os.environ["ELASTIC_PD_ROLE"] == "decode":
         if os.environ.get("SGLANG_PP2_STARTUP_PROBE"):
             from startup_timing_probe import install
@@ -687,7 +696,8 @@ def controller(run, root):
         elif root.get("prefill_roundtrip"):
             from prefill_roundtrip import measure
             results.update(measure(run, p, d, key, wait_file, replay, save,
-                                   verify_auto_capacity=root.get("auto_prefill_kv_capacity", False)))
+                                   verify_auto_capacity=root.get("auto_prefill_kv_capacity", False),
+                                   verify_prefill_kv_spill=root.get("verify_prefill_kv_spill", False)))
             return
         tokens = [1000 + (i * 31) % 20000 for i in range(512)]
         results["warmup"] = replay.request_one(p, d, key, tokens, 1, 0, True)
@@ -855,7 +865,15 @@ def controller(run, root):
                 raise RuntimeError("Owned remote execution/cleanup did not pass")
             for cfg in cfgs:
                 for row in cfg["layouts"]:
-                    save(run / "cache" / f"{cfg['role']}.usage_audit.json", h.verify_layout_usage(cfg, row, os.environ))
+                    for attempt in range(5):
+                        try:
+                            proof = h.verify_layout_usage(cfg, row, os.environ)
+                            break
+                        except RuntimeError as error:
+                            if attempt == 4 or "usage log changed while it was" not in str(error):
+                                raise
+                            time.sleep(0.5)
+                    save(run / "cache" / f"{cfg['role']}.usage_audit.json", proof)
         except Exception as error:
             results.update(passed=False, final_audit_error=str(error))
         save(run / "results.json", results)
@@ -880,6 +898,7 @@ def main():
     parser.add_argument("--lazy-cuda-modules", action="store_true")
     parser.add_argument("--kvcached-capacity", action="store_true")
     parser.add_argument("--auto-prefill-kv-capacity", action="store_true")
+    parser.add_argument("--verify-prefill-kv-spill", action="store_true")
     for option in ("prepare", "worker", "engine", "probe"):
         parser.add_argument("--" + option, action="store_true")
     args = parser.parse_args()
@@ -888,7 +907,8 @@ def main():
         return prepare(run, burst_gate=args.burst_gate, agentx_length_gate=args.agentx_length_gate, prefill_roundtrip=args.prefill_roundtrip, optimized=not args.sync_baseline, diagnostic_prepare=args.diagnostic_prepare,
                        native_prepare=args.native_prepare, lazy_cuda_modules=args.lazy_cuda_modules,
                        kvcached_capacity=args.kvcached_capacity,
-                       auto_prefill_kv_capacity=args.auto_prefill_kv_capacity)
+                       auto_prefill_kv_capacity=args.auto_prefill_kv_capacity,
+                       verify_prefill_kv_spill=args.verify_prefill_kv_spill)
     root = json.loads((run / "config.json").read_text())
     if args.client:
         from prefill_burst import run_client
