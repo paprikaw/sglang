@@ -417,23 +417,22 @@ class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
         )
         self.prepared_regions, self.prepared_generation = lease, generation
         lease.prepare()
-        rank = self.scheduler.ps.pp_rank
         logger.info(
-            "Elastic Prefill resize rank=%d generation=%d retiring_MRs=%d",
-            rank, generation, len(lease.source - lease.target_prepared),
+            "Elastic Prefill resize generation=%d retiring_MRs=%d",
+            generation, len(lease.source - lease.target_prepared),
         )
         self.suspend()
         logger.info(
-            "Elastic Prefill resize rank=%d generation=%d retired_MRs_seconds=%.4f",
-            rank, generation, lease.metrics["suspend_seconds"],
+            "Elastic Prefill resize generation=%d retired_MRs_seconds=%.4f",
+            generation, lease.metrics["suspend_seconds"],
         )
         started = time.monotonic()
         if shrinking:
             pool.resize_serving_capacity_at_fence(capacity)
         pool.reclaim_capacity_at_fence()
         logger.info(
-            "Elastic Prefill resize rank=%d generation=%d reclaim_seconds=%.4f",
-            rank, generation, time.monotonic() - started,
+            "Elastic Prefill resize generation=%d reclaim_seconds=%.4f",
+            generation, time.monotonic() - started,
         )
         self.refresh()
 
