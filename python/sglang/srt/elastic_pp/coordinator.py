@@ -1050,6 +1050,10 @@ class ElasticPPMigrationCoordinator:
         reports = agree("prefill_trim_cpu_spill", stage)
         if any(report["details"] != plan.signature for report in reports):
             raise RuntimeError("Prefill shrink row ownership differs across ranks")
+        logger.info(
+            "Elastic Prefill shrink rank=%d staged_rows=%d active_rows=%d cpu_bytes=%d",
+            self.rank, len(plan.rows), plan.request_rows, plan.cpu_bytes,
+        )
 
         # A partial index update or deregistration cannot be retried safely.
         # Once all peers verify the trim, later failures can regrow the source.

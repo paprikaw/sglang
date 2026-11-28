@@ -321,8 +321,9 @@ def install_hooks():
         from prefill_roundtrip import install_trigger_probe
         install_trigger_probe()
         if os.environ.get("PREFILL_HIGH_KV_ROWS_PROBE") == "1":
-            from prefill_roundtrip import install_high_kv_rows_probe
+            from prefill_roundtrip import install_high_kv_rows_probe, install_shrink_stack_probe
             install_high_kv_rows_probe()
+            install_shrink_stack_probe()
     if os.environ["ELASTIC_PD_ROLE"] == "decode":
         if os.environ.get("SGLANG_PP2_STARTUP_PROBE"):
             from startup_timing_probe import install

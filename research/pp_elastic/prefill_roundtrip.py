@@ -39,12 +39,15 @@ def install_trigger_probe():
 
 def install_high_kv_rows_probe():
     """Exercise occupied PP3 rows beyond the PP2 ceiling with short requests."""
+    from sglang.srt.distributed.parallel_state import get_pp_group
     from sglang.srt.mem_cache.kvcached_pool import KVCacheDTokenToKVPoolAllocator
 
     native = KVCacheDTokenToKVPoolAllocator.alloc
 
     def allocate(allocator, need_size):
-        staging = getattr(allocator._kvcache, "prefill_staging_capacity", None)
+        cache = allocator.get_kvcache()
+        full = getattr(cache, "full_kv_pool", cache)
+        staging = getattr(full, "prefill_staging_capacity", None)
         if (
             staging is None
             or allocator.serving_capacity <= staging
@@ -53,12 +56,38 @@ def install_high_kv_rows_probe():
             return native(allocator, need_size)
         allocator.merge_and_sort_free()
         pages = allocator.free_pages[-need_size:]
-        if int(pages[0]) <= staging:
+        rows = allocator._as_int_list(pages)
+        if rows[0] <= staging:
             raise RuntimeError("fixture did not allocate beyond the PP2 ceiling")
         allocator.free_pages = allocator.free_pages[:-need_size]
-        return allocator._record_allocated_pages(allocator._as_int_list(pages))
+        if not getattr(allocator, "_migration_fixture_high_allocated", False):
+            print(
+                f"PREFILL_KV_TEST_HIGH_ALLOCATED rank={get_pp_group().rank_in_group} "
+                f"min_row={rows[0]} staging={staging}",
+                flush=True,
+            )
+            allocator._migration_fixture_high_allocated = True
+        return allocator._record_allocated_pages(rows)
 
     KVCacheDTokenToKVPoolAllocator.alloc = allocate
+
+
+def install_shrink_stack_probe():
+    """Emit blocked scheduler stacks if the instrumented trim takes too long."""
+    import faulthandler
+
+    from sglang.srt.elastic_pp.coordinator import ElasticPPMigrationCoordinator
+
+    native = ElasticPPMigrationCoordinator._prepare_prefill_shrink_at_fence
+
+    def trim(coordinator, transition):
+        faulthandler.dump_traceback_later(25, repeat=True)
+        try:
+            return native(coordinator, transition)
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+
+    ElasticPPMigrationCoordinator._prepare_prefill_shrink_at_fence = trim
 
 
 def read_worker_log(path, complete, timeout=65):
@@ -113,6 +142,16 @@ def measure(
                 replay.http(endpoint["host"], endpoint["port"], "/flush_cache?timeout=60", key)
             for history in fixture["histories"]:
                 replay.request_one(p, d, key, history, 1, 0, True, request_timeout_s=90)
+            if direction == "down" and verify_prefill_kv_spill:
+                def used_high_rows(raw):
+                    high = re.findall(
+                        r"PREFILL_KV_TEST_HIGH_ALLOCATED rank=(\d+) min_row=(\d+) staging=(\d+)",
+                        raw,
+                    )
+                    return {int(rank) for rank, row, ceiling in high
+                            if int(row) > int(ceiling)} == {0, 1, 2}
+
+                read_worker_log(run / "cache/prefill.log", used_high_rows, timeout=30)
             room_base = 1827000000 + 10000 * generation + (1000 if migrate else 0)
             samples = run / "samples" / name
             samples.mkdir(parents=True, exist_ok=True)

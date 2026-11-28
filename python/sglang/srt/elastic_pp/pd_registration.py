@@ -7,6 +7,11 @@ Existing decode requests retain their slots and continue after the PP fence.
 
 from __future__ import annotations
 
+import logging
+import time
+
+logger = logging.getLogger(__name__)
+
 
 def validate_decode_args(args):
     required = dict(
@@ -289,7 +294,6 @@ class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
         if not high and group is None:
             return 0
         from collections import defaultdict
-        import logging
         from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
         cache = self.scheduler.tree_cache
@@ -378,11 +382,11 @@ class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
                 cached.update(affected)
                 if any(component.lock_ref > 0 for component in node.component_data):
                     locked.update(affected)
-            logging.getLogger(__name__).warning(
+            logger.warning(
                 "Prefill shrink kept high KV rows: cached=%d locked_cached=%d "
                 "outside_tree=%d", len(cached), len(locked), len(high - cached),
             )
-        logging.getLogger(__name__).info(
+        logger.info(
             "Elastic Prefill shrink rank=%d cap=%d high_before=%d high_after=%d "
             "live=%d demoted_KV=%d",
             self.scheduler.ps.pp_rank, capacity, before, len(high),
@@ -413,10 +417,24 @@ class PrefillRegistrationTransaction(DecodeRegistrationTransaction):
         )
         self.prepared_regions, self.prepared_generation = lease, generation
         lease.prepare()
+        rank = self.scheduler.ps.pp_rank
+        logger.info(
+            "Elastic Prefill resize rank=%d generation=%d retiring_MRs=%d",
+            rank, generation, len(lease.source - lease.target_prepared),
+        )
         self.suspend()
+        logger.info(
+            "Elastic Prefill resize rank=%d generation=%d retired_MRs_seconds=%.4f",
+            rank, generation, lease.metrics["suspend_seconds"],
+        )
+        started = time.monotonic()
         if shrinking:
             pool.resize_serving_capacity_at_fence(capacity)
         pool.reclaim_capacity_at_fence()
+        logger.info(
+            "Elastic Prefill resize rank=%d generation=%d reclaim_seconds=%.4f",
+            rank, generation, time.monotonic() - started,
+        )
         self.refresh()
 
     def suspend(self):
